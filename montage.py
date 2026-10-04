@@ -2,30 +2,31 @@ r"""
 montage.py - Valorant / CS2 kill-montage builder synced to a song. One file + montage_data\ folder. Personal use.
 Never modifies source clips. No network at runtime (only the optional one-click pip install). No admin needed.
 
-GET IT RUNNING (Windows 11, Python 3.13) - in cmd.exe:
+GET IT RUNNING (Windows 11, Python 3.12) - in cmd.exe:
     cd C:\Users\fireaxe\Desktop\CLAUDECODE
     git clone https://github.com/fireaxe77/montager.git montager      (later updates: cd montager && git pull origin main)
     cd montager
-    python -m pip install --user numpy opencv-python librosa soundfile scipy mutagen rapidfuzz
+    python -m pip install --user numpy opencv-python librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime
     python montage.py                    <- opens the GUI (the app also offers a one-click install of missing packages)
     ffmpeg missing?  winget install --id Gyan.FFmpeg -e --scope user   (open a new terminal afterwards)
 
 FIRST 3 THINGS TO CLICK:
-  1. Troubleshoot > "Selfcheck"  -> every line should say OK (ffmpeg, NVENC, packages).
-  2. Troubleshoot > "Calibrate killfeed..." once per game: Open clip, scrub to a frame where your FIREAXE kill row
-     is visible, drag a box over that row, then a tight box over the text FIREAXE (optionally the headshot icon).
-     Self-test must say "1 own row". (Or "Open screenshot..." if you have one.)
+  1. Troubleshoot > "Selfcheck"  -> every line should say OK (ffmpeg, NVENC, packages, OCR test).
+  2. Troubleshoot > "Self-test detection" after a few clips are scanned: rows found, the OCR text of your rows, verdicts.
+     (Optional: "Calibrate killfeed region" if your killfeed is not in the default top-right area.)
   3. Auto tab > "Dry plan" for a game: first run scans every clip once (cached forever), then prints the song with
-     its score breakdown, ranked kills, and the cut list. Then "Preview" (720p, 20 s around the drop) and "Run".
+     its score breakdown, ranked kills, and the cut list. Then "Preview" (720p, 20 s around the drop) and "Make this week's montage".
 
-NOTES (V3): kills are found row-first (weapon icon splits a row into killer side / victim side; FIREAXE matched on each side).
-  Dry plan, Render, Self-test and the killfeed crop view all use the same classify_row/analyse_entry code. Songs tab shows the
-  one-to-one MP3 <-> playlist matching (montage_data\\song_matches.csv) with manual override. Recalibrate once if you want the
-  highlight-border bonus (older calibrations still work without it).
+NOTES (V4): kills are read with OCR (RapidOCR, offline) from the killfeed region. Rows are grouped by height, the weapon icon
+  (white blob, else the widest gap) splits killer side / victim side. KILL = FIREAXE is the first name on the killer side (a name
+  before it = assist, rejected; small/square icon = utility, rejected). DEATH = FIREAXE on the victim side. The first scan after
+  updating rescans every clip once (new cache format kills_v5); raw OCR results are cached, so later rule changes need no rescan.
+  Dry plan, Render, Self-test and the killfeed crop view all use the same classify_row/analyse_entry code. BPM comes from the
+  CSV "Tempo" column (librosa only refines the beat grid). "python montage.py smoketest" checks the GUI buttons and the OCR.
 
 CLI (same engine):  python montage.py auto [--game valorant|cs2] [--force] [--dry] [--preview] [--max-quality] [--seed N]
                     python montage.py plan --game cs2        (dry plan only)     python montage.py pick   (GUI, Manual tab)
-                    python montage.py selfcheck | inventory | scan | verify <game> | calibrate-bars | tag <path> <game>
+                    python montage.py selfcheck | selftest | smoketest | inventory | scan | verify <game> | calibrate-bars | tag <path> <game>
 Data: montage_data\ (config.json, caches, calibration, plans, logs\montage.log). Output: E:\Movies\Montages\<Game>\.
 """
 import argparse
@@ -75,15 +76,14 @@ DEFAULT_CONFIG = {
     "window_min_s": 45,
     "window_max_s": 90,
     "game_audio_level": 0.5,        # linear gain of game audio under the music (0.5 = -6 dB); +4 dB boost around kills
-    "cfg_version": 2,
+    "cfg_version": 3,
     "include_valorant": ["VALORANT"],   # only folders whose name matches are used (any depth under clip_root)
     "include_cs": ["CS", "COUNTER STRIKE"],
     "max_mb": 60,
     "max_dur_s": 60,
     "auto_recent_days": 30,
     "auto_old_per_run": 150,
-    "thr_kill": 0.65,               # FIREAXE name on the KILLER side of a row's weapon icon
-    "thr_death": 0.78,              # FIREAXE name on the VICTIM side = my death
+    "name_match": 80,               # V4 OCR: rapidfuzz partial_ratio needed for FIREAXE (killer side = kill, victim side = death)
     "death_lock_s": 8.0,            # no kills counted this long after my own death
     "sync_report": True,
     "gap_s": {"valorant": 6.0, "cs2": 5.0},
@@ -91,6 +91,8 @@ DEFAULT_CONFIG = {
     "match_threshold": 85,
     "length_s": 85,
     "quality": "nvenc",             # nvenc | max
+    "theme": "light",               # light (default) | dark | auto
+    "scan_workers": 2,              # clips OCR-scanned in parallel
 }
 
 
@@ -151,6 +153,15 @@ def load_config():
         cfg["game_audio_level"], cfg["cfg_version"] = 0.5, 2
         try:
             save_json(CONFIG_PATH, cfg)
+        except Exception:
+            pass
+    if cfg.get("cfg_version", 1) < 3:                 # V4: light theme is the default (dark stays optional in Settings)
+        if cfg.get("theme") in (None, "auto"):
+            cfg["theme"] = "light"
+        cfg["cfg_version"] = 3
+        try:
+            if CONFIG_PATH.exists():
+                save_json(CONFIG_PATH, cfg)
         except Exception:
             pass
     return cfg
@@ -562,14 +573,19 @@ def write_song_matches(audio, matched):
 
 
 # ------------------------------------------------------------- kill detection
+# V4: OCR (RapidOCR, offline) on the killfeed region. No name template, no scale search.
 NORM_W, NORM_H = 1920, 1080     # every clip is normalised to this (content rect stretched)
-FPS = 15
-COARSE = [0.6, 0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.4, 1.6]
+FPS = 15                        # killfeed sampling rate
+OCR_MAX_PER_S = 4               # at most this many OCR calls per second of clip
+OCR_GAP = int(math.ceil(FPS / OCR_MAX_PER_S))      # frames between two OCR calls (4 -> 3.75/s)
+OCR_HEARTBEAT = FPS             # OCR at least once a second even if nothing changed (every row is seen twice)
+DIFF_THR = 0.035                # share of changed 'bright text' pixels in a band that counts as a change
 TRACK_KEEP_S = 8.0              # a killfeed row is remembered this long (so it is never counted twice)
-SAME_ROW_CORR = 0.90            # appearance match that means "same row as before" even if it moved (feed shift)
-CACHE_V = 4                     # bump when the cached per-frame format changes
+CACHE_V = 5                     # bump when the cached per-frame format changes (5 = raw OCR boxes)
 ALGO = f"v{CACHE_V}"
-IGNORE_FIRST_S = 0.5            # rows already on screen when the clip starts are not kills
+MY_NAME = "fireaxe"
+NAME_MIN = 80                   # rapidfuzz partial_ratio needed for FIREAXE
+DEFAULT_REGION = {"valorant": [0.58, 0.05, 1.0, 0.42], "cs2": [0.58, 0.03, 1.0, 0.40]}   # fractions of the content rect
 
 
 def read_img(path):
@@ -611,256 +627,224 @@ def pick_roi(img, title):
     return int(x / s), int(y / s), max(2, int(round(rw / s))), max(2, int(round(rh / s)))
 
 
-def ring_hist(bgr, x, y, tw, th, ring, sx, sy):
-    """Colour histogram of the strips just above and below the name = the row highlight signature."""
+_OCR = threading.local()
+
+
+def ocr_engine():
+    """One RapidOCR engine per thread (models ship inside the pip package: fully offline)."""
+    if getattr(_OCR, "e", None) is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            raise RuntimeError("RapidOCR missing: python -m pip install --user rapidocr-onnxruntime")
+        import logging
+        logging.getLogger("RapidOCR").setLevel(logging.ERROR)
+        _OCR.e = RapidOCR()
+    return _OCR.e
+
+
+def bright_mask(bgr):
+    """White HUD pixels (killfeed text and weapon icons): bright and unsaturated."""
     import cv2
-    import numpy as np
-    H, W = bgr.shape[:2]
-    pad, ht, hb = int(ring["pad"] * sx), max(2, int(ring["ht"] * sy)), max(2, int(ring["hb"] * sy))
-    x0, x1 = max(0, x - pad), min(W, x + tw + pad)
-    parts = [p.reshape(-1, 3) for p in (bgr[max(0, y - ht):y, x0:x1], bgr[y + th:min(H, y + th + hb), x0:x1]) if p.size]
-    if not parts:
-        return None
-    hsv = cv2.cvtColor(np.concatenate(parts).reshape(-1, 1, 3), cv2.COLOR_BGR2HSV)
-    h = cv2.calcHist([hsv], [0, 1, 2], None, [12, 4, 4], [0, 180, 0, 256, 0, 256]).flatten()
-    return h / max(h.sum(), 1)
-
-
-def hp_img(gray):
-    import cv2
-    import numpy as np
-    g = gray.astype(np.float32)
-    return g - cv2.GaussianBlur(g, (0, 0), 3)
-
-
-def row_band(gray, x, y, tw, th):
-    """Right part of the row (weapon + victim) as a compact high-pass signature (hex): identifies a row wherever it moved."""
-    import cv2
-    import numpy as np
-    b = gray[y:y + th, x + tw:].astype(np.float32)
-    if b.shape[1] < 8 or b.shape[0] < 4:
-        return ""
-    b = cv2.resize(b - cv2.GaussianBlur(b, (0, 0), 3), (48, 6), interpolation=cv2.INTER_AREA)
-    m = float(np.abs(b).max()) or 1.0
-    return np.clip(b / m * 127, -127, 127).astype(np.int8).tobytes().hex()
-
-
-_SIGS = {}
-
-
-def sig_corr(a, b):
-    import numpy as np
-    if not a or not b:
-        return 0.0
-    for k in (a, b):
-        if k not in _SIGS:
-            if len(_SIGS) > 20000:
-                _SIGS.clear()
-            v = np.frombuffer(bytes.fromhex(k), np.int8).astype(np.float32)
-            _SIGS[k] = v - v.mean()
-    va, vb = _SIGS[a], _SIGS[b]
-    d = float(np.linalg.norm(va) * np.linalg.norm(vb))
-    return float(va @ vb / d) if d > 1e-6 else 0.0
-
-
-def band_corr(a, b):
-    import cv2
-    r = float(cv2.matchTemplate(a, b, cv2.TM_CCOEFF_NORMED)[0, 0])
-    return 0.0 if r != r else r
-
-
-SCALE_GRID = [0.6, 0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.4, 1.6]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    return (hsv[..., 2] >= 185) & (hsv[..., 1] <= 70)
 
 
 def weapon_blobs(bgr, th):
-    """White weapon-icon candidates: big bright low-saturation blobs. Wide ones are guns/knives, squarish ones are utility."""
+    """White icon candidates sized like a killfeed icon (th = text box height). Wide = gun/knife, squarish = utility."""
     import cv2
     import numpy as np
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    m = ((hsv[..., 2] >= 190) & (hsv[..., 1] <= 70)).astype(np.uint8) * 255
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 5), np.uint8))
+    m = bright_mask(bgr).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     n, _, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
     res = []
     for i in range(1, n):
         x, y, w, h, a = (int(v) for v in st[i])
-        if h < 1.1 * th or h > 2.9 * th or w < 0.6 * h or a < 0.22 * w * h:
+        if h < 0.45 * th or h > 2.6 * th or w < 0.5 * h or a < 0.18 * w * h or w > 12 * th:
             continue
-        res.append((x, y, w, h))
+        res.append([x, y, w, h, round(a / float(w * h), 2)])
     return res
 
 
-class Detector:
-    def __init__(self, game):
-        import cv2
-        import numpy as np
-        d = load_json(DATA / f"detect_{game}.json", None)
-        if not d:
-            raise RuntimeError(f"{game} not calibrated: use Troubleshoot > Calibrate killfeed")
-        self.game, self.d = game, d
-        self.tmpl = cv2.imdecode(np.fromfile(str(DATA / d["name_png"]), np.uint8), cv2.IMREAD_GRAYSCALE)
-        hp = DATA / d["hs_png"] if d.get("hs_png") else None
-        self.hs = cv2.imdecode(np.fromfile(str(hp), np.uint8), cv2.IMREAD_GRAYSCALE) if hp and hp.exists() else None
-        self.lg = int(d.get("left_gap", 0))
-        self.row_h = float(d.get("row_h", 1.9 * self.tmpl.shape[0]))
-        self.dw = int(round((d["region"][2] - d["region"][0]) * NORM_W))
-        self.dh = int(round((d["region"][3] - d["region"][1]) * NORM_H))
-        self._t = {}
-
-    def tmpl_at(self, sx, sy):
-        import cv2
-        k = (round(sx, 3), round(sy, 3))
-        if k not in self._t:
-            h, w = self.tmpl.shape
-            t = cv2.resize(self.tmpl, (max(4, int(round(w * sx))), max(4, int(round(h * sy)))),
-                           interpolation=cv2.INTER_AREA if sx * sy < 1 else cv2.INTER_CUBIC)
-            self._t[k] = (t, hp_img(t))
-        return self._t[k][0]
-
-    def _resp(self, gray, hp, sx, sy):
-        """Name match = max(raw, high-pass) normalised correlation: robust to the translucent row background."""
-        import cv2
-        import numpy as np
-        t = self.tmpl_at(sx, sy)
-        if t.shape[0] >= gray.shape[0] or t.shape[1] >= gray.shape[1]:
-            return None, t
-        r1 = np.nan_to_num(cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED))
-        r2 = np.nan_to_num(cv2.matchTemplate(hp, self._t[(round(sx, 3), round(sy, 3))][1], cv2.TM_CCOEFF_NORMED))
-        return np.maximum(r1, r2), t
-
-    def score_at(self, gray, hp, sx, sy):
-        r, _ = self._resp(gray, hp, sx, sy)
-        return float(r.max()) if r is not None else -1.0
-
-    def search_scale(self, gray, hp):
-        """x and y scale searched separately (0.6-1.6): coarse grid at half resolution, then full-res refinement."""
-        import cv2
-        g2 = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        h2 = hp_img(g2)
-        base = Detector.__new__(Detector)
-        base.__dict__.update(self.__dict__)
-        base.tmpl = cv2.resize(self.tmpl, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        base._t = {}
-        best = (-1.0, 1.0, 1.0)
-        for sx in SCALE_GRID:
-            for sy in SCALE_GRID:
-                sc = base.score_at(g2, h2, sx, sy)
-                if sc > best[0]:
-                    best = (sc, sx, sy)
-        bx, by = best[1], best[2]
-        for fx in (0.94, 1.0, 1.06):
-            for fy in (0.94, 1.0, 1.06):
-                sc = self.score_at(gray, hp, bx * fx, by * fy)
-                if sc > best[0]:
-                    best = (sc, bx * fx, by * fy)
-        return best
-
-    def has_hs(self, gray, x, y, tw, th, sx, sy):
-        import cv2
-        if self.hs is None:
-            return False
-        t = cv2.resize(self.hs, (max(3, int(self.hs.shape[1] * sx)), max(3, int(self.hs.shape[0] * sy))))
-        band = gray[max(0, y - 4):y + th + 4, x + tw:]
-        if band.shape[0] <= t.shape[0] or band.shape[1] <= t.shape[1]:
-            return False
-        return float(cv2.matchTemplate(band, t, cv2.TM_CCOEFF_NORMED).max()) >= self.d.get("hs_thr", 0.7)
-
-    def _side(self, gray, hp, sx, sy, xa, xb, y0, y1):
-        """Best FIREAXE match inside one side of a row: (score, x, y) in region coordinates."""
-        import numpy as np
-        if xb - xa < 8 or y1 - y0 < 8:
-            return -1.0, 0, 0
-        r, _ = self._resp(gray[y0:y1, xa:xb], hp[y0:y1, xa:xb], sx, sy)
-        if r is None:
-            return -1.0, 0, 0
-        iy, ix = np.unravel_index(int(np.argmax(r)), r.shape)
-        return float(r[iy, ix]), xa + int(ix), y0 + int(iy)
-
-    def hl_bonus(self, bgr, y0, y1, xl, xr):
-        """BONUS only: share of the row's top/bottom border lines in the calibrated highlight colour, and the left edge
-        of that border (-1 if not found). Used to spot assist rows (row continues left of my name)."""
-        import cv2
-        import numpy as np
-        c = self.d.get("hl_color")
-        if not c or y1 - y0 < 8:
-            return 0.0, -1
-        xl, xr = max(0, int(xl)), min(bgr.shape[1], int(xr))
-        if xr - xl < 12:
-            return 0.0, -1
-        hsv = cv2.cvtColor(bgr[:, xl:xr], cv2.COLOR_BGR2HSV).astype(np.int16)
-        dh = np.abs(hsv[..., 0] - c[0])
-        dh = np.minimum(dh, 180 - dh)
-        m = (dh <= 14) & (hsv[..., 1] >= max(60, c[1] * 0.6)) & (hsv[..., 2] >= c[2] * 0.5)
-        top, bot = m[y0:y0 + 3].any(axis=0), m[max(0, y1 - 3):y1].any(axis=0)
-        frac = float((top.mean() + bot.mean()) / 2)
-        both = top & bot
-        run, best, start = 0, 0, -1
-        for i, v in enumerate(both):
-            if v:
-                run += 1
-                if run == 1:
-                    s0 = i
-                if run > best:
-                    best, start = run, s0
-            else:
-                run = 0
-        return frac, (xl + start if best >= 12 else -1)
-
-    def rows(self, gray, hp, bgr, sx, sy, floor=0.45):
-        """Row-first detection: weapon icon -> killer side / victim side -> FIREAXE match on each side separately."""
-        t = self.tmpl_at(sx, sy)
-        th, _ = t.shape
-        H, W = gray.shape
-        rh = max(th + 6, int(self.row_h * sy))
-        blobs = sorted(weapon_blobs(bgr, th), key=lambda b: -(b[2] * b[3]))
-        kept = []
-        for b in blobs:                                       # one icon per row
-            if all(abs((b[1] + b[3] / 2) - (k[1] + k[3] / 2)) >= 0.5 * rh for k in kept):
-                kept.append(b)
+def _ocr_raw(img, det=True):
+    e = ocr_engine()
+    if det:
+        r, _ = e(img, use_cls=False)
         res = []
-        for x, y, w, h in kept:
-            cy = y + h // 2
-            y0 = max(0, min(H - rh, cy - rh // 2))
-            y1 = min(H, y0 + rh)
-            ks, kx, ky = self._side(gray, hp, sx, sy, 0, x - 2, y0, y1)
-            vs, vx, vy = self._side(gray, hp, sx, sy, x + w + 2, W, y0, y1)
-            if max(ks, vs) < floor:
-                continue
-            hl, rl = self.hl_bonus(bgr, y0, y1, 0, W)
-            res.append({"y": cy, "y0": y0, "y1": y1, "ix": x, "iw": w, "ih": h, "gun": w >= 1.5 * h, "ks": ks, "kx": kx, "ky": ky,
-                        "vs": vs, "vx": vx, "vy": vy, "hl": hl, "rl": rl, "th": th, "tw": t.shape[1],
-                        "hs": self.has_hs(gray, x, y0, w, y1 - y0, sx, sy), "sig": row_band(gray, x, y0, 0, y1 - y0)})
+        for box, text, conf in r or []:
+            xs, ys = [p[0] for p in box], [p[1] for p in box]
+            res.append([int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)), str(text).strip(), round(float(conf), 3)])
         return res
+    r, _ = e(img, use_det=False, use_cls=False)
+    return (str(r[0][0]).strip(), float(r[0][1])) if r else ("", 0.0)
 
 
-def classify_row(r, cfg, lg=0.0):
-    """THE rule set, used identically by the crop view, Dry plan, Render, sync report and Self-test.
-    Returns (verdict, reason): verdict in kill / death / reject / none."""
-    tk, td = cfg.get("thr_kill", 0.65), cfg.get("thr_death", 0.78)
-    out_ = []
-    if r["vs"] >= td:
-        out_.append(("death", "death: my name on the victim side"))
-    if r["ks"] >= tk:
-        if not r["gun"]:
-            out_.append(("reject", "utility: small/square icon (grenade, molotov...)"))
-        elif r["rl"] >= 0 and r["rl"] < r["kx"] - lg - 0.9 * r["th"]:
-            out_.append(("reject", "assist: another name sits before mine in the row"))
+def ocr_frame(bgr):
+    """RAW OCR of one killfeed crop: text boxes [x0,y0,x1,y1,text,conf] + white icon blobs [x,y,w,h].
+    A box that swallowed a gun-sized icon is split there and both halves re-read."""
+    import numpy as np
+    boxes = _ocr_raw(bgr)
+    if not boxes:
+        return [], []
+    th = float(np.median([b[3] - b[1] for b in boxes]))
+    blobs = weapon_blobs(bgr, th)
+    outb = []
+    for b in boxes:
+        bh = b[3] - b[1]
+        inner = [g for g in blobs if g[2] >= 2 * g[3] and g[4] >= 0.5 and g[3] >= 0.55 * bh and g[0] - b[0] >= 0.8 * bh
+                 and b[2] - (g[0] + g[2]) >= 0.8 * bh and abs((g[1] + g[3] / 2) - (b[1] + b[3]) / 2) <= 0.5 * bh]
+        if not inner:
+            outb.append(b)
+            continue
+        g = max(inner, key=lambda g: g[2])
+        halves = [(xa, xb) + _ocr_raw(bgr[b[1]:b[3], xa:xb], det=False) for xa, xb in ((b[0], g[0] - 1), (g[0] + g[2] + 1, b[2]))]
+        if all(len(_alnum(t)) >= 3 and c >= 0.6 for _, _, t, c in halves):
+            outb += [[xa, b[1], xb, b[3], t, round(c, 3)] for xa, xb, t, c in halves]
         else:
-            out_.append(("kill", "killer-side name %.2f" % r["ks"]))
-    return out_ or [("none", "no own name")]
+            outb.append(b)
+    return outb, blobs
 
 
-def accept(n, h, tn, th):
-    return (n >= tn and h >= th) or (h >= 0.9 and n >= 0.6)
+def _alnum(s):
+    return re.sub(r"[\W_]+", "", s or "")
 
 
-def region_filter(rec, det, cfg):
-    """ffmpeg filter that cuts the killfeed region out of the content rect and stretches it to 1920x1080 space."""
+def name_match(text):
+    """(score 0-100, start index in text) of the best FIREAXE match. rapidfuzz partial_ratio, case-insensitive; a text shorter
+    than 5 letters must match as a whole (so 'fire' or 'axe' alone never counts)."""
+    from rapidfuzz import fuzz
+    t = (text or "").lower()
+    if len(_alnum(t)) < 5:
+        return float(fuzz.ratio(_alnum(t), MY_NAME)), 0
+    if len(t) <= len(MY_NAME):
+        return float(fuzz.ratio(t, MY_NAME)), 0
+    al = fuzz.partial_ratio_alignment(MY_NAME, t)
+    return float(al.score), int(al.dest_start)
+
+
+def ocr_rows(boxes, blobs):
+    """Group OCR boxes into killfeed rows (by y-centre), find each row's weapon icon (white blob between the texts, else the
+    largest horizontal gap) and split into killer side / victim side."""
+    import numpy as np
+    good = [b for b in boxes if len(_alnum(b[4])) >= 2 and b[5] >= 0.5]
+    if not good:
+        return []
+    th = float(np.median([b[3] - b[1] for b in good]))
+    # boxes that are really the icon (OCR read the silhouette as text)
+    def ov(b, g):
+        ix = max(0, min(b[2], g[0] + g[2]) - max(b[0], g[0]))
+        iy = max(0, min(b[3], g[1] + g[3]) - max(b[1], g[1]))
+        return ix * iy
+    good = [b for b in good if not ((b[5] < 0.75 or len(_alnum(b[4])) <= 2) and
+                                    any(ov(b, g) > 0.5 * (b[2] - b[0]) * (b[3] - b[1]) and g[2] >= 1.2 * g[3] for g in blobs))]
+    rows = []
+    for b in sorted(good, key=lambda b: (b[1] + b[3]) / 2):
+        cy = (b[1] + b[3]) / 2
+        if rows and abs(cy - rows[-1]["cy"]) <= 0.45 * max(th, b[3] - b[1]):
+            r = rows[-1]
+            r["boxes"].append(b)
+            r["cy"] = float(np.mean([(x[1] + x[3]) / 2 for x in r["boxes"]]))
+        else:
+            rows.append({"cy": cy, "boxes": [b]})
+    res = []
+    for r in rows:
+        bx = sorted(r["boxes"], key=lambda b: b[0])
+        rh = float(np.median([b[3] - b[1] for b in bx]))
+        y0, y1 = min(b[1] for b in bx), max(b[3] for b in bx)
+        free = [g for g in blobs if abs(g[1] + g[3] / 2 - r["cy"]) <= 0.6 * max(rh, g[3])
+                and not any(ov(b, g) > 0.5 * g[2] * g[3] for b in bx)]
+        between = [g for g in free if bx[0][0] < g[0] + g[2] / 2 < bx[-1][2]]
+        icon, split = None, None
+        if between or free:
+            icon = max(between or free, key=lambda g: g[2] * g[3])
+            split = "icon"
+            cut = icon[0] + icon[2] / 2
+        elif len(bx) >= 2:
+            gaps = [(bx[i + 1][0] - bx[i][2], i) for i in range(len(bx) - 1)]
+            gw, gi = max(gaps)
+            if gw >= 0.8 * rh:
+                split = "gap"
+                cut = (bx[gi][2] + bx[gi + 1][0]) / 2
+                icon = [int(bx[gi][2] + 0.15 * rh), int(r["cy"] - 0.6 * rh), int(max(1, gw - 0.3 * rh)), int(1.2 * rh)]
+        if split is None:
+            res.append({"y": int(r["cy"]), "y0": y0, "y1": y1, "th": rh, "killer": [], "victim": [], "icon": None, "gun": False,
+                        "split": None, "hs": False, "boxes": bx, "appear": min(b[6] if len(b) > 6 else 0 for b in bx),
+                        "appear_max": max(b[6] if len(b) > 6 else 0 for b in bx)})
+            continue
+        kil = [b for b in bx if (b[0] + b[2]) / 2 < cut]
+        vic = [b for b in bx if (b[0] + b[2]) / 2 >= cut]
+        gun = icon[2] >= 1.5 * icon[3] if split == "icon" else icon[2] >= 1.9 * rh
+        hs = split == "icon" and any(g is not icon and 0 <= g[0] - (icon[0] + icon[2]) <= 1.5 * rh and 0.6 <= g[2] / max(1, g[3]) <= 1.6
+                                     and (not vic or g[0] + g[2] <= vic[0][0] + 2) for g in free)
+        res.append({"y": int(r["cy"]), "y0": y0, "y1": y1, "th": rh, "killer": kil, "victim": vic, "icon": icon, "gun": bool(gun),
+                    "split": split, "hs": bool(hs), "boxes": bx, "appear": min(b[6] if len(b) > 6 else 0 for b in bx),
+                    "appear_max": max(b[6] if len(b) > 6 else 0 for b in bx)})
+    for d in res:
+        d["ktext"] = " ".join(b[4] for b in d["killer"])
+        d["vtext"] = " ".join(b[4] for b in d["victim"])
+        d["ks"], kpos = name_match(d["ktext"]) if d["killer"] else (0.0, 0)
+        d["vs"], _ = name_match(d["vtext"]) if d["victim"] else (0.0, 0)
+        pre = d["ktext"][:kpos]
+        d["before"] = pre.strip() if ("+" in pre or len(_alnum(pre)) >= 3) else ""
+    return res
+
+
+def classify_row(r, cfg=None, lg=0.0):
+    """THE rule set, used identically by the crop view, Dry plan, Render, sync report and Self-test.
+    Returns [(verdict, reason), ...]: verdict in kill / death / reject / none (one row can be both kill and death)."""
+    out_ = []
+    thr = float((cfg or {}).get("name_match", NAME_MIN))
+    if r.get("split") is None and max(r.get("ks", 0), r.get("vs", 0)) >= thr:
+        return [("none", "FIREAXE seen but no weapon icon / gap to split the row")]
+    if r.get("vs", 0) >= thr:
+        out_.append(("death", f"death: FIREAXE on the victim side ('{r['vtext']}' {r['vs']:.0f})"))
+    if r.get("ks", 0) >= thr:
+        w = "weapon icon" if r["split"] == "icon" else "gap"
+        if not r["gun"]:
+            out_.append(("reject", f"utility: small/square {w} (grenade, molotov, ability)"))
+        elif r.get("before"):
+            out_.append(("reject", f"assist: '{r['before']}' comes before FIREAXE on the killer side"))
+        else:
+            out_.append(("kill", f"kill: FIREAXE first on the killer side ('{r['ktext']}' {r['ks']:.0f}, split by {w})"))
+    return out_ or [("none", "no FIREAXE in this row")]
+
+
+def row_desc(r):
+    v = classify_row(r)
+    return f"[{r['ktext'] or '-'}] {'=gun=' if r['gun'] else '=util=' if r['icon'] else '=?='} [{r['vtext'] or '-'}] -> " + \
+        " + ".join(f"{a.upper()} ({b})" for a, b in v)
+
+
+def region_px(rec, det, cfg):
+    """Killfeed crop in source pixels (x, y, w, h) from the region fractions of the content rect."""
     cx, cy, cw, ch = content_rect(rec, cfg)
     x0, y0, x1, y1 = det.d["region"]
     rx, ry = int(cx + x0 * cw) & ~1, int(cy + y0 * ch) & ~1
     rw, rh = max(2, int((x1 - x0) * cw) & ~1), max(2, int((y1 - y0) * ch) & ~1)
-    rw, rh = min(rw, rec["w"] - rx), min(rh, rec["h"] - ry)
+    return rx, ry, min(rw, rec["w"] - rx) & ~1, min(rh, rec["h"] - ry) & ~1
+
+
+def region_filter(rec, det, cfg):
+    """ffmpeg filter that cuts the killfeed region out of the content rect and stretches it to 1920x1080 space."""
+    rx, ry, rw, rh = region_px(rec, det, cfg)
     return f"crop={rw}:{rh}:{rx}:{ry},scale={det.dw}:{det.dh}:flags=bicubic,format=bgr24"
+
+
+class Detector:
+    """Killfeed REGION per game (fractions of the content rect). Calibration is optional: defaults are top-right."""
+    def __init__(self, game):
+        d = load_json(DATA / f"detect_{game}.json", None) or {}
+        reg = d.get("region") or DEFAULT_REGION[game]
+        self.game, self.calibrated = game, bool(d.get("region"))
+        self.d = {"region": [float(v) for v in reg]}
+        self.d["stamp"] = "ocr" + hashlib.md5(repr([round(v, 4) for v in self.d["region"]]).encode()).hexdigest()[:8]
+        self.dw = max(16, int(round((reg[2] - reg[0]) * NORM_W)) & ~1)
+        self.dh = max(16, int(round((reg[3] - reg[1]) * NORM_H)) & ~1)
+
+    def crop_norm(self, img):
+        """Killfeed crop out of a 1920x1080 normalised frame."""
+        x0, y0, x1, y1 = self.d["region"]
+        return img[int(y0 * NORM_H):int(y0 * NORM_H) + self.dh, int(x0 * NORM_W):int(x0 * NORM_W) + self.dw]
 
 
 def frame_stream(path, rec, det, cfg, fps, use_hw=True):
@@ -890,43 +874,8 @@ def frame_stream(path, rec, det, cfg, fps, use_hw=True):
             return
 
 
-SCALES = DATA / "scales.json"
 ONSET_CACHE = DATA / "onsets_cache.json"
-_scale_lock = threading.Lock()
-
-
-def scale_key(game, det, rec, cfg):
-    return f"{game}|{det.d['stamp']}|{rec['w']}x{rec['h']}|{content_rect(rec, cfg)}"
-
-
-def get_scale(det, game, rec, cfg, peers=()):
-    """x/y HUD scale solved once per (game, resolution, content rect) and cached (scales.json)."""
-    import cv2
-    with _scale_lock:
-        cache = load_json(SCALES, {})
-        k = scale_key(game, det, rec, cfg)
-        e = cache.get(k)
-        if e and (e["solved"] or e.get("tries", 0) >= 4):
-            return e
-        best = (-1.0, 1.0, 1.0)
-        for r in ([rec] + list(peers))[:3]:
-            for fr in frame_stream(r["path"], r, det, cfg, 2):
-                g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
-                sc = det.search_scale(g, hp_img(g))
-                if sc[0] > best[0]:
-                    best = sc
-                if best[0] >= 0.85 or CANCEL.is_set():
-                    break
-            if best[0] >= 0.85 or CANCEL.is_set():
-                break
-        solved = best[0] >= 0.5
-        e = {"sx": round(best[1], 3) if solved else 1.0, "sy": round(best[2], 3) if solved else 1.0,
-             "score": round(best[0], 3), "solved": solved, "tries": (e or {}).get("tries", 0) + 1}
-        cache[k] = e
-        save_json(SCALES, cache)
-        out(f"  scale solved for {rec['w']}x{rec['h']} rect {content_rect(rec, cfg)}: x{e['sx']} y{e['sy']} (match {e['score']})"
-            + ("" if solved else "  UNSOLVED - no killfeed row seen yet, using 1.0"))
-        return e
+SCALES = DATA / "scales.json"          # V3 leftover; only deleted by Clear cache
 
 
 class KillStore:
@@ -972,84 +921,159 @@ def load_kills_cache():
     return KillStore()
 
 
-def scan_clip(path, rec, det, cfg, scale):
-    """Full 15 fps scan. Stores RAW per-frame row data (name scores per side, weapon icon, border, content signature) so any
-    later logic or threshold change needs no rescan."""
+def _band_changed(m, last):
+    """Cheap pixel diff of the bright-text mask vs the last OCR'd frame, per horizontal band (~a killfeed row)."""
+    d = m != last
+    H = d.shape[0]
+    bh = max(4, H // 12)
+    return any(d[i:i + bh].mean() >= DIFF_THR for i in range(0, H, bh))
+
+
+def _appear(box, buf, gray):
+    """First buffered frame in which this text box already looked like it does now (= the frame the row became visible)."""
     import cv2
-    t0 = time.time()
-    sx, sy = scale
-    rows, bk, bv, n = [], 0.0, 0.0, 0
-    for f, fr in enumerate(frame_stream(path, rec, det, cfg, FPS)):
+    import numpy as np
+    x0, y0, x1, y1 = max(0, box[0]), max(0, box[1]), box[2], box[3]
+    p = gray[y0:y1, x0:x1].astype(np.float32)
+    if p.size < 16 or p.std() < 3:
+        return buf[-1][0]
+    for f, g in buf:
+        q = g[y0:y1, x0:x1].astype(np.float32)
+        if q.shape != p.shape:
+            continue
+        r = float(cv2.matchTemplate(q, p, cv2.TM_CCOEFF_NORMED)[0, 0]) if q.std() >= 3 else 0.0
+        if r == r and r >= 0.8 and float(np.abs(q - p).mean()) <= 28:
+            return f
+    return buf[-1][0]
+
+
+def scan_frames(frames):
+    """OCR only when the killfeed changed (bright-pixel diff vs the last OCR'd frame), at most OCR_MAX_PER_S per second, plus a
+    1 s heartbeat. Returns RAW results: [[frame, change_frame, boxes(+appear frame), blobs], ...] and the frame count."""
+    import cv2
+    import numpy as np
+    res, last_m, last_f, since, buf, n = [], None, -10 ** 6, None, [], 0
+    for f, fr in enumerate(frames):
         n += 1
-        g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
-        for r in det.rows(g, hp_img(g), fr, sx, sy):
-            rows.append([f, int(r["y"]), int(r["ix"]), int(r["iw"]), int(r["ih"]), int(r["gun"]), round(r["ks"], 3), int(r["kx"]),
-                         round(r["vs"], 3), int(r["vx"]), round(r["hl"], 3), int(r["rl"]), int(r["hs"]), r["sig"]])
-            bk, bv = max(bk, r["ks"]), max(bv, r["vs"])
-    return {"v": CACHE_V, "rows": rows, "scale": [sx, sy], "frames": n, "row_h": int(det.row_h * sy), "lg": det.lg * sx,
-            "th": det.tmpl_at(sx, sy).shape[0], "v_off": rec.get("v_off", 0.0),
-            "best_name": round(max(bk, 0), 3), "best_vic": round(max(bv, 0), 3), "best_hl": 0.0, "secs": round(time.time() - t0, 1)}
+        small = cv2.resize(fr, (max(8, fr.shape[1] // 3), max(8, fr.shape[0] // 3)), interpolation=cv2.INTER_AREA)
+        m = bright_mask(small)
+        gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+        buf.append((f, gray))
+        if last_m is not None and since is None and _band_changed(m, last_m):
+            since = f
+        if last_m is None or (since is not None and f - last_f >= OCR_GAP) or f - last_f >= OCR_HEARTBEAT:
+            boxes, blobs = ocr_frame(np.ascontiguousarray(fr))
+            for b in boxes:
+                b.append(_appear(b, buf, gray) if last_m is not None else f)
+            res.append([f, f if since is None else since, boxes, blobs])
+            last_m, last_f, since, buf = m, f, None, [(f, gray)]
+        elif len(buf) > 2 * FPS:
+            buf = buf[:1] + buf[-FPS:]
+    return res, n
+
+
+def scan_clip(path, rec, det, cfg, scale=None):
+    """Full 15 fps pass over the killfeed crop. Stores RAW per-frame OCR results (boxes, text, confidence, icon blobs) so any
+    later logic or threshold change needs no rescan."""
+    t0 = time.time()
+    ocr, n = scan_frames(frame_stream(path, rec, det, cfg, FPS))
+    e = {"v": CACHE_V, "ocr": ocr, "frames": n, "size": [det.dw, det.dh], "region": det.d["region"],
+         "v_off": rec.get("v_off", 0.0), "ocr_calls": len(ocr), "secs": round(time.time() - t0, 1)}
+    a = analyse_entry(e, cfg)
+    e["best_name"], e["best_vic"] = round(a["best_k"], 3), round(a["best_v"], 3)
+    return e
+
+
+def _row_match(t, r, prev_f):
+    """Similarity (0-100) of a tracked row and a row in the current OCR frame: killer text + victim text + weapon, with a bonus
+    when the row's pixels did not change since the previous OCR frame at the same height (OCR noise on short names).
+    < 80 = a different row."""
+    from rapidfuzz import fuzz
+    if t["split"] == r["split"] == "icon" and t["gun"] != r["gun"]:
+        return 0.0
+    if t["iw"] and r["icon"] and abs(t["iw"] - r["icon"][2]) > 0.3 * max(t["iw"], r["icon"][2]):
+        return 0.0
+    sk = fuzz.ratio(t["k"], r["ktext"].lower()) if (t["k"] or r["ktext"]) else 100.0
+    sv = fuzz.ratio(t["v"], r["vtext"].lower()) if (t["v"] or r["vtext"]) else 100.0
+    sc = min(sk, sv)
+    if t["last"] == prev_f and abs(t["y"] - r["y"]) <= 0.5 * max(8.0, r["th"]) and r.get("appear_max", 0) <= prev_f:
+        sc += 15
+    return sc
 
 
 def analyse_entry(entry, cfg):
-    """Raw rows -> kills / deaths / rejected rows (with reasons). The ONE implementation behind Dry plan, Render, the sync
-    report, Self-test and the killfeed crop view (which uses classify_row on the same rows)."""
-    rh, off, nf = entry.get("row_h", 30), entry.get("v_off", 0.0), entry.get("frames", 0)
-    lg, th = entry.get("lg", 0.0), entry.get("th", 20)
-    byf = {}
+    """Raw OCR frames -> rows -> verdicts -> content-tracked rows (identity = killer text + victim text + weapon) -> kills /
+    deaths / rejected rows with reasons. The ONE implementation behind Dry plan, Render, the sync report, Self-test and the
+    killfeed crop view."""
+    off = entry.get("v_off", 0.0)
     bk = bv = 0.0
-    for f, y, ix, iw, ih, gun, ks, kx, vs, vx, hl, rl, hs, sig in entry.get("rows", []):
-        byf.setdefault(f, []).append({"y": y, "ix": ix, "gun": bool(gun), "ks": ks, "kx": kx, "vs": vs, "vx": vx, "hl": hl,
-                                      "rl": rl, "hs": bool(hs), "sig": sig, "th": th})
-        bk, bv = max(bk, ks), max(bv, vs)
-    tk, td = [], []
-
-    def find(tracks, r, f):
-        hit, hc = None, -1.0
-        for t in tracks:
-            if f - t["last"] > TRACK_KEEP_S * FPS:
+    tracks, mine, seen_rows = [], [], 0
+    last_ocr = entry["ocr"][-1][0] if entry.get("ocr") else 0
+    prev_f = -1
+    for f, since, boxes, blobs in entry.get("ocr", []):
+        rs = ocr_rows(boxes, blobs)
+        seen_rows = max(seen_rows, len(rs))
+        thr = float((cfg or {}).get("name_match", NAME_MIN))
+        cand = []
+        for r in rs:
+            bk, bv = max(bk, r["ks"] / 100), max(bv, r["vs"] / 100)
+            v = classify_row(r, cfg)
+            if all(x[0] == "none" for x in v) and max(r["ks"], r["vs"]) < thr:
                 continue
-            c = sig_corr(r["sig"], t["sig"])
-            pos = abs(r["ix"] - t["ix"]) <= 6 and abs(r["y"] - t["y"]) <= 0.5 * rh and f - t["last"] <= 8
-            if (pos or c >= 0.85) and c > hc:
-                hit, hc = t, c
-        return hit
-    for f in sorted(byf):
-        for r in byf[f]:
-            for v, why in classify_row(r, cfg, lg):
-                if v == "none":
-                    continue
-                tracks = td if v == "death" else tk
-                hit = find(tracks, r, f)
-                if hit:
-                    hit.update(last=f, ix=r["ix"], y=r["y"], sig=r["sig"], hits=hit["hits"] + 1,
-                               hs=hit["hs"] or (r["hs"] and f - hit["first"] <= 20), hl=max(hit["hl"], r["hl"]))
-                else:
-                    tracks.append({"first": f, "last": f, "ix": r["ix"], "y": r["y"], "sig": r["sig"], "hits": 1, "v": v, "why": why,
-                                   "hs": r["hs"], "hl": r["hl"], "ks": r["ks"], "vs": r["vs"]})
+            cand.append((r, v))
+        pairs = sorted(((_row_match(t, r, prev_f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
+                        if f - t["last"] <= TRACK_KEEP_S * FPS), reverse=True)
+        used_r, used_t, got = set(), set(), {}
+        for sc, i, j in pairs:                                 # one-to-one: two rows in one frame are never the same row
+            if sc >= 80 and i not in used_r and j not in used_t:
+                used_r.add(i)
+                used_t.add(j)
+                got[i] = tracks[j]
+        for i, (r, v) in enumerate(cand):
+            hit = got.get(i)
+            if hit:
+                hit.update(last=f, y=r["y"], hits=hit["hits"] + 1, hs=hit["hs"] or (r["hs"] and f - hit["first"] <= 20))
+                hit["votes"].append(v)
+            else:
+                first = max(prev_f + 1, min(int(r["appear"]), f)) if prev_f >= 0 else f
+                tracks.append({"first": first, "seen": f, "last": f, "y": r["y"], "hits": 1, "k": r["ktext"].lower(), "v": r["vtext"].lower(),
+                               "gun": r["gun"], "split": r["split"], "iw": r["icon"][2] if r["icon"] else 0, "hs": r["hs"],
+                               "ks": r["ks"] / 100, "vs": r["vs"] / 100, "votes": [v], "ktext": r["ktext"], "vtext": r["vtext"]})
+        prev_f = f
     kills, deaths, rej, vis = [], [], [], []
-    for t in tk:
+    for t in tracks:
         tt = round(t["first"] / FPS + off, 3)
-        if t["hits"] < 2 and t["first"] < nf - 2:
-            rej.append({"t": tt, "reason": "one-frame blip", "ks": t["ks"]})
-        elif t["first"] <= 2:
-            rej.append({"t": tt, "reason": "pre-clip: row already on screen when the clip starts", "ks": t["ks"]})
-        else:
-            vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
-            if t["v"] == "kill":
-                kills.append({"t": tt, "ks": t["ks"], "hl": t["hl"], "hs": bool(t["hs"]), "weak_hl": t["hl"] < 0.1})
-            else:
-                rej.append({"t": tt, "reason": t["why"], "ks": t["ks"]})
-    for t in td:
-        tt = round(t["first"] / FPS + off, 3)
-        if t["hits"] >= 2 or t["first"] >= nf - 2:
-            if t["first"] <= 2:
-                rej.append({"t": tt, "reason": "pre-clip: my death row already on screen", "ks": t["vs"]})
-            else:
+        tally = {}
+        for v in t["votes"]:
+            for a, why in v:
+                if a != "none":
+                    tally.setdefault(a, [0, why])[0] += 1
+        if not tally:
+            continue
+        verdicts = [a for a in ("kill", "reject", "death") if a in tally]
+        if "kill" in tally and "reject" in tally:              # OCR noise: majority wins between kill and reject
+            verdicts.remove("reject" if tally["kill"][0] >= tally["reject"][0] else "kill")
+        row = f"[{t['ktext'] or '-'}] {'gun' if t['gun'] else 'util'} [{t['vtext'] or '-'}]"
+        for a in verdicts:
+            why = tally[a][1]
+            mine.append({"t": tt, "row": row, "verdict": a, "why": why, "hits": t["hits"]})
+            if t["hits"] < 2 and t["seen"] < last_ocr - FPS:
+                rej.append({"t": tt, "reason": f"one-frame blip ({row})", "ks": t["ks"]})
+            elif t["first"] <= 2:
+                rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(t["ks"], t["vs"])})
+            elif a == "kill":
+                vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
+                kills.append({"t": tt, "ks": t["ks"], "hs": bool(t["hs"]), "row": row})
+            elif a == "death":
                 deaths.append(tt)
-                rej.append({"t": tt, "reason": f"death (victim-side name {t['vs']:.2f}) - not a kill", "ks": t["vs"]})
+                rej.append({"t": tt, "reason": f"{why} - not a kill", "ks": t["vs"]})
+            else:
+                vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
+                rej.append({"t": tt, "reason": why, "ks": t["ks"]})
     kills.sort(key=lambda k: k["t"])
-    return {"kills": kills, "deaths": sorted(deaths), "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis, "best_k": bk, "best_v": bv}
+    return {"kills": kills, "deaths": sorted(deaths), "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis, "best_k": bk, "best_v": bv,
+            "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(tracks), "rows_max": seen_rows,
+            "ocr_calls": len(entry.get("ocr", []))}
 
 
 def compute_kills(entry, cfg):
@@ -1139,7 +1163,7 @@ def kills_key(rec, game, det):
 def load_dets(only=None):
     d = {}
     for g in GAMES:
-        if (only and g != only) or not (DATA / f"detect_{g}.json").exists():
+        if only and g != only:
             continue
         try:
             d[g] = Detector(g)
@@ -1222,69 +1246,57 @@ def cmd_calibrate_bars(args):
 
 
 # ------------------------------------------------------------ calibration
-def do_calibrate(game, img, region, row, name, hs=None, expand=True):
-    """img: 1920x1080 normalised screenshot/frame. Boxes are absolute x,y,w,h in that space."""
-    import cv2
-    import numpy as np
-    (rx, ry, rw, rh), (ax, ay, aw, ah), (nx, ny, nw, nh) = region, row, name
-    if not (rx <= ax and ry <= ay and ax + aw <= rx + rw and ay + ah <= ry + rh and
-            ax <= nx and ay <= ny and nx + nw <= ax + aw and ny + nh <= ay + ah):
-        raise ValueError("boxes must nest: name inside row inside killfeed region")
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    tmpl = gray[ny:ny + nh, nx:nx + nw]
-    if tmpl.std() < 15:
-        raise ValueError("name box has almost no contrast - drag tighter around the FIREAXE letters")
-    ex = int(0.10 * rw) if expand else 0
-    rx2 = max(0, rx - ex)
-    rw2 = min(NORM_W, rx + rw) - rx2
-    rh2 = min(NORM_H - ry, int(rh * (1.10 if expand else 1.0)))
-    ring = {"pad": int(0.25 * nw), "ht": max(3, ny - ay), "hb": max(3, ay + ah - (ny + nh))}
-    hist = ring_hist(img, nx, ny, nw, nh, ring, 1.0, 1.0)
-    png = f"detect_{game}_name.png"
-    DATA.mkdir(parents=True, exist_ok=True)
-    ok, buf = cv2.imencode(".png", tmpl)
-    buf.tofile(str(DATA / png))
-    cv2.imencode(".png", img[ay:ay + ah, ax:ax + aw])[1].tofile(str(DATA / f"detect_{game}_row.png"))
-    rowimg = cv2.cvtColor(img[ay:ay + ah, ax:ax + aw], cv2.COLOR_BGR2HSV)
-    edge = np.concatenate([rowimg[:2].reshape(-1, 3), rowimg[-2:].reshape(-1, 3), rowimg[:, :2].reshape(-1, 3), rowimg[:, -2:].reshape(-1, 3)])
-    sat = edge[edge[:, 1] >= 80]
-    hl_color = [int(np.median(sat[:, i])) for i in range(3)] if len(sat) >= 0.3 * len(edge) else None   # border pixels only
-    d = {"region": [rx2 / NORM_W, ry / NORM_H, (rx2 + rw2) / NORM_W, (ry + rh2) / NORM_H],
-         "name_png": png, "ring": ring, "hist": [float(v) for v in hist], "row_h": int(ah), "hl_color": hl_color,
-         "min_right": max(40, int(0.35 * (ax + aw - (nx + nw)))), "left_gap": int(nx - ax)}
-    if hs:
-        hx, hy, hw, hh = hs
-        cv2.imencode(".png", gray[hy:hy + hh, hx:hx + hw])[1].tofile(str(DATA / f"detect_{game}_hs.png"))
-        d["hs_png"], d["hs_thr"] = f"detect_{game}_hs.png", 0.70
-    d["stamp"] = hashlib.md5(buf.tobytes() + repr(region).encode() + repr(hs).encode()).hexdigest()[:10]
-    save_json(DATA / f"detect_{game}.json", d)
+def save_region(game, region_frac):
+    """Optional calibration = only the killfeed REGION (fractions of the content rect). Other keys of an older file are kept."""
+    x0, y0, x1, y1 = (min(1.0, max(0.0, float(v))) for v in region_frac)
+    if x1 - x0 < 0.05 or y1 - y0 < 0.03:
+        raise ValueError("killfeed box too small")
+    p = DATA / f"detect_{game}.json"
+    d = load_json(p, {}) or {}
+    d["region"] = [round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)]
+    d["ocr"] = True
+    save_json(p, d)
+    return d["region"]
+
+
+def reset_region(game):
+    p = DATA / f"detect_{game}.json"
+    d = load_json(p, {}) or {}
+    d.pop("region", None)
+    save_json(p, d)
+
+
+def test_frame(game, img, cfg=None):
+    """OCR one 1920x1080 normalised frame's killfeed: rows found + verdict per row (Calibrate / Self-test / crop view)."""
     det = Detector(game)
-    reg = img[int(d["region"][1] * NORM_H):int(d["region"][3] * NORM_H), int(d["region"][0] * NORM_W):int(d["region"][2] * NORM_W)]
-    g = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
-    cfg = load_config()
-    rows = det.rows(g, hp_img(g), reg, 1.0, 1.0, floor=0.3)
-    hits = [r for r in rows if any(v == "kill" for v, _ in classify_row(r, cfg, det.lg))]
-    res = {"hits": len(hits), "name": max([r["ks"] for r in rows], default=0), "hl": max([r["hl"] for r in rows], default=0)}
-    out(f"{game} calibrated. self-test on your frame: {len(rows)} rows with a weapon icon matched, {res['hits']} are kills by FIREAXE "
-        f"(best killer-side name {res['name']:.2f}); border colour {'found' if hl_color else 'not found (highlight bonus off)'}")
-    return res
+    boxes, blobs = ocr_frame(det.crop_norm(img).copy())
+    rows = ocr_rows(boxes, blobs)
+    return rows, boxes, blobs
+
+
+def do_calibrate(game, img, region, row=None, name=None, hs=None, expand=True):
+    """img: 1920x1080 normalised screenshot/frame. region: absolute x,y,w,h of the killfeed area in that space.
+    (row/name/hs are accepted for old callers and ignored: OCR needs no name template.)"""
+    rx, ry, rw, rh = region
+    reg = save_region(game, (rx / NORM_W, ry / NORM_H, (rx + rw) / NORM_W, (ry + rh) / NORM_H))
+    rows, boxes, _ = test_frame(game, img)
+    kills = [r for r in rows if any(v == "kill" for v, _ in classify_row(r))]
+    out(f"{game} killfeed region saved {reg}. OCR on this frame: {len(boxes)} text boxes, {len(rows)} rows, {len(kills)} FIREAXE kill row(s)")
+    for r in rows:
+        out("   " + row_desc(r))
+    return {"hits": len(kills), "rows": len(rows), "name": max([r["ks"] / 100 for r in rows], default=0)}
 
 
 def cmd_calibrate(args):
     cfg = load_config()
     img = norm_image(read_img(args.screenshot), cfg)
-    if args.region and args.row and args.name:
-        box = lambda s: tuple(int(float(v)) for v in s.split(","))
-        region, row, name, hs = box(args.region), box(args.row), box(args.name), None
+    if args.region:
+        region = tuple(int(float(v)) for v in args.region.split(","))
     else:
-        out(f"Calibrating {args.game}: drags on your screenshot (the GUI Calibrate button is easier).")
-        region = pick_roi(img, "1/3 drag a box around the WHOLE killfeed area (generous)")
-        r = pick_roi(img[region[1]:region[1] + region[3], region[0]:region[0] + region[2]], "2/3 drag around YOUR kill row")
-        row = (region[0] + r[0], region[1] + r[1], r[2], r[3])
-        n = pick_roi(img[row[1]:row[1] + row[3], row[0]:row[0] + row[2]], "3/3 drag a TIGHT box around the text FIREAXE")
-        name, hs = (row[0] + n[0], row[1] + n[1], n[2], n[3]), None
+        out(f"Calibrating {args.game}: drag a box around the whole killfeed area (the GUI Calibrate button is easier).")
+        region = pick_roi(img, "drag a box around the WHOLE killfeed area (generous)")
     try:
-        do_calibrate(args.game, img, region, row, name, hs)
+        do_calibrate(args.game, img, region)
     except ValueError as ex:
         raise SystemExit(str(ex))
 
@@ -1319,7 +1331,7 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
     if games:
         dets = {g: d for g, d in dets.items() if g in games}
     if not dets:
-        raise RuntimeError("no calibrated game: use Troubleshoot > Calibrate killfeed")
+        raise RuntimeError("OCR detector unavailable (Troubleshoot > Selfcheck lists what is missing)")
     recs = [r for r in scan_clips(cfg) if not r.get("error") and r.get("w") and r.get("game") in dets]
     if paths is not None:
         ps = set(paths)
@@ -1329,24 +1341,24 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
     if limit:
         jobs = jobs[:limit]
     out(f"cached {len(recs) - len(jobs)}, scanning {len(jobs)}  (of {len(recs)} clips in scope)")
-    groups = {}
-    for r, g in jobs:
-        groups.setdefault(scale_key(g, dets[g], r, cfg), []).append(r)
+    if jobs:
+        ocr_engine()                                       # load the OCR models once up front (clear error if missing)
     done, errs, t0 = 0, 0, time.time()
 
     def work(job):
         r, g = job
         if CANCEL.is_set():
-            return r, g, None, "cancelled", None
+            return r, g, None, "cancelled"
         try:
-            sc = get_scale(dets[g], g, r, cfg, groups[scale_key(g, dets[g], r, cfg)][:3])
-            res = scan_clip(r["path"], r, dets[g], cfg, (sc["sx"], sc["sy"]))
+            res = scan_clip(r["path"], r, dets[g], cfg)
+            if CANCEL.is_set():
+                return r, g, None, "cancelled"             # half-scanned clips are never cached
             cache.put(kills_key(r, g, dets[g]), res)           # saved the moment this clip finishes
-            return r, g, res, None, sc
+            return r, g, res, None
         except Exception as ex:
-            return r, g, None, f"{type(ex).__name__}: {ex}", None
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        for r, g, res, err, sc in ex.map(work, jobs):
+            return r, g, None, f"{type(ex).__name__}: {ex}"
+    with ThreadPoolExecutor(max_workers=int(cfg.get("scan_workers", 2))) as ex:
+        for r, g, res, err in ex.map(work, jobs):
             done += 1
             progress(done / max(1, len(jobs)), f"scanning kills {done}/{len(jobs)}")
             if err == "cancelled":
@@ -1356,10 +1368,12 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
                 errs += 1
                 out(f"[{done}/{len(jobs)}] {g:8} ERROR {name}: {err}")
             else:
-                ks, ds = compute_kills(res, cfg)
-                out(f"[{done}/{len(jobs)}] {g:8} {len(ks)} kills {' '.join(ts(k['t']) for k in ks) or '-'}"
-                    f" | best killer-side {res['best_name']:.2f}, victim-side {res['best_vic']:.2f} | scale {res['scale'][0]}x{res['scale'][1]}"
-                    f"{'' if sc['solved'] else ' (UNSOLVED)'} | rect {content_rect(r, cfg)} crop {'yes' if r.get('bars') else 'no'} | {name} ({res['secs']}s)")
+                a = analyse_entry(res, cfg)
+                out(f"[{done}/{len(jobs)}] {g:8} {len(a['kills'])} kills {' '.join(ts(k['t']) for k in a['kills']) or '-'}"
+                    f" | rows found {a['rows_max']} max/frame, {a['ocr_calls']} OCR calls | best name killer-side {a['best_k']:.2f},"
+                    f" victim-side {a['best_v']:.2f} | rect {content_rect(r, cfg)} crop {'yes' if r.get('bars') else 'no'} | {name} ({res['secs']}s)")
+                for m in a["mine"]:
+                    out(f"      my row @ {ts(m['t'])} {m['row']} -> {m['verdict'].upper()}: {m['why']} ({m['hits']} sightings)")
     out(f"scan finished: {done} in {time.time() - t0:.0f}s, errors {errs}")
     return done
 
@@ -1373,7 +1387,7 @@ def game_pool(cfg, game, paths=None):
     step. Every rejected row is logged with its reason."""
     det = load_dets(game).get(game)
     if not det:
-        raise RuntimeError(f"{game} is not calibrated yet: Troubleshoot > Calibrate killfeed")
+        raise RuntimeError("OCR detector unavailable: Troubleshoot > Selfcheck (pip install rapidocr-onnxruntime)")
     cache = load_kills_cache()
     exc = []
     try:
@@ -1420,9 +1434,24 @@ def game_pool(cfg, game, paths=None):
     return pool, stats
 
 
-def grab_kill_crop(rec, det, cfg, k, scale):
-    """Killfeed crop with every detected row labelled by the SAME classify_row() the scanner uses."""
+def draw_rows(fr, rows):
+    """Label every OCR row on a killfeed crop with the SAME classify_row() verdict the scanner uses."""
     import cv2
+    for d in rows:
+        verdicts = [x[0] for x in classify_row(d)]
+        col = (0, 200, 0) if "kill" in verdicts else (0, 0, 255) if "death" in verdicts else \
+            (0, 140, 255) if "reject" in verdicts else (160, 160, 160)
+        for b in d["boxes"]:
+            cv2.rectangle(fr, (b[0], b[1]), (b[2], b[3]), col, 2 if col != (160, 160, 160) else 1)
+        if d["icon"]:
+            x, y, w, h = d["icon"][:4]
+            cv2.rectangle(fr, (x, y), (x + w, y + h), (255, 200, 0) if d["gun"] else (200, 0, 200), 1)
+        cv2.putText(fr, row_desc(d)[:90], (4, max(10, d["y0"] - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
+    return fr
+
+
+def grab_kill_crop(rec, det, cfg, k, scale=None):
+    """Killfeed crop at a kill: live OCR, every row boxed and labelled with its verdict and reason. Returns (image, rows)."""
     import numpy as np
     vf = region_filter(rec, det, cfg)
     t = k["t"] - rec.get("v_off", 0.0) + 0.3
@@ -1430,24 +1459,15 @@ def grab_kill_crop(rec, det, cfg, k, scale):
              "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], timeout=60)
     n = det.dw * det.dh * 3
     if len(r.stdout) < n:
-        return None
+        return None, []
     fr = np.frombuffer(r.stdout[:n], np.uint8).reshape(det.dh, det.dw, 3).copy()
-    g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
-    for d in det.rows(g, hp_img(g), fr, scale[0], scale[1], floor=0.45):
-        v = classify_row(d, cfg, det.lg * scale[0])
-        verdicts = [x[0] for x in v]
-        cv2.rectangle(fr, (d["ix"], d["y0"]), (d["ix"] + d["iw"], d["y1"]), (255, 200, 0) if d["gun"] else (200, 0, 200), 1)
-        if d["ks"] >= 0.45:
-            col = (0, 255, 0) if "kill" in verdicts else (0, 140, 255)
-            cv2.rectangle(fr, (d["kx"], d["ky"]), (d["kx"] + d["tw"], d["ky"] + d["th"]), col, 2)
-        if d["vs"] >= 0.45:
-            col = (0, 0, 255) if "death" in verdicts else (0, 140, 255)
-            cv2.rectangle(fr, (d["vx"], d["vy"]), (d["vx"] + d["tw"], d["vy"] + d["th"]), col, 2)
-        cv2.putText(fr, f"K{d['ks']:.2f} V{d['vs']:.2f} {'gun' if d['gun'] else 'UTIL'} -> {'/'.join(x[1].split(':')[0] for x in v)}",
-                    (4, max(10, d["y0"] - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(fr, f"{Path(rec['path']).name[-24:]} t={ts(k['t'])}" + (" HS" if k.get("hs") else ""),
-                (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
-    return fr
+    boxes, blobs = ocr_frame(fr)
+    rows = ocr_rows(boxes, blobs)
+    draw_rows(fr, rows)
+    import cv2
+    cv2.putText(fr, f"{Path(rec['path']).name[-28:]} t={ts(k['t'])}" + (" HS" if k.get("hs") else ""),
+                (4, det.dh - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+    return fr, rows
 
 
 def cmd_verify(args):
@@ -1456,7 +1476,7 @@ def cmd_verify(args):
     cfg = load_config()
     det = load_dets(args.game).get(args.game)
     if not det:
-        raise SystemExit("not calibrated")
+        raise SystemExit("OCR detector unavailable")
     cache = load_kills_cache()
     items = []
     for r in scan_clips(cfg):
@@ -1469,7 +1489,7 @@ def cmd_verify(args):
         raise SystemExit("no cached kills yet: run scan first")
     tiles = []
     for rec, e, ks in items[::max(1, len(items) // 6)][:6]:
-        fr = grab_kill_crop(rec, det, cfg, ks[0], e["scale"])
+        fr, _ = grab_kill_crop(rec, det, cfg, ks[0])
         if fr is not None:
             tiles.append(cv2.resize(fr, (480, max(1, int(480 * det.dh / det.dw)))))
     if not tiles:
@@ -1484,15 +1504,81 @@ def cmd_verify(args):
     out(f"wrote {p}")
 
 
+def synth_row_frame(left="fireaxe", right="enemy", w=720, h=360, y=120, icon_w=80, extra=()):
+    """Generated killfeed crop: '<left> [white weapon icon] <right>' on a dark row (used by Self-test and smoketest)."""
+    import cv2
+    import numpy as np
+    img = np.full((h, w, 3), (70, 78, 86), np.uint8)
+    for yy, (l2, r2) in [(y, (left, right))] + list(extra):
+        f, sc, th = cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
+        lw = cv2.getTextSize(l2, f, sc, th)[0][0]
+        rw = cv2.getTextSize(r2, f, sc, th)[0][0]
+        x0 = w - 24 - (lw + 20 + icon_w + 20 + rw)
+        cv2.rectangle(img, (x0 - 10, yy - 28), (w - 12, yy + 10), (28, 28, 30), -1)
+        cv2.putText(img, l2, (x0, yy), f, sc, (255, 255, 255), th, cv2.LINE_AA)
+        ix = x0 + lw + 20
+        cv2.rectangle(img, (ix, yy - 20), (ix + icon_w, yy + 2), (255, 255, 255), -1)
+        cv2.putText(img, r2, (ix + icon_w + 20, yy), f, sc, (255, 255, 255), th, cv2.LINE_AA)
+    return img
+
+
+def ocr_synthetic_test(verbose=True):
+    """Generated frames through the real OCR -> rows -> classify_row path AND the scan/track path.
+    Expect: 'fireaxe [gun] enemy' = exactly 1 KILL, 'enemy [gun] fireaxe' = exactly 1 DEATH. Returns list of failures."""
+    import numpy as np
+    fails = []
+    for left, right, want in (("fireaxe", "enemy", "kill"), ("enemy", "fireaxe", "death")):
+        img = synth_row_frame(left, right)
+        rows = ocr_rows(*ocr_frame(img))
+        vs = [v for r in rows for v, _ in classify_row(r)]
+        if verbose:
+            for r in rows:
+                out(f"  synthetic '{left} | {right}': " + row_desc(r))
+        if vs.count(want) != 1 or len([v for v in vs if v in ("kill", "death")]) != 1:
+            fails.append(f"single frame '{left} [icon] {right}': expected exactly one {want.upper()}, got {vs}")
+        blank = np.full_like(img, (70, 78, 86))
+        frames = [blank] * 12 + [img] * 40
+        ocr, n = scan_frames(iter(frames))
+        a = analyse_entry({"ocr": ocr, "frames": n, "v_off": 0.0}, {})
+        got = len(a["kills"]) if want == "kill" else len(a["deaths"])
+        other = len(a["deaths"]) if want == "kill" else len(a["kills"])
+        t_ok = abs((a["kills"][0]["t"] if want == "kill" and a["kills"] else a["deaths"][0] if a["deaths"] else -1) - 12 / FPS) <= 1.5 / FPS
+        if verbose:
+            out(f"  synthetic clip '{left} | {right}': {len(ocr)} OCR calls for {n} frames, kills {[k['t'] for k in a['kills']]},"
+                f" deaths {a['deaths']} (row appears at {12 / FPS:.3f}s)")
+        if got != 1 or other != 0 or not t_ok:
+            fails.append(f"scanned clip '{left} [icon] {right}': expected one {want.upper()} at {12 / FPS:.3f}s, got kills "
+                         f"{[k['t'] for k in a['kills']]} deaths {a['deaths']}")
+    for left, right, want in (("enemy + fireaxe", "victim", "reject"), ("fireaxe", "", "reject")):
+        if not right:
+            continue
+        rows = ocr_rows(*ocr_frame(synth_row_frame(left, right)))
+        vs = [v for r in rows for v, _ in classify_row(r)]
+        if verbose:
+            for r in rows:
+                out(f"  synthetic '{left} | {right}': " + row_desc(r))
+        if "kill" in vs:
+            fails.append(f"assist row '{left} [icon] {right}' was counted as a KILL")
+    return fails
+
+
 def selftest_detection(cfg, per_game=20):
-    """Same analyse_entry as Dry plan / Render. Per game: clips, zero-kill clips, score histograms, rejected rows by reason."""
+    """Same analyse_entry as Dry plan / Render. OCR engine check on generated frames, then per game: clips, zero-kill clips,
+    name-score histograms, rejected rows by reason, and the OCR text + verdict of my rows."""
+    out("== OCR engine check (generated frames) ==")
+    try:
+        fails = ocr_synthetic_test()
+        out("  OK: 'fireaxe [gun] enemy' = 1 KILL, 'enemy [gun] fireaxe' = 1 DEATH" if not fails else "  FAIL: " + "; ".join(fails))
+    except Exception as ex:
+        out(f"  OCR not working: {ex}")
+        return
     cache = load_kills_cache()
     shown = False
     for g in GAMES:
         det = load_dets(g).get(g)
         if not det:
-            out(f"{g}: not calibrated")
             continue
+        out(f"== {g}: killfeed region {det.d['region']} ({'calibrated' if det.calibrated else 'default top-right'}) ==")
         items = []
         for r in scan_clips(cfg):
             e = cache.get(kills_key(r, g, det)) if r.get("game") == g and not r.get("error") else None
@@ -1513,28 +1599,27 @@ def selftest_detection(cfg, per_game=20):
             for j in a["rej"]:
                 key = j["reason"].split(":")[0].split("(")[0].strip()
                 reasons[key] = reasons.get(key, 0) + 1
-        out(f"== {g}: {len(items)} clips scanned, {zero} with 0 kills, {nk} kills in total "
-            f"(killer-side >= {cfg['thr_kill']}, victim-side >= {cfg['thr_death']}) ==")
+        out(f"  {len(items)} clips scanned, {zero} with 0 kills, {nk} kills in total (FIREAXE fuzzy match >= {NAME_MIN})")
         bins = "  ".join(f"{i / 10:.1f}:{n}" for i, n in enumerate(kh) if n)
-        out(f"  best killer-side name score per clip (bin:clips): {bins or '-'}")
+        out(f"  best killer-side FIREAXE match per clip (bin:clips): {bins or '-'}")
         bins = "  ".join(f"{i / 10:.1f}:{n}" for i, n in enumerate(vh) if n)
-        out(f"  best victim-side name score per clip (bin:clips): {bins or '-'}")
+        out(f"  best victim-side FIREAXE match per clip (bin:clips): {bins or '-'}")
         out("  rows rejected by reason: " + (", ".join(f"{k}: {v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])) or "none"))
         for r, e in sample:
             a = analyse_entry(e, cfg)
-            out(f"  {len(a['kills'])} kills, {len(a['deaths'])} deaths | killer {a['best_k']:.2f} victim {a['best_v']:.2f} | scale {e['scale']} | {Path(r['path']).name}")
-        for k, v in load_json(SCALES, {}).items():
-            if k.startswith(g + "|"):
-                out(f"  scale {k.split('|', 2)[2]}: x{v['sx']} y{v['sy']} match {v['score']} {'' if v['solved'] else 'UNSOLVED'}")
+            out(f"  {len(a['kills'])} kills, {len(a['deaths'])} deaths | rows found {a['rows_max']} max/frame, {a['ocr_calls']} OCR calls"
+                f" | killer {a['best_k']:.2f} victim {a['best_v']:.2f} | {Path(r['path']).name}")
+            for m in a["mine"]:
+                out(f"      my row @ {ts(m['t'])} {m['row']} -> {m['verdict'].upper()}: {m['why']}")
     if not shown:
-        out("nothing to test yet")
+        out("no scanned clips yet")
 
 
 # ======================================================================= SONGS
 SONG_CACHE = DATA / "song_cache.json"
 USED_CLIPS = DATA / "used_clips.json"
 USED_SONGS = DATA / "used_songs.json"
-SONG_ALGO = "s2"
+SONG_ALGO = "s3"
 
 
 def autodetect_dirs(cfg):
@@ -1584,7 +1669,8 @@ def smooth(a, w):
 
 
 def analyse_song(path, csv_bpm=None):
-    """BPM, beat grid, downbeats, per-beat energy, section levels, drop. Cached per file."""
+    """Beat grid, downbeats, per-beat energy, section levels, drop. Cached per file. The CSV 'Tempo' is the PRIMARY BPM: librosa only
+    refines the beat grid, and is snapped to the CSV tempo when it lands at about 2x or 0.5x (or within 4% on a steady grid)."""
     cache = load_json(SONG_CACHE, {})
     key = file_key(path) + SONG_ALGO + f"|{round(csv_bpm or 0)}"
     if key in cache:
@@ -1616,6 +1702,8 @@ def analyse_song(path, csv_bpm=None):
     steady = float(max(0.0, 1 - np.std(ibi) / max(np.mean(ibi), 1e-6) * 8))
     if steady >= 0.75:      # steady (electronic) track: replace the tracked beats by a clean grid over the whole song
         per = float(np.median(ibi))
+        if csv_bpm and abs(60.0 / per - csv_bpm) / csv_bpm < 0.04:
+            per = 60.0 / float(csv_bpm)                # grid period from the CSV tempo, phase from librosa
         off = float(np.median((bt - bt[0] + per / 2) % per - per / 2))
         t0 = (bt[0] + off) % per
         bt = t0 + per * np.arange(int((len(y) / sr - t0) / per))
@@ -1645,10 +1733,11 @@ def analyse_song(path, csv_bpm=None):
     else:
         drop = None
     onsets = librosa.onset.onset_detect(onset_envelope=oenv, sr=sr, hop_length=hop, units="time")
+    grid_bpm = bpm
+    if csv_bpm:
+        bpm = float(csv_bpm)                           # CSV tempo is the primary value
     bpm_fit = 1.0 if 100 <= bpm <= 180 else max(0.0, 1 - min(abs(bpm - 100), abs(bpm - 180)) / 40)
-    if csv_bpm and abs(bpm - csv_bpm) / csv_bpm < 0.05:
-        bpm = float(csv_bpm)
-    an = {"bpm": round(bpm, 1), "beats": [round(float(t), 4) for t in bt], "down": [int(i) for i in down],
+    an = {"bpm": round(bpm, 1), "bpm_grid": round(float(grid_bpm), 1), "bpm_src": "csv" if csv_bpm else "librosa", "beats": [round(float(t), 4) for t in bt], "down": [int(i) for i in down],
           "energy": [round(float(e), 3) for e in en], "level": [int(l) for l in level],
           "drop": None if drop is None else int(drop), "drop_strength": round(dstr, 3), "steady": round(steady, 3),
           "bpm_fit": round(bpm_fit, 2), "dur": round(len(y) / sr, 1),
@@ -1658,10 +1747,13 @@ def analyse_song(path, csv_bpm=None):
     return an
 
 
-def song_fit(an, energy=None):
-    """Montage fit, 0-55: steady beat 15 + clear drop/energy rise 20 + BPM 100-180 10 + energy 10 (CSV energy if present)."""
+def song_fit(an, energy=None, dance=None):
+    """Montage fit, 0-55: steady beat 15 + clear drop/energy rise 20 + BPM 100-180 10 + energy 10 (CSV Energy, blended 70/30
+    with CSV Danceability when present; librosa loudness only when the CSV has no Energy)."""
     rise = max(an["drop_strength"], 0.0)
     en = energy if energy is not None else (sum(an["energy"]) / max(1, len(an["energy"])))
+    if dance is not None:
+        en = 0.7 * en + 0.3 * dance
     return {"steady": round(15 * an["steady"], 1), "drop": round(20 * min(1.0, rise / 0.4), 1),
             "bpm": round(10 * an["bpm_fit"], 1), "energy": round(10 * max(0.0, min(1.0, en)), 1)}
 
@@ -1720,7 +1812,7 @@ def song_pool(cfg):
             old = songs.get(a["path"])
             if old is None or (added and (old["added"] is None or added > old["added"])):
                 songs[a["path"]] = {"path": a["path"], "artist": r["artist"], "title": r["title"], "added": added,
-                                    "csv_bpm": r.get("tempo") or None, "energy": r.get("energy"), "score": sc}
+                                    "csv_bpm": r.get("tempo") or None, "energy": r.get("energy"), "dance": r.get("dance"), "score": sc}
         try:
             write_song_matches(audio, matched)
         except Exception as ex:
@@ -1751,7 +1843,7 @@ def pick_song(cfg, game, songs, now=None, forced=None):
     def score(s, an):
         d = (now - s["added"]).days if s["added"] else 999
         rec = 50.0 / (1 + max(d, 0) / 7.0) if s["added"] else 0.0
-        fit = song_fit(an, s.get("energy"))
+        fit = song_fit(an, s.get("energy"), s.get("dance"))
         pen = (30.0 if s["path"] == last else 0.0) + 8.0 * sum(1 for u in used[-4:] if u["path"] == s["path"])
         return {"recency": round(rec, 1), "fit": round(sum(fit.values()), 1), "fit_parts": fit, "penalty": pen,
                 "total": round(rec + sum(fit.values()) - pen, 1), "days": None if d == 999 else d}
@@ -2418,8 +2510,7 @@ def sync_report(plan, outfile, cfg):
     out("SYNC REPORT: scanning the finished montage with the kill detector ...")
     rec = probe_video(str(outfile))
     rec.update(path=str(outfile), game=game, bars=False)
-    sc = get_scale(det, game, rec, cfg)
-    entry = scan_clip(str(outfile), rec, det, cfg, (sc["sx"], sc["sy"]))
+    entry = scan_clip(str(outfile), rec, det, cfg)
     seen, _ = compute_kills(entry, cfg)
     seen = [k["t"] for k in seen]
     beats = np.array(plan["beats_out"])
@@ -2479,7 +2570,7 @@ def weekly_existing(cfg, game, now=None):
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None):
     cfg = autodetect_dirs(cfg)
     if not load_dets(game).get(game):
-        raise RuntimeError(f"{game} is not calibrated yet. Open Troubleshoot > Calibrate killfeed and mark your FIREAXE row once.")
+        raise RuntimeError("OCR detector unavailable: Troubleshoot > Selfcheck (pip install rapidocr-onnxruntime)")
     tagged = [r for r in scan_clips(cfg) if r.get("game") == game]
     if not tagged:
         inc = cfg["include_valorant"] if game == "valorant" else cfg["include_cs"]
@@ -2628,7 +2719,8 @@ def cmd_selfcheck(args):
     out("== python ==")
     out(f"  Python {sys.version.split()[0]}")
     pk = [("numpy", "numpy"), ("cv2", "opencv-python"), ("librosa", "librosa"), ("soundfile", "soundfile"),
-          ("scipy", "scipy"), ("mutagen", "mutagen"), ("rapidfuzz", "rapidfuzz"), ("tkinter", None)]
+          ("scipy", "scipy"), ("mutagen", "mutagen"), ("rapidfuzz", "rapidfuzz"), ("rapidocr_onnxruntime", "rapidocr-onnxruntime"),
+          ("tkinter", None)]
     missing = []
     for mod, pipname in pk:
         try:
@@ -2643,6 +2735,15 @@ def cmd_selfcheck(args):
                 out("       tkinter ships with python.org installer: re-run it, Modify, tick 'tcl/tk and IDLE'.")
     if missing:
         out(f"\n  Install: python -m pip install --user {' '.join(missing)}")
+    else:
+        out("== OCR kill detection ==")
+        try:
+            f = ocr_synthetic_test(verbose=False)
+            out("  OK   RapidOCR reads generated killfeed rows: 1 KILL / 1 DEATH as expected" if not f else "  FAIL " + "; ".join(f))
+            ok = ok and not f
+        except Exception as ex:
+            ok = False
+            out(f"  FAIL RapidOCR: {ex}")
     out("\nSELFCHECK " + ("PASSED" if ok else "has problems (see above)"))
 
 
@@ -2732,7 +2833,7 @@ except Exception:          # selfcheck reports this; CLI still works
     tk = None
 
 PIP_PKGS = [("numpy", "numpy"), ("cv2", "opencv-python"), ("librosa", "librosa"), ("soundfile", "soundfile"),
-            ("scipy", "scipy"), ("mutagen", "mutagen"), ("rapidfuzz", "rapidfuzz")]
+            ("scipy", "scipy"), ("mutagen", "mutagen"), ("rapidfuzz", "rapidfuzz"), ("rapidocr_onnxruntime", "rapidocr-onnxruntime")]
 
 
 def missing_packages():
@@ -2777,41 +2878,35 @@ def grab_norm_frame(path, t, cfg):
 
 
 class CalibDialog:
-    """Pick a clip (or screenshot), scrub to one of your kills, drag over your killfeed row, then over FIREAXE."""
+    """OPTIONAL: pick a clip (or screenshot), drag one box around the whole killfeed area. OCR then shows the rows it reads."""
     def __init__(self, app):
         self.app, self.cfg = app, load_config()
         self.win = tk.Toplevel(app.root)
-        self.win.title("Calibrate killfeed (one time per game)")
+        self.win.title("Killfeed region (optional - defaults to top-right)")
+        self.win.configure(bg=app.pal["bg"])
         top = ttk.Frame(self.win)
         top.pack(fill="x", padx=6, pady=4)
         self.game = tk.StringVar(value="valorant")
-        ttk.Combobox(top, textvariable=self.game, values=list(GAMES), width=10, state="readonly").pack(side="left")
+        cb = ttk.Combobox(top, textvariable=self.game, values=list(GAMES), width=10, state="readonly")
+        cb.pack(side="left")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.show_region())
         ttk.Button(top, text="Open clip...", command=self.open_clip).pack(side="left", padx=4)
         ttk.Button(top, text="Open screenshot...", command=self.open_shot).pack(side="left")
-        ttk.Button(top, text="Restart selection", command=self.reset).pack(side="left", padx=8)
-        self.skip = ttk.Button(top, text="Skip headshot icon", command=self.finish_ready)
-        self.save = ttk.Button(top, text="Save calibration", command=self.do_save, state="disabled")
+        ttk.Button(top, text="Test OCR on this frame", command=self.test).pack(side="left", padx=8)
+        ttk.Button(top, text="Use default region", command=self.use_default).pack(side="left")
+        self.save = ttk.Button(top, text="Save region", command=self.do_save, state="disabled")
         self.save.pack(side="right")
-        self.skip.pack(side="right", padx=6)
         self.scale = ttk.Scale(self.win, from_=0, to=1, command=lambda v: None)
         self.scale.bind("<ButtonRelease-1>", lambda e: self.load_frame())
-        self.msg = tk.StringVar(value="Open a clip (scrub to a moment your FIREAXE kill row is visible) or a screenshot.")
-        ttk.Label(self.win, textvariable=self.msg, font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=6)
-        self.cv = tk.Canvas(self.win, width=1280, height=720, bg="#222")
+        self.msg = tk.StringVar(value="Open a clip (scrub to a moment with killfeed rows) or a screenshot, then drag a box around the "
+                                      "WHOLE killfeed area. Yellow = current region.")
+        ttk.Label(self.win, textvariable=self.msg, font=("Segoe UI", 10, "bold"), wraplength=1260).pack(anchor="w", padx=6)
+        self.cv = tk.Canvas(self.win, width=1280, height=720, bg="#222", highlightthickness=1, highlightbackground="#888")
         self.cv.pack(padx=6, pady=6)
         self.cv.bind("<ButtonPress-1>", self.press)
         self.cv.bind("<B1-Motion>", self.drag)
         self.cv.bind("<ButtonRelease-1>", self.release)
-        self.base, self.path, self.dur = None, None, 0
-        self.reset()
-
-    def reset(self):
-        self.stage, self.row, self.name, self.hs, self.rect_id, self.p0 = 0, None, None, None, None, None
-        self.view = None
-        self.save.config(state="disabled")
-        if self.base is not None:
-            self.show(self.base, (0, 0))
-            self.msg.set("1/2  Drag a box around YOUR kill row (the row with FIREAXE as the killer), including its highlight border.")
+        self.base, self.path, self.dur, self.region, self.rect_id, self.p0, self.view = None, None, 0, None, None, None, None
 
     def open_clip(self):
         p = filedialog.askopenfilename(initialdir=self.cfg["clip_root"], filetypes=[("video", "*.mov *.mp4 *.mkv")])
@@ -2825,12 +2920,12 @@ class CalibDialog:
             self.scale.set(self.dur / 2)
             self.load_frame()
         except Exception as ex:
-            messagebox.showerror("Calibrate", str(ex))
+            messagebox.showerror("Killfeed region", str(ex))
 
     def load_frame(self):
         try:
             self.base, _ = grab_norm_frame(self.path, float(self.scale.get()), self.cfg)
-            self.reset()
+            self.show_region()
         except Exception as ex:
             self.msg.set(str(ex))
 
@@ -2839,26 +2934,24 @@ class CalibDialog:
         if p:
             self.scale.pack_forget()
             self.base = norm_image(read_img(p), self.cfg)
-            self.reset()
+            self.show_region()
 
-    def show(self, img, origin):
-        self.photo, s = to_photo(img)
-        self.view = {"s": s, "o": origin}
+    def show_region(self, img=None):
+        if self.base is None:
+            return
+        self.photo, s = to_photo(self.base if img is None else img)
+        self.view = {"s": s}
         self.cv.delete("all")
         self.cv.create_image(0, 0, anchor="nw", image=self.photo)
-        for r, col in ((self.row, "#0f0"), (self.name, "#ff0"), (self.hs, "#0ff")):
-            if r and self.stage == 0 and r is self.row:
-                self.box(r, col)
-
-    def box(self, r, col):
-        s, o = self.view["s"], self.view["o"]
-        self.cv.create_rectangle((r[0] - o[0]) * s, (r[1] - o[1]) * s, (r[0] + r[2] - o[0]) * s, (r[1] + r[3] - o[1]) * s, outline=col, width=2)
+        x0, y0, x1, y1 = Detector(self.game.get()).d["region"]
+        self.cv.create_rectangle(x0 * NORM_W * s, y0 * NORM_H * s, x1 * NORM_W * s, y1 * NORM_H * s, outline="#ff0", width=2, dash=(4, 2))
+        self.rect_id = None
 
     def press(self, e):
         self.p0 = (e.x, e.y)
         if self.rect_id:
             self.cv.delete(self.rect_id)
-        self.rect_id = self.cv.create_rectangle(e.x, e.y, e.x, e.y, outline="#f0f", width=2)
+        self.rect_id = self.cv.create_rectangle(e.x, e.y, e.x, e.y, outline="#0f0", width=2)
 
     def drag(self, e):
         if self.p0 and self.rect_id:
@@ -2867,60 +2960,63 @@ class CalibDialog:
     def release(self, e):
         if not self.p0 or self.base is None or not self.view:
             return
-        s, o = self.view["s"], self.view["o"]
+        s = self.view["s"]
         x0, x1 = sorted((self.p0[0], e.x))
         y0, y1 = sorted((self.p0[1], e.y))
         self.p0 = None
-        if x1 - x0 < 4 or y1 - y0 < 4:
+        if x1 - x0 < 10 or y1 - y0 < 10:
             return
-        r = (int(x0 / s + o[0]), int(y0 / s + o[1]), int((x1 - x0) / s), int((y1 - y0) / s))
-        if self.stage == 0:
-            self.row = r
-            crop = self.base[r[1]:r[1] + r[3], r[0]:r[0] + r[2]]
-            self.stage = 1
-            self.show_zoom(crop, (r[0], r[1]))
-            self.msg.set("2/2  Drag a TIGHT box around just the text FIREAXE.")
-        elif self.stage == 1:
-            self.name = r
-            self.stage = 2
-            self.msg.set("Optional: drag over the HEADSHOT icon in a row where you got a headshot (or press Skip). Then Save.")
-            self.save.config(state="normal")
-        elif self.stage == 2:
-            self.hs = r
-            self.msg.set("Headshot icon set. Press Save calibration.")
+        self.region = (int(x0 / s), int(y0 / s), int((x1 - x0) / s), int((y1 - y0) / s))
+        self.save.config(state="normal")
+        self.msg.set(f"Killfeed box {self.region}. Press Save region (it is tested with OCR right away).")
 
-    def show_zoom(self, crop, origin):
-        import cv2
-        z = min(1200 / crop.shape[1], 400 / crop.shape[0])
-        big = cv2.resize(crop, None, fx=z, fy=z, interpolation=cv2.INTER_CUBIC)
-        self.photo, s = to_photo(big, 1280, 720)
-        self.view = {"s": z * s, "o": origin}
-        self.cv.delete("all")
-        self.cv.create_image(0, 0, anchor="nw", image=self.photo)
-        self.rect_id = None
+    def test(self):
+        if self.base is None:
+            messagebox.showinfo("Killfeed region", "Open a clip or screenshot first.")
+            return
+        g = self.game.get()
+        det = Detector(g)
+        rows, _, _ = test_frame(g, self.base)
+        crop = draw_rows(det.crop_norm(self.base).copy(), rows)
+        out(f"{g}: OCR found {len(rows)} rows in the killfeed region")
+        for r in rows:
+            out("   " + row_desc(r))
+        img = self.base.copy()
+        x0, y0 = int(det.d["region"][0] * NORM_W), int(det.d["region"][1] * NORM_H)
+        img[y0:y0 + crop.shape[0], x0:x0 + crop.shape[1]] = crop
+        self.show_region(img)
+        self.msg.set(f"{len(rows)} rows read, {sum(1 for r in rows if any(v == 'kill' for v, _ in classify_row(r)))} FIREAXE kill row(s) - details in the log.")
 
-    def finish_ready(self):
-        if self.name:
-            self.do_save()
+    def use_default(self):
+        reset_region(self.game.get())
+        out(f"{self.game.get()}: default killfeed region {DEFAULT_REGION[self.game.get()]}")
+        self.show_region()
+        self.app.refresh_auto()
 
     def do_save(self):
         try:
-            rw = self.row
-            region = (max(0, int(rw[0] - 0.25 * rw[2])), max(0, int(rw[1] - 6 * rw[3])), 0, 0)
-            x1, y1 = min(NORM_W, int(rw[0] + 1.1 * rw[2])), min(NORM_H, int(rw[1] + 9 * rw[3]))
-            region = (region[0], region[1], x1 - region[0], y1 - region[1])
-            res = do_calibrate(self.game.get(), self.base, region, self.row, self.name, self.hs, expand=False)
-            msg = f"{self.game.get()} calibrated. Self-test found {res['hits']} own row(s)."
-            if res["hits"] != 1:
-                msg += "\nExpected exactly 1: try again with a tighter FIREAXE box."
-            messagebox.showinfo("Calibrate", msg)
+            if not self.region:
+                return
+            res = do_calibrate(self.game.get(), self.base, self.region)
+            self.show_region()
+            messagebox.showinfo("Killfeed region", f"{self.game.get()} region saved. OCR read {res['rows']} rows, "
+                                                   f"{res['hits']} FIREAXE kill row(s) on this frame (details in the log).")
             self.app.refresh_auto()
         except Exception as ex:
-            messagebox.showerror("Calibrate", str(ex))
+            messagebox.showerror("Killfeed region", str(ex))
 
 
-def apply_theme(root, mode="auto"):
-    """Follow Windows dark/light mode (or force one); consistent fonts, padding and row heights."""
+PALETTES = {
+    "light": dict(bg="#eef0f3", fg="#111418", field="#ffffff", acc="#1f6feb", acc_fg="#ffffff", head="#dfe3e8", dim="#5b6370",
+                  border="#8a929e", sel="#c9defc", sel_fg="#0b1f3a", btn="#f8f9fb", btn_act="#e3ecfb", check="#1f6feb"),
+    "dark": dict(bg="#2b2e34", fg="#f1f3f5", field="#3a3e46", acc="#4b8df8", acc_fg="#ffffff", head="#454a53", dim="#b0b6bf",
+                 border="#8d949e", sel="#3d5f99", sel_fg="#ffffff", btn="#3f444d", btn_act="#4f5662", check="#7fb0ff"),
+}
+
+
+def apply_theme(root, mode="light"):
+    """Light by default (clear contrast: visible borders on buttons and inputs, clear selection and checkbox colours).
+    'dark' is optional in Settings; 'auto' follows Windows."""
     dark = mode == "dark"
     if mode == "auto":
         try:
@@ -2929,31 +3025,46 @@ def apply_theme(root, mode="auto"):
             dark = winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
         except Exception:
             dark = False
-    pal = dict(bg="#1f1f1f", fg="#e8e8e8", field="#2b2b2b", acc="#3a78d4", head="#363636", dim="#9a9a9a") if dark else \
-        dict(bg="#f3f3f3", fg="#1a1a1a", field="#ffffff", acc="#2a6edb", head="#e1e1e1", dim="#666666")
+    pal = dict(PALETTES["dark" if dark else "light"])
     st = ttk.Style(root)
     st.theme_use("clam")
     root.configure(bg=pal["bg"])
     root.option_add("*Font", ("Segoe UI", 10))
+    root.option_add("*TCombobox*Listbox.background", pal["field"])
+    root.option_add("*TCombobox*Listbox.foreground", pal["fg"])
+    root.option_add("*TCombobox*Listbox.selectBackground", pal["acc"])
+    root.option_add("*TCombobox*Listbox.selectForeground", pal["acc_fg"])
     st.configure(".", background=pal["bg"], foreground=pal["fg"], fieldbackground=pal["field"], font=("Segoe UI", 10),
-                 bordercolor=pal["head"], lightcolor=pal["bg"], darkcolor=pal["bg"], troughcolor=pal["field"])
-    st.configure("Treeview", background=pal["field"], fieldbackground=pal["field"], foreground=pal["fg"], rowheight=24, borderwidth=0)
-    st.map("Treeview", background=[("selected", pal["acc"])], foreground=[("selected", "#ffffff")])
-    st.configure("Treeview.Heading", background=pal["head"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"), padding=5)
-    st.configure("TLabelframe", background=pal["bg"], bordercolor=pal["head"], padding=8)
+                 bordercolor=pal["border"], lightcolor=pal["bg"], darkcolor=pal["bg"], troughcolor=pal["head"],
+                 selectbackground=pal["sel"], selectforeground=pal["sel_fg"], insertcolor=pal["fg"], focuscolor=pal["acc"])
+    st.configure("Treeview", background=pal["field"], fieldbackground=pal["field"], foreground=pal["fg"], rowheight=24,
+                 bordercolor=pal["border"], borderwidth=1)
+    st.map("Treeview", background=[("selected", pal["sel"])], foreground=[("selected", pal["sel_fg"])])
+    st.configure("Treeview.Heading", background=pal["head"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"), padding=5,
+                 bordercolor=pal["border"], relief="raised")
+    st.configure("TLabelframe", background=pal["bg"], bordercolor=pal["border"], padding=8, relief="solid", borderwidth=1)
     st.configure("TLabelframe.Label", background=pal["bg"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"))
-    st.configure("TNotebook", background=pal["bg"], borderwidth=0)
-    st.configure("TNotebook.Tab", background=pal["head"], foreground=pal["fg"], padding=(16, 7), font=("Segoe UI", 10, "bold"))
-    st.map("TNotebook.Tab", background=[("selected", pal["acc"])], foreground=[("selected", "#ffffff")])
-    st.configure("TButton", padding=(10, 5), background=pal["head"], foreground=pal["fg"])
-    st.map("TButton", background=[("active", pal["acc"]), ("disabled", pal["bg"])], foreground=[("disabled", pal["dim"])])
-    st.configure("TEntry", padding=4, fieldbackground=pal["field"], foreground=pal["fg"])
-    st.configure("TCombobox", padding=4, fieldbackground=pal["field"], foreground=pal["fg"], arrowcolor=pal["fg"])
-    st.map("TCombobox", fieldbackground=[("readonly", pal["field"])], foreground=[("readonly", pal["fg"])])
-    st.configure("TCheckbutton", background=pal["bg"])
-    st.configure("TRadiobutton", background=pal["bg"])
-    st.configure("TProgressbar", background=pal["acc"], troughcolor=pal["field"])
-    st.configure("Vertical.TScrollbar", background=pal["head"], troughcolor=pal["field"], arrowcolor=pal["fg"])
+    st.configure("TNotebook", background=pal["bg"], borderwidth=1, bordercolor=pal["border"])
+    st.configure("TNotebook.Tab", background=pal["head"], foreground=pal["fg"], padding=(16, 7), font=("Segoe UI", 10, "bold"),
+                 bordercolor=pal["border"])
+    st.map("TNotebook.Tab", background=[("selected", pal["acc"])], foreground=[("selected", pal["acc_fg"])])
+    st.configure("TButton", padding=(10, 5), background=pal["btn"], foreground=pal["fg"], bordercolor=pal["border"],
+                 lightcolor=pal["btn"], darkcolor=pal["btn"], borderwidth=1, relief="raised")
+    st.map("TButton", background=[("disabled", pal["bg"]), ("pressed", pal["sel"]), ("active", pal["btn_act"])],
+           foreground=[("disabled", pal["dim"])], bordercolor=[("focus", pal["acc"]), ("active", pal["acc"])])
+    for w in ("TEntry", "TSpinbox", "TCombobox"):
+        st.configure(w, padding=4, fieldbackground=pal["field"], foreground=pal["fg"], bordercolor=pal["border"],
+                     lightcolor=pal["field"], darkcolor=pal["field"], arrowcolor=pal["fg"], background=pal["btn"], insertcolor=pal["fg"])
+        st.map(w, bordercolor=[("focus", pal["acc"])], lightcolor=[("focus", pal["acc"])],
+               fieldbackground=[("readonly", pal["field"]), ("disabled", pal["bg"])], foreground=[("readonly", pal["fg"]), ("disabled", pal["dim"])])
+    for w in ("TCheckbutton", "TRadiobutton"):
+        st.configure(w, background=pal["bg"], foreground=pal["fg"], indicatorbackground=pal["field"], indicatorforeground=pal["check"],
+                     indicatorcolor=pal["field"], bordercolor=pal["border"], upperbordercolor=pal["border"], lowerbordercolor=pal["border"])
+        st.map(w, indicatorcolor=[("selected", pal["check"]), ("pressed", pal["sel"])], background=[("active", pal["btn_act"])],
+               indicatorbackground=[("selected", pal["check"])])
+    st.configure("TProgressbar", background=pal["acc"], troughcolor=pal["head"], bordercolor=pal["border"])
+    st.configure("Vertical.TScrollbar", background=pal["btn"], troughcolor=pal["head"], arrowcolor=pal["fg"], bordercolor=pal["border"])
+    st.configure("Horizontal.TScale", background=pal["acc"], troughcolor=pal["head"], bordercolor=pal["border"])
     return pal
 
 
@@ -2971,29 +3082,31 @@ def make_tree(parent, cols, height=10, **kw):
 class App:
     DATES = {"All dates": None, "Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90}
 
-    def __init__(self, start_tab=0):
+    def __init__(self, start_tab=0, startup=True):
         self.root = tk.Tk()
         self.root.title("Montage builder (Valorant / CS2)")
         self.root.geometry("1220x920")
         self.root.minsize(920, 640)
         self.q, self.busy, self.buttons, self._imgs, self.pending = queue.Queue(), False, [], [], []
+        self.named = {}                   # button registry (smoketest checks every required button)
         self.clips, self.ticked, self.songs, self.bpm, self.last_video, self.byp = [], set(), [], {}, None, {}
         self._fill_token = {}
         LOG_SINK[0] = lambda m: self.q.put(("log", m))
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
-        self.pal = apply_theme(self.root, self.cfg.get("theme", "auto"))
+        self.pal = apply_theme(self.root, self.cfg.get("theme", "light"))
         self.last_click = None
         # bottom area first so the notebook can expand above it
         bot = ttk.Frame(self.root)
-        bot.pack(side="bottom", fill="both", padx=6, pady=4)
+        bot.pack(side="bottom", fill="x", padx=6, pady=4)
         row = ttk.Frame(bot)
         row.pack(fill="x")
         self.pbar = ttk.Progressbar(row, maximum=1.0)
         self.pbar.pack(side="left", fill="x", expand=True)
         self.plabel = tk.StringVar(value="idle")
         ttk.Label(row, textvariable=self.plabel, width=34).pack(side="left", padx=6)
-        ttk.Button(row, text="Cancel", command=stop_all).pack(side="left")
+        self.named["Cancel"] = ttk.Button(row, text="Cancel", command=stop_all)
+        self.named["Cancel"].pack(side="left")
         res = ttk.Frame(bot)
         res.pack(fill="x", pady=3)
         self.vlabel = tk.StringVar(value="Last video: none yet")
@@ -3002,10 +3115,12 @@ class App:
         self.b_open.pack(side="right")
         self.b_folder = ttk.Button(res, text="Open folder", command=self.safe(self.open_vfolder))
         self.b_folder.pack(side="right", padx=4)
+        self.named["Open video"], self.named["Open folder"] = self.b_open, self.b_folder
         lf = ttk.Frame(bot)
-        lf.pack(fill="both", expand=True)
-        self.log = tk.Text(lf, height=9, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"],
-                           relief="flat", padx=8, pady=6, font=("Consolas", 10))
+        lf.pack(fill="x")
+        self.log = tk.Text(lf, height=8, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"],
+                           relief="solid", bd=1, highlightthickness=0, padx=8, pady=6, font=("Consolas", 10),
+                           selectbackground=self.pal["sel"], selectforeground=self.pal["sel_fg"])
         lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=lsb.set)
         self.log.pack(side="left", fill="both", expand=True)
@@ -3021,17 +3136,29 @@ class App:
         self.build_trouble()
         self.build_settings()
         self.nb.select(start_tab)
+        self.root.bind("<Configure>", self.fit_log, add="+")
         self.root.after(100, self.poll)
-        self.root.after(400, self.startup)
+        if startup:
+            self.root.after(400, self.startup)
 
     # ------------------------------------------------------------ plumbing
-    def btn(self, parent, text, cmd, big=False, **kw):
+    def fit_log(self, e=None):
+        """Small windows give the log fewer lines so the tabs (and their buttons) keep their room."""
+        h = self.root.winfo_height()
+        lines = 4 if h < 760 else 6 if h < 880 else 8
+        if int(self.log.cget("height")) != lines:
+            self.log.configure(height=lines)
+
+    def btn(self, parent, text, cmd, big=False, name=None, **kw):
         if big:
             b = tk.Button(parent, text=text, command=self.safe(cmd), font=("Segoe UI", 12, "bold"), height=2, bg=self.pal["acc"],
-                          fg="#ffffff", activebackground=self.pal["head"], activeforeground=self.pal["fg"], relief="flat", padx=12, **kw)
+                          fg=self.pal["acc_fg"], activebackground=self.pal["btn_act"], activeforeground=self.pal["fg"],
+                          disabledforeground="#d0d6de", relief="raised", bd=2, highlightthickness=1,
+                          highlightbackground=self.pal["border"], cursor="hand2", padx=14, **kw)
         else:
             b = ttk.Button(parent, text=text, command=self.safe(cmd), **kw)
         self.buttons.append(b)
+        self.named[name or text] = b
         return b
 
     def safe(self, fn):
@@ -3157,16 +3284,17 @@ class App:
     # ------------------------------------------------------------ Auto tab
     def build_auto(self):
         f = self.tabs["Auto"]
-        ttk.Label(f, text="One montage per game per week from all your clips - nothing to pick. "
-                          "Calibrate each game once (Troubleshoot tab).", font=("Segoe UI", 10)).pack(anchor="w", padx=8, pady=8)
+        ttk.Label(f, text="One montage per game per week from all your clips - nothing to pick. Kills are read from the killfeed "
+                          "with OCR (no calibration needed; the killfeed region can be adjusted in Troubleshoot).",
+                  font=("Segoe UI", 10), wraplength=1100).pack(anchor="w", padx=8, pady=4)
         self.auto_status = {}
         for g in GAMES:
             lf = ttk.LabelFrame(f, text=GAME_DIR[g])
-            lf.pack(fill="x", padx=8, pady=8)
+            lf.pack(fill="x", padx=8, pady=4)
             sv = tk.StringVar()
             self.auto_status[g] = sv
             self.btn(lf, "Make this week's montage", lambda g=g: self.run_task(f"{g} auto", self.job_video(g, weekly=True)),
-                     big=True).pack(side="left", padx=10, pady=10)
+                     big=True, name=f"auto:{g}:make").pack(side="left", padx=10, pady=4)
             col = ttk.Frame(lf)
             col.pack(side="left", fill="x", expand=True, padx=8)
             ttk.Label(col, textvariable=sv, justify="left").pack(anchor="w")
@@ -3174,7 +3302,8 @@ class App:
             sm.pack(anchor="w", pady=4)
             for text, kw in (("Force new", dict(weekly=True, force=True)), ("Dry plan", dict(mode="dry", weekly=True)),
                              ("Preview 720p / 20 s", dict(mode="preview", weekly=True))):
-                self.btn(sm, text, lambda g=g, kw=kw, text=text: self.run_task(f"{g} {text}", self.job_video(g, **kw))).pack(side="left", padx=3)
+                self.btn(sm, text, lambda g=g, kw=kw, text=text: self.run_task(f"{g} {text}", self.job_video(g, **kw)),
+                         name=f"auto:{g}:{text}").pack(side="left", padx=3)
         self.refresh_auto()
 
     def refresh_auto(self):
@@ -3197,7 +3326,7 @@ class App:
                 lp = LAST_PLAN.get(g)
                 song = f"{lp['song']['artist']} - {lp['song']['title']} ({lp['song']['bpm']} BPM)" if lp else "chosen when the montage is made (newest week first)"
                 self.auto_status[g].set(
-                    f"Calibrated: {'yes' if det else 'NO - Troubleshoot > Calibrate killfeed'}\n"
+                    f"Killfeed region: {('calibrated' if det.calibrated else 'default top-right (optional: Troubleshoot > Calibrate killfeed region)') if det else 'OCR unavailable - Troubleshoot > Selfcheck'}\n"
                     f"Clips scanned: {done} / {len(mine)}\n"
                     f"Song: {song}\n"
                     f"This week ({week_tag(datetime.datetime.now())}): {ex[-1].name if ex else 'no montage yet'}    "
@@ -3208,8 +3337,37 @@ class App:
     # ------------------------------------------------------------ Manual tab
     def build_manual(self):
         f = self.tabs["Manual"]
-        s1 = ttk.LabelFrame(f, text="Step 1 - tick the clips (click a row to tick it)")
-        s1.pack(fill="both", expand=True, padx=8, pady=4)
+        s3 = ttk.LabelFrame(f, text="Step 3 - make it")
+        s3.pack(side="bottom", fill="x", padx=8, pady=4)          # packed FIRST so it can never be pushed off-screen
+        bb = ttk.Frame(s3)
+        bb.pack(fill="x", pady=(2, 6))
+        for text, mode in (("Dry plan", "dry"), ("Preview (720p, 20 s)", "preview"), ("Render", "render")):
+            self.btn(bb, text, lambda m=mode: self.manual(m), big=True, name=f"manual:{mode}").pack(side="left", expand=True, fill="x", padx=6)
+        c3 = ttk.Frame(s3)
+        c3.pack(fill="x", pady=2)
+        ttk.Label(c3, text="Length (s)").pack(side="left")
+        self.m_len = tk.IntVar(value=self.cfg.get("length_s", 85))
+        ttk.Scale(c3, from_=60, to=120, variable=self.m_len, length=170, command=lambda v: self.update_status()).pack(side="left", padx=4)
+        ttk.Label(c3, textvariable=self.m_len, width=4).pack(side="left")
+        ttk.Label(c3, text="Style").pack(side="left", padx=(12, 2))
+        self.m_style = tk.StringVar(value="random")
+        ttk.Combobox(c3, textvariable=self.m_style, values=["random"] + list(RECIPES) + ["mix"], width=9, state="readonly").pack(side="left")
+        ttk.Label(c3, text="Quality").pack(side="left", padx=(12, 2))
+        self.m_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
+        ttk.Radiobutton(c3, text="Fast (NVENC)", variable=self.m_q, value="nvenc").pack(side="left")
+        ttk.Radiobutton(c3, text="Max (x264 CRF15)", variable=self.m_q, value="max").pack(side="left", padx=4)
+        ttk.Label(c3, text="Seed").pack(side="left", padx=(12, 2))
+        self.m_seed = tk.StringVar()
+        ttk.Entry(c3, textvariable=self.m_seed, width=8).pack(side="left")
+        self.m_status = tk.StringVar(value="Tick some clips.")
+        ttk.Label(s3, textvariable=self.m_status, font=("Segoe UI", 10, "bold"), wraplength=1100).pack(anchor="w", pady=2)
+        mid = ttk.Frame(f)                                         # grid: steps 1 and 2 shrink instead of being cut off
+        mid.pack(side="top", fill="both", expand=True)
+        mid.columnconfigure(0, weight=1)
+        mid.rowconfigure(0, weight=3)
+        mid.rowconfigure(1, weight=2)
+        s1 = ttk.LabelFrame(mid, text="Step 1 - tick the clips (click a row to tick it)")
+        s1.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
         top = ttk.Frame(s1)
         top.pack(fill="x", pady=2)
         self.m_game = tk.StringVar(value="valorant")
@@ -3233,6 +3391,7 @@ class App:
         self.m_to = tk.StringVar()
         ttk.Entry(top, textvariable=self.m_to, width=11).pack(side="left")
         ttk.Label(top, text="(YYYY-MM-DD)").pack(side="left", padx=3)
+        top3 = ttk.Frame(s1)
         for v in (self.m_from, self.m_to):
             v.trace_add("write", lambda *a: self.root.after(400, self.apply_filter))
         top2 = ttk.Frame(s1)
@@ -3244,17 +3403,18 @@ class App:
         self.m_n = tk.StringVar(value="15")
         ttk.Spinbox(top2, from_=1, to=500, textvariable=self.m_n, width=5).pack(side="left")
         self.btn(top2, "Tick whole folder", lambda: self.tick("folder")).pack(side="left", padx=(12, 3))
-        ttk.Label(top2, text="(Shift+click ticks a range)").pack(side="left", padx=6)
-        self.btn(top2, "Reload list", lambda: self.run_task("clips", self.load_clips)).pack(side="left", padx=12)
-        self.btn(top2, "Exclude ticked from montages", self.exclude_sel).pack(side="left")
-        fr, self.ctree = make_tree(s1, ("date", "len", "kills"), height=9, selectmode="none")
+        top3.pack(fill="x", pady=2, after=top2)
+        self.btn(top3, "Reload list", lambda: self.run_task("clips", self.load_clips)).pack(side="left", padx=3)
+        self.btn(top3, "Exclude ticked from montages", self.exclude_sel).pack(side="left", padx=3)
+        ttk.Label(top3, text="(Shift+click ticks a range)").pack(side="left", padx=10)
+        fr, self.ctree = make_tree(s1, ("date", "len", "kills"), height=7, selectmode="none")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 430, "clip"), ("date", 110, "date"), ("len", 70, "length"), ("kills", 110, "kills")):
             self.ctree.column(c, width=w, minwidth=60, stretch=(c == "#0"))
             self.ctree.heading(c, text=t)
         self.ctree.bind("<Button-1>", self.on_tree_click)
-        s2 = ttk.LabelFrame(f, text="Step 2 - choose the song (newest added first)")
-        s2.pack(fill="both", expand=True, padx=8, pady=4)
+        s2 = ttk.LabelFrame(mid, text="Step 2 - choose the song (newest added first)")
+        s2.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
         r2 = ttk.Frame(s2)
         r2.pack(fill="x", pady=2)
         ttk.Label(r2, text="Search").pack(side="left")
@@ -3262,7 +3422,7 @@ class App:
         self.m_search.trace_add("write", lambda *a: self.refresh_songs())
         ttk.Entry(r2, textvariable=self.m_search, width=30).pack(side="left", padx=4)
         self.btn(r2, "Play selected song", self.play_song).pack(side="left", padx=8)
-        fr2, self.stree = make_tree(s2, ("bpm", "added"), height=6, selectmode="browse")
+        fr2, self.stree = make_tree(s2, ("bpm", "added"), height=4, selectmode="browse")
         fr2.pack(fill="both", expand=True)
         self.stree.column("#0", width=520)
         self.stree.column("bpm", width=70)
@@ -3271,30 +3431,6 @@ class App:
         self.stree.heading("bpm", text="BPM")
         self.stree.heading("added", text="added")
         self.stree.bind("<<TreeviewSelect>>", lambda e: self.update_status())
-        s3 = ttk.LabelFrame(f, text="Step 3 - make it")
-        s3.pack(fill="x", padx=8, pady=4)
-        c3 = ttk.Frame(s3)
-        c3.pack(fill="x", pady=2)
-        ttk.Label(c3, text="Length (s)").pack(side="left")
-        self.m_len = tk.IntVar(value=self.cfg.get("length_s", 85))
-        ttk.Scale(c3, from_=60, to=120, variable=self.m_len, length=170, command=lambda v: self.update_status()).pack(side="left", padx=4)
-        ttk.Label(c3, textvariable=self.m_len, width=4).pack(side="left")
-        ttk.Label(c3, text="Style").pack(side="left", padx=(12, 2))
-        self.m_style = tk.StringVar(value="random")
-        ttk.Combobox(c3, textvariable=self.m_style, values=["random"] + list(RECIPES) + ["mix"], width=9, state="readonly").pack(side="left")
-        ttk.Label(c3, text="Quality").pack(side="left", padx=(12, 2))
-        self.m_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
-        ttk.Radiobutton(c3, text="Fast (NVENC)", variable=self.m_q, value="nvenc").pack(side="left")
-        ttk.Radiobutton(c3, text="Max (x264 CRF15)", variable=self.m_q, value="max").pack(side="left", padx=4)
-        ttk.Label(c3, text="Seed").pack(side="left", padx=(12, 2))
-        self.m_seed = tk.StringVar()
-        ttk.Entry(c3, textvariable=self.m_seed, width=8).pack(side="left")
-        self.m_status = tk.StringVar(value="Tick some clips.")
-        ttk.Label(s3, textvariable=self.m_status, font=("Segoe UI", 10, "bold"), wraplength=1100).pack(anchor="w", pady=4)
-        bb = ttk.Frame(s3)
-        bb.pack(fill="x", pady=4)
-        for text, mode in (("Dry plan", "dry"), ("Preview (720p, 20 s)", "preview"), ("Render", "render")):
-            self.btn(bb, text, lambda m=mode: self.manual(m), big=True).pack(side="left", expand=True, fill="x", padx=6)
 
     def on_tree_click(self, e):
         iid = self.ctree.identify_row(e.y)
@@ -3408,22 +3544,33 @@ class App:
             if q and q not in f"{s['artist']} {s['title']}".lower():
                 continue
             rows.append((s["path"], f"{s['title']}  -  {s['artist']}" if s["artist"] else s["title"],
-                         (self.bpm.get(s["path"], ""), s["added"].strftime("%Y-%m-%d") if s["added"] else "")))
+                         (self.song_bpm(s), s["added"].strftime("%Y-%m-%d") if s["added"] else "")))
         keep = self.stree.selection()
         self.fill_chunked(self.stree, rows)
         self.root.after(50, lambda: self.stree.selection_set(keep[0]) if keep and self.stree.exists(keep[0]) else self.stree.selection_set("auto") if self.stree.exists("auto") else None)
 
+    def song_bpm(self, s):
+        """BPM shown in the song list: the CSV 'Tempo' immediately; librosa only for songs the CSV has no tempo for."""
+        if s.get("csv_bpm"):
+            return f"{float(s['csv_bpm']):.0f}"
+        b = self.bpm.get(s["path"])
+        return f"{float(b):.0f}" if b else ""
+
     def bpm_worker(self):
-        """Quietly analyses the newest songs (cached) so BPM shows in the list; waits while a job is running."""
+        """Quietly analyses the newest songs WITHOUT a CSV tempo (cached) so a BPM shows for them too; waits while a job runs."""
+        for _ in range(600):
+            if self.songs:
+                break
+            time.sleep(1)
         sc = load_json(SONG_CACHE, {})
-        for s in list(self.songs)[:40] or []:
+        for s in [x for x in list(self.songs) if not x.get("csv_bpm")][:40]:
             while self.busy:
                 time.sleep(2)
             try:
                 key = file_key(s["path"]) + SONG_ALGO + f"|{round(s.get('csv_bpm') or 0)}"
                 an = sc.get(key) or analyse_song(s["path"], s.get("csv_bpm"))
                 self.bpm[s["path"]] = an["bpm"]
-                self.q.put(("call", lambda p=s["path"], b=an["bpm"]: self.stree.exists(p) and self.stree.set(p, "bpm", b)))
+                self.q.put(("call", lambda p=s["path"], b=an["bpm"]: self.stree.exists(p) and self.stree.set(p, "bpm", f"{float(b):.0f}")))
             except Exception:
                 pass
 
@@ -3460,7 +3607,7 @@ class App:
         if sel and sel[0] != "auto":
             s = next((x for x in self.songs if x["path"] == sel[0]), None)
             if s:
-                song = f"{s['title']} ({self.bpm.get(s['path'], '? ')} BPM)"
+                song = f"{s['title']} ({self.song_bpm(s) or '?'} BPM)"
         txt = f"{len(tk_)} clips ticked, {kills} kills found"
         if uns:
             txt += f" ({uns} not scanned yet - they get scanned first)"
@@ -3495,14 +3642,15 @@ class App:
         self.btn(bar, "Open song_matches.csv", lambda: self.open_path(DATA / "song_matches.csv")).pack(side="left", padx=3)
         self.m_info = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
-        fr, self.mtree = make_tree(f, ("track", "artist", "score", "flag"), height=18, selectmode="browse")
+        fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "score", "flag"), height=18, selectmode="browse")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 420, "MP3 file"), ("track", 300, "matched playlist track"), ("artist", 200, "artist"),
-                        ("score", 70, "score"), ("flag", 130, "flag")):
+                        ("bpm", 60, "BPM"), ("score", 70, "score"), ("flag", 130, "flag")):
             self.mtree.column(c, width=w, minwidth=50, stretch=(c in ("#0", "track")))
             self.mtree.heading(c, text=t)
-        self.mtree.tag_configure("weak", foreground="#e0a030")
-        self.mtree.tag_configure("none", foreground="#e05050")
+        dark = self.pal["bg"] == PALETTES["dark"]["bg"]
+        self.mtree.tag_configure("weak", foreground="#ffc65c" if dark else "#9a5b00")
+        self.mtree.tag_configure("none", foreground="#ff8a80" if dark else "#c62828")
         self.match_rows, self.match_audio = [], []
 
     def load_matches(self):
@@ -3516,14 +3664,15 @@ class App:
         for a in sorted(audio, key=lambda a: a["path"].lower()):
             r, sc = by.get(a["path"], (None, 0))
             items.append((a["path"], Path(a["path"]).name, r["title"] if r else "", r["artist"] if r else "", sc,
-                          "NO MATCH" if not r else "CHECK (under 85)" if sc < 85 else "ok"))
+                          "NO MATCH" if not r else "CHECK (under 85)" if sc < 85 else "ok",
+                          f"{r['tempo']:.0f}" if r and r.get("tempo") else ""))
         weak = sum(1 for i in items if i[5] != "ok")
 
         def fill():
             self.match_rows, self.match_audio = rows, audio
             self.mtree.delete(*self.mtree.get_children())
-            for pth, nm, tr, ar, sc, fl in items:
-                self.mtree.insert("", "end", iid=pth, text=nm, values=(tr, ar, sc, fl), tags=("none" if fl == "NO MATCH" else "weak" if fl != "ok" else "",))
+            for pth, nm, tr, ar, sc, fl, bpm in items:
+                self.mtree.insert("", "end", iid=pth, text=nm, values=(tr, ar, bpm, sc, fl), tags=("none" if fl == "NO MATCH" else "weak" if fl != "ok" else "",))
             self.m_info.set(f"{len(audio)} MP3 files, {len(rows)} playlist tracks, {len(matched)} matched, {weak} to check, {len(unmatched)} playlist tracks without a file")
         self.q.put(("call", fill))
 
@@ -3574,12 +3723,15 @@ class App:
         r1 = ttk.LabelFrame(f, text="Checks and tools")
         r1.pack(fill="x", padx=8, pady=4)
         for text, cmd in (("Selfcheck (ffmpeg, NVENC, packages)", lambda: self.run_task("selfcheck", cmd_selfcheck, None)),
-                          ("Calibrate killfeed...", lambda: CalibDialog(self)),
+                          ("Calibrate killfeed region (optional)...", lambda: CalibDialog(self)),
                           ("Self-test detection", lambda: self.run_task("selftest", selftest_detection, load_config())),
                           ("Scan all clips now", lambda: self.run_task("scan all", run_scan, load_config(), None, None)),
                           ("Open logs", lambda: self.open_path(LOG_DIR)),
                           ("Clear kill cache", self.clear_cache)):
-            self.btn(r1, text, cmd).pack(side="left", padx=4, pady=4)
+            if text == "Scan all clips now" or text.startswith("Selfcheck"):
+                rowf = ttk.Frame(r1)
+                rowf.pack(fill="x")
+            self.btn(rowf, text, cmd).pack(side="left", padx=4, pady=3)
         r2 = ttk.LabelFrame(f, text="Black bars (measured once, fixed crop)")
         r2.pack(fill="x", padx=8, pady=4)
         self.bar_var = tk.StringVar()
@@ -3591,6 +3743,8 @@ class App:
             ttk.Label(rr, text=lab).pack(side="left")
             ttk.Entry(rr, textvariable=v, width=6).pack(side="left", padx=2)
         self.btn(rr, "Apply override (selected clip's size)", self.bar_override).pack(side="left", padx=6)
+        rr = ttk.Frame(r2)
+        rr.pack(anchor="w", padx=6, pady=3)
         self.btn(rr, "Re-measure", lambda: self.run_task("bars", lambda: (ensure_bars(load_config(), True), self.q.put(("call", self.refresh_bar))))).pack(side="left")
         self.btn(rr, "No bars", self.bar_off).pack(side="left", padx=4)
         self.btn(rr, "Before/after preview", self.bar_preview).pack(side="left", padx=4)
@@ -3634,7 +3788,7 @@ class App:
         g, cfg = self.t_game.get(), load_config()
         det = load_dets(g).get(g)
         if not det:
-            out(f"{g} is not calibrated")
+            out("OCR detector unavailable: Troubleshoot > Selfcheck")
             return
         rec = analyse_clip(p, load_json(CLIPS_CACHE, {}), False, cfg.get("bar"))[1]
         rec["game"] = g
@@ -3642,19 +3796,28 @@ class App:
         if not e:
             out("not scanned yet: press Rescan this clip")
             return
-        ks, ds = compute_kills(e, cfg)
+        a = analyse_entry(e, cfg)
+        ks, ds = a["kills"], a["deaths"]
         out(f"{Path(p).name}: {len(ks)} kills (before the gunshot check): " + ", ".join(ts(k['t']) + ("*HS" if k.get("hs") else "") for k in ks) +
-            f"; my deaths at {', '.join(ts(d) for d in ds) or '-'}; best name {e['best_name']} hl {e['best_hl']}; scale {e['scale']}")
-        pick = ks[0] if ks else None
-        if pick is None and e.get("rows"):
-            best = max(e["rows"], key=lambda d: max(d[6], d[8]))
-            pick = {"t": best[0] / FPS - 0.3 + e.get("v_off", 0)}
+            f"; my deaths at {', '.join(ts(d) for d in ds) or '-'}; rows found {a['rows_max']} max/frame, {a['ocr_calls']} OCR calls;"
+            f" best FIREAXE match killer-side {a['best_k']:.2f} victim-side {a['best_v']:.2f}")
+        for m in a["mine"]:
+            out(f"   my row @ {ts(m['t'])} {m['row']} -> {m['verdict'].upper()}: {m['why']} ({m['hits']} sightings)")
+        for j in a["rej"]:
+            out(f"   rejected @ {ts(j['t'])}: {j['reason']}")
+        pick = ks[0] if ks else ({"t": a["mine"][0]["t"]} if a["mine"] else None)
+        if pick is None and e.get("ocr"):
+            busiest = max(e["ocr"], key=lambda o: len(o[2]))
+            pick = {"t": busiest[0] / FPS - 0.3 + e.get("v_off", 0)}
         if pick:
-            fr = grab_kill_crop(rec, det, cfg, pick, e["scale"])
+            fr, rows = grab_kill_crop(rec, det, cfg, pick)
             if fr is not None:
+                out(f"   crop at {ts(pick['t'])}: {len(rows)} rows")
+                for r in rows:
+                    out("     " + row_desc(r))
                 w = tk.Toplevel(self.root)
-                w.title("Killfeed crop (green = accepted own row, red = rejected/death) with name/highlight scores")
-                ph, _ = to_photo(fr, 900, 700)
+                w.title("Killfeed crop: green = KILL, red = DEATH, orange = rejected (assist/utility), grey = other rows")
+                ph, _ = to_photo(fr, 1100, 700)
                 self._imgs.append(ph)
                 ttk.Label(w, image=ph).pack()
 
@@ -3739,7 +3902,7 @@ class App:
         for k, lab in (("max_mb", "Skip files larger than (MB)"), ("max_dur_s", "Skip clips longer than (s)"),
                        ("auto_recent_days", "Auto: scan every new clip from the last (days)"),
                        ("auto_old_per_run", "Auto: plus up to this many older clips per run"),
-                       ("thr_kill", "Detection: killer-side name score for a kill"), ("thr_death", "Detection: victim-side name score for my death"),
+                       ("name_match", "Detection: FIREAXE OCR fuzzy match needed (0-100)"),
                        ("death_lock_s", "No kills for this long after my death (s)"),
                        ("week_days", "'This week' means the last N days")):
             ttk.Label(f, text=lab).grid(row=r, column=0, sticky="w", padx=8, pady=3)
@@ -3756,7 +3919,7 @@ class App:
             r += 1
         self.set_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
         self.set_sync = tk.BooleanVar(value=self.cfg.get("sync_report", True))
-        self.set_theme = tk.StringVar(value=self.cfg.get("theme", "auto"))
+        self.set_theme = tk.StringVar(value=self.cfg.get("theme", "light"))
         ttk.Label(f, text="Quality").grid(row=r, column=0, sticky="w", padx=8, pady=4)
         qf = ttk.Frame(f)
         qf.grid(row=r, column=1, sticky="w")
@@ -3766,7 +3929,7 @@ class App:
         ttk.Checkbutton(f, text="Print a sync report after each render (re-scans the finished montage)", variable=self.set_sync).grid(row=r, column=1, sticky="w")
         r += 1
         ttk.Label(f, text="Theme (restart to apply)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
-        ttk.Combobox(f, textvariable=self.set_theme, values=["auto", "dark", "light"], width=8, state="readonly").grid(row=r, column=1, sticky="w")
+        ttk.Combobox(f, textvariable=self.set_theme, values=["light", "dark", "auto"], width=8, state="readonly").grid(row=r, column=1, sticky="w")
         r += 1
         self.btn(f, "Save settings", self.save_settings).grid(row=r, column=1, sticky="w", pady=12)
 
@@ -3794,6 +3957,173 @@ def grab_gray_bgr(path, t, w, h):
     import numpy as np
     r = run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", path, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], timeout=60)
     return np.frombuffer(r.stdout[:w * h * 3], np.uint8).reshape(h, w, 3).copy()
+
+
+# button name -> (tab, task name / action it must trigger when clicked)
+REQUIRED_BUTTONS = {}
+for _g in GAMES:
+    REQUIRED_BUTTONS[f"auto:{_g}:make"] = ("Auto", f"task:{_g} auto")
+    REQUIRED_BUTTONS[f"auto:{_g}:Force new"] = ("Auto", f"task:{_g} Force new")
+    REQUIRED_BUTTONS[f"auto:{_g}:Dry plan"] = ("Auto", f"task:{_g} Dry plan")
+    REQUIRED_BUTTONS[f"auto:{_g}:Preview 720p / 20 s"] = ("Auto", f"task:{_g} Preview 720p / 20 s")
+REQUIRED_BUTTONS.update({
+    "Exclude ticked from montages": ("Manual", "write:exclude.txt"),
+    "manual:dry": ("Manual", "task:manual dry"), "manual:preview": ("Manual", "task:manual preview"),
+    "manual:render": ("Manual", "task:manual render"),
+    "Tick all shown": ("Manual", "ticked"), "Untick all": ("Manual", "unticked"), "Tick clips with kills": ("Manual", "ticked"),
+    "Tick newest": ("Manual", "ticked"), "Tick whole folder": ("Manual", "ticked"), "Reload list": ("Manual", "task:clips"),
+    "Play selected song": ("Manual", "open:song.mp3"),
+    "Refresh": ("Songs", "task:matches"), "Change match for selected file...": ("Songs", "info"),
+    "Play selected file": ("Songs", "open:song.mp3"), "Open song_matches.csv": ("Songs", "open:song_matches.csv"),
+    "Selfcheck (ffmpeg, NVENC, packages)": ("Troubleshoot", "task:selfcheck"),
+    "Calibrate killfeed region (optional)...": ("Troubleshoot", "window"),
+    "Self-test detection": ("Troubleshoot", "task:selftest"), "Scan all clips now": ("Troubleshoot", "task:scan all"),
+    "Open logs": ("Troubleshoot", "open:logs"), "Clear kill cache": ("Troubleshoot", "ask"),
+    "Load clips": ("Troubleshoot", "task:tclips"), "Kill timestamps + killfeed crop": ("Troubleshoot", "info"),
+    "Rescan this clip": ("Troubleshoot", "info"), "Before/after preview": ("Troubleshoot", "info"),
+    "Re-measure": ("Troubleshoot", "task:bars"),
+    "Save settings": ("Settings", "write:config.json"),
+    "Open folder": (None, "open:"), "Open video": (None, None), "Cancel": (None, None),
+})
+
+
+def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
+    """Builds the real GUI (no startup jobs), checks that every required button exists, is visible inside the window at several
+    window sizes, and that clicking it triggers the right action (jobs/dialogs/files are intercepted, nothing runs)."""
+    fails = []
+    g = globals()
+    app = App(0, startup=False)
+    root = app.root
+    calls = []
+    app.run_task = lambda name, fn, *a: calls.append(f"task:{name}")
+    app.open_path = lambda p: calls.append(f"open:{Path(p).name}")
+    saved = {k: g[k] for k in ("save_json",)}
+    mb = {k: getattr(messagebox, k) for k in ("showinfo", "showerror", "askyesno")}
+    real_open = open
+    try:
+        g["save_json"] = lambda p, obj: calls.append(f"write:{Path(p).name}")
+        messagebox.showinfo = lambda *a, **k: calls.append("info")
+        messagebox.showerror = lambda *a, **k: calls.append("error")
+        messagebox.askyesno = lambda *a, **k: (calls.append("ask"), False)[1]
+        g["open"] = lambda p, *a, **k: (calls.append(f"write:{Path(p).name}"), real_open(os.devnull, *a, **k))[1]
+        tabs = {str(f): n for n, f in app.tabs.items()}
+
+        def tab_of(w):
+            while w is not None:
+                if str(w) in tabs:
+                    return tabs[str(w)]
+                w = w.master
+            return None
+        for W, H in sizes:
+            root.geometry(f"{W}x{H}+0+0")
+            for tname in app.tabs:
+                app.nb.select(app.tabs[tname])
+                root.update()
+                rx, ry, rw, rh = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
+                for name, (want_tab, _) in REQUIRED_BUTTONS.items():
+                    b = app.named.get(name)
+                    if b is None:
+                        if (W, H) == sizes[0] and tname == "Auto":
+                            fails.append(f"button missing: {name}")
+                        continue
+                    t = tab_of(b)
+                    if want_tab and t != want_tab:
+                        if tname == "Auto" and (W, H) == sizes[0]:
+                            fails.append(f"button {name} is on tab {t}, expected {want_tab}")
+                        continue
+                    if t not in (None, tname):
+                        continue
+                    bx, by, bw, bh = b.winfo_rootx(), b.winfo_rooty(), b.winfo_width(), b.winfo_height()
+                    vis = b.winfo_viewable() and bw >= 20 and bh >= 15 and bx >= rx and by >= ry and \
+                        bx + bw <= rx + rw + 1 and by + bh <= ry + rh + 1
+                    if not vis:
+                        fails.append(f"{W}x{H} {tname}: button '{name}' not fully visible (at {bx - rx},{by - ry} size {bw}x{bh})")
+        root.geometry(f"{sizes[0][0]}x{sizes[0][1]}+0+0")
+        # wiring: fake one clip and one song so the Manual buttons have something to act on
+        fake = {"path": "x/clip.mp4", "name": "clip.mp4", "folder": "VALORANT", "mtime": time.time(), "dur": 20, "kills": 2, "ks": [3.0, 4.0]}
+        app.clips, app.byp = [fake], {fake["path"]: fake}
+        app.songs = [{"path": "x/song.mp3", "artist": "a", "title": "t", "added": None, "csv_bpm": 128.0}]
+        app.apply_filter()
+        app.refresh_songs()
+        for _ in range(3):                                         # let the chunked fills and delayed re-selection finish
+            root.update()
+            time.sleep(0.1)
+        root.update()
+        for name, (want_tab, want) in REQUIRED_BUTTONS.items():
+            b = app.named.get(name)
+            if b is None or want is None:
+                continue
+            if want_tab:
+                app.nb.select(app.tabs[want_tab])
+            if name.startswith("manual:"):
+                app.ticked = {fake["path"]}
+            if name in ("Play selected song",):
+                app.stree.selection_set("x/song.mp3")
+            if name == "Play selected file":
+                app.mtree.insert("", "end", iid="x/song.mp3", text="song.mp3", values=("t", "a", "128", 100, "ok"))
+                app.mtree.selection_set("x/song.mp3")
+            if name in ("Tick all shown", "Tick clips with kills", "Tick newest", "Tick whole folder"):
+                app.ticked = set()
+                app.m_folder.set("VALORANT")
+            root.update()
+            calls.clear()
+            nwin = len(root.winfo_children())
+            try:
+                b.invoke()
+                root.update()
+            except Exception as ex:
+                fails.append(f"button '{name}' raised {type(ex).__name__}: {ex}")
+                continue
+            if want == "ticked":
+                ok = app.ticked == {fake["path"]}
+            elif want == "unticked":
+                ok = not app.ticked
+            elif want == "window":
+                ok = len(root.winfo_children()) > nwin
+                for w in root.winfo_children():
+                    if isinstance(w, tk.Toplevel):
+                        w.destroy()
+            else:
+                ok = any(c == want or (want.endswith(":") and c.startswith(want)) for c in calls)
+            if not ok:
+                fails.append(f"button '{name}' is not wired: expected {want}, got {calls or 'nothing'}")
+            app.m_folder.set("All folders")
+            if name == "Untick all":
+                app.ticked = {fake["path"]}
+    finally:
+        g.update(saved)
+        g.pop("open", None)
+        for k, v in mb.items():
+            setattr(messagebox, k, v)
+        LOG_SINK[0] = PROGRESS[0] = None
+        root.destroy()
+    return fails
+
+
+def cmd_smoketest(args):
+    """Offline checks (no clips needed): GUI buttons exist/visible/wired + OCR detection on generated frames."""
+    fails = []
+    if not getattr(args, "no_gui", False):
+        out("== GUI buttons ==")
+        try:
+            f = smoketest_gui()
+            fails += f
+            out("  OK: every required button exists, is visible at 1220x920, 1920x1040 and 920x640, and is wired" if not f else
+                "\n".join("  FAIL " + x for x in f))
+        except Exception as ex:
+            fails.append(f"GUI could not be built: {ex}")
+            out("  FAIL GUI: " + traceback.format_exc())
+    out("== OCR detection (generated frames) ==")
+    try:
+        f = ocr_synthetic_test()
+        fails += f
+        out("  OK: one KILL for 'fireaxe [gun] enemy', one DEATH for 'enemy [gun] fireaxe'" if not f else "\n".join("  FAIL " + x for x in f))
+    except Exception as ex:
+        fails.append(f"OCR: {ex}")
+        out("  FAIL OCR: " + traceback.format_exc())
+    out("SMOKETEST " + ("PASSED" if not fails else f"FAILED ({len(fails)})"))
+    if fails:
+        sys.exit(1)
 
 
 def gui_main(start_tab=0):
@@ -3856,6 +4186,9 @@ def main():
         a_.add_argument("--max-quality", action="store_true")
         a_.add_argument("--seed", type=int)
         a_.set_defaults(fn=cmd_auto, plan_only=(name == "plan"))
+    st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
+    st_.add_argument("--no-gui", action="store_true")
+    st_.set_defaults(fn=cmd_smoketest)
     t = sp.add_parser("tag")
     t.add_argument("path")
     t.add_argument("game", choices=list(GAMES) + ["auto"])
