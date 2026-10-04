@@ -3122,6 +3122,9 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False):
         app = lead_t - 1.0
         r = min(ramp, max(1.0, (ev["pre"] - 1.0) / app))
         r = r if r >= 1.15 else 1.0
+    cover = lead_t if r == 1.0 else 1.0 + (lead_t - 1.0) * r
+    if first - min(ev.get("rows") or ev["times"]) > cover - 0.05:                   # killfeed row must be inside the footage
+        return None
     dmax = (ev["death_after"] - 0.05) if ev.get("death_after") is not None else 99.0
     post = min(ev["post"], dmax)
     if ending:
@@ -3728,19 +3731,21 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
         # effects on the take's own timeline; frames outside an effect window stay untouched
         tr = t.get("trans", "hard") if ti > 0 and "transition" in fx else "hard"
         zt, wins = [], []
+        tt = "(in/60)"                                                                     # take-timeline seconds inside perspective
         if "zoom" in fx:
-            for p in t.get("pulses", []):
-                zt.append(f"{t['amp']:.3f}*between(t,{p:.4f},{p + 0.45:.4f})*exp(-9*(t-{p:.4f}))")         # V4 zoom curve
+            for p in t.get("pulses", []):                                                  # smooth punch: float zoom, eased in AND out
+                zt.append(f"between({tt},{p:.4f},{p + 0.45:.4f})*{t['amp']:.3f}*0.5*(1-cos(2*PI*({tt}-{p:.4f})/0.45))")
                 wins.append((p, p + 0.45))
         if tr == "zoom":
-            zt.append("0.06*max(0,1-t/0.25)")
+            zt.append(f"between({tt},0,0.25)*0.06*0.5*(1+cos(PI*{tt}/0.25))")
             wins.append((0.0, 0.26))
         lab = f"[{base}c]"
         if zt:
             en_ = "+".join(f"between(t,{a_:.4f},{b_:.4f})" for a_, b_ in wins)
+            m_ = f"(1-1/(1+{_sum_expr(zt)}))/2"                                            # inset of the sampled quad (fraction)
             chains.append(f"[{base}c]split=2[{base}m][{base}f]")
-            chains.append(f"[{base}f]scale=w='trunc(3840*(1+{_sum_expr(zt)})/2)*2':h=-2:eval=frame:flags=lanczos,"
-                          f"crop=3840:2160:(iw-ow)/2:(ih-oh)/2,scale=1920:1080:flags=lanczos,format=yuv420p[{base}e]")
+            chains.append(f"[{base}f]perspective=x0='W*{m_}':y0='H*{m_}':x1='W-W*{m_}':y1='H*{m_}':x2='W*{m_}':y2='H-H*{m_}':"
+                          f"x3='W-W*{m_}':y3='H-H*{m_}':interpolation=cubic:eval=frame,format=yuv420p[{base}e]")
             chains.append(f"[{base}m]format=yuv420p[{base}m2]")
             chains.append(f"[{base}m2][{base}e]overlay=0:0:eof_action=pass:enable='{en_}'[{base}o]")
             lab = f"[{base}o]"
@@ -3824,7 +3829,10 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     outfile.parent.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = slice_plan(plan) if preview else plan
-    bad = verify_cutlist(p) if not preview else []
+    bad = verify_cutlist(p)
+    for b_ in [x for x in bad if "kill row" in x]:
+        out("WARNING (render continues): " + b_)
+    bad = [x for x in bad if "kill row" not in x]
     if bad:
         raise RuntimeError("cut list problem, not rendering: " + "; ".join(bad))
     D = p["duration"]
@@ -4002,8 +4010,22 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         target = cfg.get("length_s", "optimal")
     if style is None:
         style = cfg.get("style", "auto")
-    plan = plan_montage(cfg, game, events, song, an, seed, style, target, hist_list(USED_CLIPS, game), notes, lock=lock,
-                        placement=placement)
+    pool_ev, fixes = list(events), []
+    for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
+        n2 = list(notes)
+        plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
+                            placement=placement)
+        bad = [b_ for b_ in verify_cutlist(plan) if "kill row" in b_]
+        idx = {int(m.group(1)) for b_ in bad for m in [re.match(r"take (\d+):", b_)] if m}
+        gone = {plan["takes"][i - 1]["path"] for i in idx if 0 < i <= len(plan["takes"])}
+        if not gone:
+            break
+        fixes += [f"cut list repair: dropped {Path(p_).name} (kill row outside its footage), re-planned with the next best events"
+                  for p_ in gone]
+        pool_ev = [e for e in pool_ev if e["path"] not in gone]
+    plan["notes"] = list(plan["notes"]) + fixes
+    for f_ in fixes:
+        out(f_)
     plan["song_score"] = sinfo
     LAST_PLAN[game] = plan
     return plan, fmt_plan(plan, events, sinfo, runners, unmatched, csvname)
