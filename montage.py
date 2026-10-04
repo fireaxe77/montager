@@ -14,19 +14,23 @@ FIRST 3 THINGS TO CLICK:
   1. Troubleshoot > "Selfcheck"  -> every line should say OK (ffmpeg, NVENC, packages, OCR test).
   2. Troubleshoot > "Self-test detection" after a few clips are scanned: rows found, the OCR text of your rows, verdicts.
      (Optional: "Calibrate killfeed region" if your killfeed is not in the default top-right area.)
-  3. Auto tab > "Dry plan" for a game: first run scans every clip once (cached forever), then prints the song with
-     its score breakdown, ranked kills, and the cut list. Then "Preview" (720p, 20 s around the drop) and "Make this week's montage".
+  3. Settings: check the Valorant / CS2 clip folder lists. Then Auto tab > "Dry plan": first run scans every clip once (cached
+     forever), then prints the song + map, recipe, lock level, ranked kills and the cut list. Then "Preview" and "Make this week's montage".
 
-NOTES (V4): kills are read with OCR (RapidOCR, offline) from the killfeed region. Rows are grouped by height, the weapon icon
-  (white blob, else the widest gap) splits killer side / victim side. KILL = FIREAXE is the first name on the killer side (a name
-  before it = assist, rejected; small/square icon = utility, rejected). DEATH = FIREAXE on the victim side. The first scan after
-  updating rescans every clip once (new cache format kills_v5); raw OCR results are cached, so later rule changes need no rescan.
-  Dry plan, Render, Self-test and the killfeed crop view all use the same classify_row/analyse_entry code. BPM comes from the
-  CSV "Tempo" column (librosa only refines the beat grid). "python montage.py smoketest" checks the GUI buttons and the OCR.
+NOTES (V5): clips come from the explicit folder lists in Settings (the list decides the game). Kills are read with OCR (RapidOCR,
+  offline) from the killfeed; KILL = FIREAXE first on the killer side, assists / utility / knife kills never reach a montage, OCR
+  variants of one row are merged, a single sighting under 90 needs a gunshot. Each kill is refined to the FIRST frame its row is
+  visible. Every song gets a cached SONG MAP (beat grid locked to the CSV Tempo, downbeats, 4/8-bar phrases, sections, all drops,
+  accents, loudness; Songs tab > Song map). The montage is built FROM the map: first kills land on the beat (how many are locked
+  depends on the style recipe + the song's rhythm, printed as the lock level), every drop gets a strong clip, the last take ends in
+  slow-mo with the music + video fade. Duplicate / continuation clips are merged (and stitched into one take when needed); no clip is
+  used twice. Game audio is loudness-normalised per clip and mixed ~4 dB under the music, which ducks ~4 dB around kills.
+  "python montage.py smoketest" = GUI + OCR + planner + a real render whose sync is measured from the file (< 3 min).
+  "python montage.py detectcheck" = V4 vs V5 kill classification on all cached OCR data.
 
 CLI (same engine):  python montage.py auto [--game valorant|cs2] [--force] [--dry] [--preview] [--max-quality] [--seed N]
                     python montage.py plan --game cs2        (dry plan only)     python montage.py pick   (GUI, Manual tab)
-                    python montage.py selfcheck | selftest | smoketest | inventory | scan | verify <game> | calibrate-bars | tag <path> <game>
+                    python montage.py selfcheck | selftest | smoketest | detectcheck | inventory | scan | verify <game> | calibrate-bars | tag <path> <game>
 Data: montage_data\ (config.json, caches, calibration, plans, logs\montage.log). Output: E:\Movies\Montages\<Game>\.
 """
 import argparse
@@ -75,8 +79,8 @@ DEFAULT_CONFIG = {
     "week_days": 7,
     "window_min_s": 45,
     "window_max_s": 90,
-    "game_audio_level": 0.5,        # linear gain of game audio under the music (0.5 = -6 dB); +4 dB boost around kills
-    "cfg_version": 3,
+    "game_audio_level": 0.5,        # V4 setting, unused since V5 (see game_under_music_db / duck_db)
+    "cfg_version": 4,
     "include_valorant": ["VALORANT"],   # only folders whose name matches are used (any depth under clip_root)
     "include_cs": ["CS", "COUNTER STRIKE"],
     "max_mb": 60,
@@ -93,6 +97,13 @@ DEFAULT_CONFIG = {
     "quality": "nvenc",             # nvenc | max
     "theme": "light",               # light (default) | dark | auto
     "scan_workers": 2,              # clips OCR-scanned in parallel
+    # V5: explicit clip folders; the game comes from the list a folder is in (replaces folder-name matching)
+    "clip_dirs": {"valorant": [r"E:\Movies\VALORANT\Clips", r"E:\Movies\LEGACY\Valorant"],
+                  "cs2": [r"E:\Movies\2026\Counter-strike 2", r"E:\Movies\2026\cs clips",
+                          r"E:\Movies\Movies 2025\Counter-strike 2", r"E:\Movies\LEGACY\Counter-strike 2"]},
+    "game_under_music_db": 4.0,     # loudness-normalised game audio sits this many dB under the music
+    "duck_db": 4.0,                 # music ducked this many dB around each kill
+    "ui_scale": 1.0,                # GUI font / row height scale
 }
 
 
@@ -155,16 +166,26 @@ def load_config():
             save_json(CONFIG_PATH, cfg)
         except Exception:
             pass
+    if cfg.get("cfg_version", 1) < 4:                 # V5: explicit clip folder lists
+        cfg["clip_dirs"] = cfg.get("clip_dirs") or DEFAULT_CONFIG["clip_dirs"]
     if cfg.get("cfg_version", 1) < 3:                 # V4: light theme is the default (dark stays optional in Settings)
         if cfg.get("theme") in (None, "auto"):
             cfg["theme"] = "light"
         cfg["cfg_version"] = 3
+    if cfg["cfg_version"] < 4:
+        cfg["cfg_version"] = 4
         try:
             if CONFIG_PATH.exists():
                 save_json(CONFIG_PATH, cfg)
         except Exception:
             pass
     return cfg
+
+
+def clip_dirs(cfg, game=None):
+    """[(dir, game), ...] from Settings (explicit lists)."""
+    d = cfg.get("clip_dirs") or {}
+    return [(p, g) for g in GAMES if game in (None, g) for p in d.get(g, []) if p]
 
 
 def setup_path():
@@ -230,7 +251,7 @@ def folder_match(part, entries):
 
 
 def tag_game(path, cfg):
-    """Game from the nearest folder name under clip_root that matches the include lists; None = ignored clip."""
+    """Game from the explicit folder lists (Settings): the list a clip's folder is in decides the game. None = ignored clip."""
     pl = norm(path)
     best = None
     for pre, g in cfg.get("game_overrides", {}).items():
@@ -239,6 +260,13 @@ def tag_game(path, cfg):
             best = (len(n), g)
     if best and best[1] in GAMES:
         return best[1], "override"
+    if cfg.get("clip_dirs"):
+        hit = None
+        for d, g in clip_dirs(cfg):
+            n = norm(d)
+            if pl.startswith(n + os.sep) and (hit is None or len(n) > hit[0]):
+                hit = (len(n), g)
+        return (hit[1], "folder list") if hit else (None, "not in a listed clip folder")
     try:
         rel = os.path.relpath(path, cfg["clip_root"])
     except ValueError:
@@ -359,12 +387,29 @@ def analyse_clip(path, cache, rescan, bar):
     return path, rec
 
 
+def clip_roots(cfg):
+    roots = [d for d, _ in clip_dirs(cfg)] if cfg.get("clip_dirs") else [cfg["clip_root"]]
+    return [d for d in roots if os.path.isdir(d)]
+
+
+def clip_folder(path, cfg):
+    """Folder label for the Manual filter: '<listed folder name>/<subfolder>'."""
+    for d, _ in clip_dirs(cfg):
+        if norm(path).startswith(norm(d) + os.sep):
+            rel = os.path.relpath(os.path.dirname(path), d)
+            return Path(d).name + ("" if rel == "." else os.sep + rel)
+    try:
+        return str(Path(os.path.relpath(path, cfg["clip_root"])).parent)
+    except ValueError:
+        return Path(path).parent.name
+
+
 def scan_clips(cfg, rescan=False):
-    root = cfg["clip_root"]
-    out(f"Scanning {root} ...")
+    roots = clip_roots(cfg)
+    out(f"Scanning {'; '.join(roots) or '(no clip folder found - check Settings)'} ...")
     max_b = int(cfg.get("max_mb", 60)) * 1024 * 1024
     paths = []
-    for p in walk_files([root], VIDEO_EXT, MIN_VIDEO, cfg):
+    for p in sorted(set(walk_files(roots, VIDEO_EXT, MIN_VIDEO, cfg))):
         try:
             if tag_game(p, cfg)[0] and os.path.getsize(p) <= max_b:
                 paths.append(p)
@@ -1001,8 +1046,138 @@ def _row_match(t, r, prev_f):
     return sc
 
 
+def weapon_class(r):
+    """gun / knife / util from the weapon icon. util = small or square icon (grenades, molotov, abilities); knife = thin, sparse
+    and low icon (a blade). Conservative: anything unclear stays 'gun'."""
+    ic = r.get("icon")
+    if not r.get("gun"):
+        return "util"
+    if r.get("split") == "icon" and ic and len(ic) >= 5 and ic[4] < 0.30 and ic[3] <= 0.75 * r.get("th", 20) and ic[2] >= 2.0 * ic[3]:
+        return "knife"
+    return "gun"
+
+
+def merge_variants(tracks):
+    """OCR variants of one row ('ap15'/'apT5', 'Ryuk' seen twice) become one track: same killer side, victim names fuzzy >= 80
+    or one edit apart, first sightings within 1.5 s - and NEVER seen in the same OCR frame (two rows on screen at the same
+    time are two different kills, e.g. 'clean' and 'clean2')."""
+    from rapidfuzz import fuzz
+    from rapidfuzz.distance import Levenshtein
+    tracks = sorted(tracks, key=lambda t: t["first"])
+    out_ = []
+    for t in tracks:
+        hit = None
+        for m in out_:
+            if abs(t["first"] - m["first"]) > 1.5 * FPS:
+                continue
+            a, b = _alnum(t["v"]), _alnum(m["v"])
+            same_v = (a == b) or fuzz.ratio(a, b) >= 80 or (min(len(a), len(b)) >= 4 and Levenshtein.distance(a, b) <= 1)
+            same_k = fuzz.ratio(_alnum(t["k"]), _alnum(m["k"])) >= 70 or (t["ks"] >= 0.8 and m["ks"] >= 0.8)
+            if a and b and same_v and same_k and (t["ks"] >= 0.8) == (m["ks"] >= 0.8) and (t["vs"] >= 0.8) == (m["vs"] >= 0.8) \
+                    and not (t.get("frames", set()) & m.get("frames", set())):
+                hit = m
+                break
+        if hit is None:
+            out_.append(t)
+            continue
+        hit["hits"] += t["hits"]
+        hit["first"], hit["last"] = min(hit["first"], t["first"]), max(hit["last"], t["last"])
+        hit["seen"] = min(hit["seen"], t["seen"])
+        hit["votes"] += t["votes"]
+        hit["frames"] = hit.get("frames", set()) | t.get("frames", set())
+        hit["hs"] = hit["hs"] or t["hs"]
+        hit["ks"], hit["vs"] = max(hit["ks"], t["ks"]), max(hit["vs"], t["vs"])
+    return out_
+
+
 def analyse_entry(entry, cfg):
     """Raw OCR frames -> rows -> verdicts -> content-tracked rows (identity = killer text + victim text + weapon) -> kills /
+    deaths / rejected rows with reasons. The ONE implementation behind Dry plan, Render, the sync report, Self-test and the
+    killfeed crop view."""
+    off = entry.get("v_off", 0.0)
+    bk = bv = 0.0
+    tracks, mine, seen_rows = [], [], 0
+    last_ocr = entry["ocr"][-1][0] if entry.get("ocr") else 0
+    prev_f = -1
+    for f, since, boxes, blobs in entry.get("ocr", []):
+        rs = ocr_rows(boxes, blobs)
+        seen_rows = max(seen_rows, len(rs))
+        thr = float((cfg or {}).get("name_match", NAME_MIN))
+        cand = []
+        for r in rs:
+            bk, bv = max(bk, r["ks"] / 100), max(bv, r["vs"] / 100)
+            v = classify_row(r, cfg)
+            if all(x[0] == "none" for x in v) and max(r["ks"], r["vs"]) < thr:
+                continue
+            cand.append((r, v))
+        pairs = sorted(((_row_match(t, r, prev_f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
+                        if f - t["last"] <= TRACK_KEEP_S * FPS), reverse=True)
+        used_r, used_t, got = set(), set(), {}
+        for sc, i, j in pairs:                                 # one-to-one: two rows in one frame are never the same row
+            if sc >= 80 and i not in used_r and j not in used_t:
+                used_r.add(i)
+                used_t.add(j)
+                got[i] = tracks[j]
+        for i, (r, v) in enumerate(cand):
+            hit = got.get(i)
+            if hit:
+                hit.update(last=f, y=r["y"], hits=hit["hits"] + 1, hs=hit["hs"] or (r["hs"] and f - hit["first"] <= 20))
+                hit["votes"].append(v)
+                hit["frames"].add(f)
+            else:
+                first = max(prev_f + 1, min(int(r["appear"]), f)) if prev_f >= 0 else f
+                tracks.append({"first": first, "seen": f, "last": f, "y": r["y"], "hits": 1, "k": r["ktext"].lower(), "v": r["vtext"].lower(),
+                               "gun": r["gun"], "split": r["split"], "iw": r["icon"][2] if r["icon"] else 0, "hs": r["hs"],
+                               "ks": r["ks"] / 100, "vs": r["vs"] / 100, "votes": [v], "ktext": r["ktext"], "vtext": r["vtext"], "frames": {f},
+                               "weapon": weapon_class(r), "box": [min(b[0] for b in r["boxes"]), min(b[1] for b in r["boxes"]),
+                                                                  max(b[2] for b in r["boxes"]), max(b[3] for b in r["boxes"])]})
+        prev_f = f
+    tracks = merge_variants(tracks)
+    kills, deaths, rej, vis = [], [], [], []
+    for t in tracks:
+        tt = round(t["first"] / FPS + off, 3)
+        tally = {}
+        for v in t["votes"]:
+            for a, why in v:
+                if a != "none":
+                    tally.setdefault(a, [0, why])[0] += 1
+        if not tally:
+            continue
+        verdicts = [a for a in ("kill", "reject", "death") if a in tally]
+        if "kill" in tally and "reject" in tally:              # OCR noise: majority wins between kill and reject
+            verdicts.remove("reject" if tally["kill"][0] >= tally["reject"][0] else "kill")
+        row = f"[{t['ktext'] or '-'}] {'gun' if t['gun'] else 'util'} [{t['vtext'] or '-'}]"
+        for a in verdicts:
+            why = tally[a][1]
+            mine.append({"t": tt, "row": row, "verdict": a, "why": why, "hits": t["hits"]})
+            need_shot = False
+            if t["hits"] < 2:
+                if a == "kill":
+                    need_shot = t["ks"] < 0.9                  # 1 sighting, name < 90: a gunshot must confirm it
+                elif t["seen"] < last_ocr - FPS:
+                    rej.append({"t": tt, "reason": f"one-frame blip ({row})", "ks": t["ks"]})
+                    continue
+            if t["first"] <= 2:
+                rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(t["ks"], t["vs"])})
+            elif a == "kill":
+                vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
+                kills.append({"t": tt, "ks": t["ks"], "hs": bool(t["hs"]), "row": row, "hits": t["hits"], "victim": t["vtext"],
+                              "weapon": t.get("weapon", "gun"), "box": t.get("box"), "t_last": round(t["last"] / FPS + off, 3),
+                              "needs_shot": need_shot})
+            elif a == "death":
+                deaths.append(tt)
+                rej.append({"t": tt, "reason": f"{why} - not a kill", "ks": t["vs"]})
+            else:
+                vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
+                rej.append({"t": tt, "reason": why, "ks": t["ks"]})
+    kills.sort(key=lambda k: k["t"])
+    return {"kills": kills, "deaths": sorted(deaths), "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis, "best_k": bk, "best_v": bv,
+            "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(tracks), "rows_max": seen_rows,
+            "ocr_calls": len(entry.get("ocr", []))}
+
+
+def _analyse_entry_v4(entry, cfg):
+    """FROZEN V4 logic (only used by the before/after detection regression check). Raw OCR frames -> rows -> verdicts -> content-tracked rows (identity = killer text + victim text + weapon) -> kills /
     deaths / rejected rows with reasons. The ONE implementation behind Dry plan, Render, the sync report, Self-test and the
     killfeed crop view."""
     off = entry.get("v_off", 0.0)
@@ -1063,7 +1238,7 @@ def analyse_entry(entry, cfg):
                 rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(t["ks"], t["vs"])})
             elif a == "kill":
                 vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
-                kills.append({"t": tt, "ks": t["ks"], "hs": bool(t["hs"]), "row": row})
+                kills.append({"t": tt, "ks": t["ks"], "hs": bool(t["hs"]), "row": row, "hits": t["hits"]})
             elif a == "death":
                 deaths.append(tt)
                 rej.append({"t": tt, "reason": f"{why} - not a kill", "ks": t["vs"]})
@@ -1091,7 +1266,7 @@ def gun_onsets(rec, cache=None):
     if key in cache:
         return cache[key]
     import librosa
-    r = subprocess.run(["ffmpeg", "-v", "error", "-i", rec["path"], "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "22050",
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", rec["path"], "-map", f"0:a:{int(rec.get('a_stream', 0))}", "-vn", "-ac", "1", "-ar", "22050",
                         "-f", "f32le", "-"], capture_output=True, timeout=120)
     y = np.frombuffer(r.stdout, np.float32)
     ons = []
@@ -1135,10 +1310,13 @@ def verified_kills(pool_items, cfg):
                     shot = max(cand, key=lambda o: o[0])[0]
             if shot is None:
                 st["no_shot"] += 1
+                if k.get("needs_shot"):
+                    it["rej"].append({"t": k["t"], "reason": "1 sighting, name < 90 and no gunshot to confirm it", "ks": k["ks"]})
+                    continue
                 it["rej"].append({"t": k["t"], "reason": "no gunshot heard (kept - audio is only a bonus)", "ks": k["ks"], "soft": True})
-                k = dict(k, shot=False, lag=0.1, t=round(max(0.0, k["t"] - 0.1), 3))
-            else:
-                k = dict(k, shot=True, lag=round(k["t"] - shot, 3), t=round(shot, 3))
+                k = dict(k, shot=False, lag=0.0)
+            else:                                              # V5: the kill time stays the ROW time (that is what lands on the beat)
+                k = dict(k, shot=True, lag=round(k["t"] - shot, 3), shot_t=round(shot, 3))
             if k.get("weak_hl"):
                 it["rej"].append({"t": k["t"], "reason": "no highlight colour (kept - highlight is only a bonus)", "ks": k["ks"], "soft": True})
             if any(d < k["t"] <= d + lock for d in it.get("deaths", [])):
@@ -1180,7 +1358,7 @@ def clip_game(rec, dets=None, cache=None):
 def measure_bars(cfg, paths=None, sample=60):
     """Find the black-border rectangle that repeats across clips (clusters of near-identical rects)."""
     if not paths:
-        allp = sorted(walk_files([cfg["clip_root"]], VIDEO_EXT, MIN_VIDEO, cfg))
+        allp = sorted(walk_files(clip_roots(cfg), VIDEO_EXT, MIN_VIDEO, cfg))
         random.Random(7).shuffle(allp)
         paths = allp[:sample]
     out(f"measuring black bars on {len(paths)} clips ...")
@@ -1226,7 +1404,7 @@ def ensure_bars(cfg, force=False):
     """First run: auto-measure once and store the fixed crop in config."""
     if cfg.get("bar_checked") and not force:
         return
-    if not next(walk_files([cfg["clip_root"]], VIDEO_EXT, MIN_VIDEO, cfg), None):
+    if not next(walk_files(clip_roots(cfg), VIDEO_EXT, MIN_VIDEO, cfg), None):
         return                                   # no clips yet: check again next time
     cfg["bar"] = measure_bars(cfg)
     cfg["bar_checked"] = True
@@ -1562,6 +1740,55 @@ def ocr_synthetic_test(verbose=True):
     return fails
 
 
+def detection_regression(cfg=None, dirs=None, verbose=True):
+    """Re-runs the classification on ALL cached OCR data with the frozen V4 rules and the current rules. No clip may lose a kill
+    that V4 saw with 2+ sightings and a name score of 86+. Prints a before/after kill-count table. Returns (rows, lost)."""
+    cfg = cfg or load_config()
+    files = []
+    for d in (dirs or [KillStore().dir]):
+        files += sorted(Path(d).glob("*.json"))
+    rows, lost = [], []
+    for fp in files:
+        try:
+            j = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        e = j.get("e") or {}
+        if not e.get("ocr"):
+            continue
+        name = Path(j.get("key", fp.name).split("|")[0]).name
+        a4, a5 = _analyse_entry_v4(e, cfg), analyse_entry(e, cfg)
+        from rapidfuzz.distance import Levenshtein
+        must = [k for k in a4["kills"] if k.get("hits", 0) >= 2 and k["ks"] >= 0.86]
+        vic = lambda row: _alnum(row.rsplit("[", 1)[-1].rstrip("]").lower())
+
+        def kept(k):
+            for k5 in a5["kills"]:
+                if abs(k["t"] - k5["t"]) <= 0.3:
+                    return True
+                a_, b_ = vic(k["row"]), _alnum((k5.get("victim") or "").lower())
+                if abs(k["t"] - k5["t"]) <= 1.5 and a_ and b_ and len(a_) == len(b_) and Levenshtein.distance(a_, b_) <= 1:
+                    return True                          # merged OCR variant of the same row
+            return False
+        miss = [k for k in must if not kept(k)]
+        rows.append((name, len(a4["kills"]), len(a5["kills"]), len(must), len(miss)))
+        lost += [(name, k["t"], k["row"]) for k in miss]
+    if verbose:
+        out("DETECTION REGRESSION (cached OCR data, V4 rules vs V5 rules)")
+        out(f"  {'clip':44} {'V4 kills':>8} {'V5 kills':>8} {'V4 2+ seen & >=86':>18} {'lost':>5}")
+        for r in rows:
+            out(f"  {r[0][-44:]:44} {r[1]:8d} {r[2]:8d} {r[3]:18d} {r[4]:5d}")
+        out(f"  total: V4 {sum(r[1] for r in rows)} kills, V5 {sum(r[2] for r in rows)} kills, {len(lost)} protected kill(s) lost"
+            + ("" if not lost else ": " + "; ".join(f"{n} @ {ts(t)} {row}" for n, t, row in lost)))
+    return rows, lost
+
+
+def cmd_detectcheck(args):
+    rows, lost = detection_regression()
+    if lost:
+        sys.exit(1)
+
+
 def selftest_detection(cfg, per_game=20):
     """Same analyse_entry as Dry plan / Render. OCR engine check on generated frames, then per game: clips, zero-kill clips,
     name-score histograms, rejected rows by reason, and the OCR text + verdict of my rows."""
@@ -1613,6 +1840,8 @@ def selftest_detection(cfg, per_game=20):
                 out(f"      my row @ {ts(m['t'])} {m['row']} -> {m['verdict'].upper()}: {m['why']}")
     if not shown:
         out("no scanned clips yet")
+    else:
+        detection_regression(cfg)
 
 
 # ======================================================================= SONGS
@@ -1655,10 +1884,16 @@ def autodetect_dirs(cfg):
     return cfg
 
 
-def decode_mono(path, sr=22050):
+SONG_SR = 22050
+SONGMAP_V = "map1"
+
+
+def decode_mono(path, sr=SONG_SR):
+    """Mono float32 samples. Sample 0 = the first DECODED sample (ffmpeg already skipped the MP3 encoder delay); the render
+    uses the same origin (asetpts=N/SR/TB), so beat times are exact in the final mix."""
     import numpy as np
-    r = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
-                       capture_output=True, timeout=300)
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-af", f"aresample={sr},asetpts=N/SR/TB",
+                        "-ar", str(sr), "-f", "f32le", "-"], capture_output=True, timeout=300)
     return np.frombuffer(r.stdout, np.float32), sr
 
 
@@ -1668,80 +1903,316 @@ def smooth(a, w):
     return np.convolve(a, np.ones(w) / w, mode="same")
 
 
-def analyse_song(path, csv_bpm=None):
-    """Beat grid, downbeats, per-beat energy, section levels, drop. Cached per file. The CSV 'Tempo' is the PRIMARY BPM: librosa only
-    refines the beat grid, and is snapped to the CSV tempo when it lands at about 2x or 0.5x (or within 4% on a steady grid)."""
-    cache = load_json(SONG_CACHE, {})
-    key = file_key(path) + SONG_ALGO + f"|{round(csv_bpm or 0)}"
-    if key in cache:
-        return cache[key]
+def ebur128_lufs(path, stream=None):
+    """Integrated loudness (LUFS) of a file / audio stream, or None."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-i", path] + (["-map", f"0:a:{stream}"] if stream is not None else ["-vn"]) + \
+          ["-af", "ebur128=framelog=quiet", "-f", "null", "-"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=180)
+        txt = r.stderr.decode(errors="replace")
+        m = re.findall(r"I:\s+(-?[\d.]+|-inf)\s+LUFS", txt)
+        if m and m[-1] != "-inf":
+            v = float(m[-1])
+            return v if v > -70 else None
+    except Exception:
+        pass
+    return None
+
+
+def _norm01(x, lo=5, hi=95):
+    import numpy as np
+    x = np.asarray(x, float)
+    if not len(x):
+        return x
+    a, b = np.percentile(x, lo), np.percentile(x, hi)
+    return np.clip((x - a) / max(b - a, 1e-9), 0, 1)
+
+
+def fit_grid(env, hop_t, bpm, dur):
+    """Constant beat grid locked to `bpm` (period searched +-0.4 %), phase fitted to the onset envelope. Returns (period, phase, score)."""
+    import numpy as np
+    from scipy.ndimage import maximum_filter1d
+    e = maximum_filter1d(env, 3)
+    best = (-1.0, 60.0 / bpm, 0.0)
+    for P in (60.0 / bpm) * (1 + np.linspace(-0.004, 0.004, 33)):
+        ph = np.arange(0, P, hop_t)
+        k = np.arange(int(dur / P) + 1)
+        idx = np.round((ph[:, None] + P * k[None, :]) / hop_t).astype(int)
+        idx = np.clip(idx, 0, len(e) - 1)
+        sc = e[idx].mean(1)
+        i = int(np.argmax(sc))
+        if sc[i] > best[0]:
+            best = (float(sc[i]), float(P), float(ph[i]))
+    return best[1], best[2], best[0]
+
+
+def build_song_map(path, csv_bpm=None):
+    """THE song map: beat grid locked to the CSV tempo, downbeats/bars, 4- and 8-bar phrases, sections (intro / verse / build /
+    drop / breakdown / outro), ALL drops, strong accents, rhythm strength, loudness, waveform for the GUI view."""
     import numpy as np
     import librosa
     y, sr = decode_mono(path)
     if len(y) < sr * 20:
         raise RuntimeError("audio too short / undecodable")
-    hop = 512
+    dur = len(y) / sr
+    hop = 128
+    hop_t = hop / sr
     oenv = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-    tempo, bf = librosa.beat.beat_track(onset_envelope=oenv, sr=sr, hop_length=hop, tightness=100)
-    bf = np.asarray(bf, int)
-    bt = librosa.frames_to_time(bf, sr=sr, hop_length=hop)
-    if len(bt) < 16:
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    oenv_low = librosa.onset.onset_strength(S=librosa.amplitude_to_db(S[freqs < 160] + 1e-6), sr=sr, hop_length=512)
+    bass_frames = S[freqs < 160].mean(0)
+    rms_frames = librosa.feature.rms(S=S)[0]
+    # 1) tempo + grid
+    lib_tempo, lib_beats = librosa.beat.beat_track(onset_envelope=oenv, sr=sr, hop_length=hop, start_bpm=float(csv_bpm or 120),
+                                                   tightness=400 if csv_bpm else 100)
+    bpm0 = float(csv_bpm) if csv_bpm else float(np.atleast_1d(lib_tempo)[0])
+    while bpm0 > 200:
+        bpm0 /= 2
+    while bpm0 < 60:
+        bpm0 *= 2
+    # high-resolution attack envelope (5.8 ms frames, 1.45 ms hop): rise of log energy, so beats sit on the ATTACK, not after it
+    fr_ = librosa.util.frame(np.pad(y, (64, 64)), frame_length=128, hop_length=32)
+    le = np.log(np.mean(fr_ ** 2, axis=0) + 1e-8)
+    att = np.maximum(0, np.diff(le, prepend=le[0]))
+    att = smooth(att, 3)
+    hi_t = 32 / sr
+    P, ph, gscore = fit_grid(oenv, hop_t, bpm0, dur)              # coarse: period + phase on the onset envelope
+    phs = ph + np.arange(-0.03, 0.03, hi_t)                        # fine: phase on the attack envelope
+    k_ = np.arange(int((dur - ph) / P))
+    idx = np.clip(np.round((phs[:, None] + P * k_[None, :]) / hi_t).astype(int), 0, len(att) - 1)
+    from scipy.ndimage import maximum_filter1d
+    ph = float(phs[int(np.argmax(maximum_filter1d(att, 2)[idx].mean(1)))])
+    while ph - P >= 0:
+        ph -= P
+    while ph < 0:
+        ph += P
+    bt = ph + P * np.arange(int((dur - ph) / P))
+    # small local corrections toward strong onsets (follows slight drift; never more than 12 ms)
+    e = oenv / (np.median(oenv) + 1e-9)
+    dev = np.zeros(len(bt))
+    w = int(0.012 / hop_t)
+    for i, t in enumerate(bt):
+        c = int(round(t / hi_t))
+        w2 = int(0.012 / hi_t)
+        a, b = max(0, c - w2), min(len(att), c + w2 + 1)
+        if b > a and att[a:b].max() >= 4 * (np.median(att) + 1e-9):
+            dev[i] = (a + int(np.argmax(att[a:b])) - c) * hi_t
+    from scipy.ndimage import median_filter
+    bt = bt + median_filter(dev, size=9, mode="nearest")
+    lb = librosa.frames_to_time(np.asarray(lib_beats, int), sr=sr, hop_length=hop)
+    agree = float(np.median([np.min(np.abs(bt - t)) for t in lb])) * 1000 if len(lb) else None
+    nb = len(bt)
+    if nb < 16:
         raise RuntimeError("no steady beat found")
-    bpm = float(np.atleast_1d(tempo)[0])
-    if csv_bpm:                                   # librosa half/double-tempo errors: trust the CSV tempo
-        ratio = bpm / csv_bpm
-        if 1.8 < ratio < 2.2:
-            st = oenv[np.clip(bf, 0, len(oenv) - 1)]
-            ph = int(st[1::2].sum() > st[0::2].sum())
-            bf, bt, bpm = bf[ph::2], bt[ph::2], bpm / 2
-        elif 0.45 < ratio < 0.55:
-            bt = np.sort(np.concatenate([bt, (bt[:-1] + bt[1:]) / 2]))
-            bf = np.round(bt * sr / hop).astype(int)
-            bpm *= 2
-    ibi = np.diff(bt)
-    steady = float(max(0.0, 1 - np.std(ibi) / max(np.mean(ibi), 1e-6) * 8))
-    if steady >= 0.75:      # steady (electronic) track: replace the tracked beats by a clean grid over the whole song
-        per = float(np.median(ibi))
-        if csv_bpm and abs(60.0 / per - csv_bpm) / csv_bpm < 0.04:
-            per = 60.0 / float(csv_bpm)                # grid period from the CSV tempo, phase from librosa
-        off = float(np.median((bt - bt[0] + per / 2) % per - per / 2))
-        t0 = (bt[0] + off) % per
-        bt = t0 + per * np.arange(int((len(y) / sr - t0) / per))
-        bf = np.round(bt * sr / hop).astype(int)
-        bpm = 60.0 / per
-    rms = librosa.feature.rms(y=y, hop_length=hop)[0]
-    edges = np.append(bf, min(len(rms) - 1, bf[-1] + int(np.median(np.diff(bf)))))
-    en = np.array([rms[edges[i]:max(edges[i] + 1, edges[i + 1])].mean() for i in range(len(bf))])
-    lo, hi = np.percentile(en, 5), np.percentile(en, 95)
-    en = np.clip((en - lo) / max(hi - lo, 1e-9), 0, 1)
-    en = smooth(en, 3)
-    stren = oenv[np.clip(bf, 0, len(oenv) - 1)]
-    phase = int(np.argmax([stren[p::4].mean() + 0.5 * en[p::4].mean() for p in range(4)]))
-    down = [i for i in range(len(bt)) if i % 4 == phase]
-    sm = smooth(en, 8)
-    n = len(bt)
-    best, drop, dstr = -1, None, 0.0
-    for i in down:
-        if 8 <= i <= n - 12:
-            j = float(en[i:i + 8].mean() - en[i - 8:i].mean())
-            if j > dstr:
-                dstr, drop = j, i
-    level = np.where(sm < 0.4, 0, np.where(sm < 0.7, 1, 2)).astype(int)
-    if drop is not None and dstr > 0.12:
-        level[max(0, drop - 16):drop] = np.maximum(level[max(0, drop - 16):drop], 1)
-        level[drop:drop + 24] = 2
-    else:
-        drop = None
-    onsets = librosa.onset.onset_detect(onset_envelope=oenv, sr=sr, hop_length=hop, units="time")
-    grid_bpm = bpm
-    if csv_bpm:
-        bpm = float(csv_bpm)                           # CSV tempo is the primary value
-    bpm_fit = 1.0 if 100 <= bpm <= 180 else max(0.0, 1 - min(abs(bpm - 100), abs(bpm - 180)) / 40)
-    an = {"bpm": round(bpm, 1), "bpm_grid": round(float(grid_bpm), 1), "bpm_src": "csv" if csv_bpm else "librosa", "beats": [round(float(t), 4) for t in bt], "down": [int(i) for i in down],
-          "energy": [round(float(e), 3) for e in en], "level": [int(l) for l in level],
-          "drop": None if drop is None else int(drop), "drop_strength": round(dstr, 3), "steady": round(steady, 3),
-          "bpm_fit": round(bpm_fit, 2), "dur": round(len(y) / sr, 1),
-          "onsets": [round(float(t), 3) for t in onsets[:2000]]}
+    # 2) per-beat features
+    def per_beat(sig, t_per):
+        idx = np.clip((bt / t_per).astype(int), 0, len(sig) - 1)
+        nxt = np.clip(((bt + P) / t_per).astype(int), 0, len(sig))
+        return np.array([sig[a:max(a + 1, b)].mean() for a, b in zip(idx, nxt)])
+    st512 = 512 / sr
+    rms_b = per_beat(rms_frames, st512)
+    bass_b = per_beat(bass_frames, st512)
+    kick_b = np.array([oenv_low[max(0, int(t / st512) - 1):int(t / st512) + 2].max(initial=0) for t in bt])
+    on_b = np.array([e[max(0, int(t / hop_t) - w):int(t / hop_t) + w + 1].max(initial=0) for t in bt])
+    # 3) downbeats: bar phase from low-frequency / kick onset energy
+    rb = smooth(_norm01(rms_b), 2)
+    jumps = np.abs(np.diff(_norm01(bass_b) + rb, prepend=0))          # sections change on downbeats
+    phase = int(np.argmax([kick_b[p::4].mean() / (kick_b.mean() + 1e-9) + 0.3 * on_b[p::4].mean() / (on_b.mean() + 1e-9)
+                           + 4.0 * jumps[p::4].mean() / (jumps.mean() + 1e-9) * 0.25 for p in range(4)]))
+    down = [i for i in range(nb) if i % 4 == phase]
+    # 4) bar features + novelty
+    mel = librosa.feature.melspectrogram(S=S ** 2, sr=sr, n_mels=40)
+    lm = np.log1p(mel)
+    bars = [(down[i], down[i + 1] if i + 1 < len(down) else nb) for i in range(len(down))]
+    if down[0] > 0:
+        bars.insert(0, (0, down[0]))
+    bar_feat = []
+    for a, b in bars:
+        fa, fb = int(bt[a] / st512), int((bt[b - 1] + P) / st512)
+        v = lm[:, fa:max(fa + 1, fb)].mean(1)
+        bar_feat.append(v / (np.linalg.norm(v) + 1e-9))
+    nov = [0.0] + [float(1 - bar_feat[i] @ bar_feat[i - 1]) for i in range(1, len(bars))]
+    rms_n, bass_n = _norm01(rms_b), _norm01(bass_b)
+    dens = smooth((on_b >= 2.5).astype(float), 8)
+    dens_n = _norm01(dens)
+    level_b = 0.45 * rms_n + 0.35 * bass_n + 0.2 * dens_n
+    # 5) phrases: 4-bar phase chosen where novelty peaks
+    bar_down = [i for i, (a, b) in enumerate(bars) if a in down]
+    q = int(np.argmax([sum(nov[i] for i in bar_down if (bar_down.index(i) - p) % 4 == 0) for p in range(4)])) if len(bar_down) >= 8 else 0
+    ph4 = [bars[i][0] for k, i in enumerate(bar_down) if (k - q) % 4 == 0]
+    q8 = int(np.argmax([sum(nov[bars.index(next(bb for bb in bars if bb[0] == b0))] for j, b0 in enumerate(ph4) if j % 2 == p)
+                        for p in range(2)])) if len(ph4) >= 4 else 0
+    ph8 = [b0 for j, b0 in enumerate(ph4) if j % 2 == q8]
+    # 6) sections on 4-bar phrases (units)
+    edges = ([0] if ph4 and ph4[0] > 0 else []) + ph4 + [nb]
+    units = [(edges[i], edges[i + 1]) for i in range(len(edges) - 1) if edges[i + 1] > edges[i]]
+    L = np.array([level_b[a:b].mean() for a, b in units])
+    B = np.array([bass_n[a:b].mean() for a, b in units])
+    lab = ["verse"] * len(units)
+    drops = []
+    for i in range(1, len(units)):
+        jump = L[i] - L[i - 1]
+        bj = B[i] - B[i - 1]
+        if L[i] >= 0.55 and (jump >= 0.18 or bj >= 0.22) and L[i - 1] <= L[i] - 0.12:
+            a, b = units[i]
+            # exact drop downbeat: biggest bass jump among the downbeats around the unit start
+            cands = [d for d in down if units[i - 1][0] + (units[i - 1][1] - units[i - 1][0]) // 2 <= d <= a + 4]
+            dj = max(cands or [a], key=lambda d: bass_n[d:d + 4].mean() - bass_n[max(0, d - 4):d].mean())
+            drops.append({"beat": int(dj), "t": round(float(bt[dj]), 4), "strength": round(float(max(jump, 0) + max(bj, 0) + L[i]), 3)})
+    unit_of = lambda beat: max([k for k, u in enumerate(units) if u[0] <= beat] or [0])
+    for d in drops:
+        k = unit_of(d["beat"] + 2)
+        lab[k] = "drop"
+        k += 1
+        while k < len(units) and L[k] >= 0.5:
+            lab[k] = "drop"
+            k += 1
+    has_later_drop = lambda i: any(lab[k] == "drop" for k in range(i + 1, len(units)))
+    for i in range(1, len(units)):                         # breakdown: calm stretch after a drop, before another drop
+        if lab[i] == "verse" and lab[i - 1] in ("drop", "breakdown") and L[i] < 0.5 and has_later_drop(i):
+            lab[i] = "breakdown"
+    for d in drops:                                        # build: the phrase before each drop (+ one more if rising)
+        i = unit_of(d["beat"] + 2)
+        if i - 1 >= 0 and lab[i - 1] in ("verse", "breakdown", "intro"):
+            if not (lab[i - 1] == "breakdown" and (i - 2 < 0 or lab[i - 2] != "breakdown") and L[i - 1] < 0.08):
+                lab[i - 1] = "build"
+        k = i - 2
+        if k >= 0 and lab[k] == "verse" and L[k] < L[k + 1] - 0.03 and L[k] > (L[k - 1] if k else 0) + 0.03:
+            lab[k] = "build"
+    uidx = {b0: j for j, (b0, _) in enumerate(bars)}
+    unov = [nov[uidx[u[0]]] if u[0] in uidx else 0.0 for u in units]
+    cut = float(np.percentile(unov[1:], 70)) if len(unov) > 2 else 1.0
+    first = next((i for i in range(1, len(units)) if unov[i] >= cut or lab[i] != "verse"), 1)
+    for i in range(first):
+        if lab[i] == "verse" and L[i] <= np.median(L) + 0.05:
+            lab[i] = "intro"
+    last_drop = max([i for i in range(len(units)) if lab[i] == "drop"], default=-1)
+    for i in range(len(units) - 1, last_drop, -1):
+        if units[i][0] >= 0.72 * nb and L[i] < 0.5:
+            lab[i] = "outro"
+        else:
+            break
+    sections = []
+    for (a, b), l, lv in zip(units, lab, L):
+        if sections and sections[-1]["label"] == l:
+            sections[-1].update(end=b, end_t=round(float(bt[b - 1] + P), 3))
+        else:
+            sections.append({"label": l, "start": int(a), "end": int(b), "start_t": round(float(bt[a]), 3),
+                             "end_t": round(float(bt[b - 1] + P), 3), "level": round(float(lv), 3)})
+    # 7) accents: big transients (kicks, snares, claps, bass hits, stabs) + rhythm strength
+    from scipy.signal import find_peaks
+    pk, pr = find_peaks(e, height=max(3.0, float(np.percentile(e, 97))), distance=int(0.09 / hop_t))
+    low_e = oenv_low / (np.median(oenv_low) + 1e-9)
+    accents = []
+    for i in pk[np.argsort(-pr["peak_heights"])][:800]:
+        t = float(i * hop_t)
+        bass_hit = bool(low_e[min(len(low_e) - 1, int(t / st512))] >= 3.0)
+        accents.append([round(t, 4), round(float(e[i]), 2), int(bass_hit)])
+    accents.sort()
+    # tick strength (beats + half-beats) and how REPEATING the rhythm is: the same position in the bar hit bar after bar
+    ticks = np.sort(np.concatenate([bt, bt[:-1] + P / 2]))
+    tick_on = np.array([e[max(0, int(t / hop_t) - w):int(t / hop_t) + w + 1].max(initial=0) for t in ticks])
+    pos = np.array([(int(np.argmin(np.abs(bt - t))) - phase) % 4 * 2 + (0 if np.min(np.abs(bt - t)) < P / 4 else 1) for t in ticks])
+    pat = np.array([np.median(tick_on[pos == k]) if np.any(pos == k) else 0 for k in range(8)])
+    hit_rate = np.array([np.mean(tick_on[pos == k] >= 2.5) if np.any(pos == k) else 0 for k in range(8)])
+    rhythm = float(np.clip(0.6 * hit_rate.max() + 0.4 * min(1.0, gscore / (np.mean(e) * 3 + 1e-9)), 0, 1))
+    strength = []
+    drop_beats = {d["beat"] for d in drops}
+    ph4s, ph8s, downs = set(ph4), set(ph8), set(down)
+    for i in range(nb):
+        s_ = 0.3 + 0.25 * (i in downs) + 0.15 * (i in ph4s) + 0.15 * (i in ph8s) + 0.8 * (i in drop_beats)
+        s_ += 0.35 * min(1.0, on_b[i] / 6.0) + 0.15 * min(1.0, kick_b[i] / (kick_b.mean() * 3 + 1e-9))
+        strength.append(round(float(s_), 3))
+    lvl_beat = np.zeros(nb, int)
+    sec_beat = [""] * nb
+    for sct in sections:
+        for i in range(sct["start"], sct["end"]):
+            sec_beat[i] = sct["label"]
+            lvl_beat[i] = {"drop": 2, "build": 1, "breakdown": 1}.get(sct["label"], 0)
+    big = max(drops, key=lambda d: d["strength"]) if drops else None
+    env = np.abs(y[: len(y) // 2000 * 2000]).reshape(2000, -1).max(1) if len(y) >= 2000 else np.abs(y)
+    bpm_fit = 1.0 if 100 <= bpm0 <= 180 else max(0.0, 1 - min(abs(bpm0 - 100), abs(bpm0 - 180)) / 40)
+    steady = float(np.clip(1 - (agree or 30) / 60.0, 0, 1)) * 0.5 + 0.5 * rhythm
+    try:
+        st_ = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=start_time",
+                              "-of", "json", path]).stdout or b"{}")
+        start_time = float((st_.get("streams") or [{}])[0].get("start_time") or 0)
+    except Exception:
+        start_time = 0.0
+    return {"v": SONGMAP_V, "bpm": round(bpm0, 3), "bpm_src": "csv" if csv_bpm else "librosa",
+            "bpm_librosa": round(float(np.atleast_1d(lib_tempo)[0]), 1), "period": round(P, 6), "grid_score": round(gscore, 3),
+            "librosa_agree_ms": None if agree is None else round(agree, 1),
+            "beats": [round(float(t), 4) for t in bt], "down": [int(i) for i in down], "phrase4": [int(i) for i in ph4],
+            "phrase8": [int(i) for i in ph8], "sections": sections, "drops": drops, "accents": accents,
+            "strength": strength, "energy": [round(float(v), 3) for v in level_b], "level": [int(v) for v in lvl_beat],
+            "section_of_beat": sec_beat, "drop": big["beat"] if big else None,
+            "drop_strength": round(big["strength"] / 3, 3) if big else 0.0, "rhythm": round(rhythm, 3),
+            "pattern": [round(float(v), 2) for v in pat], "steady": round(steady, 3), "bpm_fit": round(bpm_fit, 2),
+            "dur": round(dur, 3), "onsets": [a[0] for a in accents], "wave": [round(float(v), 3) for v in env],
+            "lufs": ebur128_lufs(path), "start_time": round(start_time, 6),
+            "origin": "first decoded sample (ffmpeg skips the encoder delay); render trims with asetpts=N/SR/TB"}
+
+
+def synth_song(path, bpm=128.0, layout=(("intro", 8), ("verse", 8), ("build", 4), ("drop", 8), ("breakdown", 4), ("build", 4),
+                                        ("drop", 8), ("outro", 4)), sr=44100, click=False):
+    """Generated test song (bars per section): kicks / snares / hats by section, a bass line in drops, rising noise in builds.
+    click=True: a plain click on every beat (used by the end-to-end sync test). Returns the true beat times (decoded origin)."""
+    import numpy as np
+    per = 60.0 / bpm
+    nbeats = sum(n for _, n in layout) * 4
+    dur = nbeats * per + 1.0
+    t = np.arange(int(dur * sr)) / sr
+    y = np.zeros_like(t, np.float32)
+    rng = np.random.default_rng(5)
+    beats, b = [], 0
+    for name, bars in layout:
+        for k in range(bars * 4):
+            t0 = b * per
+            s = int(t0 * sr)
+            beats.append(t0)
+            def add(sig, at=s):
+                e = min(len(y), at + len(sig))
+                y[at:e] += sig[:e - at]
+            n = np.arange(int(0.15 * sr))
+            if click:
+                add((np.sin(2 * np.pi * 1500 * n[:int(0.03 * sr)] / sr) * np.exp(-n[:int(0.03 * sr)] / (0.004 * sr)) * 0.9).astype(np.float32))
+            else:
+                kick_amp = {"intro": 0.25, "verse": 0.5, "build": 0.6, "drop": 0.95, "breakdown": 0.0, "outro": 0.3}[name]
+                add((np.sin(2 * np.pi * (50 + 60 * np.exp(-n / 400)) * n / sr) * np.exp(-n / (0.05 * sr)) * kick_amp).astype(np.float32))
+                if k % 2 == 1 and name in ("verse", "build", "drop"):
+                    add((rng.standard_normal(len(n)) * np.exp(-n / (0.03 * sr)) * (0.5 if name == "drop" else 0.3)).astype(np.float32))
+                hh = (rng.standard_normal(int(0.03 * sr)) * np.exp(-np.arange(int(0.03 * sr)) / 200) * 0.08).astype(np.float32)
+                add(hh, s + int(per / 2 * sr))
+                if name == "drop":
+                    m = np.arange(int(per * sr))
+                    add((np.sin(2 * np.pi * 55 * m / sr) * 0.35).astype(np.float32))
+                if name == "build":
+                    m = np.arange(int(per * sr))
+                    add((rng.standard_normal(len(m)) * 0.02 * (1 + k / 4)).astype(np.float32))
+                if name in ("intro", "breakdown", "outro"):
+                    m = np.arange(int(per * sr))
+                    add((np.sin(2 * np.pi * 330 * m / sr) * 0.08).astype(np.float32))
+            b += 1
+    y = np.clip(y, -1, 1)
+    wav = str(path) + ".wav"
+    import soundfile as sf
+    sf.write(wav, y, sr)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", wav, "-c:a", "libmp3lame", "-b:a", "192k", str(path)], check=True)
+    os.remove(wav)
+    return beats
+
+
+def analyse_song(path, csv_bpm=None):
+    """Cached song map (key: path + mtime + size + CSV tempo). Same dict is used by the song pick, the planner, the render and
+    the Song map view."""
+    cache = load_json(SONG_CACHE, {})
+    st = os.stat(path)
+    key = f"{path}|{int(st.st_mtime)}|{st.st_size}|{SONGMAP_V}|{round(float(csv_bpm or 0), 3)}"
+    if key in cache:
+        return cache[key]
+    an = build_song_map(path, csv_bpm)
+    cache = load_json(SONG_CACHE, {})
     cache[key] = an
     save_json(SONG_CACHE, cache)
     return an
@@ -1875,6 +2346,9 @@ def pick_song(cfg, game, songs, now=None, forced=None):
 
 # ======================================================================= EVENTS
 FLICK_CACHE = DATA / "flick_cache.json"
+REFINE_CACHE = DATA / "refine_cache.json"
+LOUD_CACHE = DATA / "loud_cache.json"
+_FN_TIME = re.compile(r"(20\d\d)[.\-_ ]?(\d\d)[.\-_ ]?(\d\d)\D{1,6}?(\d\d)[.\-_:h ]?(\d\d)[.\-_:m ]?(\d\d)")
 
 
 def flick_value(rec, cfg, t):
@@ -1903,7 +2377,88 @@ def flick_value(rec, cfg, t):
     return cache[key]
 
 
+def clip_time(path):
+    """Recording time from the filename (ShadowPlay / Outplayed style 'YYYY.MM.DD - HH.MM.SS'), else the file mtime."""
+    m = _FN_TIME.search(Path(path).name)
+    if m:
+        try:
+            return datetime.datetime(*[int(x) for x in m.groups()]).timestamp()
+        except ValueError:
+            pass
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def refine_kill(rec, det, cfg, k, cache):
+    """Frame-exact time of the FIRST frame a kill row is visible, at the clip's native frame rate (detection samples 15 fps).
+    Bright killfeed pixels in the row's box (widened for slide-in) reach half of their final count = the row is visible."""
+    import numpy as np
+    key = f"{file_key(rec['path'])}|{k['t']:.3f}|{det.d['stamp']}|r3"
+    if key in cache:
+        return cache[key]
+    box = k.get("box")
+    t = float(k["t"])
+    if not box:
+        return t
+    t0 = max(0.0, t - 0.4)
+    vf = region_filter(rec, det, cfg).replace(",format=bgr24", ",format=gray,showinfo")
+    r = run(["ffmpeg", "-hide_banner", "-ss", f"{t0:.4f}", "-i", rec["path"], "-t", "0.75", "-an", "-vf", vf, "-vsync", "0",
+             "-f", "rawvideo", "-pix_fmt", "gray", "-"], timeout=60)
+    n = det.dw * det.dh
+    frames = np.frombuffer(r.stdout, np.uint8)
+    pts = [float(x) for x in re.findall(r"pts_time:\s*(-?[\d.]+)", r.stderr.decode(errors="replace"))]
+    cnt = min(len(frames) // n, len(pts))
+    res = t
+    if cnt >= 3:
+        fr = frames[:cnt * n].reshape(cnt, det.dh, det.dw)
+        x0, y0, x1, y1 = box
+        x0, x1 = max(0, x0 - 40), min(det.dw, x1 + 40)
+        y0, y1 = max(0, y0 - 2), min(det.dh, y1 + 2)
+        c = (fr[:, y0:y1, x0:x1] >= 180).sum(axis=(1, 2)).astype(float)
+        ref = np.median(c[-3:])
+        base = np.median(c[:3])
+        if ref > base + 20:
+            half = base + 0.5 * (ref - base)
+            for i in range(1, cnt):
+                if c[i] >= half and c[i - 1] < half and all(c[j] >= half for j in range(i, min(cnt, i + 3))):
+                    res = round(t0 + pts[i], 4)
+            if res == t:
+                above = [i for i in range(cnt) if c[i] >= half]
+                res = round(t0 + pts[above[0]], 4) if above else t
+    cache[key] = res
+    return res
+
+
+def clip_audio(rec):
+    """{'stream': index of the audio stream with the most game sound (loudest), 'lufs': its loudness} - cached."""
+    if not rec.get("audio"):
+        return {"stream": None, "lufs": None}
+    cache = load_json(LOUD_CACHE, {})
+    key = file_key(rec["path"])
+    if key in cache:
+        return cache[key]
+    try:
+        j = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "json",
+                            rec["path"]]).stdout or b"{}")
+        ns = len(j.get("streams") or []) or 1
+    except Exception:
+        ns = 1
+    best = {"stream": 0, "lufs": None, "all": []}
+    for i in range(min(ns, 4)):
+        v = ebur128_lufs(rec["path"], i)
+        best["all"].append(v)
+        if v is not None and (best["lufs"] is None or v > best["lufs"]):
+            best.update(stream=i, lufs=v)
+    cache = load_json(LOUD_CACHE, {})
+    cache[key] = best
+    save_json(LOUD_CACHE, cache)
+    return best
+
+
 def base_score(ev):
+    """ace > 4k > 3k > fast double > flick or headshot single > plain kills."""
     n = ev["n"]
     if n >= 5:
         s = 100.0
@@ -1912,36 +2467,122 @@ def base_score(ev):
     elif n == 3:
         s = 60.0
     elif n == 2:
-        s = 42.0 if ev["span"] <= 2.5 else 30.0
+        s = 42.0 if ev["span"] <= 2.5 else 26.0
     else:
-        s = 8.0 + (14 if ev.get("flick") else 0) + (12 if ev["hs"] else 0)
+        s = 8.0 + (14 if (ev.get("flick") or ev["hs"]) else 0) + (4 if (ev.get("flick") and ev["hs"]) else 0)
     if n >= 2:
-        s += min(10.0, 10.0 * n / (ev["span"] + 1.0) / 2) + 4 * ev["hs"]
+        s += min(6.0, 6.0 * n / (ev["span"] + 1.0) / 2) + 2 * min(ev["hs"], 2)
     return s
 
 
+def _victim_offset(ka, kb, rf=None):
+    """Timeline offset between two clips from a shared victim (fuzzy >= 80): t_in_a - t_in_b, or None. rf refines kill times to
+    the exact frame so stitched clips line up without repeated or skipped frames."""
+    from rapidfuzz import fuzz
+    best = None
+    for x in ka:
+        for y in kb:
+            a, b = _alnum((x.get("victim") or "").lower()), _alnum((y.get("victim") or "").lower())
+            if a and b and fuzz.ratio(a, b) >= 80:
+                sc = fuzz.ratio(a, b)
+                if best is None or sc > best[0]:
+                    best = (sc, (rf(x) - rf(y)) if rf else (x["t"] - y["t"]))
+    return None if best is None else best[1]
+
+
 def build_events(pool, game, cfg, rng, flick_budget=40):
+    """Clip pool -> montage events. Knife / utility kills are excluded. Clips recorded within ~60 s of each other that share a
+    victim are ONE event (union of kills): the clip covering most kills is used, or - if none shows them all - the clips are
+    stitched back to back at the overlap. One event per clip, so no clip and no kill is ever used twice. Kill times are made
+    frame-exact (first frame the row is visible)."""
+    det = load_dets(game).get(game)
     gap = cfg["gap_s"][game]
+    notes = []
+    items = []
+    for it in pool:
+        ks = [k for k in it["kills"] if k.get("weapon", "gun") == "gun"]
+        drop = len(it["kills"]) - len(ks)
+        if drop:
+            notes.append(f"{Path(it['rec']['path']).name}: {drop} knife/utility kill(s) excluded")
+        if ks:
+            items.append(dict(it, kills=sorted(ks, key=lambda k: k["t"]), ctime=clip_time(it["rec"]["path"])))
+    # duplicates / continuations
+    refine = load_json(REFINE_CACHE, {})
+    kref = {}
+    for it in items:
+        for k in it["kills"]:
+            kref[id(k)] = it
+    def rf(k):
+        it = kref.get(id(k))
+        if det is None or it is None or not k.get("box"):
+            return k["t"]
+        try:
+            return refine_kill(it["rec"], det, cfg, k, refine)
+        except Exception:
+            return k["t"]
+    items.sort(key=lambda i: i["ctime"])
+    groups, used = [], set()
+    for i, a in enumerate(items):
+        if i in used:
+            continue
+        g = [(a, 0.0)]
+        used.add(i)
+        for j in range(i + 1, len(items)):
+            b = items[j]
+            if j in used or b["ctime"] - a["ctime"] > 60 + a["rec"].get("dur", 0):
+                continue
+            off = None
+            for (m, mo) in g:
+                o = _victim_offset(m["kills"], b["kills"], rf)
+                if o is not None and abs(b["ctime"] - m["ctime"]) <= 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
+                    off = mo + o
+                    break
+            if off is not None:
+                g.append((b, off))
+                used.add(j)
+        groups.append(g)
     evs = []
-    for item in pool:
-        ks = sorted(item["kills"], key=lambda k: k["t"])
-        groups, cur = [], [ks[0]]
-        for k in ks[1:]:
-            if k["t"] - cur[-1]["t"] <= gap:
+    for g in groups:
+        # union of kills on the timeline of the group's first clip (kills of the same victim within 1.5 s are one kill)
+        allk = []
+        for it, off in g:
+            for k in it["kills"]:
+                tt = k["t"] + off
+                if not any(abs(tt - u["tt"]) <= 1.5 and _alnum(u.get("victim", "").lower()) == _alnum(k.get("victim", "").lower())
+                           for u in allk):
+                    allk.append(dict(k, tt=tt, src=it, off=off))
+        if len(g) > 1:
+            notes.append("merged continuation/duplicate clips: " + " + ".join(Path(it["rec"]["path"]).name for it, _ in g)
+                         + f" ({len(allk)} distinct kills)")
+        # events by kill spacing on the group timeline
+        allk.sort(key=lambda k: k["tt"])
+        clusters, cur = [], [allk[0]]
+        for k in allk[1:]:
+            if k["tt"] - cur[-1]["tt"] <= gap:
                 cur.append(k)
             else:
-                groups.append(cur)
+                clusters.append(cur)
                 cur = [k]
-        groups.append(cur)
-        for g in groups:
-            times = [k["t"] for k in g]                      # refined to the gunshot when one was heard
-            first_row = g[0]["t"] + g[0].get("lag", 0.1)
-            vis = [(t0, t1) for t0, t1 in item.get("vis", []) if t0 < first_row - 0.1]   # EARLIER own rows only
-            evs.append({"rec": item["rec"], "path": item["rec"]["path"], "times": times, "n": len(g),
-                        "lags": [k.get("lag", 0.1) for k in g], "vis": vis,
-                        "shots": sum(1 for k in g if k.get("shot")) / len(g),
-                        "first": times[0], "last": times[-1], "span": times[-1] - times[0],
-                        "hs": sum(1 for k in g if k.get("hs")), "flick": False})
+        clusters.append(cur)
+        best_ev = None
+        for cl in clusters:
+            # which clips cover which kills (a clip covers a kill it detected itself)
+            cover = {id(it): [k for k in cl if k["src"] is it or any(abs(k["tt"] - (x["t"] + off)) <= 0.3 for x in it["kills"])]
+                     for it, off in g}
+            it, off = max(g, key=lambda p: (len(cover[id(p[0])]), p[0]["rec"].get("dur", 0)))
+            parts = [(it, off)]
+            if len(cover[id(it)]) < len(cl):                     # stitch: add clips for the kills the main clip does not show
+                missing = [k for k in cl if k not in cover[id(it)]]
+                for it2, off2 in g:
+                    if it2 is it or not any(k in cover[id(it2)] for k in missing):
+                        continue
+                    parts.append((it2, off2))
+            ev = make_event(cl, parts, det, cfg, refine)
+            if ev and (best_ev is None or ev["score_pre"] > best_ev["score_pre"]):
+                best_ev = ev
+        if best_ev:
+            evs.append(best_ev)
+    save_json(REFINE_CACHE, refine)
     singles = [e for e in evs if e["n"] == 1 and not e["hs"]]
     rng.shuffle(singles)
     for e in singles[:flick_budget]:
@@ -1950,39 +2591,126 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
         except Exception:
             pass
     for e in evs:
-        e["score"] = base_score(e) + 3.0 * e["shots"]          # gunshot heard = small bonus only
+        e["score"] = base_score(e) + 2.0 * e["shots"]
+        e["plain"] = e["n"] == 1 and not e["hs"] and not e["flick"]
     evs.sort(key=lambda e: -e["score"])
-    return evs
+    return evs, notes
+
+
+def make_event(cl, parts, det, cfg, refine):
+    """One event from a kill cluster. parts = [(pool item, timeline offset), ...]; >1 part = stitched continuation.
+    Times are on the timeline of parts[0]; each part covers a source range; cut points sit inside the overlaps."""
+    main, moff = parts[0]
+    times, victims, hs, shots = [], [], 0, 0
+    for k in cl:
+        src, off = k["src"], k["off"]
+        t_ref = k["t"]
+        if det is not None and k.get("box"):
+            try:
+                t_ref = refine_kill(src["rec"], det, cfg, k, refine)
+            except Exception:
+                pass
+        times.append(round(t_ref + off - moff, 4))
+        victims.append(k.get("victim", ""))
+        hs += bool(k.get("hs"))
+        shots += bool(k.get("shot"))
+    order = sorted(range(len(times)), key=lambda i: times[i])
+    times = [times[i] for i in order]
+    victims = [victims[i] for i in order]
+    # source ranges per part on the main timeline: [start, end] of what each clip can show
+    spans = []
+    for it, off in parts:
+        o = off - moff
+        start = o + max(0.05, it["rec"].get("v_off", 0.0))
+        end = o + it["rec"].get("dur", 0) - 0.08
+        spans.append({"it": it, "shift": o, "start": start, "end": end})
+    spans.sort(key=lambda s: s["start"])
+    # a stitched take must be continuous: every point from first-kill run-up to last kill covered
+    if len(spans) > 1:
+        chain = [spans[0]]
+        for s in spans[1:]:
+            if s["start"] <= chain[-1]["end"] - 0.1 and s["end"] > chain[-1]["end"]:
+                chain.append(s)
+        spans = chain
+    cover_start, cover_end = spans[0]["start"], spans[-1]["end"]
+    if any(not (cover_start <= t <= cover_end) for t in times):
+        times_ok = [(t, v) for t, v in zip(times, victims) if cover_start <= t <= cover_end]
+        if not times_ok:
+            return None
+        times, victims = [t for t, _ in times_ok], [v for _, v in times_ok]
+    deaths = []
+    for s in spans:
+        deaths += [d + s["shift"] for d in s["it"].get("deaths", [])]
+    last = times[-1]
+    d_after = min([d - last for d in deaths if 0 < d - last <= 2.0], default=None)
+    # most important kill: the last, or the one closing the fastest spray
+    imp = len(times) - 1
+    if len(times) >= 3:
+        gaps = [times[i + 1] - times[i] for i in range(len(times) - 1)]
+        j = int(min(range(len(gaps)), key=lambda i: gaps[i]))
+        if gaps[j] <= 0.6:
+            imp = j + 1
+    rec = main["rec"]
+    ev = {"rec": rec, "path": rec["path"], "times": times, "n": len(times), "victims": victims, "first": times[0], "last": last,
+          "span": last - times[0], "hs": hs, "flick": False, "shots": shots / max(1, len(cl)), "imp": imp,
+          "pre": times[0] - cover_start, "post": cover_end - last, "death_after": d_after,
+          "parts": [{"path": s["it"]["rec"]["path"], "shift": round(s["shift"], 4), "start": round(s["start"], 4),
+                     "end": round(s["end"], 4), "rec": s["it"]["rec"]} for s in spans],
+          "stitched": len(spans) > 1, "lags": [0.0] * len(times), "vis": main.get("vis", [])}
+    ev["score_pre"] = base_score(ev)
+    return ev
 
 
 # ======================================================================= PLANNER
-LEAD_MIN, SLOW_OUT = 0.3, 0.4
+LEAD_MIN, SLOW_OUT = 1.0, 0.4          # 1.0x from 1.0 s before the FIRST kill
 MIN_TAKE_BEATS, MIN_TAKE_S, OUT_FPS = 2, 1.2, 60
+TAIL = (0.2, 0.5)                      # after the last kill, snapped to the beat grid
+FADE_IN_V, END_FADE = 0.5, (2.0, 3.0)
+CALM = ("intro", "verse", "outro", "breakdown")
+SECTION_ENERGY = {"intro": 0.3, "verse": 0.45, "outro": 0.3, "breakdown": 0.4, "build": 0.75, "drop": 1.0, "": 0.45}
+# lead (run-up before the first kill, seconds) per section: calm = 1-2 s extra, builds tight with a speed-ramped approach
+LEAD_T = {"intro": (2.0, 3.2), "verse": (1.8, 3.0), "outro": (2.0, 3.2), "breakdown": (1.6, 2.8), "build": (1.1, 1.8),
+          "drop": (1.0, 1.6), "": (1.4, 2.4)}
 RECIPES = {
-    "hardcut": {"zoom_p": 0.15, "zoom_amp": 0.05, "ramp_p": 0.0, "flash": False, "slow_max": 1},
-    "ramp": {"zoom_p": 0.30, "zoom_amp": 0.06, "ramp_p": 0.7, "flash": False, "slow_max": 1},
-    "zoom": {"zoom_p": 0.95, "zoom_amp": 0.11, "ramp_p": 0.1, "flash": False, "slow_max": 1},
-    "flash": {"zoom_p": 0.50, "zoom_amp": 0.08, "ramp_p": 0.15, "flash": True, "slow_max": 1},
-    "slowmo": {"zoom_p": 0.40, "zoom_amp": 0.07, "ramp_p": 0.0, "flash": False, "slow_max": 4},
+    "hype":       {"lock": 0.85, "zoom": 0.9, "zoom_amp": 1.0, "shake": 0.8, "flash": 0.9, "ramp": 0.7, "slow": 1, "freeze": True,
+                   "trans": ["hard", "whip", "zoom", "flash"], "xfade": False, "lead": 0.9,
+                   "grade": {"contrast": 1.04, "saturation": 1.12, "gamma": 0.99, "rs": 0.015, "bs": -0.015}},
+    "smooth":     {"lock": 0.6, "zoom": 0.45, "zoom_amp": 0.6, "shake": 0.2, "flash": 0.3, "ramp": 0.4, "slow": 1, "freeze": False,
+                   "trans": ["hard", "crossfade", "zoom"], "xfade": True, "lead": 1.15,
+                   "grade": {"contrast": 1.02, "saturation": 1.05, "gamma": 1.01, "rs": 0.02, "bs": 0.0}},
+    "cinematic":  {"lock": 0.45, "zoom": 0.35, "zoom_amp": 0.7, "shake": 0.35, "flash": 0.6, "ramp": 0.3, "slow": 2, "freeze": True,
+                   "trans": ["hard", "crossfade", "flash"], "xfade": True, "lead": 1.3,
+                   "grade": {"contrast": 1.05, "saturation": 0.93, "gamma": 0.99, "rs": 0.03, "bs": -0.03}},
+    "aggressive": {"lock": 0.95, "zoom": 1.0, "zoom_amp": 1.25, "shake": 1.0, "flash": 1.0, "ramp": 0.85, "slow": 0, "freeze": True,
+                   "trans": ["hard", "whip", "flash"], "xfade": False, "lead": 0.8,
+                   "grade": {"contrast": 1.06, "saturation": 1.15, "gamma": 0.98, "rs": 0.0, "bs": 0.02}},
+    "chill":      {"lock": 0.35, "zoom": 0.2, "zoom_amp": 0.5, "shake": 0.0, "flash": 0.15, "ramp": 0.1, "slow": 2, "freeze": False,
+                   "trans": ["hard", "crossfade"], "xfade": True, "lead": 1.4,
+                   "grade": {"contrast": 1.0, "saturation": 0.96, "gamma": 1.02, "rs": 0.025, "bs": 0.01}},
 }
 
 
 def pick_recipe(rng, style, avoid):
-    names = list(RECIPES) + ["mix"]
+    names = list(RECIPES)
+    if style == "mix":
+        style = None
     name = style if style in names else rng.choice([n for n in names if n != avoid] or names)
-    if name == "mix":
-        return name, {"zoom_p": rng.uniform(.2, .9), "zoom_amp": rng.uniform(.05, .10), "ramp_p": rng.uniform(0, .5),
-                      "flash": rng.random() < .5, "slow_max": rng.randint(1, 3)}
-    return name, dict(RECIPES[name])
+    rp = dict(RECIPES[name])
+    rp["grade"] = {k: round(v * rng.uniform(0.97, 1.03), 3) if k in ("contrast", "saturation", "gamma") else round(v + rng.uniform(-0.01, 0.01), 3)
+                   for k, v in rp["grade"].items()}
+    return name, rp
 
 
 def src_to_out(segs, src_t):
-    """THE source-time -> output-time map of one take (seconds from the take's first frame). segs = [[a, b, speed, frames], ...].
+    """THE source-time -> output-time map of one take (seconds from the take's first frame). segs = [[a, b, speed, frames, ...], ...].
     Used for kill placement, effect placement and the sync report, so they can never disagree."""
     off = 0
-    for a, b, sp, n in segs:
+    for sg in segs:
+        a, b, sp, n = sg[:4]
         if b > a and a - 1e-6 <= src_t <= b + 1e-6:
             return (off + (src_t - a) / (b - a) * n) / OUT_FPS
+        if b <= a and abs(src_t - a) < 1e-6:
+            return off / OUT_FPS
         off += n
     if segs and src_t < segs[0][0]:
         return (src_t - segs[0][0]) / OUT_FPS
@@ -1994,323 +2722,578 @@ def vis_ok(ev, src_start):
     return not any(t0 <= src_start <= t1 for t0, t1 in ev.get("vis", []))
 
 
-def geom(ev, bt, c, kb, end, ramp, slow):
-    """One continuous take: starts 1-2 beats (more only if an earlier row would still be on screen) before the FIRST kill,
-    kills always play at 1.0x from 0.5 s before the first through the last, short tail (0.3-0.6 s) to the next beat.
-    Speed-ups only in the approach; slow-mo (0.4 s) only right after the last kill, on a beat."""
-    lead_t = float(bt[kb] - bt[c])
-    D = float(bt[end] - bt[c])
-    if lead_t < LEAD_MIN or end - c < MIN_TAKE_BEATS or D < MIN_TAKE_S:
-        return None
-    times = ev["times"]
-    first, last = times[0], times[-1]
-    r = 1.0
-    segs = []
-    if ramp > 1.0 and lead_t >= 1.2:
-        app = lead_t - 0.5
-        r = min(ramp, max(1.0, (first - 0.5) / app))
-        r = r if r >= 1.15 else 1.0
-    if r > 1.0:
-        segs += [(first - 0.5 - app * r, first - 0.5, r), (first - 0.5, first, 1.0)]
-    else:
-        segs.append((first - lead_t, first, 1.0))
-    if segs[0][0] < -1e-6:
-        return None
-    if last - first > 0.03:
-        segs.append((first, last, 1.0))
-    cur_out = lead_t + (last - first)
-    post = D - cur_out
-    if post < 0.3:
-        return None
-    t0 = float(bt[c])
-    slow_start = None
-    if slow:
-        j = next((j for j in range(c + 1, end) if bt[j] - t0 >= cur_out + 0.05), None)
-        if j is not None and D - (bt[j] - t0) >= SLOW_OUT + 0.25:
-            slow_start = float(bt[j] - t0)
-    if slow_start is not None:
-        pre = slow_start - cur_out
-        if pre > 0.02:
-            segs.append((last, last + pre, 1.0))
-        a2 = last + pre
-        rest = D - slow_start - SLOW_OUT
-        segs += [(a2, a2 + 0.2, 0.5), (a2 + 0.2, a2 + 0.2 + rest, 1.0)]
-        src_end = a2 + 0.2 + rest
-    else:
-        src_end = last + post
-        segs.append((last, src_end, 1.0))
-    if src_end > ev["rec"]["dur"] - 0.08:
-        return None
-    return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "dur": D, "segs": segs, "ramp": r,
-            "slow": slow_start is not None, "snapped": 0}
+class Grid:
+    """Song-map time grid: ticks = beats + half-beats (cuts may sit on either), anchors = beats and, where the song has a
+    repeating off-beat hit, those half-beats too. Strength = how hard the music hits there."""
+    def __init__(self, an):
+        import numpy as np
+        self.an = an
+        bt = np.array(an["beats"], float)
+        self.bt, self.P = bt, float(an.get("period") or np.median(np.diff(bt)))
+        self.U = np.empty(2 * len(bt) - 1)
+        self.U[0::2], self.U[1::2] = bt, bt[:-1] + np.diff(bt) / 2
+        self.beat_str = np.array(an.get("strength") or [0.5] * len(bt))
+        pat = an.get("pattern") or [0] * 8
+        even = np.mean([pat[i] for i in range(0, 8, 2)]) if pat else 0
+        self.off_ok = bool(pat) and max(pat[1::2]) >= 0.8 * max(even, 1e-9)
+        acc = an.get("accents") or []
+        self.acc_t = np.array([a[0] for a in acc]) if acc else np.zeros(0)
+        self.acc_s = np.array([a[1] for a in acc]) if acc else np.zeros(0)
+        self.acc_bass = np.array([a[2] for a in acc]) if acc else np.zeros(0)
+        self.sec = an.get("section_of_beat") or [""] * len(bt)
+        self.drops = {int(d["beat"]) for d in an.get("drops", [])}
+
+    def tick_of_time(self, t):
+        import numpy as np
+        return int(np.argmin(np.abs(self.U - t)))
+
+    def is_anchor(self, k):
+        return k % 2 == 0 or self.off_ok
+
+    def strength(self, k):
+        """Hit strength at tick k (beat strength from the map + accent right there)."""
+        import numpy as np
+        s = float(self.beat_str[k // 2]) if k % 2 == 0 else 0.25
+        if len(self.acc_t):
+            j = int(np.argmin(np.abs(self.acc_t - self.U[k])))
+            if abs(self.acc_t[j] - self.U[k]) <= 0.03:
+                s += 0.25 * min(1.0, self.acc_s[j] / 8.0)
+        return s
+
+    def near_strength(self, t):
+        """Strongest nearby hit for a non-anchored kill: (strength, error s)."""
+        k = self.tick_of_time(t)
+        return self.strength(k), abs(self.U[k] - t)
+
+    def section(self, t):
+        import numpy as np
+        i = int(np.clip(np.searchsorted(self.bt, t + 1e-6) - 1, 0, len(self.bt) - 1))
+        return self.sec[i] or ""
 
 
-def place(ev, bt, down, c=None, kb=None, end=None, ramp=1.0, slow=False):
-    """Lead-in 1-2 beats before the first kill (more only to keep earlier killfeed rows off the first frame), tail 0.3-0.6 s to the
-    next beat, whole-beat length, 4-beat multiples preferred."""
-    nb = len(bt) - 1
-    first = ev["times"][0]
-    span = ev["times"][-1] - first
-    if kb is not None:
-        pairs = [(kb - k, kb, k) for k in range(1, min(kb, 16) + 1) if bt[kb] - bt[kb - k] >= LEAD_MIN]
+def take_options(ev, c, G, ctx, role=None, anchor=None):
+    """Possible takes for event ev starting at cut tick c: [(score, take)]. The first kill lands on an anchor tick when the event is
+    locked (or the slot demands it), else wherever the section's run-up puts it. Tail 0.2-0.5 s to a tick, never into my death."""
+    import numpy as np
+    U = G.U
+    t_c = U[c]
+    res = []
+    locked = anchor is not None or ev.get("lock", True)
+    rp = ctx["rp"]
+    span = ev["span"]
+    if anchor is not None:
+        anchors = [anchor]
+    elif locked:
+        anchors = [k for k in range(c + 2, min(len(U), c + 20)) if G.is_anchor(k) and 1.0 <= U[k] - t_c <= 4.0]
     else:
-        pairs = [(c, c + k, k) for k in range(1, 17) if c + k < nb and bt[c + k] - bt[c] >= LEAD_MIN]
-    if ramp > 1.0:
-        pairs = [q for q in pairs if bt[q[1]] - bt[q[0]] >= 1.2]
-    pairs = [q for q in pairs if first - (bt[q[1]] - bt[q[0]]) >= -1e-6]
-    good = sorted([q for q in pairs if vis_ok(ev, first - (bt[q[1]] - bt[q[0]]))],
-                  key=lambda q: (0 if q[2] == 2 else 1 if q[2] == 1 else 2 + q[2], q[1] not in down))
-    bad = sorted([q for q in pairs if q not in good], key=lambda q: -(bt[q[1]] - bt[q[0]]))[:2]
-    for cc, kk, _ in good + bad:
-        lead = bt[kk] - bt[cc]
-        last_out = lead + span
-        if end is not None:
-            ends = [end]
+        sec = G.section(t_c + 2.0)
+        lo, hi = LEAD_T.get(sec, LEAD_T[""])
+        anchors = [t_c + x * rp["lead"] for x in (lo, (lo + hi) / 2, hi)]
+    for A in anchors:
+        t_k = U[A] if isinstance(A, (int, np.integer)) else float(A)
+        lead = t_k - t_c
+        if lead < LEAD_MIN - 1e-6 or lead > ev["pre"]:
+            continue
+        sec = G.section(t_k)
+        lo, hi = LEAD_T.get(sec, LEAD_T[""])
+        lo, hi = max(1.0, lo * rp["lead"]), max(1.2, hi * rp["lead"])
+        if anchor is None and lead > hi + 0.9:
+            continue
+        energy = SECTION_ENERGY.get(sec, 0.45)
+        role_ = role or ("ending" if ctx.get("ending") else sec or "verse")
+        slow = role_ in ("headline", "ending") or (role_ == "breakdown" and rp["slow"] >= 2)
+        if role_ == "headline" and rp["slow"] < 1:
+            slow = False
+        freeze = rp["freeze"] and ev["n"] >= 5 and role_ != "ending"
+        t_last = t_k + span
+        dmax = (ev["death_after"] - 0.05) if ev.get("death_after") is not None else 9.0
+        if role_ == "ending":
+            # slow-mo from the final kill frame; 2-3 s, ending on a tick when possible (music + video fade over it)
+            ks_ = [k for k in range(len(U)) if END_FADE[0] <= U[k] - t_last <= END_FADE[1]]
+            fade = (U[min(ks_, key=lambda k: abs(U[k] - t_last - 2.5))] - t_last) if ks_ else 2.5
+            ends = [("end", t_last + fade)]
         else:
-            cand = [j for j in range(kk + 1, nb + 1) if bt[j] - bt[cc] - last_out >= 0.3 and bt[j] - bt[cc] >= MIN_TAKE_S and j - cc >= 2]
-            tl = lambda j: bt[j] - bt[cc] - last_out
-            short = [j for j in cand if tl(j) <= 0.6]
-            mid = [j for j in cand if 0.6 < tl(j) <= 1.2]
-            longer = [j for j in cand if tl(j) > 1.2][:6]
-            order = lambda L: ([j for j in L if (j - cc) % 4 == 0] + [j for j in L if (j - cc) % 4 and (j - cc) % 2 == 0] +
-                               [j for j in L if (j - cc) % 2])
-            ends = order(short) + order(mid) + longer
-            if slow:
-                ends = order([j for j in cand if 0.85 <= tl(j) <= 1.8]) + ends
-        for j in ends:
-            g = geom(ev, bt, cc, kk, j, ramp, slow)
-            if g:
-                return g
-    return None
+            if freeze:
+                win = (0.3, 0.6)
+            elif slow:
+                win = (0.35, 0.8)
+            else:
+                win = TAIL
+            ends = []
+            for x in range(A + 1 if isinstance(A, (int, np.integer)) else G.tick_of_time(t_last), min(len(U), c + 40)):
+                tail = U[x] - t_last
+                if tail < win[0] - 1e-6:
+                    continue
+                if tail > win[1] + 1e-6:
+                    break
+                src_tail = tail * (0.5 if slow and not freeze else (0.0 if freeze else 1.0))
+                if src_tail > min(ev["post"], dmax) + 1e-6:
+                    continue
+                if x - c < 2 * MIN_TAKE_BEATS:
+                    continue
+                ends.append((x, U[x]))
+            if not ends and dmax < win[0]:          # my death comes right after the last kill: end just before it
+                for x in range(G.tick_of_time(t_last), min(len(U), c + 40)):
+                    if 0.08 <= U[x] - t_last <= dmax and x - c >= 2 * MIN_TAKE_BEATS:
+                        ends.append((x, U[x]))
+                        break
+        for x, t_x in ends[:2]:
+            # ramp: speed-up in the approach only, ending >= 1.0 s before the first kill
+            ramp = 1.0
+            if lead >= 1.4 and rp["ramp"] > 0 and (sec == "build" or (sec not in CALM and ev["rnd"] < rp["ramp"] * 0.5)):
+                r = 1.5 + 0.5 * ev["rnd2"]
+                if ev["pre"] >= 1.0 + (lead - 1.0) * r:
+                    ramp = round(r, 2)
+            sc = ev["score"] * (0.55 + 0.6 * energy) / 10.0
+            if isinstance(A, (int, np.integer)):
+                sc += 1.5 * G.strength(A) * ctx["lock"]
+            # most important kill on the strongest nearby hit; other kills on the grid (tight lock rewards it)
+            ti = t_k + (ev["times"][ev["imp"]] - ev["times"][0])
+            s_, err = G.near_strength(ti)
+            sc += ctx["lock"] * s_ * max(0.0, 1 - err / 0.05)
+            fit = [max(0.0, 1 - G.near_strength(t_k + (t - ev["times"][0]))[1] / 0.06) for t in ev["times"][1:]]
+            if fit:
+                sc += ctx["lock"] * 0.8 * sum(fit) / len(fit)
+            sc -= 0.6 * max(0.0, lo - lead) + 0.3 * max(0.0, lead - hi)
+            if sec in CALM and ev["n"] >= 3:
+                sc -= 0.8                                   # big multikills belong where the energy is
+            res.append((sc, {"ev": ev, "c": c, "A": A, "t_k": t_k, "x": x, "t_x": t_x, "lead": lead, "ramp": ramp, "slow": slow,
+                             "freeze": freeze, "role": role_, "sec": sec, "locked": isinstance(A, (int, np.integer))}))
+    res.sort(key=lambda r: -r[0])
+    return res[:4]
 
 
-def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes):
-    """Event-driven, song-anchored layout: every usable event is placed (never dropped for build-up reasons); the best
-    multikill lands on the drop downbeat; takes are whole beats (4-beat phrases preferred); length follows the material."""
+def fill_gap(G, ctx, c0, ends, cands):
+    """Exactly fill the timeline from tick c0 to a tick in `ends` (set) with takes from cands (in order, any subset).
+    Calm stretches (intro / verse / breakdown / outro) first try without 3k+ multikills - those belong to builds and drops.
+    Returns (score, [take, ...]) or None. ends=None: open end up to ctx['cap_tick']."""
+    hi = max(ends) if ends else ctx["cap_tick"]
+    secs = [G.section(G.U[k]) for k in range(c0, min(len(G.U), hi + 1), 2)]
+    if secs and sum(1 for x in secs if x in CALM) >= 0.6 * len(secs):
+        small = tuple(e for e in cands if e["n"] <= 2)
+        if small != tuple(cands):
+            r = _fill_gap(G, ctx, c0, ends, small)
+            if r is not None:
+                return r
+    return _fill_gap(G, ctx, c0, ends, cands)
+
+
+def _fill_gap(G, ctx, c0, ends, cands):
+    import functools
+    cap = ctx["cap_tick"]
+    hi = max(ends) if ends else cap
+
+    @functools.lru_cache(maxsize=None)
+    def f(c, i):
+        ok_end = (c in ends) if ends else (c <= cap)
+        best = (0.0, ()) if ok_end else (-1e9, ())
+        if i >= len(cands) or c >= hi:
+            return best
+        r = f(c, i + 1)
+        if r[0] > best[0]:
+            best = r
+        for sc, tk in take_options(cands[i], c, G, ctx):
+            if tk["x"] == "end" or tk["x"] > hi:
+                continue
+            r = f(int(tk["x"]), i + 1)
+            if r[0] > -1e8 and sc + r[0] > best[0]:
+                best = (sc + r[0], (tk,) + r[1])
+        return best
+    r = f(c0, 0)
+    return None if r[0] < -1e8 else (r[0], list(r[1]))
+
+
+def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None):
+    """Montage built FROM the song map. Every drop gets a strong clip (best multikill on the biggest drop), gaps between are filled
+    exactly with takes whose first kill lands on the rhythm (lock level per montage), calm sections get longer run-ups, builds
+    speed-ramped approaches; the last take is strong and ends in slow-mo with the music + video fade."""
     import numpy as np
     rng = random.Random(seed)
     rname, rp = pick_recipe(rng, style, hist_c[-1].get("recipe") if hist_c else None)
-    bt = np.array(an["beats"], float)
-    N = len(bt) - 1
-    down, en, lv = set(an["down"]), an["energy"], an["level"]
-    bd = float(np.median(np.diff(bt)))
-    cap_b = int(min(120.0, max(60.0, float(target_s or 85)) * 1.1) / bd)
+    G = Grid(an)
+    U = G.U
+    lock_level = lock if lock is not None else float(np.clip(0.6 * rp["lock"] + 0.4 * an.get("rhythm", 0.5) + rng.uniform(-0.12, 0.12), 0.15, 1.0))
+    ctx = {"rp": rp, "lock": lock_level, "cap_tick": len(U) - 1}
+    target = min(120.0, max(60.0, float(target_s or 85)))
     heads = {h.get("headline") for h in hist_c[-4:]}
-    ev_sorted = sorted(events, key=lambda e: -e["score"])
-    total_ev = len(ev_sorted)
-
-    def nat(e):
-        lead = 2
-        span = e["times"][-1] - e["times"][0]
-        L = lead + int(math.ceil((span + 0.5) / bd))
-        L = ((L + 3) // 4) * 4
-        avail = int((e["rec"]["dur"] - 0.1 - e["times"][0]) / bd) + lead
-        if L > avail:
-            L = max(avail // 2 * 2, lead + int(math.ceil((span + 0.4) / bd)))
-        return max(L, MIN_TAKE_BEATS)
-    usable, skipped = [], []
-    for e in ev_sorted:
-        (usable if place(e, bt, down, c=8) else skipped).append(e)
-    if skipped:
-        notes.append(f"{len(skipped)} events cannot form a take (clip too short around the kill)")
-    if not usable:
+    evs = [dict(e) for e in events]
+    for e in evs:
+        e["rnd"], e["rnd2"] = rng.random(), rng.random()
+        e["lock"] = rng.random() < lock_level
+    est = lambda e: 2.0 + e["span"] + 0.4
+    strong = [e for e in evs if not e.get("plain")]
+    plain = [e for e in evs if e.get("plain")]
+    if sum(est(e) for e in strong) < target:
+        strong += plain                                     # plain kills only when the montage would be too short without them
+        if plain:
+            notes.append(f"{len(plain)} plain single kills used (not enough multikills / headshots for {target:.0f} s)")
+    elif plain:
+        notes.append(f"{len(plain)} plain single kills left out (enough better material)")
+    pool = sorted(strong, key=lambda e: (-e["score"], e["path"] in heads))
+    if not pool:
         raise RuntimeError("no kill event has enough footage around it to form a take")
-    head_cands = [e for e in usable if e["path"] not in heads] or usable
-    head = head_cands[0]
-    rest = [e for e in usable if e is not head]
-    total = nat(head) + sum(nat(e) for e in rest)
-    cut_len = []
-    while total > cap_b and rest:                          # length-driven only: drop the lowest-ranked
-        e = rest.pop()
-        total -= nat(e)
-        cut_len.append(e)
-    if cut_len:
-        notes.append(f"{len(cut_len)} lowest-ranked events left out to keep the montage near {target_s or 85:.0f} s")
-    d0 = min(down)
-    dr = an["drop"] if an["drop"] is not None else int(0.45 * N)
-    dc = [i for i in sorted(down) if 12 <= i <= N - 16] or sorted(down)
-    dc8 = [i for i in dc if (i - d0) % 8 == 0]             # drop on an 8-beat phrase boundary
-    drop = min(dc8 or dc, key=lambda i: abs(i - dr))
-    fx = {}
-    for e in rest:                                         # speed-ups only in the approach; slow-mo only after the headline
-        fx[id(e)] = (rng.uniform(1.4, 1.9) if rng.random() < rp["ramp_p"] else 1.0, False)
+    # ending: a strong clip, reserved first (second best, so the best goes on the biggest drop)
+    drops = sorted(an.get("drops", []), key=lambda d: -d["strength"])
+    ending = pool[1] if len(pool) >= 3 else None
+    rest = [e for e in pool if e is not ending]
+    # drop slots: biggest drop gets the best event; other drops the next best (seed varies the choice among near-equals)
+    slots = []
+    avail = list(rest)
+    for d in drops:
+        cand = [e for e in avail if e["n"] >= 2] or avail
+        if not cand:
+            break
+        top = [e for e in cand if e["score"] >= cand[0]["score"] * 0.9][:2]
+        e = top[0] if not slots else rng.choice(top)
+        slots.append((2 * int(d["beat"]), e, d))
+        avail.remove(e)
+    slots.sort(key=lambda s: s[0])
+    order = list(avail)
+    rng.shuffle(order)
+    order.sort(key=lambda e: -e["score"] * rng.uniform(0.7, 1.3))
+    # the opening: start on a phrase boundary / downbeat so the first drop slot is reached exactly
+    p8, p4 = set(an.get("phrase8", [])), set(an.get("phrase4", []))
+    starts = sorted({2 * b for b in (an.get("phrase4") or []) + an.get("down", [])})
+    plan_takes, used = [], set()
 
-    def place_fx(e, c=None, kb=None, end=None):
-        ramp, sl = fx.get(id(e), (1.0, False))
-        for rr in (ramp, 1.0):
-            t = place(e, bt, down, c=c, kb=kb, end=end, ramp=rr, slow=sl)
-            if t:
-                return t
-        return None
-    head_take = None
-    for e in head_cands[:10]:
-        head_take = (place(e, bt, down, kb=drop, slow=True) if rp["slow_max"] > 0 else None) or place(e, bt, down, kb=drop)
-        if head_take:
-            if e is not head:
-                rest = [x for x in rest if x is not e] + ([head] if head not in rest else [])
-                head = e
-            break
-    if not head_take:
-        raise RuntimeError("no clip could be placed on the drop")
-    c_h = head_take["c"]
-    avail_pre = c_h
-    asc = sorted(rest, key=lambda e: e["score"])
-    pre, acc = [], 0
-    for e in asc:
-        if acc >= 0.38 * total or acc + nat(e) > avail_pre:
-            break
-        pre.append(e)
-        acc += nat(e)
-    post = [e for e in sorted(rest, key=lambda e: -e["score"]) if e not in pre]
-    singles = [e for e in post if e["n"] == 1]
-    if len(post) >= 4 and singles:                         # a quiet single as the outro
-        post.remove(singles[0])
-        post.append(singles[0])
-    pre.sort(key=lambda e: (e["n"], e["score"]))
+    def cut_range(slot_tick, ev):
+        return {k for k in range(max(0, slot_tick - 16), slot_tick - 1) if LEAD_MIN - 1e-6 <= U[slot_tick] - U[k] <= min(ev["pre"], 3.2)}
 
-    def run_pre(order, s):
-        takes, c = [], s
-        for e in order:
-            t = place_fx(e, c=c)
-            if t is None:
-                return None, e
-            takes.append(t)
-            c = t["end"]
-        return takes, c
-    s0 = max(0, c_h - sum(nat(e) for e in pre))
-    pre_takes = []
-    for _ in range(12):
-        if not pre:
-            break
-        res, c_end = run_pre(pre, s0)
-        if res is None:                                    # that event cannot sit here: it goes after the drop instead
-            pre.remove(c_end)
-            post.insert(0, c_end)
+    first_slot = None
+    while slots:
+        tick, ev, d = slots[0]
+        rng_ = frozenset(cut_range(tick, ev))
+        role0 = "headline" if drops and d is drops[0] else "drop"
+        best = None
+        if rng_:
+            cands0 = tuple(e for e in order if e is not ev)
+            for s in starts:
+                if s > max(rng_) or U[tick] - U[s] > 0.45 * target + 4:
+                    continue
+                r = (0.0, []) if s in rng_ else fill_gap(G, ctx, s, rng_, cands0)
+                if r is None:
+                    continue
+                c_end = r[1][-1]["x"] if r[1] else s
+                opts = take_options(ev, c_end, G, ctx, role=role0, anchor=tick)
+                if not opts:
+                    continue
+                pre_len = U[tick] - U[s]
+                sc = r[0] + opts[0][0] + (3 if s // 2 in p8 else 1.5 if s // 2 in p4 else 0) - 0.08 * abs(pre_len - 0.28 * target)
+                if best is None or sc > best[0]:
+                    best = (sc, s, r[1], opts[0][1])
+        slots.pop(0)
+        if best is None:
+            notes.append(f"drop at {ts(d['t'])} cannot be reached with the material: next drop used instead")
+            order.insert(0, ev)
             continue
-        g = c_h - c_end
-        if g == 0:
-            pre_takes = res
-            break
-        if s0 + g < 0:
-            e = pre.pop()
-            post.insert(0, e)
-            s0 = max(0, c_h - sum(nat(x) for x in pre))
+        first_slot = best[1]
+        plan_takes += best[2] + [best[3]]
+        used |= {id(t["ev"]) for t in best[2]} | {id(ev)}
+        break
+    if first_slot is None:                                  # no drop usable: open montage from the best phrase start
+        s0 = next((2 * b for b in an.get("phrase4", []) if G.section(U[2 * b]) not in ("intro",)), starts[0] if starts else 0)
+        first_slot = s0
+        slots = []
+    s_tick = first_slot
+    cur = plan_takes[-1]["x"] if plan_takes else s_tick
+    order = [e for e in order if id(e) not in used]
+    ctx["cap_tick"] = int(min(len(U) - 1, G.tick_of_time(U[s_tick] + target * 1.04)))
+    for si, (tick, ev, d) in enumerate(slots):
+        # the drop take itself (anchor = drop downbeat)
+        best = None
+        for c in sorted(cut_range(tick, ev), reverse=True):
+            if c < cur:
+                continue
+            for sc, tk in take_options(ev, c, G, ctx, role="headline" if d is drops[0] else "drop", anchor=tick)[:1]:
+                if c == cur:
+                    fill = (0.0, [])
+                else:
+                    fill = fill_gap(G, ctx, cur, frozenset({c}), tuple(e for e in order if id(e) not in used and e is not ev))
+                if fill is None:
+                    continue
+                if best is None or sc + fill[0] > best[0]:
+                    best = (sc + fill[0], fill[1], tk)
+        if best is None:
+            notes.append(f"drop at {ts(d['t'])}: its clip could not be placed exactly - used elsewhere")
+            order.insert(0, ev)
             continue
-        s0 += g                                            # start later/earlier so the build-up ends exactly on the headline
+        plan_takes += best[1] + [best[2]]
+        used |= {id(t["ev"]) for t in best[1]} | {id(ev)}
+        cur = best[2]["x"]
+        if U[cur] - U[s_tick] > target:
+            break
+    # after the last drop: fill to the target, then the ending take
+    left = tuple(e for e in order if id(e) not in used)
+    end_ev = ending if ending is not None and id(ending) not in used else (left[0] if left else None)
+    if end_ev is not None:
+        left = tuple(e for e in left if e is not end_ev)
+        best = None
+        cands_end = []
+        for c in range(cur, min(len(U) - 4, cur + 2 * int(target / G.P) + 4)):
+            ectx = dict(ctx, ending=True)
+            for sc, tk in take_options(dict(end_ev, lock=True), c, G, ectx, role="ending")[:1]:
+                cands_end.append((c, sc, tk))
+        need = U[s_tick] + target
+        ctx["cap_tick"] = int(min(len(U) - 1, G.tick_of_time(need)))
+        endset = {c for c, _, _ in cands_end if U[c] <= need - 2.0}
+        if any(c == cur for c, _, _ in cands_end):
+            endset.add(cur)
+        fill = fill_gap(G, ctx, cur, frozenset(endset), left) if endset else None
+        if fill is not None:
+            c_end = fill[1][-1]["x"] if fill[1] else cur
+            pick = [(sc, tk) for c, sc, tk in cands_end if c == c_end]
+            if pick:
+                plan_takes += fill[1] + [pick[0][1]]
+            else:
+                plan_takes += fill[1]
+        if not plan_takes or plan_takes[-1]["role"] != "ending":
+            notes.append("the planned ending clip could not be placed; the last take ends the montage")
     else:
-        notes.append("build-up could not be aligned exactly; the montage starts at the headline lead-in")
-        for e in pre:
-            post.insert(0, e)
-        pre, pre_takes = [], []
-    if pre and not pre_takes:
-        notes.append("build-up events moved after the drop (could not be aligned)")
-        for e in pre:
-            post.insert(0, e)
-    takes = pre_takes + [head_take]
-    c = head_take["end"]
-    left = []
-    for e in post:
-        t = place_fx(e, c=c)
-        if t:
-            takes.append(t)
-            c = t["end"]
-        else:
-            left.append(e)
-    for e in left[:]:
-        t = place_fx(e, c=c)
-        if t:
-            takes.append(t)
-            c = t["end"]
-            left.remove(e)
-    if left:
-        notes.append(f"{len(left)} events did not fit before the song ended")
-    for t in list(takes):                                  # no fragments
-        if t["end"] - t["c"] < MIN_TAKE_BEATS or bt[t["end"]] - bt[t["c"]] < MIN_TAKE_S:
-            takes.remove(t)
-            notes.append("removed a take shorter than the minimum")
-    bt0 = float(bt[takes[0]["c"]])
-    c0 = takes[0]["c"]
+        fill = fill_gap(G, ctx, cur, None, left)
+        if fill:
+            plan_takes += fill[1]
+    if not plan_takes:
+        raise RuntimeError("no clip could be placed on the song's beat grid")
+    plan_takes.sort(key=lambda t: t["c"])
+    return finish_plan(cfg, game, plan_takes, song, an, G, seed, rname, rp, lock_level, notes, len(events), rng)
 
-    def cf(i):
-        return int(round((float(bt[i]) - bt0) * OUT_FPS))
+
+def take_segments(tk, f_c, f_k, f_x):
+    """Source segments of one take with EXACT frame counts: the first kill shows on output frame f_k (relative to montage start)."""
+    ev = tk["ev"]
+    k0, kl = ev["times"][0], ev["times"][-1]
+    segs = []
+    n_lead = f_k - f_c
+    if tk["ramp"] > 1.0:
+        n1 = OUT_FPS                                       # 1.0x for the last 1.0 s before the first kill
+        nr = n_lead - n1
+        a1 = k0 - n1 / OUT_FPS
+        segs.append([round(a1 - nr / OUT_FPS * tk["ramp"], 6), round(a1, 6), tk["ramp"], nr])
+    else:
+        a1 = k0 - n_lead / OUT_FPS
+    n_rest = f_x - f_k
+    n_kill = int(round((kl - k0) * OUT_FPS))
+    if tk["freeze"] or tk["slow"]:
+        n_to_last = (f_k - f_c - (segs[0][3] if segs else 0)) + n_kill
+        kl = a1 + n_to_last / OUT_FPS                      # frame-true end of the 1.0x part (= the final kill frame)
+        segs.append([round(a1, 6), round(kl, 6), 1.0, n_to_last])
+        rem = n_rest - n_kill
+        if tk["freeze"]:
+            segs.append([round(kl, 6), round(kl, 6), 0.0, rem])
+        else:
+            src = rem / OUT_FPS * 0.5
+            post = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
+            if src <= post + 1e-6:
+                segs.append([round(kl, 6), round(kl + src, 6), 0.5, rem])
+            else:                                          # not enough footage for the whole slow-mo: slow, then freeze
+                ns = int(max(0, post) * 2 * OUT_FPS)
+                if ns > 0:
+                    segs.append([round(kl, 6), round(kl + ns / OUT_FPS * 0.5, 6), 0.5, ns])
+                segs.append([round(kl + ns / OUT_FPS * 0.5, 6), round(kl + ns / OUT_FPS * 0.5, 6), 0.0, rem - ns])
+    else:
+        n1 = (f_x - f_c) - (segs[0][3] if segs else 0)
+        segs.append([round(a1, 6), round(a1 + n1 / OUT_FPS, 6), 1.0, n1])
+    return [s for s in segs if s[3] > 0]
+
+
+def split_parts(segs, ev):
+    """Stitched continuation: split segments where the source switches clip (middle of each overlap) and tag each piece with its
+    clip + timeline shift, so no frame repeats or jumps."""
+    parts = ev.get("parts") or []
+    if len(parts) <= 1:
+        return [s + [0] for s in segs]
+    cuts = [round((max(parts[i]["start"], parts[i + 1]["start"]) + parts[i]["end"]) / 2, 4) for i in range(len(parts) - 1)]
+    out_ = []
+    for a, b, sp, n in segs:
+        pieces = [(a, b, n)]
+        for cpt in cuts:
+            nxt = []
+            for pa, pb, pn in pieces:
+                if pa < cpt < pb and sp > 0:
+                    n1 = int(round((cpt - pa) / (pb - pa) * pn))
+                    nxt += [(pa, pa + n1 / OUT_FPS * sp, n1), (pa + n1 / OUT_FPS * sp, pb, pn - n1)]
+                else:
+                    nxt.append((pa, pb, pn))
+            pieces = nxt
+        for pa, pb, pn in pieces:
+            mid = (pa + pb) / 2 if pb > pa else pa
+            pi = sum(1 for cpt in cuts if mid >= cpt)
+            if pn > 0:
+                out_.append([round(pa, 6), round(pb, 6), sp, pn, pi])
+    return out_
+
+
+def finish_plan(cfg, game, takes, song, an, G, seed, rname, rp, lock_level, notes, total_ev, rng):
+    """Frame-exact take list + effects (beat-locked: kills, drops, downbeats, accents) + transitions + fades."""
+    import numpy as np
+    U = G.U
+    S0 = float(U[takes[0]["c"]])
+    fr = lambda t: int(round((t - S0) * OUT_FPS))
     out_takes = []
-    for t in takes:
-        ev, kb = t["ev"], t["kb"]
-        role = "headline" if t is head_take else ("drop" if lv[kb] == 2 else "build" if lv[kb] == 1 else "calm")
-        f0, nf = cf(t["c"]), cf(t["end"]) - cf(t["c"])
-        cum, bounds = 0.0, [0]
-        for a, b, sp in t["segs"]:
-            cum += (b - a) / sp
-            bounds.append(int(round(cum * OUT_FPS)))
-        bounds[-1] = nf
-        segs = []
-        for i, (a, b, sp) in enumerate(t["segs"]):
-            n = bounds[i + 1] - bounds[i]
-            if n > 0:
-                segs.append([round(a, 3), round(b, 3), round(sp, 4), n])
-        strong = kb in down or en[kb] >= 0.6
-        ko = [src_to_out(segs, tk) for tk in ev["times"]]          # kill output times through the ONE mapping function
+    biggest = max(an.get("drops", []), key=lambda d: d["strength"]) if an.get("drops") else None
+    drop_times = [d["t"] for d in an.get("drops", [])]
+    for i, tk in enumerate(takes):
+        ev = tk["ev"]
+        f_c = fr(U[tk["c"]])
+        f_k = fr(tk["t_k"])
+        f_x = fr(tk["t_x"]) if tk["role"] == "ending" or tk["x"] == "end" else fr(U[tk["x"]])
+        if i + 1 < len(takes):
+            f_x = fr(U[takes[i + 1]["c"]])                 # contiguous by construction (cut ticks)
+        segs = take_segments(tk, f_c, f_k, f_x)
+        segs = split_parts(segs, ev)
+        nf = f_x - f_c
+        if sum(s[3] for s in segs) != nf:
+            segs[-1][3] += nf - sum(s[3] for s in segs)
+        ko = [src_to_out(segs, t) for t in ev["times"]]
+        sec = tk["sec"] or G.section(tk["t_k"])
+        I = SECTION_ENERGY.get(sec, 0.45) * (1.25 if tk["role"] in ("headline", "drop") else 1.0)
+        t0s, t1s = U[tk["c"]], U[tk["c"]] + nf / OUT_FPS
+        zoom, shake, flash = [], [], []
+        if rp["zoom"] > 0:
+            for j, k in enumerate(ko):
+                if j == 0 and (I >= 0.45 or tk["role"] in ("headline", "drop", "ending") or rng.random() < rp["zoom"]):
+                    zoom.append([round(k, 4), round((0.03 + 0.07 * I) * rp["zoom_amp"], 3)])
+                elif j > 0 and rng.random() < rp["zoom"] * I:
+                    zoom.append([round(k, 4), round((0.025 + 0.05 * I) * rp["zoom_amp"], 3)])
+            if sec == "drop" and rp["zoom"] >= 0.8:           # punch on strong downbeats inside drop takes too
+                for b in an["down"]:
+                    tb = G.bt[b] - t0s
+                    if 0.2 < tb < nf / OUT_FPS - 0.2 and all(abs(tb - z[0]) > 0.3 for z in zoom) and len(zoom) < 5:
+                        zoom.append([round(tb, 4), round(0.03 * rp["zoom_amp"], 3)])
+        if rp["shake"] > 0 and sec in ("drop", "build") and len(G.acc_t):
+            for t_, s_, bass in zip(G.acc_t, G.acc_s, G.acc_bass):
+                if bass and t0s + 0.05 < t_ < t1s - 0.1 and len(shake) < 6 and s_ >= 4:
+                    shake.append([round(t_ - t0s, 4), round((5 + 9 * I) * rp["shake"], 1)])
+        for dt in drop_times:
+            if t0s - 1e-3 <= dt < t1s and rp["flash"] > 0:
+                flash.append([round(dt - t0s, 4), round(0.22 + 0.2 * rp["flash"], 3)])
+        trans = "hard"
+        if i > 0:
+            prev_sec = out_takes[-1]["section"]
+            choices = [t for t in rp["trans"] if t != "crossfade"]
+            if rp["xfade"] and sec in CALM and prev_sec in CALM and not flash and \
+                    out_takes[-1]["post_left"] >= 0.25 and not out_takes[-1]["slow"]:
+                trans = "crossfade" if rng.random() < 0.6 else "hard"
+            elif sec in ("drop", "build") or tk["role"] in ("headline", "drop"):
+                trans = rng.choice(choices)
+            else:
+                trans = "hard" if rng.random() < 0.6 else rng.choice(choices)
         slow_at = None
         o = 0
         for sg in segs:
-            if sg[2] == 0.5:
+            if sg[2] in (0.5, 0.0):
                 slow_at = o / OUT_FPS
                 break
             o += sg[3]
-        fr = lambda x: round(x * OUT_FPS) / OUT_FPS
-        pulses = []
-        if role == "headline" or (strong and rng.random() < rp["zoom_p"]):
-            pulses.append(fr(ko[0]))
-        for k2 in ko[1:]:
-            j = int(np.argmin(np.abs(bt - (bt[t["c"]] + k2))))
-            if abs(bt[j] - (bt[t["c"]] + k2)) < 0.06 and (j in down or en[j] >= 0.6) and len(pulses) < 3 \
-                    and rng.random() < rp["zoom_p"] * 0.6:
-                pulses.append(fr(k2))
-        out_takes.append({"path": ev["path"], "rect": content_rect(ev["rec"], cfg), "audio": ev["rec"].get("audio", True),
-                          "wh": [ev["rec"]["w"], ev["rec"]["h"]], "segs": segs, "f0": f0, "nf": nf,
-                          "out_start": round(f0 / OUT_FPS, 3), "dur": round(nf / OUT_FPS, 3), "role": role,
-                          "pulses": [round(p, 3) for p in pulses], "amp": round(rp["zoom_amp"], 3),
-                          "flash": fr(ko[0]) if role == "headline" and rp["flash"] else None, "slow_at": slow_at,
-                          "beat0": int(t["c"] - c0), "beat_end": int(t["end"] - c0), "beat_kill": int(kb - c0),
-                          "song_beat": int(t["c"]), "kill_down": kb in down,
-                          "kills": [round(x, 2) for x in ev["times"]], "kills_out": [round(x, 3) for x in ko],
-                          "lags": [round(x, 3) for x in ev["lags"]], "n": ev["n"], "score": round(ev["score"], 1),
-                          "hs": ev["hs"], "ramp": round(t["ramp"], 2), "slow": t["slow"], "snapped": t["snapped"],
-                          "level": int(lv[kb])})
+        post_left = (ev["times"][-1] + ev["post"]) - segs[-1][1]
+        if ev.get("death_after") is not None:
+            post_left = min(post_left, ev["times"][-1] + ev["death_after"] - 0.05 - segs[-1][1])
+        parts = ev.get("parts") or [{"path": ev["path"], "shift": 0.0, "rec": ev["rec"]}]
+        srcs = []
+        for p in parts:
+            r = p["rec"]
+            au = clip_audio(r) if r.get("audio") else {"stream": None, "lufs": None}
+            g_db = 0.0 if au["lufs"] is None else max(-12.0, min(24.0, ((an.get("lufs") or -14.0) - float(cfg.get("game_under_music_db", 4.0)))
+                                                                   - au["lufs"]))
+            srcs.append({"path": p["path"], "shift": p.get("shift", 0.0), "rect": content_rect(r, cfg), "wh": [r["w"], r["h"]],
+                         "audio": bool(r.get("audio")) and au["stream"] is not None, "a_stream": au["stream"] or 0, "lufs": au["lufs"],
+                         "gain_db": round(g_db, 1)})
+        b0 = tk["c"] / 2 - takes[0]["c"] / 2
+        out_takes.append({"path": ev["path"], "srcs": srcs, "rect": srcs[0]["rect"], "audio": srcs[0]["audio"], "wh": srcs[0]["wh"],
+                          "segs": segs, "f0": f_c, "nf": nf, "out_start": round(f_c / OUT_FPS, 3), "dur": round(nf / OUT_FPS, 3),
+                          "role": tk["role"], "section": sec, "locked": tk["locked"], "anchor_t": round(tk["t_k"] - S0, 4),
+                          "zoom": zoom, "pulses": [z[0] for z in zoom], "amp": max([z[1] for z in zoom] or [0.0]),
+                          "shake": shake, "flash_at": flash, "flash": flash[0][0] if flash else None, "trans": trans,
+                          "xf": 0, "post_left": round(max(0.0, post_left), 3), "slow_at": slow_at,
+                          "beat0": round(b0, 1), "beat_end": round(b0 + (f_x - f_c) / OUT_FPS / G.P, 1),
+                          "beat_kill": round((tk["t_k"] - S0) / G.P, 2), "song_beat": tk["c"] // 2, "kill_down": tk["locked"] and
+                          isinstance(tk["A"], (int, np.integer)) and tk["A"] % 2 == 0 and (tk["A"] // 2) in set(an["down"]),
+                          "kills": [round(x, 6) for x in ev["times"]], "kills_out": [round(x, 5) for x in ko],
+                          "victims": ev.get("victims", []), "lags": [0.0] * ev["n"], "n": ev["n"], "score": round(ev["score"], 1),
+                          "hs": ev["hs"], "ramp": tk["ramp"], "slow": tk["slow"], "freeze": tk["freeze"], "snapped": 0,
+                          "stitched": ev.get("stitched", False), "level": int(an["level"][min(len(an["level"]) - 1, tk["c"] // 2)])})
+    # crossfades: the outgoing take runs on under the incoming one
+    XF = 12
+    for i in range(1, len(out_takes)):
+        if out_takes[i]["trans"] == "crossfade":
+            p = out_takes[i - 1]
+            if p["segs"][-1][2] == 1.0 and p["post_left"] >= XF / OUT_FPS + 0.05:
+                p["xf"] = XF
+            else:
+                out_takes[i]["trans"] = "hard"
     total_f = out_takes[-1]["f0"] + out_takes[-1]["nf"]
     total_s = total_f / OUT_FPS
+    last = out_takes[-1]
+    kill_end = last["out_start"] + last["kills_out"][-1]
+    ending_ok = last["role"] == "ending"
+    fade_out_start = round(kill_end if ending_ok else max(0.0, total_s - 2.0), 3)
+    music_fade_in = round(min(1.0, max(0.5, 2 * G.P)), 3)
     notes.insert(0, f"MONTAGE LENGTH {total_s:.0f} s from {len(out_takes)} of {total_ev} kill events" +
                  (" - UNDER 60 s: not enough usable material, this is the longest good montage possible" if total_s < 60 else ""))
-    return {"game": game, "seed": seed, "recipe": rname,
-            "params": {k: (round(v, 3) if isinstance(v, float) else v) for k, v in rp.items()},
+    b_first = takes[0]["c"]
+    beats_out = [round(float(t) - S0, 4) for t in G.bt if S0 - 1e-6 <= t <= S0 + total_s + 1e-6]
+    drops_out = [round(d["t"] - S0, 3) for d in an.get("drops", []) if S0 <= d["t"] <= S0 + total_s]
+    heads = [t for t in out_takes if t["role"] == "headline"]
+    return {"game": game, "seed": seed, "recipe": rname, "lock": round(lock_level, 2),
+            "params": {k: v for k, v in rp.items() if k != "grade"}, "grade": rp["grade"],
             "song": {"path": song["path"], "artist": song["artist"], "title": song["title"], "bpm": an["bpm"],
-                     "start_t": round(bt0, 4), "drop_t": round(cf(drop) / OUT_FPS, 2), "drop_beat": int(drop - c0)},
-            "takes": out_takes, "duration": round(total_s, 3), "total_frames": total_f, "notes": notes,
-            "beats_out": [round(float(bt[i]) - bt0, 4) for i in range(c0, takes[-1]["end"] + 1)],
-            "beats_n": int(takes[-1]["end"] - c0), "headline": head_take["ev"]["path"]}
+                     "start_t": round(S0, 4), "drop_t": round(biggest["t"] - S0, 3) if biggest and S0 <= biggest["t"] <= S0 + total_s else None,
+                     "drop_beat": None, "music_fade_in": music_fade_in, "fade_out_start": fade_out_start, "lufs": an.get("lufs")},
+            "takes": out_takes, "duration": round(total_s, 4), "total_frames": total_f, "notes": notes,
+            "beats_out": beats_out, "beats_n": len(beats_out), "drops_out": drops_out,
+            "sections_out": [[s["label"], round(max(0, s["start_t"] - S0), 2), round(min(total_s, s["end_t"] - S0), 2)]
+                             for s in an.get("sections", []) if s["end_t"] > S0 and s["start_t"] < S0 + total_s],
+            "headline": (heads[0] if heads else max(out_takes, key=lambda t: t["score"]))["path"],
+            "start_beat": b_first // 2, "ending": ending_ok, "under_db": float(cfg.get("game_under_music_db", 4.0)),
+            "duck_db": float(cfg.get("duck_db", 4.0))}
 
 
-def verify_cutlist(plan):
-    """Final check before rendering: contiguous frames, every take >= 2 beats and >= 1.2 s, segments add up."""
-    bad, pos = [], 0
+def verify_cutlist(plan, events=None):
+    """Final check before rendering: contiguous frames, every take >= 2 beats and holds a kill frame, 1.0x from 1.0 s before the
+    first kill through the last, ramps end >= 1.0 s before the first kill, tails 0.2-0.5 s (slow-mo / freeze / ending excepted),
+    no clip and no kill used twice."""
+    bad, pos, seen_clips = [], 0, set()
     for i, t in enumerate(plan["takes"], 1):
         if t["f0"] != pos:
             bad.append(f"take {i} starts at frame {t['f0']}, expected {pos}")
-        if t["nf"] < MIN_TAKE_S * OUT_FPS or t["beat_end"] - t["beat0"] < MIN_TAKE_BEATS:
-            bad.append(f"take {i} is under the minimum ({t['nf']} frames, {t['beat_end'] - t['beat0']} beats)")
         if sum(sg[3] for sg in t["segs"]) != t["nf"]:
             bad.append(f"take {i} segment frames do not add up")
+        if t["nf"] < MIN_TAKE_S * OUT_FPS * 0.8 or t["beat_end"] - t["beat0"] < MIN_TAKE_BEATS - 0.05:
+            bad.append(f"take {i} is under the minimum ({t['nf']} frames, {t['beat_end'] - t['beat0']:.1f} beats)")
+        if not any(0 <= k < t["nf"] / OUT_FPS for k in t["kills_out"]):
+            bad.append(f"take {i} shows no kill frame")
+        k0, kl = t["kills"][0], t["kills"][-1]
+        for sg in t["segs"]:
+            a, b, sp = sg[:3]
+            if sp != 1.0 and a < kl - 1.0 / OUT_FPS and b > k0 - 1.0 + 1.0 / OUT_FPS:
+                bad.append(f"take {i}: speed {sp} between 1.0 s before the first kill and the last kill")
+        tail = t["dur"] - t["kills_out"][-1]
+        if not (t["slow"] or t["freeze"] or t["role"] == "ending") and tail > TAIL[1] + 0.02:
+            bad.append(f"take {i}: tail {tail:.2f} s after the last kill (max {TAIL[1]})")
+        if t["path"] in seen_clips:
+            bad.append(f"take {i}: clip {Path(t['path']).name} used twice")
+        seen_clips.add(t["path"])
         pos = t["f0"] + t["nf"]
     return bad
+
+
+def cfg_under_txt(plan):
+    return f"{plan.get('under_db', 4.0):.0f} dB"
 
 
 def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     L = []
     sg = plan["song"]
-    L.append(f"GAME     {plan['game']}      seed {plan['seed']}      style recipe: {plan['recipe']} {plan['params']}")
-    L.append(f"SONG     {sg['artist']} - {sg['title']}   [{Path(sg['path']).name}]   BPM {sg['bpm']}")
-    L.append(f"TIMELINE song starts at {ts(sg['start_t'])}; {plan['beats_n']} beats = {plan['duration']:.1f}s at 60 fps "
-             f"({plan['total_frames']} frames); best multikill on the drop: beat {sg['drop_beat']} at {sg['drop_t']:.1f}s")
+    L.append(f"GAME     {plan['game']}      seed {plan['seed']}      style recipe: {plan['recipe']}      rhythm lock level {plan['lock']:.2f}"
+             f"  ({'tight - almost every kill on the rhythm' if plan['lock'] >= 0.75 else 'key moments and drops locked' if plan['lock'] < 0.5 else 'most kills locked'})")
+    L.append(f"         recipe {plan['params']}  grade {plan['grade']}")
+    L.append(f"SONG     {sg['artist']} - {sg['title']}   [{Path(sg['path']).name}]   BPM {sg['bpm']}   loudness {sg.get('lufs')} LUFS")
+    L.append(f"SOUND    game audio loudness-normalised per clip to {cfg_under_txt(plan)} under the music, music ducked "
+             f"{plan.get('duck_db', 4.0)} dB around each kill, limiter on the mix")
+    L.append(f"TIMELINE song starts at {ts(sg['start_t'])} (music fades in over {sg['music_fade_in']} s, video from black 0.5 s); "
+             f"{plan['duration']:.1f}s at 60 fps ({plan['total_frames']} frames); drops at "
+             f"{', '.join(f'{d:.1f}s' for d in plan['drops_out']) or '-'}; ending slow-mo + fades from {sg['fade_out_start']:.2f}s")
+    L.append("SECTIONS " + "  ".join(f"{s[0]} {s[1]:.0f}-{s[2]:.0f}s" for s in plan["sections_out"]))
     if score_info:
         fp = score_info["fit_parts"]
         L.append(f"SONG SCORE total {score_info['total']} = recency {score_info['recency']} (added {score_info['days']} days ago)"
@@ -2320,19 +3303,22 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     for n in plan["notes"]:
         L.append(f"NOTE     {n}")
     bad = verify_cutlist(plan)
-    L.append("CUT LIST CHECK: " + ("OK - no take under 2 beats / 1.2 s, contiguous frames" if not bad else "PROBLEMS: " + "; ".join(bad)))
+    L.append("CUT LIST CHECK: " + ("OK - contiguous frames, every take >= 2 beats with a kill frame, 1.0x through the kills, "
+                                   "short tails, no clip twice" if not bad else "PROBLEMS: " + "; ".join(bad)))
     L.append("\nRANKED KILL EVENTS (top 20)")
     for i, ev in enumerate(events[:20], 1):
-        L.append(f"  {i:2}. score {ev['score']:5.1f}  {ev['n']}k{' HS' * (ev['hs'] > 0)}{' flick' * bool(ev['flick'])}  "
-                 f"{Path(ev['path']).name} @ {', '.join(ts(t) for t in ev['times'])}")
-    L.append(f"\nCUT LIST ({len(plan['takes'])} takes; 'beat' = beat number in the montage, [song beat])")
+        L.append(f"  {i:2}. score {ev['score']:5.1f}  {ev['n']}k{' HS' * (ev['hs'] > 0)}{' flick' * bool(ev['flick'])}"
+                 f"{' STITCHED' if ev.get('stitched') else ''}  {Path(ev['path']).name} @ {', '.join(ts(t) for t in ev['times'])}")
+    L.append(f"\nCUT LIST ({len(plan['takes'])} takes)")
     for i, t in enumerate(plan["takes"], 1):
-        fx = ("slow-mo " if t["slow"] else "") + (f"ramp x{t['ramp']} " if t["ramp"] > 1 else "") + \
-             (f"snap{t['snapped']} " if t["snapped"] else "") + (f"zoom@{','.join(f'{p:.2f}' for p in t['pulses'])} " if t["pulses"] else "") + \
-             ("FLASH" if t["flash"] is not None else "")
-        L.append(f"  {i:2}. cut at beat {t['beat0']:3d} [{t['song_beat']}] {t['f0'] / OUT_FPS:6.2f}s  {t['nf']:4d}f = {t['beat_end'] - t['beat0']:2d} beats  "
-                 f"first kill on beat {t['beat_kill']}{' (downbeat)' if t['kill_down'] else ''}  [{t['role']}] {t['n']}k  "
-                 f"{Path(t['path']).name} @ {', '.join(ts(k) for k in t['kills'])}  {fx}")
+        fx = (f"trans:{t['trans']} " if i > 1 else "") + ("slow-mo " if t["slow"] else "") + ("FREEZE " if t["freeze"] else "") + \
+             (f"ramp x{t['ramp']} " if t["ramp"] > 1 else "") + (f"zoom@{','.join(f'{z[0]:.2f}' for z in t['zoom'])} " if t["zoom"] else "") + \
+             (f"shake x{len(t['shake'])} " if t["shake"] else "") + ("FLASH " if t["flash_at"] else "") + ("xfade-out " if t["xf"] else "") + \
+             " | game audio " + ", ".join(f"{s_.get('lufs') if s_.get('lufs') is not None else '?'} LUFS {s_.get('gain_db', 0):+.1f} dB"
+                                          for s_ in t.get("srcs", []) if s_.get("audio"))
+        L.append(f"  {i:2}. {t['f0'] / OUT_FPS:6.2f}s {t['nf']:4d}f [{t['section']:9}] {t['role']:9} {'LOCKED' if t['locked'] else 'free  '} "
+                 f"first kill @{t['out_start'] + t['kills_out'][0]:6.2f}s  {t['n']}k  {Path(t['path']).name} @ {', '.join(ts(k) for k in t['kills'])}"
+                 f"{' (stitched)' if t['stitched'] else ''}  {fx}")
     L.append(f"\nPLAYLIST tracks with no MP3 yet: {len(unmatched)}" + (f" (CSV {csvname})" if csvname else ""))
     for r in unmatched[:15]:
         L.append(f"   {r['artist']} - {r['title']}")
@@ -2340,7 +3326,7 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
 
 
 # ======================================================================= RENDER
-FX_ALL = ("zoom", "flash", "slow")
+FX_ALL = ("zoom", "flash", "slow", "shake", "transition", "grade", "freeze")
 
 
 def ff_has(kind, name):
@@ -2348,77 +3334,191 @@ def ff_has(kind, name):
     return name in r
 
 
+def _alimiter_latency():
+    """alimiter's look-ahead delays the audio by its attack time unless 'latency' compensation exists (ffmpeg >= 5.1)."""
+    return "latency" in run(["ffmpeg", "-hide_banner", "-h", "filter=alimiter"]).stdout.decode(errors="replace")
+
+
 def amix_has_normalize():
     return "normalize" in run(["ffmpeg", "-hide_banner", "-h", "filter=amix"]).stdout.decode(errors="replace")
 
 
 def slice_plan(plan, length=20.0):
-    """Preview slice: ~20 s centred on the drop, cut at take boundaries (frame exact)."""
+    """Preview slice: ~20 s around the biggest drop, cut at take boundaries (frame exact)."""
     takes = plan["takes"]
-    t0 = max([t["f0"] for t in takes if t["f0"] <= (plan["song"]["drop_t"] - 8.0) * OUT_FPS] or [0])
+    centre = plan["song"]["drop_t"] if plan["song"].get("drop_t") is not None else plan["duration"] / 2
+    t0 = max([t["f0"] for t in takes if t["f0"] <= (centre - 8.0) * OUT_FPS] or [0])
     sel = [t for t in takes if t["f0"] >= t0 and t["f0"] < t0 + length * OUT_FPS]
     nt = [dict(t, f0=t["f0"] - t0, out_start=round((t["f0"] - t0) / OUT_FPS, 3)) for t in sel]
+    if nt:
+        nt[0] = dict(nt[0], trans="hard")
     sg = dict(plan["song"], start_t=plan["song"]["start_t"] + t0 / OUT_FPS)
     tf = nt[-1]["f0"] + nt[-1]["nf"]
+    sg["fade_out_start"] = max(0.0, min(sg["fade_out_start"] - t0 / OUT_FPS, tf / OUT_FPS - 1.0))
     return dict(plan, takes=nt, song=sg, duration=tf / OUT_FPS, total_frames=tf)
 
 
+def _sum_expr(terms):
+    return "+".join(terms) if terms else "0"
+
+
 def build_filter(plan, cfg, preview, fx=FX_ALL):
-    """One filter graph. Every effect is placed on the OUTPUT timeline of its take (after speed ramps/trims)."""
-    inputs, chains, vl, k = [], [], [], 0
-    gv = float(cfg.get("game_audio_level", 0.5))
-    boost = min(1.0, gv * 1.585)                                   # about +4 dB around each kill
-    for t in plan["takes"]:
-        off_f, shift = 0, 0.0
-        for si, (a, b, sp, n) in enumerate(t["segs"]):
-            out_len = n / OUT_FPS
-            if "slow" not in fx and sp == 0.5:                       # slow-mo disabled: play that stretch at normal speed
-                b2 = a + out_len
-                shift = b2 - b
-                b, sp = b2, 1.0
-            elif shift:
-                a, b = a + shift, b + shift
-            src_len = (b - a)
-            off = off_f / OUT_FPS
-            i = k
-            inputs += ["-threads", "2", "-ss", f"{a:.3f}", "-t", f"{src_len + 0.1:.3f}", "-i", t["path"]]
-            cx, cy, cw, ch = t["rect"]
-            crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, t["wh"][0], t["wh"][1]] else ""
-            v = f"[{i}:v:0]{crop}scale=1920:1080:flags=lanczos,setsar=1,setpts=(PTS-STARTPTS)/{sp:.4f},"
-            v += "framerate=fps=60:scene=100" if sp < 1 else "fps=60"
-            terms = []
-            if "zoom" in fx:
-                for p in t["pulses"]:
-                    pf = (p - off) * OUT_FPS
-                    if -30 < pf < n:
-                        terms.append(f"between(in-({pf:.1f}),0,27)*exp(-0.15*(in-({pf:.1f})))")
-            if terms:
-                v += (f",zoompan=z='1+{t['amp']}*({'+'.join(terms)})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-                      f":d=1:s=1920x1080:fps=60")
-            if "flash" in fx and t["flash"] is not None and 0 <= t["flash"] - off < out_len:
-                f0 = t["flash"] - off
-                v += f",drawbox=x=0:y=0:w=iw:h=ih:color=white@0.8:t=fill:enable='between(t,{f0:.3f},{f0 + 0.12:.3f})'"
-            v += f",tpad=stop_mode=clone:stop_duration=0.2,trim=end_frame={n},setpts=PTS-STARTPTS[v{k}]"
-            chains.append(v)
-            if t["audio"]:
-                at = f"atempo={min(2.0, max(0.5, sp)):.4f}," if abs(sp - 1.0) > 1e-3 else ""
-                kt = [f"between(t,{ko - off - 0.2:.3f},{ko - off + 0.2:.3f})" for ko in t["kills_out"] if -0.25 < ko - off < out_len + 0.25]
-                vol = f"volume='{gv:.3f}+{boost - gv:.3f}*min(1,{'+'.join(kt)})':eval=frame" if kt else f"volume={gv:.3f}"
-                chains.append(f"[{i}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,{at}{vol},"
-                              f"asetpts=PTS-STARTPTS,apad,atrim=duration={out_len:.4f}[a{k}]")
+    """ONE filter graph. Video segments keep their real timestamps (input -ss shifts them exactly) so the first kill frame lands
+    on the planned output frame. Effects are placed on each take's output timeline. Music: sample-exact trim from the song map
+    origin, fade in, ducked around kills, faded out from the final kill. Game audio: loudness-normalised per clip."""
+    inputs, chains, k = [], [], 0
+    takes = plan["takes"]
+    song_lufs = plan["song"].get("lufs") or -14.0
+    under = float(cfg.get("game_under_music_db", 4.0))
+    duck = float(cfg.get("duck_db", 4.0))
+    take_v, take_a = [], []
+    for ti, t in enumerate(takes):
+        srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"], "audio": t["audio"],
+                                  "a_stream": 0, "lufs": None}]
+        segs = [list(s) for s in t["segs"]]
+        if t.get("xf"):                                      # crossfade-out: the last segment runs on under the next take
+            a, b, sp, n = segs[-1][:4]
+            segs[-1] = [a, b + t["xf"] / OUT_FPS * sp, sp, n + t["xf"]] + segs[-1][4:]
+        if "slow" not in fx:                                 # slow-mo / freeze disabled: play that stretch at 1.0x
+            for s in segs:
+                if s[2] in (0.5, 0.0):
+                    s[1], s[2] = s[0] + s[3] / OUT_FPS, 1.0
+        elif "freeze" not in fx:
+            for s in segs:
+                if s[2] == 0.0:
+                    s[1], s[2] = s[0] + s[3] / OUT_FPS * 0.5, 0.5
+        vparts, aparts = [], []
+        for s in segs:
+            a, b, sp, n = s[:4]
+            src = srcs[s[4] if len(s) > 4 and s[4] < len(srcs) else 0]
+            sa = a - src["shift"]                            # this clip's own time for the stitched timeline
+            dur_src = (b - a) if sp > 0 else 1.0 / OUT_FPS
+            inputs += ["-threads", "2", "-ss", f"{max(0.0, sa):.4f}", "-t", f"{dur_src + 0.25:.4f}", "-i", src["path"]]
+            cx, cy, cw, ch = src["rect"]
+            crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, src["wh"][0], src["wh"][1]] else ""
+            scl = "scale=1920:1080:flags=lanczos," if (crop or list(src["wh"]) != [1920, 1080]) else ""   # 1080p clips: pixel-exact
+            v = f"[{k}:v:0]{crop}{scl}setsar=1,"
+            if sp == 0.0:
+                v += f"trim=end_frame=1,setpts=PTS-STARTPTS,fps=60,tpad=stop_mode=clone:stop_duration={n / OUT_FPS + 0.1:.4f}"
+            elif sp < 1:
+                v += f"setpts=PTS/{sp:.4f},framerate=fps=60:scene=100"
             else:
-                chains.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={out_len:.4f},asetpts=PTS-STARTPTS[a{k}]")
-            vl.append(f"[v{k}][a{k}]")
-            off_f += n
+                v += f"setpts=PTS/{sp:.4f},fps=60:start_time=0"
+            v += f",trim=end_frame={n},setpts=PTS-STARTPTS[s{k}v]"
+            chains.append(v)
+            vparts.append(f"[s{k}v]")
+            out_len = n / OUT_FPS
+            if src["audio"] and sp > 0:
+                g_db = src.get("gain_db", 0.0 if src.get("lufs") is None else max(-12.0, min(24.0, (song_lufs - under) - src["lufs"])))
+                gain = 10 ** (g_db / 20)
+                at = f"atempo={min(2.0, max(0.5, sp)):.4f}," if abs(sp - 1.0) > 1e-3 else ""
+                if sp > 2.0:
+                    at = f"atempo=2.0,atempo={sp / 2:.4f},"
+                off = sum(x[3] for x in segs[:segs.index(s)]) / OUT_FPS
+                kt = [f"between(t,{ko - off - 0.15:.3f},{ko - off + 0.35:.3f})" for ko in t["kills_out"] if -0.4 < ko - off < out_len + 0.2]
+                vol = f"volume='{gain:.4f}*(1+0.26*min(1,{_sum_expr(kt)}))':eval=frame" if kt else f"volume={gain:.4f}"
+                chains.append(f"[{k}:a:{src['a_stream']}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                              f"asetpts=PTS-STARTPTS,{at}{vol},apad,atrim=duration={out_len:.4f}[s{k}a]")
+            else:
+                chains.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={out_len:.4f},asetpts=PTS-STARTPTS[s{k}a]")
+            aparts.append(f"[s{k}a]")
             k += 1
+        nf = sum(x[3] for x in segs)
+        base = f"t{ti}"
+        chains.append("".join(vparts) + f"concat=n={len(vparts)}:v=1:a=0[{base}c]" if len(vparts) > 1 else f"{vparts[0]}null[{base}c]")
+        chains.append("".join(aparts) + f"concat=n={len(aparts)}:v=0:a=1[{base}a]" if len(aparts) > 1 else f"{aparts[0]}anull[{base}a]")
+        # take effects (output-relative). They run in a side branch that is overlaid ONLY inside the effect windows, so every
+        # other frame stays pixel-exact. Zoom = scale+crop at 2x internal resolution (lanczos), not zoompan.
+        tr = t.get("trans", "hard") if ti > 0 and "transition" in fx else "hard"
+        sh = t.get("shake", []) if "shake" in fx else []
+        zt, wins = [], []
+        if "zoom" in fx:
+            for p, amp in t.get("zoom", []):
+                zt.append(f"{amp:.3f}*between(t,{p:.4f},{p + 0.45:.4f})*exp(-9*(t-{p:.4f}))")
+                wins.append((p, p + 0.45))
+        if tr == "zoom":
+            zt.append("0.22*max(0,1-t/0.15)")
+            wins.append((0.0, 0.16))
+        A = 48 if tr == "whip" else (14 if sh else 0)
+        if tr == "whip":
+            wins.append((0.0, 0.12))
+        wins += [(h, h + 0.16) for h, _ in sh]
+        fxc = []
+        if A:
+            sx = _sum_expr([f"between(t,{h:.3f},{h + 0.16:.3f})*sin(2*PI*27*(t-{h:.3f}))*exp(-(t-{h:.3f})*16)*{amp / 14:.3f}" for h, amp in sh])
+            sy = _sum_expr([f"between(t,{h:.3f},{h + 0.16:.3f})*cos(2*PI*23*(t-{h:.3f}))*exp(-(t-{h:.3f})*16)*{amp / 14:.3f}" for h, amp in sh])
+            wx = "0.9*max(0,1-t/0.12)" if tr == "whip" else "0"
+            fxc.append(f"crop=w=iw-{2 * A}:h=ih-{2 * A}:x='{A}+{A}*max(-1,min(1,{sx}+{wx}))':y='{A}+{A}*max(-1,min(1,{sy}))',"
+                       f"scale=1920:1080:flags=lanczos")
+        if zt:
+            fxc.append(f"scale=w='trunc(3840*(1+{_sum_expr(zt)})/2)*2':h=-2:eval=frame:flags=lanczos,"
+                       f"crop=3840:2160:(iw-ow)/2:(ih-oh)/2,scale=1920:1080:flags=lanczos")
+        if tr == "whip":
+            fxc.append("gblur=sigma=18:steps=1")
+        if fxc:
+            en = "+".join(f"between(t,{a:.4f},{b:.4f})" for a, b in wins)
+            chains.append(f"[{base}c]split=2[{base}m][{base}f]")
+            chains.append(f"[{base}f]" + ",".join(fxc) + f",format=yuv420p[{base}e]")
+            chains.append(f"[{base}m]format=yuv420p[{base}m2]")
+            chains.append(f"[{base}m2][{base}e]overlay=0:0:eof_action=pass:enable='{en}'[{base}o]")
+            src_lab = f"[{base}o]"
+        else:
+            src_lab = f"[{base}c]"
+        bt = []
+        if "flash" in fx:
+            bt += [(f"{pk:.3f}*(1-(t-{f0:.3f})/0.2)", f0, f0 + 0.2) for f0, pk in t.get("flash_at", [])]
+        if tr == "flash":
+            bt.append(("0.45*max(0,1-t/0.09)", 0.0, 0.09))
+        post = []
+        for ex, a_, b_ in bt:
+            post.append(f"eq=brightness='{ex}':eval=frame:enable='between(t,{a_:.4f},{b_:.4f})'")
+        chains.append(src_lab + (",".join(post) + "," if post else "") + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS,settb=AVTB[{base}v]")
+        take_v.append((f"[{base}v]", nf, t.get("xf", 0), tr))
+        take_a.append(f"[{base}a]")
+    # fold takes: concat, or a real crossfade where planned
+    cur_v, cur_a, cur_len = take_v[0][0], take_a[0], take_v[0][1]
+    for i in range(1, len(take_v)):
+        lab, nf, xf, tr = take_v[i]
+        pxf = take_v[i - 1][2]
+        if tr == "crossfade" and pxf:
+            chains.append(f"{cur_v}{lab}xfade=transition=fade:duration={pxf / OUT_FPS:.4f}:offset={(cur_len - pxf) / OUT_FPS:.4f},settb=AVTB[fv{i}]")
+            chains.append(f"{cur_a}{take_a[i]}acrossfade=d={pxf / OUT_FPS:.4f}:c1=tri:c2=tri[fa{i}]")
+            cur_len = cur_len - pxf + nf
+        else:
+            if pxf:                                          # planned xfade dropped: trim the run-on again
+                chains.append(f"{cur_v}trim=end_frame={cur_len - pxf},setpts=PTS-STARTPTS,settb=AVTB[pv{i}]")
+                chains.append(f"{cur_a}atrim=duration={(cur_len - pxf) / OUT_FPS:.4f}[pa{i}]")
+                cur_v, cur_a, cur_len = f"[pv{i}]", f"[pa{i}]", cur_len - pxf
+            chains.append(f"{cur_v}{cur_a}{lab}{take_a[i]}concat=n=2:v=1:a=1[fv{i}x][fa{i}]")
+            chains.append(f"[fv{i}x]settb=AVTB[fv{i}]")
+            cur_len += nf
+        cur_v, cur_a = f"[fv{i}]", f"[fa{i}]"
+    if take_v[-1][2]:
+        chains.append(f"{cur_v}trim=end_frame={cur_len - take_v[-1][2]},setpts=PTS-STARTPTS[fvz]")
+        chains.append(f"{cur_a}atrim=duration={(cur_len - take_v[-1][2]) / OUT_FPS:.4f}[faz]")
+        cur_v, cur_a = "[fvz]", "[faz]"
     D = plan["duration"]
-    sidx = k
-    inputs += ["-ss", f"{plan['song']['start_t']:.3f}", "-t", f"{D + 0.6:.3f}", "-i", plan["song"]["path"]]
-    chains.append("".join(vl) + f"concat=n={k}:v=1:a=1[vc][gc]")
-    chains.append(f"[vc]{'scale=1280:720:flags=bicubic,' if preview else ''}fade=t=out:st={max(0, D - 1.5):.3f}:d=1.5,format=yuv420p[vout]")
-    chains.append(f"[{sidx}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[sg]")
+    fo = float(plan["song"].get("fade_out_start", max(0.0, D - 2.0)))
+    fo_v = min(D - 0.3, fo + 0.3) if plan.get("ending") else fo
+    g = plan.get("grade") or {}
+    grade = (f"eq=contrast={g.get('contrast', 1):.3f}:saturation={g.get('saturation', 1):.3f}:gamma={g.get('gamma', 1):.3f},"
+             f"colorbalance=rs={g.get('rs', 0):.3f}:bs={g.get('bs', 0):.3f}:rh={g.get('rs', 0) / 2:.3f}:bh={g.get('bs', 0) / 2:.3f},") \
+        if g and "grade" in fx else ""
+    chains.append(f"{cur_v}{grade}{'scale=1280:720:flags=bicubic,' if preview else ''}fade=t=in:st=0:d={FADE_IN_V},"
+                  f"fade=t=out:st={fo_v:.3f}:d={max(0.3, D - fo_v):.3f},format=yuv420p[vout]")
+    sidx = len([x for x in inputs if x == "-i"])
+    inputs += ["-i", plan["song"]["path"]]
+    kills = [t["out_start"] + ko for t in takes for ko in t["kills_out"] if 0 <= ko <= t["dur"]]
+    gduck = 10 ** (-duck / 20)
+    dk = _sum_expr([f"max(0,min(1,(t-{x - 0.12:.3f})/0.06))*max(0,min(1,({x + 0.45:.3f}-t)/0.2))" for x in kills])
+    mf = float(plan["song"].get("music_fade_in", 0.75))
+    chains.append(f"[{sidx}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=N/SR/TB,"
+                  f"atrim=start={plan['song']['start_t']:.6f}:duration={D + 0.05:.4f},asetpts=PTS-STARTPTS,"
+                  f"volume='1-{1 - gduck:.4f}*min(1,{dk})':eval=frame,afade=t=in:st=0:d={mf:.3f}[sg]")
     mix = "amix=inputs=2:duration=longest:normalize=0" if amix_has_normalize() else "amix=inputs=2:duration=longest,volume=2"
-    chains.append(f"[sg][gc]{mix},alimiter=limit=0.97,atrim=duration={D:.3f},afade=t=out:st={max(0, D - 2):.3f}:d=2[aout]")
+    lim = "alimiter=limit=0.95:level=disabled:latency=1" if _alimiter_latency() else "alimiter=limit=0.95:level=disabled:attack=0.1"
+    chains.append(f"[sg]{cur_a}{mix},{lim},atrim=duration={D:.4f},"
+                  f"afade=t=out:st={fo:.3f}:d={max(0.3, D - fo):.3f}[aout]")
     return inputs, ";\n".join(chains)
 
 
@@ -2428,7 +3528,8 @@ def enc_args(maxq, preview, nvenc):
     elif maxq:
         v = ["-c:v", "libx264", "-crf", "15", "-preset", "slow"]
     elif nvenc:
-        v = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", "18", "-b:v", "0", "-rc-lookahead", "32"]
+        v = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", "16", "-b:v", "0", "-maxrate", "120M",
+             "-bufsize", "240M", "-spatial-aq", "1", "-aq-strength", "8", "-rc-lookahead", "32", "-profile:v", "high"]
     else:
         v = ["-c:v", "libx264", "-crf", "17", "-preset", "medium"]
     return v + ["-pix_fmt", "yuv420p", "-r", "60", "-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-movflags", "+faststart"]
@@ -2453,8 +3554,8 @@ def _run_ffmpeg(cmd, D, elog):
     return pr.returncode
 
 
-def render_plan(plan, outfile, cfg, maxq=False, preview=False):
-    """Encode with all effects; if ffmpeg fails, retry without the failing effect, then without all effects."""
+def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None):
+    """Encode with all effects; if ffmpeg fails, retry without the failing effect, then without all effects. NVENC -> x264."""
     outfile = Path(outfile)
     outfile.parent.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -2462,8 +3563,8 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False):
     bad = verify_cutlist(p)
     if bad:
         raise RuntimeError("cut list problem, not rendering: " + "; ".join(bad))
-    D = min(p["duration"], 20.0) if preview else p["duration"]
-    nvenc = ff_has("encoders", "h264_nvenc")
+    D = p["duration"]
+    nvenc = ff_has("encoders", "h264_nvenc") if encoder is None else encoder == "nvenc"
     tmp = outfile.with_name(outfile.stem + ".part.mp4")
     elog = LOG_DIR / "last_render_stderr.txt"
     gp = LOG_DIR / "last_filter.txt"
@@ -2474,8 +3575,8 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False):
         txt = ""
         for use_nv in ((nvenc, False) if nvenc else (False,)):
             cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"] + inputs +
-                   ["-filter_complex_script", str(gp), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.3f}"] +
-                   enc_args(maxq, preview, use_nv) + [str(tmp)])
+                   ["-filter_complex_script", str(gp), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.4f}"] +
+                   enc_args(maxq, preview, use_nv) + (["-preset", "veryfast"] if encoder == "fast" else []) + [str(tmp)])
             rc = _run_ffmpeg(cmd, D, elog)
             if CANCEL.is_set():
                 raise RuntimeError("cancelled")
@@ -2492,8 +3593,10 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False):
         if not fx:
             break
         low = txt.lower()
-        culprit = next((n for key, n in (("zoompan", "zoom"), ("drawbox", "flash"), ("framerate", "slow"), ("atempo", "slow"))
-                        if key in low and n in fx), None) or next(n for n in FX_ALL if n in fx)
+        culprit = next((n for key, n in (("overlay", "zoom"), ("xfade", "transition"), ("gblur", "transition"), ("eq", "flash"),
+                                         ("colorbalance", "grade"), ("framerate", "slow"), ("tpad", "freeze"), ("atempo", "slow"),
+                                         ("crop", "shake")) if key in low and n in fx), None) or \
+            next(n for n in ("transition", "shake", "zoom", "flash", "grade", "freeze", "slow") if n in fx)
         failed.append(culprit)
         fx.discard(culprit)
         out(f"effect '{culprit}' failed - retrying without it" + ("" if fx else " (no effects left)"))
@@ -2501,7 +3604,7 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False):
 
 
 def sync_report(plan, outfile, cfg):
-    """Runs the kill detector on the finished montage; each kill vs the nearest beat, in ms (target < 40 ms)."""
+    """Runs the kill detector on the finished montage; each first kill vs its planned beat, plus every effect and drop."""
     import numpy as np
     game = plan["game"]
     det = load_dets(game).get(game)
@@ -2511,44 +3614,81 @@ def sync_report(plan, outfile, cfg):
     rec = probe_video(str(outfile))
     rec.update(path=str(outfile), game=game, bars=False)
     entry = scan_clip(str(outfile), rec, det, cfg)
-    seen, _ = compute_kills(entry, cfg)
-    seen = [k["t"] for k in seen]
-    beats = np.array(plan["beats_out"])
-    rows, errs_first, errs_all = [], [], []
+    seen = [k["t"] for k in analyse_entry(entry, cfg)["kills"]]
+    beats = np.array(plan["beats_out"]) if plan["beats_out"] else np.zeros(1)
+    errs = []
+    out(f"SYNC REPORT  recipe {plan['recipe']}  seed {plan['seed']}  lock level {plan['lock']}  "
+        f"drops at {', '.join(f'{d:.2f}s' for d in plan['drops_out']) or '-'}")
     for i, t in enumerate(plan["takes"], 1):
-        cb = int(np.argmin(np.abs(beats - t["f0"] / OUT_FPS)))
-        rows.append(f"  take {i:2}: CUT at {t['f0'] / OUT_FPS:7.3f}s = beat #{t['beat0']} [song beat {t['song_beat']}], "
-                    f"nearest beat #{cb} error {(t['f0'] / OUT_FPS - beats[cb]) * 1000:+.0f} ms, {t['beat_end'] - t['beat0']} beats")
-        for j, ko in enumerate(t["kills_out"]):
-            tp = t["f0"] / OUT_FPS + ko
-            kb = int(np.argmin(np.abs(beats - tp)))
-            err = (tp - beats[kb]) * 1000
-            lag = t["lags"][j] if j < len(t["lags"]) else 0.1
-            m = [x for x in seen if abs(x - (tp + lag)) < 0.45]
-            drift = (min(m, key=lambda x: abs(x - (tp + lag))) - (tp + lag)) * 1000 if m else None
-            errs_all.append(abs(err))
-            if j == 0:
-                errs_first.append(abs(err))
-            rows.append(f"  take {i:2} kill {j + 1}: at {tp:7.3f}s  nearest beat #{kb} ({beats[kb]:7.3f}s)  error {err:+6.0f} ms"
-                        f"{' (first kill, on beat by design)' if j == 0 else ' (nudged)' if t['snapped'] else ''}"
-                        f"   detector saw the row {'%+.0f ms vs plan' % drift if drift is not None else 'NOT FOUND'}")
-    out("SYNC REPORT (planned kill times on the output timeline vs beats; detector drift is +-33 ms resolution)")
-    for r in rows:
-        out(r)
-    out("  effects (placed through the same source->output map as the kills):")
-    for i, t in enumerate(plan["takes"], 1):
-        for kind, vals in (("zoom", t["pulses"]), ("flash", [t["flash"]] if t["flash"] is not None else []),
-                           ("slow-mo start", [t["slow_at"]] if t.get("slow_at") is not None else [])):
+        tp = t["out_start"] + t["kills_out"][0]
+        kb = int(np.argmin(np.abs(beats - tp)))
+        err = (tp - beats[kb]) * 1000
+        if t["locked"]:
+            errs.append(abs(err))
+        m = [x for x in seen if abs(x - tp) < 0.45]
+        drift = (min(m, key=lambda x: abs(x - tp)) - tp) * 1000 if m else None
+        out(f"  take {i:2} [{t['section']:9}] cut {t['out_start']:7.3f}s  first kill {tp:7.3f}s  nearest beat {beats[kb]:7.3f}s "
+            f"error {err:+5.0f} ms {'(locked)' if t['locked'] else '(free)'}  detector {'%+.0f ms' % drift if drift is not None else 'NOT FOUND (15 fps scan)'}"
+            f"  trans {t['trans']}")
+        for kind, vals in (("zoom", [z[0] for z in t["zoom"]]), ("shake", [s[0] for s in t["shake"]]),
+                           ("flash", [f[0] for f in t["flash_at"]]), ("slow/freeze", [t["slow_at"]] if t.get("slow_at") is not None else [])):
             for v in vals:
-                tp = t["f0"] / OUT_FPS + v
-                kb = int(np.argmin(np.abs(beats - tp)))
-                near = min(abs(tp - (t["f0"] / OUT_FPS + ko)) for ko in t["kills_out"]) * 1000
-                out(f"    take {i:2} {kind:13} at {tp:7.3f}s  nearest beat #{kb} error {(tp - beats[kb]) * 1000:+5.0f} ms"
-                    f"   ({near:.0f} ms from the nearest kill)")
-    ok = sum(1 for e in errs_all if e < 40)
-    okf = sum(1 for e in errs_first if e < 40)
-    out(f"SYNC SUMMARY: first kills within 40 ms of a beat: {okf}/{len(errs_first)}; all kills: {ok}/{len(errs_all)}; "
-        f"detector found {len(seen)} kill rows in the montage for {len(errs_all)} planned kills")
+                tq = t["out_start"] + v
+                kb = int(np.argmin(np.abs(beats - tq)))
+                out(f"        {kind:11} at {tq:7.3f}s  nearest beat error {(tq - beats[kb]) * 1000:+5.0f} ms")
+    out(f"SYNC SUMMARY: locked first kills within 17 ms of a beat: {sum(1 for e in errs if e <= 17)}/{len(errs)}; "
+        f"detector found {len(seen)} kill rows for {sum(t['n'] for t in plan['takes'])} planned kills")
+
+
+def quality_check(plan, outfile, cfg, preview=False):
+    """SSIM of the rendered frames vs the source frames on one effect-free stretch (1.0x, no zoom/shake/flash/transition,
+    away from the fades). Target >= 0.97. Returns the value (or None when no clean stretch exists)."""
+    takes = plan["takes"]
+    D = plan["duration"]
+    fo = plan["song"].get("fade_out_start", D)
+    best = None
+    for t in sorted(takes, key=lambda t: (t["trans"] != "hard", bool(t["zoom"]))):
+        off = 0
+        for sg in t["segs"]:
+            a, b, sp, n = sg[:4]
+            if sp == 1.0 and n >= 30:
+                busy = [z[0] for z in t["zoom"]] + [s_[0] for s_ in t["shake"]] + [f[0] for f in t["flash_at"]]
+                for start in (off / OUT_FPS + 0.45, off / OUT_FPS + 0.8):
+                    seg_end = (off + n) / OUT_FPS
+                    if start + 0.5 > seg_end or any(start - 0.5 < x < start + 0.6 for x in busy) or start < 0.2:
+                        continue
+                    g0 = t["out_start"] + start
+                    if g0 < FADE_IN_V + 0.1 or g0 + 0.5 > fo - 0.05:
+                        continue
+                    src = (t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"]}])[sg[4] if len(sg) > 4 else 0]
+                    best = (g0, a + (start - off / OUT_FPS) - src["shift"], src)
+                    break
+            if best:
+                break
+            off += n
+        if best:
+            break
+    if not best:
+        out("QUALITY CHECK: no effect-free stretch to compare (all takes carry effects)")
+        return None
+    g0, s0, src = best
+    cx, cy, cw, ch = src["rect"]
+    crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, src["wh"][0], src["wh"][1]] else ""
+    size = "1280:720" if preview else "1920:1080"
+    ref = f"{crop}scale={size}:flags=lanczos," if (crop or preview or list(src["wh"]) != [1920, 1080]) else ""
+    r = run(["ffmpeg", "-hide_banner", "-ss", f"{g0:.4f}", "-t", "0.5", "-i", str(outfile), "-ss", f"{max(0.0, s0):.4f}", "-t", "0.5",
+             "-i", src["path"], "-filter_complex",
+             f"[0:v]setpts=PTS-STARTPTS,format=yuv420p[a];[1:v]{ref}fps=60,setpts=PTS-STARTPTS,format=yuv420p[b];[a][b]ssim",
+             "-f", "null", "-"], timeout=120)
+    m = re.findall(r"SSIM Y:([\d.]+).*?All:([\d.]+)", r.stderr.decode(errors="replace"))
+    if not m:
+        out("QUALITY CHECK: could not measure SSIM")
+        return None
+    y, al = float(m[-1][0]), float(m[-1][1])
+    out(f"QUALITY CHECK: SSIM {al:.4f} (luma {y:.4f}) output vs source on an effect-free stretch at {g0:.2f}s "
+        f"({Path(src['path']).name} @ {s0:.2f}s) - {'OK (>= 0.97)' if al >= 0.97 else 'BELOW 0.97 - check encoder settings'}")
+    plan["ssim"] = round(al, 4)
+    return al
 
 
 # ======================================================================= ORCHESTRATION
@@ -2567,15 +3707,14 @@ def weekly_existing(cfg, game, now=None):
     return sorted(d.glob(pat)) if d.is_dir() else []
 
 
-def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None):
+def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None):
     cfg = autodetect_dirs(cfg)
     if not load_dets(game).get(game):
         raise RuntimeError("OCR detector unavailable: Troubleshoot > Selfcheck (pip install rapidocr-onnxruntime)")
     tagged = [r for r in scan_clips(cfg) if r.get("game") == game]
     if not tagged:
-        inc = cfg["include_valorant"] if game == "valorant" else cfg["include_cs"]
-        raise RuntimeError(f"No {game} clips found: no folder under {cfg['clip_root']} has a name containing {inc} "
-                           f"(or clips are over {cfg['max_mb']} MB / {cfg['max_dur_s']} s). Check Settings.")
+        raise RuntimeError(f"No {game} clips found in {[d for d, _ in clip_dirs(cfg, game)]} "
+                           f"(or clips are over {cfg['max_mb']} MB / {cfg['max_dur_s']} s). Check Settings > clip folders.")
     manual = paths is not None
     if paths is None:
         paths = auto_scan_set(cfg, game)
@@ -2591,11 +3730,13 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
                            f"({au['raw']} found, {au['death_lock']} dropped after my death; rejected rows are listed above with their reasons). "
                            "Run Troubleshoot > Self-test detection to see the scores, or scan more clips.")
     seed = int(seed) if seed else random.randrange(1, 10 ** 6)
-    events = build_events(pool, game, cfg, random.Random(seed))
+    events, notes = build_events(pool, game, cfg, random.Random(seed))
+    if not events:
+        raise RuntimeError("no usable kill events (knife / utility kills are excluded)")
     songs, unmatched, csvname = song_pool(cfg)
     song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path)
-    notes = []
-    plan = plan_montage(cfg, game, events, song, an, seed, style, target or cfg.get("length_s", 85), hist_list(USED_CLIPS, game), notes)
+    plan = plan_montage(cfg, game, events, song, an, seed, style, target or cfg.get("length_s", 85), hist_list(USED_CLIPS, game),
+                        notes, lock=lock)
     plan["song_score"] = sinfo
     LAST_PLAN[game] = plan
     return plan, fmt_plan(plan, events, sinfo, runners, unmatched, csvname)
@@ -2614,7 +3755,7 @@ def record_history(plan):
 
 
 def run_job(game, mode="render", force=False, paths=None, song_path=None, target=None, style=None,
-            seed=None, maxq=None, weekly=False):
+            seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None):
     """mode: dry | preview | render. weekly=True is Auto. Always prints a plan or a plain-language reason."""
     try:
         cfg = load_config()
@@ -2627,7 +3768,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
                 out(f"{game}: this week's montage already exists ({ex[0].name}). Use 'Force new' to make another.")
                 return None
         out(f"== {game} / {mode} ==")
-        plan, text = make_plan(cfg, game, paths, song_path, target, style, seed)
+        plan, text = make_plan(cfg, game, paths, song_path, target, style, seed, lock)
         out(text)
         plans = DATA / "plans"
         plans.mkdir(parents=True, exist_ok=True)
@@ -2639,9 +3780,16 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             return plan
         odir = Path(cfg["output_root"]) / GAME_DIR[game]
         if mode == "preview":
-            return render_plan(plan, odir / f"preview_{GAME_DIR[game]}.mp4", cfg, maxq, True)
-        outfile = odir / (base + ".mp4")
-        render_plan(plan, outfile, cfg, maxq, False)
+            pv = render_plan(plan, odir / f"preview_{GAME_DIR[game]}.mp4", cfg, maxq, True, encoder)
+            quality_check(slice_plan(plan), pv, cfg, preview=True)
+            return pv
+        outfile = Path(outfile) if outfile else odir / (base + ".mp4")
+        odir.mkdir(parents=True, exist_ok=True)
+        render_plan(plan, outfile, cfg, maxq, False, encoder)
+        try:
+            quality_check(plan, outfile, cfg)
+        except Exception as ex:
+            out(f"quality check skipped: {ex}")
         (odir / (base + ".plan.txt")).write_text(text, encoding="utf-8")
         save_json(odir / (base + ".plan.json"), plan)
         record_history(plan)
@@ -2900,7 +4048,7 @@ class CalibDialog:
         self.scale.bind("<ButtonRelease-1>", lambda e: self.load_frame())
         self.msg = tk.StringVar(value="Open a clip (scrub to a moment with killfeed rows) or a screenshot, then drag a box around the "
                                       "WHOLE killfeed area. Yellow = current region.")
-        ttk.Label(self.win, textvariable=self.msg, font=("Segoe UI", 10, "bold"), wraplength=1260).pack(anchor="w", padx=6)
+        ttk.Label(self.win, textvariable=self.msg, font=("Segoe UI", F(10), "bold"), wraplength=1260).pack(anchor="w", padx=6)
         self.cv = tk.Canvas(self.win, width=1280, height=720, bg="#222", highlightthickness=1, highlightbackground="#888")
         self.cv.pack(padx=6, pady=6)
         self.cv.bind("<ButtonPress-1>", self.press)
@@ -3014,7 +4162,15 @@ PALETTES = {
 }
 
 
-def apply_theme(root, mode="light"):
+UI_SCALE = [1.0]
+
+
+def F(size):
+    """Font size scaled by Settings > UI scale."""
+    return max(7, int(round(size * UI_SCALE[0])))
+
+
+def apply_theme(root, mode="light", scale=None):
     """Light by default (clear contrast: visible borders on buttons and inputs, clear selection and checkbox colours).
     'dark' is optional in Settings; 'auto' follows Windows."""
     dark = mode == "dark"
@@ -3026,26 +4182,28 @@ def apply_theme(root, mode="light"):
         except Exception:
             dark = False
     pal = dict(PALETTES["dark" if dark else "light"])
+    if scale:
+        UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
     st = ttk.Style(root)
     st.theme_use("clam")
     root.configure(bg=pal["bg"])
-    root.option_add("*Font", ("Segoe UI", 10))
+    root.option_add("*Font", ("Segoe UI", F(10)))
     root.option_add("*TCombobox*Listbox.background", pal["field"])
     root.option_add("*TCombobox*Listbox.foreground", pal["fg"])
     root.option_add("*TCombobox*Listbox.selectBackground", pal["acc"])
     root.option_add("*TCombobox*Listbox.selectForeground", pal["acc_fg"])
-    st.configure(".", background=pal["bg"], foreground=pal["fg"], fieldbackground=pal["field"], font=("Segoe UI", 10),
+    st.configure(".", background=pal["bg"], foreground=pal["fg"], fieldbackground=pal["field"], font=("Segoe UI", F(10)),
                  bordercolor=pal["border"], lightcolor=pal["bg"], darkcolor=pal["bg"], troughcolor=pal["head"],
                  selectbackground=pal["sel"], selectforeground=pal["sel_fg"], insertcolor=pal["fg"], focuscolor=pal["acc"])
-    st.configure("Treeview", background=pal["field"], fieldbackground=pal["field"], foreground=pal["fg"], rowheight=24,
+    st.configure("Treeview", background=pal["field"], fieldbackground=pal["field"], foreground=pal["fg"], rowheight=int(24 * UI_SCALE[0]),
                  bordercolor=pal["border"], borderwidth=1)
     st.map("Treeview", background=[("selected", pal["sel"])], foreground=[("selected", pal["sel_fg"])])
-    st.configure("Treeview.Heading", background=pal["head"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"), padding=5,
+    st.configure("Treeview.Heading", background=pal["head"], foreground=pal["fg"], font=("Segoe UI", F(10), "bold"), padding=5,
                  bordercolor=pal["border"], relief="raised")
     st.configure("TLabelframe", background=pal["bg"], bordercolor=pal["border"], padding=8, relief="solid", borderwidth=1)
-    st.configure("TLabelframe.Label", background=pal["bg"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"))
+    st.configure("TLabelframe.Label", background=pal["bg"], foreground=pal["fg"], font=("Segoe UI", F(10), "bold"))
     st.configure("TNotebook", background=pal["bg"], borderwidth=1, bordercolor=pal["border"])
-    st.configure("TNotebook.Tab", background=pal["head"], foreground=pal["fg"], padding=(16, 7), font=("Segoe UI", 10, "bold"),
+    st.configure("TNotebook.Tab", background=pal["head"], foreground=pal["fg"], padding=(16, 7), font=("Segoe UI", F(10), "bold"),
                  bordercolor=pal["border"])
     st.map("TNotebook.Tab", background=[("selected", pal["acc"])], foreground=[("selected", pal["acc_fg"])])
     st.configure("TButton", padding=(10, 5), background=pal["btn"], foreground=pal["fg"], bordercolor=pal["border"],
@@ -3068,6 +4226,107 @@ def apply_theme(root, mode="light"):
     return pal
 
 
+SECTION_COLORS = {"intro": "#9db4d6", "verse": "#a8d5a2", "build": "#f2c46d", "drop": "#ef6f6c", "breakdown": "#b49ad8",
+                  "outro": "#9fa6ad", "": "#cccccc"}
+
+
+class SongMapView:
+    """Songs tab > Song map: waveform, energy curve, beat + downbeat ticks, coloured sections, drops and accents."""
+    def __init__(self, app, path, csv_bpm=None):
+        self.app, self.path, self.an, self.zoom = app, path, None, 1
+        self.win = tk.Toplevel(app.root)
+        self.win.title(f"Song map - {Path(path).name}")
+        self.win.configure(bg=app.pal["bg"])
+        top = ttk.Frame(self.win)
+        top.pack(fill="x", padx=6, pady=4)
+        self.info = tk.StringVar(value="analysing (cached after the first time) ...")
+        ttk.Label(top, textvariable=self.info, wraplength=1100).pack(side="left")
+        self.zv = tk.StringVar(value="1x")
+        cb = ttk.Combobox(top, textvariable=self.zv, values=["1x", "2x", "4x", "8x"], width=5, state="readonly")
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.draw())
+        ttk.Label(top, text="Zoom").pack(side="right", padx=4)
+        fr = ttk.Frame(self.win)
+        fr.pack(fill="both", expand=True, padx=6, pady=4)
+        self.cv = tk.Canvas(fr, width=1300, height=int(360 * UI_SCALE[0]), bg="#ffffff" if app.pal["bg"] != PALETTES["dark"]["bg"] else "#1e1f22",
+                            highlightthickness=1, highlightbackground=app.pal["border"])
+        sb = ttk.Scrollbar(fr, orient="horizontal", command=self.cv.xview)
+        self.cv.configure(xscrollcommand=sb.set)
+        self.cv.pack(fill="both", expand=True)
+        sb.pack(fill="x")
+        leg = ttk.Frame(self.win)
+        leg.pack(fill="x", padx=6, pady=2)
+        for k in ("intro", "verse", "build", "drop", "breakdown", "outro"):
+            tk.Label(leg, text=f"  {k}  ", bg=SECTION_COLORS[k], fg="#111").pack(side="left", padx=2)
+        ttk.Label(leg, text="   red line = drop   | tall tick = downbeat   | dot = accent (filled = bass hit)   | line = energy").pack(side="left")
+        self.cv.bind("<Configure>", lambda e: self.draw())
+
+        def work():
+            try:
+                an = analyse_song(path, csv_bpm)
+                self.app.q.put(("call", lambda: self.show(an)))
+            except Exception as ex:
+                msg = f"song map failed: {ex}"
+                self.app.q.put(("call", lambda: self.info.set(msg)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def show(self, an):
+        self.an = an
+        drops = ", ".join(f"{ts(d['t'])} ({d['strength']:.2f})" for d in an.get("drops", [])) or "none"
+        self.info.set(f"BPM {an['bpm']} ({an.get('bpm_src')}, librosa {an.get('bpm_librosa')}, agree {an.get('librosa_agree_ms')} ms)   "
+                      f"beats {len(an['beats'])}   rhythm {an.get('rhythm')}   loudness {an.get('lufs')} LUFS   drops: {drops}   "
+                      f"sections: {' > '.join(s['label'] for s in an.get('sections', []))}")
+        self.draw()
+
+    def draw(self):
+        if not self.an or not self.cv.winfo_exists():
+            return
+        an, cv = self.an, self.cv
+        cv.delete("all")
+        z = int(self.zv.get().rstrip("x") or 1)
+        W = max(400, cv.winfo_width() - 4) * z
+        H = max(200, cv.winfo_height() - 4)
+        dur = an["dur"]
+        X = lambda t: 2 + t / dur * W
+        cv.configure(scrollregion=(0, 0, W + 4, H))
+        top, mid = 18, H * 0.45
+        for sct in an.get("sections", []):
+            cv.create_rectangle(X(sct["start_t"]), top, X(sct["end_t"]), H - 18, fill=SECTION_COLORS.get(sct["label"], "#ccc"), outline="")
+            cv.create_text(X(sct["start_t"]) + 4, top + 2, text=sct["label"], anchor="nw", font=("Segoe UI", F(9), "bold"), fill="#111")
+        wave = an.get("wave") or []
+        if wave:
+            mx = max(wave) or 1
+            pts = []
+            for i, v in enumerate(wave):
+                t = (i + 0.5) / len(wave) * dur
+                pts.append((X(t), mid - v / mx * (mid - top - 18), mid + v / mx * (mid - top - 18)))
+            for x, a, b in pts:
+                cv.create_line(x, a, x, b, fill="#3d5a80")
+        en = an.get("energy") or []
+        bt = an["beats"]
+        if en:
+            pts = []
+            for t, e in zip(bt, en):
+                pts += [X(t), H - 22 - e * (H * 0.35)]
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill="#d1495b", width=2)
+        down = set(an.get("down", []))
+        for i, t in enumerate(bt):
+            x = X(t)
+            if i in down:
+                cv.create_line(x, H - 18, x, H - 4, fill="#111", width=2)
+            elif z >= 2:
+                cv.create_line(x, H - 12, x, H - 4, fill="#555")
+        for t, s_, bass in an.get("accents", [])[:800]:
+            r = 2 + min(4, s_ / 4)
+            cv.create_oval(X(t) - r, top + 20 - r, X(t) + r, top + 20 + r, outline="#222", fill="#222" if bass else "")
+        for d in an.get("drops", []):
+            cv.create_line(X(d["t"]), top, X(d["t"]), H - 18, fill="#d00000", width=3)
+            cv.create_text(X(d["t"]) + 3, H - 34, text=f"DROP {ts(d['t'])}", anchor="w", fill="#d00000", font=("Segoe UI", F(9), "bold"))
+        for s in range(0, int(dur) + 1, 10 if z == 1 else 5):
+            cv.create_text(X(s), H - 2, text=ts(s)[:-2], anchor="s", font=("Segoe UI", F(8)), fill="#444")
+
+
 def make_tree(parent, cols, height=10, **kw):
     """Treeview with a vertical scrollbar; returns (frame, tree)."""
     fr = ttk.Frame(parent)
@@ -3085,16 +4344,18 @@ class App:
     def __init__(self, start_tab=0, startup=True):
         self.root = tk.Tk()
         self.root.title("Montage builder (Valorant / CS2)")
-        self.root.geometry("1220x920")
+        sc = UI_SCALE[0]
+        self.root.geometry(f"{min(int(1220 * sc), self.root.winfo_screenwidth())}x{min(int(920 * sc), self.root.winfo_screenheight() - 60)}")
         self.root.minsize(920, 640)
         self.q, self.busy, self.buttons, self._imgs, self.pending = queue.Queue(), False, [], [], []
         self.named = {}                   # button registry (smoketest checks every required button)
+        self.sorts, self.sort_refill, self.sort_labels = {}, {}, {}
         self.clips, self.ticked, self.songs, self.bpm, self.last_video, self.byp = [], set(), [], {}, None, {}
         self._fill_token = {}
         LOG_SINK[0] = lambda m: self.q.put(("log", m))
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
-        self.pal = apply_theme(self.root, self.cfg.get("theme", "light"))
+        self.pal = apply_theme(self.root, self.cfg.get("theme", "light"), self.cfg.get("ui_scale", 1.0))
         self.last_click = None
         # bottom area first so the notebook can expand above it
         bot = ttk.Frame(self.root)
@@ -3119,7 +4380,7 @@ class App:
         lf = ttk.Frame(bot)
         lf.pack(fill="x")
         self.log = tk.Text(lf, height=8, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"],
-                           relief="solid", bd=1, highlightthickness=0, padx=8, pady=6, font=("Consolas", 10),
+                           relief="solid", bd=1, highlightthickness=0, padx=8, pady=6, font=("Consolas", F(10)),
                            selectbackground=self.pal["sel"], selectforeground=self.pal["sel_fg"])
         lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=lsb.set)
@@ -3151,7 +4412,7 @@ class App:
 
     def btn(self, parent, text, cmd, big=False, name=None, **kw):
         if big:
-            b = tk.Button(parent, text=text, command=self.safe(cmd), font=("Segoe UI", 12, "bold"), height=2, bg=self.pal["acc"],
+            b = tk.Button(parent, text=text, command=self.safe(cmd), font=("Segoe UI", F(12), "bold"), height=2, bg=self.pal["acc"],
                           fg=self.pal["acc_fg"], activebackground=self.pal["btn_act"], activeforeground=self.pal["fg"],
                           disabledforeground="#d0d6de", relief="raised", bd=2, highlightthickness=1,
                           highlightbackground=self.pal["border"], cursor="hand2", padx=14, **kw)
@@ -3286,7 +4547,7 @@ class App:
         f = self.tabs["Auto"]
         ttk.Label(f, text="One montage per game per week from all your clips - nothing to pick. Kills are read from the killfeed "
                           "with OCR (no calibration needed; the killfeed region can be adjusted in Troubleshoot).",
-                  font=("Segoe UI", 10), wraplength=1100).pack(anchor="w", padx=8, pady=4)
+                  font=("Segoe UI", F(10)), wraplength=1100).pack(anchor="w", padx=8, pady=4)
         self.auto_status = {}
         for g in GAMES:
             lf = ttk.LabelFrame(f, text=GAME_DIR[g])
@@ -3360,11 +4621,11 @@ class App:
         self.m_seed = tk.StringVar()
         ttk.Entry(c3, textvariable=self.m_seed, width=8).pack(side="left")
         self.m_status = tk.StringVar(value="Tick some clips.")
-        ttk.Label(s3, textvariable=self.m_status, font=("Segoe UI", 10, "bold"), wraplength=1100).pack(anchor="w", pady=2)
+        ttk.Label(s3, textvariable=self.m_status, font=("Segoe UI", F(10), "bold"), wraplength=1100).pack(anchor="w", pady=2)
         mid = ttk.Frame(f)                                         # grid: steps 1 and 2 shrink instead of being cut off
         mid.pack(side="top", fill="both", expand=True)
         mid.columnconfigure(0, weight=1)
-        mid.rowconfigure(0, weight=3)
+        mid.rowconfigure(0, weight=5)
         mid.rowconfigure(1, weight=2)
         s1 = ttk.LabelFrame(mid, text="Step 1 - tick the clips (click a row to tick it)")
         s1.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
@@ -3407,11 +4668,12 @@ class App:
         self.btn(top3, "Reload list", lambda: self.run_task("clips", self.load_clips)).pack(side="left", padx=3)
         self.btn(top3, "Exclude ticked from montages", self.exclude_sel).pack(side="left", padx=3)
         ttk.Label(top3, text="(Shift+click ticks a range)").pack(side="left", padx=10)
-        fr, self.ctree = make_tree(s1, ("date", "len", "kills"), height=7, selectmode="none")
+        fr, self.ctree = make_tree(s1, ("date", "len", "kills"), height=12, selectmode="none")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 430, "clip"), ("date", 110, "date"), ("len", 70, "length"), ("kills", 110, "kills")):
             self.ctree.column(c, width=w, minwidth=60, stretch=(c == "#0"))
             self.ctree.heading(c, text=t)
+        self.make_sortable(self.ctree, self.apply_filter, {"#0": "clip", "date": "date", "len": "length", "kills": "kills"})
         self.ctree.bind("<Button-1>", self.on_tree_click)
         s2 = ttk.LabelFrame(mid, text="Step 2 - choose the song (newest added first)")
         s2.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
@@ -3422,6 +4684,7 @@ class App:
         self.m_search.trace_add("write", lambda *a: self.refresh_songs())
         ttk.Entry(r2, textvariable=self.m_search, width=30).pack(side="left", padx=4)
         self.btn(r2, "Play selected song", self.play_song).pack(side="left", padx=8)
+        self.btn(r2, "Song map", self.map_song, name="Song map (Manual)").pack(side="left")
         fr2, self.stree = make_tree(s2, ("bpm", "added"), height=4, selectmode="browse")
         fr2.pack(fill="both", expand=True)
         self.stree.column("#0", width=520)
@@ -3430,9 +4693,12 @@ class App:
         self.stree.heading("#0", text="song")
         self.stree.heading("bpm", text="BPM")
         self.stree.heading("added", text="added")
+        self.make_sortable(self.stree, self.refresh_songs, {"#0": "song", "bpm": "BPM", "added": "added"})
         self.stree.bind("<<TreeviewSelect>>", lambda e: self.update_status())
 
     def on_tree_click(self, e):
+        if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
+            return None                                    # header click = sort
         iid = self.ctree.identify_row(e.y)
         if iid:
             if (e.state & 0x1) and self.last_click and self.ctree.exists(self.last_click):
@@ -3498,8 +4764,7 @@ class App:
                 mt = os.path.getmtime(r["path"])
             except OSError:
                 continue
-            rel = os.path.relpath(r["path"], cfg["clip_root"])
-            rows.append({"path": r["path"], "name": Path(r["path"]).name, "folder": str(Path(rel).parent), "mtime": mt,
+            rows.append({"path": r["path"], "name": Path(r["path"]).name, "folder": clip_folder(r["path"], cfg), "mtime": mt,
                          "dur": r.get("dur", 0), "kills": None if ks is None else len(ks), "ks": ks or []})
         rows.sort(key=lambda c: -c["mtime"])
         songs, _, _ = song_pool(load_config()) if load_config().get("mp3_dir") else ([], [], None)
@@ -3534,8 +4799,47 @@ class App:
             rows.append((c["path"], self.row_text(c["path"]),
                          (time.strftime("%Y-%m-%d", time.localtime(c["mtime"])), f"{int(c['dur'] // 60)}:{int(c['dur'] % 60):02d}",
                           "not scanned" if c["kills"] is None else str(c["kills"]))))
-        self.fill_chunked(self.ctree, rows)
+        self.fill_chunked(self.ctree, self.sorted_rows(self.ctree, rows))
         self.update_status()
+
+    # ------------------------------------------------------------ column sorting (click a header; click again to reverse)
+    def sort_key(self, tree, col, row):
+        iid, text, vals = row
+        cols = list(tree["columns"])
+        v = text if col == "#0" else (vals[cols.index(col)] if cols.index(col) < len(vals) else "")
+        v = str(v).strip()
+        if col == "#0":
+            return (1, 0.0, v.lstrip("\u2610\u2611\u2605 ").lower())
+        m = re.fullmatch(r"(\d+):(\d\d)", v)
+        if m:
+            return (0, int(m.group(1)) * 60 + int(m.group(2)), "")
+        try:
+            return (0, float(v), "")
+        except ValueError:
+            return (1, 0.0, v.lower()) if v and v != "not scanned" else (-1, 0.0, "")
+
+    def sorted_rows(self, tree, rows):
+        st = self.sorts.get(str(tree))
+        if not st:
+            return rows
+        col, desc = st
+        pinned = [r for r in rows if r[0] == "auto"]
+        rest = sorted([r for r in rows if r[0] != "auto"], key=lambda r: self.sort_key(tree, col, r), reverse=desc)
+        return pinned + rest
+
+    def make_sortable(self, tree, refill, labels):
+        self.sort_refill[str(tree)] = refill
+        self.sort_labels[str(tree)] = dict(labels)
+        for c in labels:
+            tree.heading(c, command=lambda c=c, tree=tree: self.sort_by(tree, c))
+
+    def sort_by(self, tree, col):
+        cur = self.sorts.get(str(tree))
+        desc = (not cur[1]) if cur and cur[0] == col else col in ("date", "kills", "bpm", "added", "score", "len")
+        self.sorts[str(tree)] = (col, desc)
+        for c, lab in self.sort_labels[str(tree)].items():
+            tree.heading(c, text=lab + ((" \u25bc" if desc else " \u25b2") if c == col else ""))
+        self.sort_refill[str(tree)]()
 
     def refresh_songs(self):
         q = self.m_search.get().strip().lower()
@@ -3546,7 +4850,7 @@ class App:
             rows.append((s["path"], f"{s['title']}  -  {s['artist']}" if s["artist"] else s["title"],
                          (self.song_bpm(s), s["added"].strftime("%Y-%m-%d") if s["added"] else "")))
         keep = self.stree.selection()
-        self.fill_chunked(self.stree, rows)
+        self.fill_chunked(self.stree, self.sorted_rows(self.stree, rows))
         self.root.after(50, lambda: self.stree.selection_set(keep[0]) if keep and self.stree.exists(keep[0]) else self.stree.selection_set("auto") if self.stree.exists("auto") else None)
 
     def song_bpm(self, s):
@@ -3640,6 +4944,7 @@ class App:
         self.btn(bar, "Change match for selected file...", self.change_match).pack(side="left", padx=3)
         self.btn(bar, "Play selected file", self.play_match).pack(side="left", padx=3)
         self.btn(bar, "Open song_matches.csv", lambda: self.open_path(DATA / "song_matches.csv")).pack(side="left", padx=3)
+        self.btn(bar, "Song map of selected file...", self.map_match).pack(side="left", padx=3)
         self.m_info = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
         fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "score", "flag"), height=18, selectmode="browse")
@@ -3648,6 +4953,8 @@ class App:
                         ("bpm", 60, "BPM"), ("score", 70, "score"), ("flag", 130, "flag")):
             self.mtree.column(c, width=w, minwidth=50, stretch=(c in ("#0", "track")))
             self.mtree.heading(c, text=t)
+        self.make_sortable(self.mtree, self.fill_matches, {"#0": "MP3 file", "track": "matched playlist track", "artist": "artist",
+                                                            "bpm": "BPM", "score": "score", "flag": "flag"})
         dark = self.pal["bg"] == PALETTES["dark"]["bg"]
         self.mtree.tag_configure("weak", foreground="#ffc65c" if dark else "#9a5b00")
         self.mtree.tag_configure("none", foreground="#ff8a80" if dark else "#c62828")
@@ -3669,12 +4976,38 @@ class App:
         weak = sum(1 for i in items if i[5] != "ok")
 
         def fill():
-            self.match_rows, self.match_audio = rows, audio
-            self.mtree.delete(*self.mtree.get_children())
-            for pth, nm, tr, ar, sc, fl, bpm in items:
-                self.mtree.insert("", "end", iid=pth, text=nm, values=(tr, ar, bpm, sc, fl), tags=("none" if fl == "NO MATCH" else "weak" if fl != "ok" else "",))
+            self.match_rows, self.match_audio, self.match_items = rows, audio, items
+            self.fill_matches()
             self.m_info.set(f"{len(audio)} MP3 files, {len(rows)} playlist tracks, {len(matched)} matched, {weak} to check, {len(unmatched)} playlist tracks without a file")
         self.q.put(("call", fill))
+
+    def fill_matches(self):
+        items = getattr(self, "match_items", [])
+        rows = self.sorted_rows(self.mtree, [(pth, nm, (tr, ar, bpm, sc, fl)) for pth, nm, tr, ar, sc, fl, bpm in items])
+        self.mtree.delete(*self.mtree.get_children())
+        for pth, nm, vals in rows:
+            fl = vals[4]
+            self.mtree.insert("", "end", iid=pth, text=nm, values=vals, tags=("none" if fl == "NO MATCH" else "weak" if fl != "ok" else "",))
+
+    def map_song(self):
+        sel = self.stree.selection()
+        if not sel or sel[0] == "auto":
+            messagebox.showinfo("Song map", "Select a song in the list first.")
+            return
+        s = next((x for x in self.songs if x["path"] == sel[0]), {})
+        return SongMapView(self, sel[0], s.get("csv_bpm"))
+
+    def map_match(self):
+        sel = self.mtree.selection()
+        if not sel:
+            messagebox.showinfo("Song map", "Select a file first (press Refresh if the list is empty).")
+            return
+        item = next((i for i in getattr(self, "match_items", []) if i[0] == sel[0]), None)
+        bpm = None
+        if item and item[2]:
+            r = next((r for r in self.match_rows if r["title"] == item[2] and r["artist"] == item[3]), None)
+            bpm = r.get("tempo") if r else None
+        return SongMapView(self, sel[0], bpm or None)
 
     def play_match(self):
         sel = self.mtree.selection()
@@ -3882,8 +5215,9 @@ class App:
     def build_settings(self):
         f = self.tabs["Settings"]
         self.sv = {}
-        r = 0
-        for k, lab in (("clip_root", "Clips folder (searched recursively)"), ("mp3_dir", "MP3 folder"),
+        self.btn(f, "Save settings", self.save_settings).grid(row=0, column=1, sticky="w", pady=6)
+        r = 1
+        for k, lab in (("mp3_dir", "MP3 folder"),
                        ("playlist_dir", "Exportify CSV folder"), ("output_root", "Output folder")):
             ttk.Label(f, text=lab).grid(row=r, column=0, sticky="w", padx=8, pady=4)
             v = tk.StringVar(value=self.cfg.get(k, ""))
@@ -3892,11 +5226,13 @@ class App:
             ttk.Button(f, text="Browse", command=lambda v=v: v.set(filedialog.askdirectory(initialdir=v.get() or None) or v.get())).grid(row=r, column=2)
             r += 1
         self.sl = {}
-        for k, lab in (("include_valorant", "Valorant folder names (comma separated)"), ("include_cs", "CS2 folder names (comma separated)")):
+        for g, lab in (("valorant", "Valorant clip folders (; separated)"), ("cs2", "CS2 clip folders (; separated)")):
             ttk.Label(f, text=lab).grid(row=r, column=0, sticky="w", padx=8, pady=4)
-            v = tk.StringVar(value=", ".join(self.cfg.get(k, [])))
-            self.sl[k] = v
+            v = tk.StringVar(value="; ".join((self.cfg.get("clip_dirs") or {}).get(g, [])))
+            self.sl[g] = v
             ttk.Entry(f, textvariable=v, width=70).grid(row=r, column=1, padx=4)
+            ttk.Button(f, text="Add folder", command=lambda v=v: v.set("; ".join([x for x in v.get().split(";") if x.strip()] +
+                                                                                   [filedialog.askdirectory() or ""]).strip("; "))).grid(row=r, column=2)
             r += 1
         self.sn = {}
         for k, lab in (("max_mb", "Skip files larger than (MB)"), ("max_dur_s", "Skip clips longer than (s)"),
@@ -3904,6 +5240,8 @@ class App:
                        ("auto_old_per_run", "Auto: plus up to this many older clips per run"),
                        ("name_match", "Detection: FIREAXE OCR fuzzy match needed (0-100)"),
                        ("death_lock_s", "No kills for this long after my death (s)"),
+                       ("game_under_music_db", "Game audio: dB under the music (after per-clip loudness normalising)"),
+                       ("duck_db", "Music ducked around each kill (dB)"), ("ui_scale", "UI scale (font + row height, restart to apply)"),
                        ("week_days", "'This week' means the last N days")):
             ttk.Label(f, text=lab).grid(row=r, column=0, sticky="w", padx=8, pady=3)
             v = tk.StringVar(value=str(self.cfg.get(k, "")))
@@ -3911,8 +5249,7 @@ class App:
             ttk.Entry(f, textvariable=v, width=10).grid(row=r, column=1, sticky="w", padx=4)
             r += 1
         self.set_len = tk.IntVar(value=self.cfg.get("length_s", 85))
-        self.set_aud = tk.IntVar(value=int(100 * self.cfg.get("game_audio_level", 0.5)))
-        for lab, var, lo, hi in (("Default length (s)", self.set_len, 60, 120), ("Game audio level under the music (%)", self.set_aud, 0, 100)):
+        for lab, var, lo, hi in (("Default length (s)", self.set_len, 60, 120),):
             ttk.Label(f, text=lab).grid(row=r, column=0, sticky="w", padx=8, pady=4)
             ttk.Scale(f, from_=lo, to=hi, variable=var, length=300).grid(row=r, column=1, sticky="w", padx=4)
             ttk.Label(f, textvariable=var).grid(row=r, column=2)
@@ -3931,20 +5268,18 @@ class App:
         ttk.Label(f, text="Theme (restart to apply)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
         ttk.Combobox(f, textvariable=self.set_theme, values=["light", "dark", "auto"], width=8, state="readonly").grid(row=r, column=1, sticky="w")
         r += 1
-        self.btn(f, "Save settings", self.save_settings).grid(row=r, column=1, sticky="w", pady=12)
 
     def save_settings(self):
         cfg = load_config()
         for k, v in self.sv.items():
             cfg[k] = v.get().strip()
-        for k, v in self.sl.items():
-            cfg[k] = [x.strip() for x in v.get().split(",") if x.strip()]
+        cfg["clip_dirs"] = {g: [x.strip() for x in v.get().split(";") if x.strip()] for g, v in self.sl.items()}
         for k, v in self.sn.items():
             try:
                 cfg[k] = float(v.get()) if "." in v.get() else int(v.get())
             except ValueError:
                 out(f"ignored invalid number for {k}")
-        cfg["length_s"], cfg["game_audio_level"] = int(self.set_len.get()), round(self.set_aud.get() / 100, 2)
+        cfg["length_s"] = int(self.set_len.get())
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["theme"] = self.set_theme.get()
         save_json(CONFIG_PATH, cfg)
@@ -3957,6 +5292,265 @@ def grab_gray_bgr(path, t, w, h):
     import numpy as np
     r = run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", path, "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], timeout=60)
     return np.frombuffer(r.stdout[:w * h * 3], np.uint8).reshape(h, w, 3).copy()
+
+
+DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_SONGS",
+                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE")
+
+
+def use_data_dir(d):
+    """Point every cache / config path at another folder (tests). Returns the old values for restore_data_dir()."""
+    g = globals()
+    old = {k: g[k] for k in DATA_GLOBALS}
+    d = Path(d)
+    for k in DATA_GLOBALS:
+        g[k] = d / ("logs" if k == "LOG_DIR" else Path(old[k]).name) if k != "DATA" else d
+    d.mkdir(parents=True, exist_ok=True)
+    return old
+
+
+def restore_data_dir(old):
+    globals().update(old)
+
+
+def synth_clip(path, kills, dur=7.0, fps=60, row_s=4.0, t0_frames=0):
+    """Generated 1920x1080 clip: moving background, killfeed rows '<left> [gun] <right>' appearing at exact FRAMES."""
+    import numpy as np
+    W, H = 1920, 1080
+    n = int(dur * fps)
+    sr = 48000
+    a = (np.random.default_rng(1).standard_normal(int(dur * sr)) * 0.01).astype(np.float32)
+    wav = str(path) + ".wav"
+    import soundfile as sf
+    sf.write(wav, np.stack([a, a], 1), sr)
+    p = subprocess.Popen(["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+                          "-i", wav, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-g", "30", "-pix_fmt", "yuv420p",
+                          "-c:a", "aac", "-shortest", str(path)], stdin=subprocess.PIPE)
+    x0, y0 = int(0.58 * W), int(0.05 * H)
+    rows = {}
+    yy, xx = np.mgrid[0:H, 0:W + 400]
+    base = np.zeros((H, W + 400, 3), np.uint8)
+    base[..., 0] = (40 + 30 * np.sin(xx / 200.0)).astype(np.uint8)
+    base[..., 1] = 60
+    base[..., 2] = (90 + 30 * np.cos(yy / 150.0)).astype(np.uint8)
+    for f in range(n):
+        sh = int((f + t0_frames) * 3) % 400
+        img = np.ascontiguousarray(base[:, sh:sh + W])
+        code = f + t0_frames                               # game-frame barcode (16 bits, bottom-left): continuity checks
+        for bit in range(16):
+            img[1040:1064, 20 + bit * 28:44 + bit * 28] = 255 if (code >> bit) & 1 else 0
+        vis = [(kf, l, r) for kf, l, r in kills if kf <= f < kf + row_s * fps]
+        if vis:
+            key = tuple(vis)
+            if key not in rows:
+                rows[key] = synth_row_frame(*vis[0][1:], w=int(0.42 * W), h=int(0.37 * H), y=60,
+                                            extra=[(60 + 48 * (i + 1), (l, r)) for i, (_, l, r) in enumerate(vis[1:])])
+            fr = rows[key]
+            region = img[y0:y0 + fr.shape[0], x0:x0 + fr.shape[1]]
+            m = fr.astype(int).sum(2) != (70 + 78 + 86)
+            region[m] = fr[m]
+        p.stdin.write(img.tobytes())
+    p.stdin.close()
+    p.wait()
+    os.remove(wav)
+
+
+def read_barcodes(outfile):
+    """Game-frame numbers from the generated clips' barcode, per output frame (continuity check of stitched takes)."""
+    import numpy as np
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(outfile), "-an", "-vf", "crop=480:24:0:1040,format=gray", "-f", "rawvideo", "-"],
+                       capture_output=True, timeout=120)
+    fr = np.frombuffer(r.stdout, np.uint8)
+    n = len(fr) // (480 * 24)
+    fr = fr[:n * 480 * 24].reshape(n, 24, 480)
+    vals = []
+    for f in fr:
+        bits = [f[6:18, 26 + b * 28:38 + b * 28].mean() > 128 for b in range(16)]
+        vals.append(sum(1 << b for b, on in enumerate(bits) if on))
+    return vals
+
+
+def measure_sync(outfile, plan):
+    """From the RENDERED FILE: click onsets in its audio vs the first frame each take's kill row is visible in its video."""
+    import numpy as np
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(outfile), "-vn", "-ac", "1", "-ar", "48000", "-f", "f32le", "-"],
+                       capture_output=True, timeout=120)
+    y = np.abs(np.frombuffer(r.stdout, np.float32))
+    sr = 48000
+    env = np.maximum.reduceat(y, np.arange(0, len(y), 24)) if len(y) else np.zeros(1)      # 0.5 ms
+    on = []
+    pk = np.percentile(env, 99.5)
+    thr = 0.35 * pk
+    i, last = 0, -1e9
+    idx = np.flatnonzero(env >= thr)
+    for j in idx:
+        t = j * 24 / sr
+        if t - last > 0.2:
+            # walk back to the attack start (first sample above 15 % of this click's peak)
+            seg = env[max(0, j - 20):j + 1]
+            peak = env[j:j + 40].max()
+            k = j
+            while k > max(0, j - 20) and env[k - 1] >= 0.15 * peak:
+                k -= 1
+            on.append(k * 24 / sr)
+            last = t
+    on = np.array(on)
+    W, H = 640, 360
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(outfile), "-an", "-vf", f"scale={W}:{H}:flags=area,format=gray",
+                        "-f", "rawvideo", "-"], capture_output=True, timeout=120)
+    fr = np.frombuffer(r.stdout, np.uint8)
+    nfr = len(fr) // (W * H)
+    fr = fr[:nfr * W * H].reshape(nfr, H, W)
+    reg = (fr[:, 5:int(0.45 * H), int(0.52 * W):] >= 200).sum(axis=(1, 2)).astype(float)
+    rows = []
+    for t in plan["takes"]:
+        a, b = t["f0"], min(nfr, t["f0"] + t["nf"])
+        seg = reg[a:b]
+        if len(seg) < 5:
+            continue
+        base = np.median(seg[:max(3, int(0.3 * OUT_FPS))])
+        top = np.percentile(seg, 95)
+        if top < base + 30:
+            rows.append((t, None, None, None))
+            continue
+        half = base + max(20.0, 0.15 * (top - base))      # the FIRST row appearing (later rows add more)
+        k = next((i for i in range(1, len(seg) - 2) if seg[i - 1] < half and all(seg[j] >= half for j in (i, i + 1, i + 2))), None)
+        if k is None:
+            rows.append((t, None, None, None))
+            continue
+        tk = (a + k) / OUT_FPS
+        near = on[np.argmin(np.abs(on - tk))] if len(on) else None
+        rows.append((t, tk, near, None if near is None else (tk - near) * 1000))
+    return rows, on
+
+
+def sync_e2e_test(workdir=None, keep=False, verbose=True):
+    """END-TO-END SYNC TEST: click-track song with known beats + 60 fps clips with kill rows at known frames -> real plan and render
+    -> measured from the rendered file. Every first kill must be within 1 frame (17 ms) of its beat. Returns (fails, rows)."""
+    import tempfile
+    wd = Path(workdir or tempfile.mkdtemp(prefix="montage_sync_"))
+    old = use_data_dir(wd / "montage_data")
+    fails = []
+    try:
+        clips = wd / "clips" / "VALORANT"
+        clips.mkdir(parents=True, exist_ok=True)
+        mp3 = wd / "mp3"
+        mp3.mkdir(exist_ok=True)
+        t0 = time.time()
+        specs = [(181, "fireaxe", "alpha"), (197, "fireaxe", "bravo"), (233, "fireaxe", "charlie"), (211, "fireaxe", "delta")]
+        for i, (kf, l, r) in enumerate(specs):
+            p = clips / f"VALORANT 2026.01.0{i + 1} - 20.1{i}.00.00.DVR.mp4"
+            if not p.exists():
+                synth_clip(p, [(kf, l, r)])
+        song = mp3 / "Test Artist - Click Song.mp3"
+        if not song.exists():
+            synth_song(song, 120.0, layout=(("verse", 32),), click=True)
+        with open(wd / "playlist.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Track URI", "Track Name", "Artist Name(s)", "Added At", "Duration (ms)", "Danceability", "Energy", "Tempo"])
+            w.writerow(["u:1", "Click Song", "Test Artist", datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), "65000", "0.7", "0.8", "120.000"])
+        cfg = dict(DEFAULT_CONFIG, clip_dirs={"valorant": [str(clips)], "cs2": []}, mp3_dir=str(mp3), playlist_dir=str(wd),
+                   output_root=str(wd / "out"), bar_checked=True, bar=None, sync_report=False, length_s=60)
+        save_json(CONFIG_PATH, cfg)
+        if verbose:
+            out(f"  sync test material ready in {time.time() - t0:.0f}s")
+        outfile = run_job("valorant", "render", force=True, seed=7, lock=1.0, encoder="fast", outfile=wd / "out" / "sync_test.mp4")
+        if not outfile or not Path(outfile).exists():
+            return ["sync test: the render failed"], []
+        plan = LAST_PLAN["valorant"]
+        rows, on = measure_sync(outfile, plan)
+        for t, tk, near, err in rows:
+            msg = f"  take at {t['out_start']:6.2f}s ({Path(t['path']).name[-28:]}): kill row first frame " + \
+                  (f"{tk:7.3f}s, beat onset {near:7.3f}s, error {err:+6.1f} ms" if err is not None else "NOT FOUND")
+            if verbose:
+                out(msg)
+            if err is None or abs(err) > 1000 / OUT_FPS + 0.5:
+                fails.append("sync: " + msg.strip())
+        if len(rows) < 2:
+            fails.append(f"sync: only {len(rows)} takes in the test montage")
+        if plan.get("ssim") is not None and plan["ssim"] < 0.97:
+            fails.append(f"quality: SSIM {plan['ssim']} < 0.97")
+        return fails, rows
+    finally:
+        restore_data_dir(old)
+        LAST_PLAN.pop("valorant", None)
+        if not keep and workdir is None:
+            shutil.rmtree(wd, ignore_errors=True)
+
+
+def fake_events(n=26, seed=3):
+    """Synthetic kill events (no clips needed) for planner tests."""
+    rng = random.Random(seed)
+    evs = []
+    for i in range(n):
+        k = rng.choice([1, 1, 1, 2, 2, 3, 4, 5])
+        k0 = rng.uniform(4, 30)
+        times = [k0]
+        for _ in range(k - 1):
+            times.append(times[-1] + rng.uniform(0.3, 1.5))
+        rec = {"path": f"/fake/clip{i}.mp4", "w": 1920, "h": 1080, "dur": 45.0, "audio": False}
+        ev = {"rec": rec, "path": rec["path"], "times": times, "n": k, "victims": [f"v{i}{j}" for j in range(k)], "first": k0,
+              "last": times[-1], "span": times[-1] - k0, "hs": rng.random() < 0.3, "flick": False, "shots": 0, "imp": k - 1,
+              "pre": k0 - 0.05, "post": 45 - times[-1] - 0.1, "death_after": rng.uniform(0.25, 1.5) if rng.random() < 0.2 else None,
+              "parts": None, "stitched": False, "lags": [0.0] * k, "vis": []}
+        ev["score"] = base_score(ev)
+        ev["plain"] = k == 1 and not ev["hs"]
+        evs.append(ev)
+    evs.sort(key=lambda e: -e["score"])
+    return evs
+
+
+def planner_selftest(verbose=True):
+    """Song-map planner on a generated song with intro/verse/build/drop/breakdown/drop/outro and synthetic events: cut-list rules,
+    every drop gets a strong clip anchored on its downbeat, strong ending with slow-mo, variety between seeds."""
+    import tempfile
+    import numpy as np
+    fails = []
+    tmpd = Path(tempfile.mkdtemp(prefix="montage_plan_"))
+    old = use_data_dir(tmpd / "data")
+    real_ca = globals()["clip_audio"]
+    globals()["clip_audio"] = lambda rec: {"stream": None, "lufs": None}
+    try:
+        sp_ = tmpd / "plan test.mp3"
+        synth_song(sp_, 128.0)
+        an = analyse_song(str(sp_), 128.0)
+        evs = fake_events()
+        song = {"path": str(sp_), "artist": "a", "title": "t"}
+        sigs = []
+        for seed in (1, 2, 3, 4):
+            plan = plan_montage(dict(DEFAULT_CONFIG), "valorant", evs, song, an, seed, None, 85, [], [])
+            bad = verify_cutlist(plan)
+            if bad:
+                fails.append(f"seed {seed}: " + "; ".join(bad))
+            takes = plan["takes"]
+            for d in plan["drops_out"]:
+                hit = [t for t in takes if abs(t["out_start"] + t["kills_out"][0] - d) <= 1 / OUT_FPS + 1e-6]
+                if not hit:
+                    fails.append(f"seed {seed}: drop at {d:.2f}s has no clip whose first kill lands on it")
+                elif hit[0]["n"] < 3:
+                    fails.append(f"seed {seed}: drop at {d:.2f}s got a weak clip ({hit[0]['n']}k)")
+            best = max(e["score"] for e in evs)
+            if not any(t["role"] == "headline" and t["score"] >= 0.9 * best for t in takes):
+                fails.append(f"seed {seed}: the biggest drop does not carry the best multikill")
+            if takes[-1]["role"] != "ending" or not takes[-1]["slow"] or takes[-1]["n"] < 3:
+                fails.append(f"seed {seed}: the last take is not a strong slow-mo ending")
+            if abs(plan["song"]["fade_out_start"] - (takes[-1]["out_start"] + takes[-1]["kills_out"][-1])) > 0.02:
+                fails.append(f"seed {seed}: music fade-out does not start at the final kill")
+            beats = np.array(plan["beats_out"])
+            errs = [abs(beats - (t["out_start"] + t["kills_out"][0])).min() * 1000 for t in takes if t["locked"]]
+            if errs and max(errs) > 1000 / OUT_FPS / 2 + 0.5 and not Grid(an).off_ok:
+                fails.append(f"seed {seed}: a locked first kill is {max(errs):.1f} ms off its beat")
+            sigs.append((plan["recipe"], tuple(Path(t["path"]).name for t in takes), tuple(t["trans"] for t in takes)))
+            if verbose:
+                out(f"  seed {seed}: recipe {plan['recipe']}, lock {plan['lock']}, {len(takes)} takes, {plan['duration']:.0f} s, "
+                    f"drops at {plan['drops_out']}, locked first-kill error max {max(errs or [0]):.1f} ms")
+        if len({s[1] for s in sigs}) < 3 or len({s[2] for s in sigs}) < 3:
+            fails.append("variety: different seeds did not give clearly different montages (order / transitions)")
+    finally:
+        globals()["clip_audio"] = real_ca
+        restore_data_dir(old)
+        shutil.rmtree(tmpd, ignore_errors=True)
+    return fails
 
 
 # button name -> (tab, task name / action it must trigger when clicked)
@@ -3982,6 +5576,7 @@ REQUIRED_BUTTONS.update({
     "Load clips": ("Troubleshoot", "task:tclips"), "Kill timestamps + killfeed crop": ("Troubleshoot", "info"),
     "Rescan this clip": ("Troubleshoot", "info"), "Before/after preview": ("Troubleshoot", "info"),
     "Re-measure": ("Troubleshoot", "task:bars"),
+    "Song map (Manual)": ("Manual", "window"), "Song map of selected file...": ("Songs", "window"),
     "Save settings": ("Settings", "write:config.json"),
     "Open folder": (None, "open:"), "Open video": (None, None), "Cancel": (None, None),
 })
@@ -4090,6 +5685,47 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
             app.m_folder.set("All folders")
             if name == "Untick all":
                 app.ticked = {fake["path"]}
+        # sorting: click headers, check order, click again = reversed
+        now = time.time()
+        app.clips = [{"path": f"c{i}.mp4", "name": f"c{i}.mp4", "folder": "V", "mtime": now - i * 86400, "dur": 10 + 7 * ((i * 3) % 5),
+                      "kills": (i * 7) % 4, "ks": []} for i in range(6)]
+        app.byp = {c["path"]: c for c in app.clips}
+        app.songs = [{"path": f"s{i}.mp3", "artist": "a", "title": f"t{i}", "added": None, "csv_bpm": 90.0 + (i * 37) % 80} for i in range(5)]
+        for tree, col, refill, getv in ((app.ctree, "kills", app.apply_filter, lambda iid: app.byp[iid]["kills"]),
+                                        (app.ctree, "len", app.apply_filter, lambda iid: app.byp[iid]["dur"]),
+                                        (app.stree, "bpm", app.refresh_songs, lambda iid: next(x["csv_bpm"] for x in app.songs if x["path"] == iid))):
+            for want_desc in (None, None):
+                app.sort_by(tree, col)
+                for _ in range(4):
+                    root.update()
+                    time.sleep(0.03)
+                ids = [i for i in tree.get_children() if i != "auto"]
+                vals = [getv(i) for i in ids]
+                desc = app.sorts[str(tree)][1]
+                if vals != sorted(vals, reverse=desc):
+                    fails.append(f"sorting {col}: order {vals} is not {'descending' if desc else 'ascending'}")
+        # song map view on a generated song
+        import tempfile
+        tmpd = Path(tempfile.mkdtemp(prefix="montage_map_"))
+        old_d = use_data_dir(tmpd / "data")
+        try:
+            sp_ = tmpd / "map test.mp3"
+            synth_song(sp_, 128.0, layout=(("intro", 4), ("build", 2), ("drop", 4), ("outro", 2)))
+            v = SongMapView(app, str(sp_), 128.0)
+            t_end = time.time() + 120
+            while v.an is None and time.time() < t_end:
+                root.update()
+                time.sleep(0.05)
+            root.update()
+            n_items = len(v.cv.find_all())
+            if v.an is None or n_items < 50:
+                fails.append(f"song map view did not draw (items {n_items}, map {'missing' if v.an is None else 'ok'})")
+            elif not v.an.get("drops"):
+                fails.append("song map view: the generated song's drop was not found")
+            v.win.destroy()
+        finally:
+            restore_data_dir(old_d)
+            shutil.rmtree(tmpd, ignore_errors=True)
     finally:
         g.update(saved)
         g.pop("open", None)
@@ -4121,6 +5757,26 @@ def cmd_smoketest(args):
     except Exception as ex:
         fails.append(f"OCR: {ex}")
         out("  FAIL OCR: " + traceback.format_exc())
+    out("== Song-map planner (generated song, synthetic events, 4 seeds) ==")
+    try:
+        f = planner_selftest()
+        fails += f
+        out("  OK: cut-list rules, a strong clip on every drop, best multikill on the biggest drop, slow-mo ending, variety" if not f
+            else "\n".join("  FAIL " + x for x in f))
+    except Exception:
+        fails.append("planner test crashed")
+        out("  FAIL planner: " + traceback.format_exc())
+    if not getattr(args, "no_render", False):
+        out("== END-TO-END SYNC TEST (click-track song + clips with kill rows at known frames -> real render -> measured) ==")
+        try:
+            f, rows = sync_e2e_test()
+            fails += f
+            errs = [abs(r[3]) for r in rows if r[3] is not None]
+            out(f"  {'OK' if not f else 'FAIL'}: {len(errs)} first kills measured in the rendered file, max error "
+                f"{max(errs or [999]):.1f} ms (limit {1000 / OUT_FPS:.1f} ms = 1 frame)" + ("" if not f else "\n" + "\n".join("  FAIL " + x for x in f)))
+        except Exception:
+            fails.append("sync test crashed")
+            out("  FAIL sync test: " + traceback.format_exc())
     out("SMOKETEST " + ("PASSED" if not fails else f"FAILED ({len(fails)})"))
     if fails:
         sys.exit(1)
@@ -4186,8 +5842,10 @@ def main():
         a_.add_argument("--max-quality", action="store_true")
         a_.add_argument("--seed", type=int)
         a_.set_defaults(fn=cmd_auto, plan_only=(name == "plan"))
+    sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
     st_.add_argument("--no-gui", action="store_true")
+    st_.add_argument("--no-render", action="store_true", help="skip the end-to-end render sync test")
     st_.set_defaults(fn=cmd_smoketest)
     t = sp.add_parser("tag")
     t.add_argument("path")
