@@ -18,6 +18,11 @@ FIRST 3 THINGS TO CLICK:
   3. Auto tab > "Dry plan" for a game: first run scans every clip once (cached forever), then prints the song with
      its score breakdown, ranked kills, and the cut list. Then "Preview" (720p, 20 s around the drop) and "Run".
 
+NOTES (V3): kills are found row-first (weapon icon splits a row into killer side / victim side; FIREAXE matched on each side).
+  Dry plan, Render, Self-test and the killfeed crop view all use the same classify_row/analyse_entry code. Songs tab shows the
+  one-to-one MP3 <-> playlist matching (montage_data\\song_matches.csv) with manual override. Recalibrate once if you want the
+  highlight-border bonus (older calibrations still work without it).
+
 CLI (same engine):  python montage.py auto [--game valorant|cs2] [--force] [--dry] [--preview] [--max-quality] [--seed N]
                     python montage.py plan --game cs2        (dry plan only)     python montage.py pick   (GUI, Manual tab)
                     python montage.py selfcheck | inventory | scan | verify <game> | calibrate-bars | tag <path> <game>
@@ -77,9 +82,8 @@ DEFAULT_CONFIG = {
     "max_dur_s": 60,
     "auto_recent_days": 30,
     "auto_old_per_run": 150,
-    "thr_name": 0.60,
-    "thr_hl": 0.30,
-    "thr_left": 0.80,               # a row whose left edge continues past FIREAXE = assist/other killer -> rejected
+    "thr_kill": 0.65,               # FIREAXE name on the KILLER side of a row's weapon icon
+    "thr_death": 0.78,              # FIREAXE name on the VICTIM side = my death
     "death_lock_s": 8.0,            # no kills counted this long after my own death
     "sync_report": True,
     "gap_s": {"valorant": 6.0, "cs2": 5.0},
@@ -96,6 +100,15 @@ LOG_SINK = [None]       # GUI sets callable(str)
 PROGRESS = [None]       # GUI sets callable(frac, text)
 CANCEL = threading.Event()
 PROCS = []              # running ffmpeg processes, killed on cancel
+
+
+def LOGONLY(msg):
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "montage.log", "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except Exception:
+        pass
 
 
 def out(*a):
@@ -420,6 +433,9 @@ HEADER_ALIASES = {
     "added": ["added at", "added", "date added"],
     "uri": ["track uri", "uri", "track id"],
     "dur": ["duration (ms)", "duration_ms", "duration ms", "duration"],
+    "tempo": ["tempo", "bpm"],
+    "energy": ["energy"],
+    "dance": ["danceability"],
 }
 
 
@@ -427,6 +443,13 @@ def newest_csv(cfg):
     d = Path(cfg["playlist_dir"])
     files = sorted(d.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if d.is_dir() else []
     return files[0] if files else None
+
+
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _ms(v):
@@ -455,7 +478,10 @@ def read_playlist(cfg):
             rows.append({"title": title, "artist": artist,
                          "added": (r.get(col["added"]) or "").strip() if col["added"] else "",
                          "uri": (r.get(col["uri"]) or "").strip() if col["uri"] else "",
-                         "dur": _ms(r.get(col["dur"])) if col["dur"] else 0.0})
+                         "dur": _ms(r.get(col["dur"])) if col["dur"] else 0.0,
+                         "tempo": _f(r.get(col["tempo"])) if col["tempo"] else 0.0,
+                         "energy": _f(r.get(col["energy"])) if col["energy"] else None,
+                         "dance": _f(r.get(col["dance"])) if col["dance"] else None})
     return p, rows, col
 
 
@@ -483,28 +509,56 @@ def audio_titles(a):
 
 
 def match_playlist(rows, audio, cfg):
-    """CSV track name vs MP3 title (artist not needed): token_set_ratio >= threshold, ties by duration (+-3 s)."""
-    from rapidfuzz import fuzz
-    thr = cfg["match_threshold"]
-    prepared = [(a, audio_titles(a)) for a in audio]
-    matched, unmatched = [], []
-    for r in rows:
-        rt = clean(r["title"]) or re.sub(r"\W+", " ", r["title"].lower()).strip()
-        best = None
-        for a, titles in prepared:
-            sc = max((fuzz.token_set_ratio(rt, t) for t in titles), default=0)
-            if sc < thr:
-                continue
-            rr = max(fuzz.ratio(rt, t) for t in titles)
-            dd = abs(a.get("dur", 0) - r.get("dur", 0)) if a.get("dur") and r.get("dur") else 99.0
-            key = (round(sc), dd <= 3.0, -dd, rr)
-            if best is None or key > best[0]:
-                best = (key, a, sc)
-        if best:
-            matched.append((r, best[1], round(best[2])))
-        else:
-            unmatched.append(r)
-    return matched, unmatched
+    """ONE-TO-ONE best global assignment of MP3 files to CSV rows. Each file (ID3 title if present, else the filename) is compared
+    with 'Track', 'Artist - Track' and 'Track - Artist' using rapidfuzz WRatio; duration within 3 s adds a little."""
+    import numpy as np
+    from rapidfuzz import fuzz, process
+    from scipy.optimize import linear_sum_assignment
+    if not rows or not audio:
+        return [], list(rows)
+    names = []
+    for a in audio:
+        stem = re.sub(r"^\s*\d{1,3}[\s._-]+", "", Path(a["path"]).stem)
+        names.append(clean(a.get("title", "")) or clean(stem) or stem.lower())
+    t1 = [clean(r["title"]) or r["title"].lower() for r in rows]
+    t2 = [clean(f"{r['artist']} - {r['title']}") for r in rows]
+    t3 = [clean(f"{r['title']} - {r['artist']}") for r in rows]
+    M = np.zeros((len(audio), len(rows)))
+    for i, nm in enumerate(names):
+        M[i] = np.maximum.reduce([process.cdist([nm], t, scorer=fuzz.WRatio)[0] for t in (t1, t2, t3)])
+        da = audio[i].get("dur") or 0
+        if da:
+            for j, r in enumerate(rows):
+                if r.get("dur") and abs(da - r["dur"]) <= 3:
+                    M[i, j] += 2.0
+    rk = lambda r: r.get("uri") or f"{r['artist']} - {r['title']}"
+    idx = {a["path"]: i for i, a in enumerate(audio)}
+    for path, key in cfg.get("song_overrides", {}).items():              # manual overrides from the Songs view
+        i = idx.get(path)
+        j = next((k for k, r in enumerate(rows) if rk(r) == key), None)
+        if i is not None and j is not None:
+            M[i, :], M[:, j] = -1, -1
+            M[i, j] = 1000
+    ri, ci = linear_sum_assignment(-M)
+    matched, got = [], set()
+    for i, j in zip(ri, ci):
+        sc = M[i, j]
+        if sc >= cfg.get("match_floor", 60):
+            matched.append((rows[j], audio[i], int(min(sc, 100) if sc < 1000 else 100)))
+            got.add(j)
+    return matched, [r for j, r in enumerate(rows) if j not in got]
+
+
+def write_song_matches(audio, matched):
+    """montage_data\\song_matches.csv: file, matched track, score, flag (under 85 = check it)."""
+    by = {a["path"]: (r, sc) for r, a, sc in matched}
+    with open(DATA / "song_matches.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["file", "matched track", "artist", "score", "flag"])
+        for a in sorted(audio, key=lambda a: a["path"].lower()):
+            r, sc = by.get(a["path"], (None, 0))
+            w.writerow([a["path"], r["title"] if r else "", r["artist"] if r else "", sc,
+                        "NO MATCH" if not r else "CHECK (under 85)" if sc < 85 else "ok"])
 
 
 # ------------------------------------------------------------- kill detection
@@ -513,7 +567,7 @@ FPS = 15
 COARSE = [0.6, 0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.4, 1.6]
 TRACK_KEEP_S = 8.0              # a killfeed row is remembered this long (so it is never counted twice)
 SAME_ROW_CORR = 0.90            # appearance match that means "same row as before" even if it moved (feed shift)
-CACHE_V = 3                     # bump when the cached per-frame format changes
+CACHE_V = 4                     # bump when the cached per-frame format changes
 ALGO = f"v{CACHE_V}"
 IGNORE_FIRST_S = 0.5            # rows already on screen when the clip starts are not kills
 
@@ -618,6 +672,23 @@ def band_corr(a, b):
 SCALE_GRID = [0.6, 0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.4, 1.6]
 
 
+def weapon_blobs(bgr, th):
+    """White weapon-icon candidates: big bright low-saturation blobs. Wide ones are guns/knives, squarish ones are utility."""
+    import cv2
+    import numpy as np
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    m = ((hsv[..., 2] >= 190) & (hsv[..., 1] <= 70)).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 5), np.uint8))
+    n, _, st, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    res = []
+    for i in range(1, n):
+        x, y, w, h, a = (int(v) for v in st[i])
+        if h < 1.1 * th or h > 2.9 * th or w < 0.6 * h or a < 0.22 * w * h:
+            continue
+        res.append((x, y, w, h))
+    return res
+
+
 class Detector:
     def __init__(self, game):
         import cv2
@@ -627,10 +698,10 @@ class Detector:
             raise RuntimeError(f"{game} not calibrated: use Troubleshoot > Calibrate killfeed")
         self.game, self.d = game, d
         self.tmpl = cv2.imdecode(np.fromfile(str(DATA / d["name_png"]), np.uint8), cv2.IMREAD_GRAYSCALE)
-        self.hist = np.array(d["hist"], np.float32)
         hp = DATA / d["hs_png"] if d.get("hs_png") else None
         self.hs = cv2.imdecode(np.fromfile(str(hp), np.uint8), cv2.IMREAD_GRAYSCALE) if hp and hp.exists() else None
         self.lg = int(d.get("left_gap", 0))
+        self.row_h = float(d.get("row_h", 1.9 * self.tmpl.shape[0]))
         self.dw = int(round((d["region"][2] - d["region"][0]) * NORM_W))
         self.dh = int(round((d["region"][3] - d["region"][1]) * NORM_H))
         self._t = {}
@@ -693,38 +764,89 @@ class Detector:
             return False
         return float(cv2.matchTemplate(band, t, cv2.TM_CCOEFF_NORMED).max()) >= self.d.get("hs_thr", 0.7)
 
-    def detect(self, gray, hp, bgr, sx, sy, floor=0.45):
-        """All FIREAXE-name candidates >= floor with raw scores: name, highlight, victim-side flag, left-edge evidence."""
+    def _side(self, gray, hp, sx, sy, xa, xb, y0, y1):
+        """Best FIREAXE match inside one side of a row: (score, x, y) in region coordinates."""
         import numpy as np
-        r, t = self._resp(gray, hp, sx, sy)
+        if xb - xa < 8 or y1 - y0 < 8:
+            return -1.0, 0, 0
+        r, _ = self._resp(gray[y0:y1, xa:xb], hp[y0:y1, xa:xb], sx, sy)
         if r is None:
-            return []
-        th, tw = t.shape
-        ys, xs = np.where(r >= floor)
-        if not len(xs):
-            return []
-        picked = []
-        for i in np.argsort(-r[ys, xs])[:300]:
-            x, y = int(xs[i]), int(ys[i])
-            if any(abs(x - p[2]) < tw // 2 and abs(y - p[3]) < th // 2 for p in picked):
-                continue
-            picked.append((float(r[y, x]), 0, x, y))
-            if len(picked) >= 8:
-                break
+            return -1.0, 0, 0
+        iy, ix = np.unravel_index(int(np.argmax(r)), r.shape)
+        return float(r[iy, ix]), xa + int(ix), y0 + int(iy)
+
+    def hl_bonus(self, bgr, y0, y1, xl, xr):
+        """BONUS only: share of the row's top/bottom border lines in the calibrated highlight colour, and the left edge
+        of that border (-1 if not found). Used to spot assist rows (row continues left of my name)."""
+        import cv2
+        import numpy as np
+        c = self.d.get("hl_color")
+        if not c or y1 - y0 < 8:
+            return 0.0, -1
+        xl, xr = max(0, int(xl)), min(bgr.shape[1], int(xr))
+        if xr - xl < 12:
+            return 0.0, -1
+        hsv = cv2.cvtColor(bgr[:, xl:xr], cv2.COLOR_BGR2HSV).astype(np.int16)
+        dh = np.abs(hsv[..., 0] - c[0])
+        dh = np.minimum(dh, 180 - dh)
+        m = (dh <= 14) & (hsv[..., 1] >= max(60, c[1] * 0.6)) & (hsv[..., 2] >= c[2] * 0.5)
+        top, bot = m[y0:y0 + 3].any(axis=0), m[max(0, y1 - 3):y1].any(axis=0)
+        frac = float((top.mean() + bot.mean()) / 2)
+        both = top & bot
+        run, best, start = 0, 0, -1
+        for i, v in enumerate(both):
+            if v:
+                run += 1
+                if run == 1:
+                    s0 = i
+                if run > best:
+                    best, start = run, s0
+            else:
+                run = 0
+        return frac, (xl + start if best >= 12 else -1)
+
+    def rows(self, gray, hp, bgr, sx, sy, floor=0.45):
+        """Row-first detection: weapon icon -> killer side / victim side -> FIREAXE match on each side separately."""
+        t = self.tmpl_at(sx, sy)
+        th, _ = t.shape
+        H, W = gray.shape
+        rh = max(th + 6, int(self.row_h * sy))
+        blobs = sorted(weapon_blobs(bgr, th), key=lambda b: -(b[2] * b[3]))
+        kept = []
+        for b in blobs:                                       # one icon per row
+            if all(abs((b[1] + b[3] / 2) - (k[1] + k[3] / 2)) >= 0.5 * rh for k in kept):
+                kept.append(b)
         res = []
-        for sc, _, x, y in picked:
-            victim = gray.shape[1] - (x + tw) < self.d["min_right"] * sx       # my name at the victim end = my death
-            h = ring_hist(bgr, x, y, tw, th, self.d["ring"], sx, sy)
-            hl = float(np.minimum(h, self.hist).sum()) if h is not None else 0.0
-            lf = 0.0
-            if not victim and self.lg >= 3:                                    # does the row continue left of my name?
-                xs0 = int(x - self.lg * sx - 14 * sx)
-                if xs0 >= 0:
-                    hh = ring_hist(bgr, xs0, y, 12, th, dict(self.d["ring"], pad=0), sx, sy)
-                    lf = float(np.minimum(hh, self.hist).sum()) if hh is not None else 0.0
-            res.append({"score": sc, "hl": hl, "x": x, "y": y, "w": tw, "h": th, "v": int(victim), "lf": lf,
-                        "hs": self.has_hs(gray, x, y, tw, th, sx, sy), "sig": row_band(gray, x, y, tw, th)})
+        for x, y, w, h in kept:
+            cy = y + h // 2
+            y0 = max(0, min(H - rh, cy - rh // 2))
+            y1 = min(H, y0 + rh)
+            ks, kx, ky = self._side(gray, hp, sx, sy, 0, x - 2, y0, y1)
+            vs, vx, vy = self._side(gray, hp, sx, sy, x + w + 2, W, y0, y1)
+            if max(ks, vs) < floor:
+                continue
+            hl, rl = self.hl_bonus(bgr, y0, y1, 0, W)
+            res.append({"y": cy, "y0": y0, "y1": y1, "ix": x, "iw": w, "ih": h, "gun": w >= 1.5 * h, "ks": ks, "kx": kx, "ky": ky,
+                        "vs": vs, "vx": vx, "vy": vy, "hl": hl, "rl": rl, "th": th, "tw": t.shape[1],
+                        "hs": self.has_hs(gray, x, y0, w, y1 - y0, sx, sy), "sig": row_band(gray, x, y0, 0, y1 - y0)})
         return res
+
+
+def classify_row(r, cfg, lg=0.0):
+    """THE rule set, used identically by the crop view, Dry plan, Render, sync report and Self-test.
+    Returns (verdict, reason): verdict in kill / death / reject / none."""
+    tk, td = cfg.get("thr_kill", 0.65), cfg.get("thr_death", 0.78)
+    out_ = []
+    if r["vs"] >= td:
+        out_.append(("death", "death: my name on the victim side"))
+    if r["ks"] >= tk:
+        if not r["gun"]:
+            out_.append(("reject", "utility: small/square icon (grenade, molotov...)"))
+        elif r["rl"] >= 0 and r["rl"] < r["kx"] - lg - 0.9 * r["th"]:
+            out_.append(("reject", "assist: another name sits before mine in the row"))
+        else:
+            out_.append(("kill", "killer-side name %.2f" % r["ks"]))
+    return out_ or [("none", "no own name")]
 
 
 def accept(n, h, tn, th):
@@ -807,79 +929,132 @@ def get_scale(det, game, rec, cfg, peers=()):
         return e
 
 
-def scan_clip(path, rec, det, cfg, scale):
-    """Full 15 fps scan. Stores RAW per-frame candidates (name, highlight, slot...) so thresholds can change without rescanning."""
-    import cv2
-    t0 = time.time()
-    sx, sy = scale
-    dets, bn, bh, n = [], 0.0, 0.0, 0
-    for f, fr in enumerate(frame_stream(path, rec, det, cfg, FPS)):
-        n += 1
-        g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
-        for c in det.detect(g, hp_img(g), fr, sx, sy):
-            dets.append([f, round(c["score"], 3), round(c["hl"], 3), c["x"], c["y"], int(c["hs"]), c["sig"], c["v"], round(c["lf"], 3)])
-            if not c["v"]:
-                bn, bh = max(bn, c["score"]), max(bh, c["hl"])
-    return {"v": CACHE_V, "dets": dets, "scale": [sx, sy], "frames": n, "row_h": det.tmpl_at(sx, sy).shape[0],
-            "v_off": rec.get("v_off", 0.0), "best_name": round(bn, 3), "best_hl": round(bh, 3), "secs": round(time.time() - t0, 1)}
+class KillStore:
+    """One small JSON file per scanned clip (written atomically the moment the clip finishes): resumable, never rescans."""
+    def __init__(self):
+        self.dir = DATA / f"kills_v{CACHE_V}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def _p(self, key):
+        fkey = "|".join(key.split("|")[:3])
+        return self.dir / (hashlib.md5(fkey.encode()).hexdigest()[:12] + "_" + hashlib.md5(key.encode()).hexdigest()[:12] + ".json")
+
+    def __contains__(self, key):
+        return self._p(key).exists()
+
+    def get(self, key, default=None):
+        try:
+            return json.loads(self._p(key).read_text(encoding="utf-8")).get("e", default)
+        except Exception:
+            return default
+
+    def put(self, key, entry):
+        p = self._p(key)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"key": key, "e": entry}, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+
+    def drop_file(self, fkey):
+        pre = hashlib.md5(fkey.encode()).hexdigest()[:12] + "_"
+        for p in self.dir.glob(pre + "*.json"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def clear_all(self):
+        for d in DATA.glob("kills_v*"):
+            shutil.rmtree(d, ignore_errors=True)
+        self.dir.mkdir(parents=True, exist_ok=True)
 
 
 def load_kills_cache():
-    c = load_json(KILLS_CACHE, {})
-    return c if c.get("__version__") == CACHE_V else {"__version__": CACHE_V}
+    return KillStore()
+
+
+def scan_clip(path, rec, det, cfg, scale):
+    """Full 15 fps scan. Stores RAW per-frame row data (name scores per side, weapon icon, border, content signature) so any
+    later logic or threshold change needs no rescan."""
+    import cv2
+    t0 = time.time()
+    sx, sy = scale
+    rows, bk, bv, n = [], 0.0, 0.0, 0
+    for f, fr in enumerate(frame_stream(path, rec, det, cfg, FPS)):
+        n += 1
+        g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+        for r in det.rows(g, hp_img(g), fr, sx, sy):
+            rows.append([f, int(r["y"]), int(r["ix"]), int(r["iw"]), int(r["ih"]), int(r["gun"]), round(r["ks"], 3), int(r["kx"]),
+                         round(r["vs"], 3), int(r["vx"]), round(r["hl"], 3), int(r["rl"]), int(r["hs"]), r["sig"]])
+            bk, bv = max(bk, r["ks"]), max(bv, r["vs"])
+    return {"v": CACHE_V, "rows": rows, "scale": [sx, sy], "frames": n, "row_h": int(det.row_h * sy), "lg": det.lg * sx,
+            "th": det.tmpl_at(sx, sy).shape[0], "v_off": rec.get("v_off", 0.0),
+            "best_name": round(max(bk, 0), 3), "best_vic": round(max(bv, 0), 3), "best_hl": 0.0, "secs": round(time.time() - t0, 1)}
+
+
+def analyse_entry(entry, cfg):
+    """Raw rows -> kills / deaths / rejected rows (with reasons). The ONE implementation behind Dry plan, Render, the sync
+    report, Self-test and the killfeed crop view (which uses classify_row on the same rows)."""
+    rh, off, nf = entry.get("row_h", 30), entry.get("v_off", 0.0), entry.get("frames", 0)
+    lg, th = entry.get("lg", 0.0), entry.get("th", 20)
+    byf = {}
+    bk = bv = 0.0
+    for f, y, ix, iw, ih, gun, ks, kx, vs, vx, hl, rl, hs, sig in entry.get("rows", []):
+        byf.setdefault(f, []).append({"y": y, "ix": ix, "gun": bool(gun), "ks": ks, "kx": kx, "vs": vs, "vx": vx, "hl": hl,
+                                      "rl": rl, "hs": bool(hs), "sig": sig, "th": th})
+        bk, bv = max(bk, ks), max(bv, vs)
+    tk, td = [], []
+
+    def find(tracks, r, f):
+        hit, hc = None, -1.0
+        for t in tracks:
+            if f - t["last"] > TRACK_KEEP_S * FPS:
+                continue
+            c = sig_corr(r["sig"], t["sig"])
+            pos = abs(r["ix"] - t["ix"]) <= 6 and abs(r["y"] - t["y"]) <= 0.5 * rh and f - t["last"] <= 8
+            if (pos or c >= 0.85) and c > hc:
+                hit, hc = t, c
+        return hit
+    for f in sorted(byf):
+        for r in byf[f]:
+            for v, why in classify_row(r, cfg, lg):
+                if v == "none":
+                    continue
+                tracks = td if v == "death" else tk
+                hit = find(tracks, r, f)
+                if hit:
+                    hit.update(last=f, ix=r["ix"], y=r["y"], sig=r["sig"], hits=hit["hits"] + 1,
+                               hs=hit["hs"] or (r["hs"] and f - hit["first"] <= 20), hl=max(hit["hl"], r["hl"]))
+                else:
+                    tracks.append({"first": f, "last": f, "ix": r["ix"], "y": r["y"], "sig": r["sig"], "hits": 1, "v": v, "why": why,
+                                   "hs": r["hs"], "hl": r["hl"], "ks": r["ks"], "vs": r["vs"]})
+    kills, deaths, rej, vis = [], [], [], []
+    for t in tk:
+        tt = round(t["first"] / FPS + off, 3)
+        if t["hits"] < 2 and t["first"] < nf - 2:
+            rej.append({"t": tt, "reason": "one-frame blip", "ks": t["ks"]})
+        elif t["first"] <= 2:
+            rej.append({"t": tt, "reason": "pre-clip: row already on screen when the clip starts", "ks": t["ks"]})
+        else:
+            vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
+            if t["v"] == "kill":
+                kills.append({"t": tt, "ks": t["ks"], "hl": t["hl"], "hs": bool(t["hs"]), "weak_hl": t["hl"] < 0.1})
+            else:
+                rej.append({"t": tt, "reason": t["why"], "ks": t["ks"]})
+    for t in td:
+        tt = round(t["first"] / FPS + off, 3)
+        if t["hits"] >= 2 or t["first"] >= nf - 2:
+            if t["first"] <= 2:
+                rej.append({"t": tt, "reason": "pre-clip: my death row already on screen", "ks": t["vs"]})
+            else:
+                deaths.append(tt)
+                rej.append({"t": tt, "reason": f"death (victim-side name {t['vs']:.2f}) - not a kill", "ks": t["vs"]})
+    kills.sort(key=lambda k: k["t"])
+    return {"kills": kills, "deaths": sorted(deaths), "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis, "best_k": bk, "best_v": bv}
 
 
 def compute_kills(entry, cfg):
-    """Raw frames -> (kills, deaths). A kill = a NEW row where FIREAXE is the first name; persisting/shifting rows,
-    my deaths (name on the victim side), assists (row continues left of my name) and double counts are excluded."""
-    tn, th, tl = cfg.get("thr_name", 0.60), cfg.get("thr_hl", 0.30), cfg.get("thr_left", 0.80)
-    rh, off = entry.get("row_h", 30), entry.get("v_off", 0.0)
-    nf = entry.get("frames", 0)
-    by, dth = {}, []
-    for f, n, h, x, y, hs, sig, v, lf in entry.get("dets", []):
-        if not accept(n, h, tn, th):
-            continue
-        if v:
-            dth.append(f / FPS + off)
-        elif lf < tl:
-            by.setdefault(f, []).append((n, h, x, y, hs, sig))
-    deaths, lastd = [], -9.0
-    for t in sorted(dth):
-        if t - lastd > 1.0:
-            deaths.append(round(t, 2))
-        lastd = t
-    tracks, cnt, hist = [], {}, {}
-    for f in sorted(by):
-        keep = []
-        for d in sorted(by[f], key=lambda d: -d[0]):
-            if all(abs(d[3] - k[3]) > 0.6 * rh or abs(d[2] - k[2]) > 6 for k in keep):
-                keep.append(d)
-        cnt[f], hist[f] = len(keep), [d[3] for d in keep]
-        prev = max([cnt.get(g, 0) for g in range(f - 4, f)] or [0])
-        recent = [y for g in range(f - 4, f) for y in hist.get(g, [])] + [t["y"] for t in tracks if f - t["last"] <= 8]
-        for n, h, x, y, hs, sig in keep:
-            hit, hc = None, -1.0
-            for t in tracks:
-                if f - t["last"] > TRACK_KEEP_S * FPS:
-                    continue
-                c = sig_corr(sig, t["sig"])
-                pos = abs(x - t["x"]) <= 6 and abs(y - t["y"]) <= 0.5 * rh and f - t["last"] <= 8
-                if (pos or c >= 0.85) and c > hc:
-                    hit, hc = t, c
-            if hit:
-                hit.update(last=f, x=x, y=y, sig=sig, hits=hit["hits"] + 1)
-                if hs and hit["kill"] is not None and f - hit["first"] <= 20:
-                    hit["kill"]["hs"] = True
-                continue
-            maxc = max([sig_corr(sig, t["sig"]) for t in tracks if f - t["last"] <= 8] or [0.0])
-            is_new = len(keep) > prev or (all(abs(y - py) > 0.6 * rh for py in recent) and maxc < 0.6)
-            k = None
-            if is_new and f / FPS >= IGNORE_FIRST_S:
-                k = {"t": round(f / FPS + off, 3), "name": n, "hl": h, "hs": bool(hs)}
-            tracks.append({"first": f, "last": f, "x": x, "y": y, "sig": sig, "kill": k, "hits": 1})
-    kills = [t["kill"] for t in tracks if t["kill"] and (t["hits"] >= 2 or t["first"] >= nf - 2)]
-    kills.sort(key=lambda k: k["t"])
-    return kills, deaths
+    a = analyse_entry(entry, cfg)
+    return a["kills"], a["deaths"]
 
 
 def gun_onsets(rec, cache=None):
@@ -908,8 +1083,8 @@ def gun_onsets(rec, cache=None):
 
 
 def verified_kills(pool_items, cfg):
-    """Apply the gunshot rule (a strong audio transient within 0.5 s before the kill row), refine each kill time with
-    the shot, and drop kills inside the death lock. Returns stats."""
+    """Gunshot audio is a SOFT signal now: it refines each kill to the shot time and adds a score bonus, never rejects.
+    The only hard rule here is the death lock. Returns stats; every rejection is logged with its reason."""
     cache = load_json(ONSET_CACHE, {})
     todo = [it["rec"] for it in pool_items if it["rec"].get("audio") and file_key(it["rec"]["path"]) + "o1" not in cache]
     if todo:
@@ -926,19 +1101,25 @@ def verified_kills(pool_items, cfg):
     for it in pool_items:
         ons = gun_onsets(it["rec"], cache)
         keep = []
+        name = Path(it["rec"]["path"]).name
         for k in it["kills"]:
             st["raw"] += 1
-            if ons is not None:
+            shot = None
+            if ons:
                 cand = [o for o in ons if k["t"] - 0.6 <= o[0] <= k["t"] + 0.05]
-                if not cand:
-                    st["no_shot"] += 1
-                    continue
-                shot = max(cand, key=lambda o: o[0])[0]
-                k = dict(k, lag=round(k["t"] - shot, 3), t=round(shot, 3))
+                if cand:
+                    shot = max(cand, key=lambda o: o[0])[0]
+            if shot is None:
+                st["no_shot"] += 1
+                it["rej"].append({"t": k["t"], "reason": "no gunshot heard (kept - audio is only a bonus)", "ks": k["ks"], "soft": True})
+                k = dict(k, shot=False, lag=0.1, t=round(max(0.0, k["t"] - 0.1), 3))
             else:
-                k = dict(k, lag=0.1, t=round(k["t"] - 0.1, 3))
+                k = dict(k, shot=True, lag=round(k["t"] - shot, 3), t=round(shot, 3))
+            if k.get("weak_hl"):
+                it["rej"].append({"t": k["t"], "reason": "no highlight colour (kept - highlight is only a bonus)", "ks": k["ks"], "soft": True})
             if any(d < k["t"] <= d + lock for d in it.get("deaths", [])):
                 st["death_lock"] += 1
+                it["rej"].append({"t": k["t"], "reason": f"within {lock:.0f}s after my death", "ks": k["ks"]})
                 continue
             keep.append(k)
         it["kills"] = keep
@@ -1044,6 +1225,7 @@ def cmd_calibrate_bars(args):
 def do_calibrate(game, img, region, row, name, hs=None, expand=True):
     """img: 1920x1080 normalised screenshot/frame. Boxes are absolute x,y,w,h in that space."""
     import cv2
+    import numpy as np
     (rx, ry, rw, rh), (ax, ay, aw, ah), (nx, ny, nw, nh) = region, row, name
     if not (rx <= ax and ry <= ay and ax + aw <= rx + rw and ay + ah <= ry + rh and
             ax <= nx and ay <= ny and nx + nw <= ax + aw and ny + nh <= ay + ah):
@@ -1063,8 +1245,12 @@ def do_calibrate(game, img, region, row, name, hs=None, expand=True):
     ok, buf = cv2.imencode(".png", tmpl)
     buf.tofile(str(DATA / png))
     cv2.imencode(".png", img[ay:ay + ah, ax:ax + aw])[1].tofile(str(DATA / f"detect_{game}_row.png"))
+    rowimg = cv2.cvtColor(img[ay:ay + ah, ax:ax + aw], cv2.COLOR_BGR2HSV)
+    edge = np.concatenate([rowimg[:2].reshape(-1, 3), rowimg[-2:].reshape(-1, 3), rowimg[:, :2].reshape(-1, 3), rowimg[:, -2:].reshape(-1, 3)])
+    sat = edge[edge[:, 1] >= 80]
+    hl_color = [int(np.median(sat[:, i])) for i in range(3)] if len(sat) >= 0.3 * len(edge) else None   # border pixels only
     d = {"region": [rx2 / NORM_W, ry / NORM_H, (rx2 + rw2) / NORM_W, (ry + rh2) / NORM_H],
-         "name_png": png, "ring": ring, "hist": [float(v) for v in hist],
+         "name_png": png, "ring": ring, "hist": [float(v) for v in hist], "row_h": int(ah), "hl_color": hl_color,
          "min_right": max(40, int(0.35 * (ax + aw - (nx + nw)))), "left_gap": int(nx - ax)}
     if hs:
         hx, hy, hw, hh = hs
@@ -1076,10 +1262,11 @@ def do_calibrate(game, img, region, row, name, hs=None, expand=True):
     reg = img[int(d["region"][1] * NORM_H):int(d["region"][3] * NORM_H), int(d["region"][0] * NORM_W):int(d["region"][2] * NORM_W)]
     g = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
     cfg = load_config()
-    loose = [c for c in det.detect(g, hp_img(g), reg, 1.0, 1.0, floor=0.3) if not c["v"]]
-    hits = [c for c in loose if accept(c["score"], c["hl"], cfg["thr_name"], cfg["thr_hl"]) and c["lf"] < cfg["thr_left"]]
-    res = {"hits": len(hits), "name": max([h["score"] for h in loose], default=0), "hl": max([h["hl"] for h in loose], default=0)}
-    out(f"{game} calibrated. self-test: {res['hits']} own row(s) found (name {res['name']:.2f}, highlight {res['hl']:.2f})")
+    rows = det.rows(g, hp_img(g), reg, 1.0, 1.0, floor=0.3)
+    hits = [r for r in rows if any(v == "kill" for v, _ in classify_row(r, cfg, det.lg))]
+    res = {"hits": len(hits), "name": max([r["ks"] for r in rows], default=0), "hl": max([r["hl"] for r in rows], default=0)}
+    out(f"{game} calibrated. self-test on your frame: {len(rows)} rows with a weapon icon matched, {res['hits']} are kills by FIREAXE "
+        f"(best killer-side name {res['name']:.2f}); border colour {'found' if hl_color else 'not found (highlight bonus off)'}")
     return res
 
 
@@ -1141,10 +1328,10 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
     jobs = [(r, r["game"]) for r in recs if rescan or kills_key(r, r["game"], dets[r["game"]]) not in cache]
     if limit:
         jobs = jobs[:limit]
+    out(f"cached {len(recs) - len(jobs)}, scanning {len(jobs)}  (of {len(recs)} clips in scope)")
     groups = {}
     for r, g in jobs:
         groups.setdefault(scale_key(g, dets[g], r, cfg), []).append(r)
-    out(f"{len(jobs)} clips to scan ({len(recs)} candidates; cached ones skipped)")
     done, errs, t0 = 0, 0, time.time()
 
     def work(job):
@@ -1153,7 +1340,9 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
             return r, g, None, "cancelled", None
         try:
             sc = get_scale(dets[g], g, r, cfg, groups[scale_key(g, dets[g], r, cfg)][:3])
-            return r, g, scan_clip(r["path"], r, dets[g], cfg, (sc["sx"], sc["sy"])), None, sc
+            res = scan_clip(r["path"], r, dets[g], cfg, (sc["sx"], sc["sy"]))
+            cache.put(kills_key(r, g, dets[g]), res)           # saved the moment this clip finishes
+            return r, g, res, None, sc
         except Exception as ex:
             return r, g, None, f"{type(ex).__name__}: {ex}", None
     with ThreadPoolExecutor(max_workers=3) as ex:
@@ -1165,17 +1354,12 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
             name = Path(r["path"]).name
             if err:
                 errs += 1
-                res = {"kills": [], "error": err}
                 out(f"[{done}/{len(jobs)}] {g:8} ERROR {name}: {err}")
             else:
                 ks, ds = compute_kills(res, cfg)
                 out(f"[{done}/{len(jobs)}] {g:8} {len(ks)} kills {' '.join(ts(k['t']) for k in ks) or '-'}"
-                    f" | best name {res['best_name']:.2f} hl {res['best_hl']:.2f} | scale {res['scale'][0]}x{res['scale'][1]}"
+                    f" | best killer-side {res['best_name']:.2f}, victim-side {res['best_vic']:.2f} | scale {res['scale'][0]}x{res['scale'][1]}"
                     f"{'' if sc['solved'] else ' (UNSOLVED)'} | rect {content_rect(r, cfg)} crop {'yes' if r.get('bars') else 'no'} | {name} ({res['secs']}s)")
-            cache[kills_key(r, g, dets[g])] = res
-            if done % 5 == 0:
-                save_json(KILLS_CACHE, cache)
-    save_json(KILLS_CACHE, cache)
     out(f"scan finished: {done} in {time.time() - t0:.0f}s, errors {errs}")
     return done
 
@@ -1185,7 +1369,8 @@ def cmd_scan(args):
 
 
 def game_pool(cfg, game, paths=None):
-    """([{rec, kills, deaths}], stats) from cached scans for one game; kills computed now from raw frames, then audio-verified."""
+    """([{rec, kills, deaths, vis}], stats): same analyse_entry as the crop view / Self-test, then the soft audio + death-lock
+    step. Every rejected row is logged with its reason."""
     det = load_dets(game).get(game)
     if not det:
         raise RuntimeError(f"{game} is not calibrated yet: Troubleshoot > Calibrate killfeed")
@@ -1197,7 +1382,7 @@ def game_pool(cfg, game, paths=None):
         pass
     ps = set(paths) if paths is not None else None
     stats = {"tagged": 0, "scanned": 0, "with_kills": 0}
-    pool = []
+    pool, allrej = [], []
     for r in scan_clips(cfg):
         if r.get("error") or not r.get("w") or r.get("game") != game or (ps is not None and r["path"] not in ps):
             continue
@@ -1208,16 +1393,35 @@ def game_pool(cfg, game, paths=None):
         if not e or e.get("error"):
             continue
         stats["scanned"] += 1
-        ks, ds = compute_kills(e, cfg)
-        if ks:
-            pool.append({"rec": r, "kills": ks, "deaths": ds})
+        a = analyse_entry(e, cfg)
+        for j in a["rej"]:
+            allrej.append((Path(r["path"]).name, j))
+        if a["kills"]:
+            pool.append({"rec": r, "kills": a["kills"], "deaths": a["deaths"], "vis": a["vis"], "rej": []})
     stats["with_kills"] = len(pool)
     stats["audio"] = verified_kills(pool, cfg) if pool else {"raw": 0, "no_shot": 0, "death_lock": 0, "kept": 0}
+    for it in pool:
+        nm = Path(it["rec"]["path"]).name
+        allrej += [(nm, j) for j in it["rej"]]
+    reasons = {}
+    for nm, j in allrej:
+        key = j["reason"].split(":")[0].split("(")[0].strip()
+        reasons[key] = reasons.get(key, 0) + 1
+    stats["rejected"] = reasons
+    if allrej:
+        out(f"REJECTED ROWS in {game}: " + ", ".join(f"{k}: {v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])))
+        for nm, j in allrej[:80]:
+            out(f"   {nm} @ {ts(j['t'])}  name {j['ks']:.2f}  -> {j['reason']}")
+        if len(allrej) > 80:
+            out(f"   ... {len(allrej) - 80} more (see montage_data\\logs\\montage.log)")
+            for nm, j in allrej[80:]:
+                LOGONLY(f"   {nm} @ {ts(j['t'])}  name {j['ks']:.2f}  -> {j['reason']}")
     pool = [it for it in pool if it["kills"]]
     return pool, stats
 
 
 def grab_kill_crop(rec, det, cfg, k, scale):
+    """Killfeed crop with every detected row labelled by the SAME classify_row() the scanner uses."""
     import cv2
     import numpy as np
     vf = region_filter(rec, det, cfg)
@@ -1229,12 +1433,18 @@ def grab_kill_crop(rec, det, cfg, k, scale):
         return None
     fr = np.frombuffer(r.stdout[:n], np.uint8).reshape(det.dh, det.dw, 3).copy()
     g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
-    for d in det.detect(g, hp_img(g), fr, scale[0], scale[1], floor=0.45):
-        ok = accept(d["score"], d["hl"], cfg["thr_name"], cfg["thr_hl"])
-        col = (0, 255, 0) if ok and not d["v"] else (0, 0, 255)
-        cv2.rectangle(fr, (d["x"], d["y"]), (d["x"] + d["w"], d["y"] + d["h"]), col, 2)
-        cv2.putText(fr, f"{d['score']:.2f}/{d['hl']:.2f}{' DEATH' if d['v'] else ''} lf{d['lf']:.2f}", (d["x"], max(10, d["y"] - 3)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
+    for d in det.rows(g, hp_img(g), fr, scale[0], scale[1], floor=0.45):
+        v = classify_row(d, cfg, det.lg * scale[0])
+        verdicts = [x[0] for x in v]
+        cv2.rectangle(fr, (d["ix"], d["y0"]), (d["ix"] + d["iw"], d["y1"]), (255, 200, 0) if d["gun"] else (200, 0, 200), 1)
+        if d["ks"] >= 0.45:
+            col = (0, 255, 0) if "kill" in verdicts else (0, 140, 255)
+            cv2.rectangle(fr, (d["kx"], d["ky"]), (d["kx"] + d["tw"], d["ky"] + d["th"]), col, 2)
+        if d["vs"] >= 0.45:
+            col = (0, 0, 255) if "death" in verdicts else (0, 140, 255)
+            cv2.rectangle(fr, (d["vx"], d["vy"]), (d["vx"] + d["tw"], d["vy"] + d["th"]), col, 2)
+        cv2.putText(fr, f"K{d['ks']:.2f} V{d['vs']:.2f} {'gun' if d['gun'] else 'UTIL'} -> {'/'.join(x[1].split(':')[0] for x in v)}",
+                    (4, max(10, d["y0"] - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1, cv2.LINE_AA)
     cv2.putText(fr, f"{Path(rec['path']).name[-24:]} t={ts(k['t'])}" + (" HS" if k.get("hs") else ""),
                 (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
     return fr
@@ -1275,8 +1485,7 @@ def cmd_verify(args):
 
 
 def selftest_detection(cfg, per_game=20):
-    """Runs the kill logic on up to 20 cached clips per game and prints score distributions to judge thresholds."""
-    import numpy as np
+    """Same analyse_entry as Dry plan / Render. Per game: clips, zero-kill clips, score histograms, rejected rows by reason."""
     cache = load_kills_cache()
     shown = False
     for g in GAMES:
@@ -1292,21 +1501,29 @@ def selftest_detection(cfg, per_game=20):
         if not items:
             out(f"{g}: no scanned clips yet (scan a few first)")
             continue
-        items = items[::max(1, len(items) // per_game)][:per_game]
         shown = True
-        bn = [e["best_name"] for _, e in items]
-        bh = [e["best_hl"] for _, e in items]
-        nk = []
-        out(f"== {g}: {len(items)} cached clips, thresholds name>={cfg['thr_name']} hl>={cfg['thr_hl']} (or hl>=0.9 & name>=0.6), left<{cfg['thr_left']} ==")
+        sample = items[::max(1, len(items) // per_game)][:per_game]
+        zero, kh, vh, reasons, nk = 0, [0] * 11, [0] * 11, {}, 0
         for r, e in items:
-            ks, ds = compute_kills(e, cfg)
-            nk.append(len(ks))
-            out(f"  {len(ks)} kills, {len(ds)} deaths | best name {e['best_name']:.2f} hl {e['best_hl']:.2f} | scale {e['scale']} | {Path(r['path']).name}")
-        pc = lambda a: ", ".join(f"p{q}={np.percentile(a, q):.2f}" for q in (10, 50, 90))
-        out(f"  best-name scores: {pc(bn)}   best-highlight: {pc(bh)}")
-        out(f"  clips with 0 kills: {sum(1 for k in nk if k == 0)}/{len(nk)}; clips with name<0.5 everywhere (likely detector/scale miss): {sum(1 for b in bn if b < 0.5)}")
-        sc = load_json(SCALES, {})
-        for k, v in sc.items():
+            a = analyse_entry(e, cfg)
+            zero += 0 if a["kills"] else 1
+            nk += len(a["kills"])
+            kh[min(10, int(a["best_k"] * 10))] += 1
+            vh[min(10, int(a["best_v"] * 10))] += 1
+            for j in a["rej"]:
+                key = j["reason"].split(":")[0].split("(")[0].strip()
+                reasons[key] = reasons.get(key, 0) + 1
+        out(f"== {g}: {len(items)} clips scanned, {zero} with 0 kills, {nk} kills in total "
+            f"(killer-side >= {cfg['thr_kill']}, victim-side >= {cfg['thr_death']}) ==")
+        bins = "  ".join(f"{i / 10:.1f}:{n}" for i, n in enumerate(kh) if n)
+        out(f"  best killer-side name score per clip (bin:clips): {bins or '-'}")
+        bins = "  ".join(f"{i / 10:.1f}:{n}" for i, n in enumerate(vh) if n)
+        out(f"  best victim-side name score per clip (bin:clips): {bins or '-'}")
+        out("  rows rejected by reason: " + (", ".join(f"{k}: {v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])) or "none"))
+        for r, e in sample:
+            a = analyse_entry(e, cfg)
+            out(f"  {len(a['kills'])} kills, {len(a['deaths'])} deaths | killer {a['best_k']:.2f} victim {a['best_v']:.2f} | scale {e['scale']} | {Path(r['path']).name}")
+        for k, v in load_json(SCALES, {}).items():
             if k.startswith(g + "|"):
                 out(f"  scale {k.split('|', 2)[2]}: x{v['sx']} y{v['sy']} match {v['score']} {'' if v['solved'] else 'UNSOLVED'}")
     if not shown:
@@ -1366,10 +1583,10 @@ def smooth(a, w):
     return np.convolve(a, np.ones(w) / w, mode="same")
 
 
-def analyse_song(path):
+def analyse_song(path, csv_bpm=None):
     """BPM, beat grid, downbeats, per-beat energy, section levels, drop. Cached per file."""
     cache = load_json(SONG_CACHE, {})
-    key = file_key(path) + SONG_ALGO
+    key = file_key(path) + SONG_ALGO + f"|{round(csv_bpm or 0)}"
     if key in cache:
         return cache[key]
     import numpy as np
@@ -1385,6 +1602,16 @@ def analyse_song(path):
     if len(bt) < 16:
         raise RuntimeError("no steady beat found")
     bpm = float(np.atleast_1d(tempo)[0])
+    if csv_bpm:                                   # librosa half/double-tempo errors: trust the CSV tempo
+        ratio = bpm / csv_bpm
+        if 1.8 < ratio < 2.2:
+            st = oenv[np.clip(bf, 0, len(oenv) - 1)]
+            ph = int(st[1::2].sum() > st[0::2].sum())
+            bf, bt, bpm = bf[ph::2], bt[ph::2], bpm / 2
+        elif 0.45 < ratio < 0.55:
+            bt = np.sort(np.concatenate([bt, (bt[:-1] + bt[1:]) / 2]))
+            bf = np.round(bt * sr / hop).astype(int)
+            bpm *= 2
     ibi = np.diff(bt)
     steady = float(max(0.0, 1 - np.std(ibi) / max(np.mean(ibi), 1e-6) * 8))
     if steady >= 0.75:      # steady (electronic) track: replace the tracked beats by a clean grid over the whole song
@@ -1419,6 +1646,8 @@ def analyse_song(path):
         drop = None
     onsets = librosa.onset.onset_detect(onset_envelope=oenv, sr=sr, hop_length=hop, units="time")
     bpm_fit = 1.0 if 100 <= bpm <= 180 else max(0.0, 1 - min(abs(bpm - 100), abs(bpm - 180)) / 40)
+    if csv_bpm and abs(bpm - csv_bpm) / csv_bpm < 0.05:
+        bpm = float(csv_bpm)
     an = {"bpm": round(bpm, 1), "beats": [round(float(t), 4) for t in bt], "down": [int(i) for i in down],
           "energy": [round(float(e), 3) for e in en], "level": [int(l) for l in level],
           "drop": None if drop is None else int(drop), "drop_strength": round(dstr, 3), "steady": round(steady, 3),
@@ -1429,11 +1658,12 @@ def analyse_song(path):
     return an
 
 
-def song_fit(an):
-    """Montage fit, 0-45: steady beat 15 + clear drop/energy rise 20 + BPM 100-180 10."""
+def song_fit(an, energy=None):
+    """Montage fit, 0-55: steady beat 15 + clear drop/energy rise 20 + BPM 100-180 10 + energy 10 (CSV energy if present)."""
     rise = max(an["drop_strength"], 0.0)
+    en = energy if energy is not None else (sum(an["energy"]) / max(1, len(an["energy"])))
     return {"steady": round(15 * an["steady"], 1), "drop": round(20 * min(1.0, rise / 0.4), 1),
-            "bpm": round(10 * an["bpm_fit"], 1)}
+            "bpm": round(10 * an["bpm_fit"], 1), "energy": round(10 * max(0.0, min(1.0, en)), 1)}
 
 
 def pick_window(an, target_s):
@@ -1489,7 +1719,12 @@ def song_pool(cfg):
             added = parse_added(r["added"]) if r["added"] else None
             old = songs.get(a["path"])
             if old is None or (added and (old["added"] is None or added > old["added"])):
-                songs[a["path"]] = {"path": a["path"], "artist": r["artist"], "title": r["title"], "added": added}
+                songs[a["path"]] = {"path": a["path"], "artist": r["artist"], "title": r["title"], "added": added,
+                                    "csv_bpm": r.get("tempo") or None, "energy": r.get("energy"), "score": sc}
+        try:
+            write_song_matches(audio, matched)
+        except Exception as ex:
+            out(f"could not write song_matches.csv: {ex}")
     if rows:
         wk = [r for r in rows if r["added"] and parse_added(r["added"]) and (datetime.datetime.now() - parse_added(r["added"])).days < cfg.get("week_days", 7)]
         have = {id(r) for r, a, sc in matched}
@@ -1516,13 +1751,13 @@ def pick_song(cfg, game, songs, now=None, forced=None):
     def score(s, an):
         d = (now - s["added"]).days if s["added"] else 999
         rec = 50.0 / (1 + max(d, 0) / 7.0) if s["added"] else 0.0
-        fit = song_fit(an)
+        fit = song_fit(an, s.get("energy"))
         pen = (30.0 if s["path"] == last else 0.0) + 8.0 * sum(1 for u in used[-4:] if u["path"] == s["path"])
         return {"recency": round(rec, 1), "fit": round(sum(fit.values()), 1), "fit_parts": fit, "penalty": pen,
                 "total": round(rec + sum(fit.values()) - pen, 1), "days": None if d == 999 else d}
     if forced:
         s = next((x for x in songs if x["path"] == forced), None) or {"path": forced, "artist": "", "title": Path(forced).stem, "added": None}
-        an = analyse_song(forced)
+        an = analyse_song(forced, (next((x for x in songs if x['path'] == forced), {}) or {}).get('csv_bpm'))
         return s, an, score(s, an), []
     week = sorted([s for s in songs if s["added"] and (now - s["added"]).days < wd], key=lambda s: s["added"], reverse=True)
     rest = sorted([s for s in songs if s not in week], key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
@@ -1533,7 +1768,7 @@ def pick_song(cfg, game, songs, now=None, forced=None):
                 raise RuntimeError("cancelled")
             progress(i / 15, f"analysing song {i + 1}")
             try:
-                an = analyse_song(s["path"])
+                an = analyse_song(s["path"], s.get("csv_bpm"))
             except Exception as ex:
                 out(f"  skip {Path(s['path']).name}: {ex}")
                 continue
@@ -1607,9 +1842,12 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
                 cur = [k]
         groups.append(cur)
         for g in groups:
-            times = [k["t"] for k in g]                      # already refined to the gunshot
+            times = [k["t"] for k in g]                      # refined to the gunshot when one was heard
+            first_row = g[0]["t"] + g[0].get("lag", 0.1)
+            vis = [(t0, t1) for t0, t1 in item.get("vis", []) if t0 < first_row - 0.1]   # EARLIER own rows only
             evs.append({"rec": item["rec"], "path": item["rec"]["path"], "times": times, "n": len(g),
-                        "lags": [k.get("lag", 0.1) for k in g],
+                        "lags": [k.get("lag", 0.1) for k in g], "vis": vis,
+                        "shots": sum(1 for k in g if k.get("shot")) / len(g),
                         "first": times[0], "last": times[-1], "span": times[-1] - times[0],
                         "hs": sum(1 for k in g if k.get("hs")), "flick": False})
     singles = [e for e in evs if e["n"] == 1 and not e["hs"]]
@@ -1620,13 +1858,13 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
         except Exception:
             pass
     for e in evs:
-        e["score"] = base_score(e)
+        e["score"] = base_score(e) + 3.0 * e["shots"]          # gunshot heard = small bonus only
     evs.sort(key=lambda e: -e["score"])
     return evs
 
 
 # ======================================================================= PLANNER
-LEAD_LO, LEAD_HI, LEAD_MIN, TAIL_S, SLOW_OUT = 1.5, 2.5, 1.2, 1.0, 0.4
+LEAD_MIN, SLOW_OUT = 0.3, 0.4
 MIN_TAKE_BEATS, MIN_TAKE_S, OUT_FPS = 2, 1.2, 60
 RECIPES = {
     "hardcut": {"zoom_p": 0.15, "zoom_amp": 0.05, "ramp_p": 0.0, "flash": False, "slow_max": 1},
@@ -1646,10 +1884,28 @@ def pick_recipe(rng, style, avoid):
     return name, dict(RECIPES[name])
 
 
+def src_to_out(segs, src_t):
+    """THE source-time -> output-time map of one take (seconds from the take's first frame). segs = [[a, b, speed, frames], ...].
+    Used for kill placement, effect placement and the sync report, so they can never disagree."""
+    off = 0
+    for a, b, sp, n in segs:
+        if b > a and a - 1e-6 <= src_t <= b + 1e-6:
+            return (off + (src_t - a) / (b - a) * n) / OUT_FPS
+        off += n
+    if segs and src_t < segs[0][0]:
+        return (src_t - segs[0][0]) / OUT_FPS
+    return off / OUT_FPS
+
+
+def vis_ok(ev, src_start):
+    """True if no earlier own killer row is on screen at the take's first source frame."""
+    return not any(t0 <= src_start <= t1 for t0, t1 in ev.get("vis", []))
+
+
 def geom(ev, bt, c, kb, end, ramp, slow):
-    """One continuous take: starts lead_t (1.5-2.5 s, whole beats) before the FIRST kill, keeps every kill in view,
-    ends on a beat ~1 s after the LAST kill. Later kills are nudged onto beats with 0.85-1.15x speed. None if infeasible."""
-    import numpy as np
+    """One continuous take: starts 1-2 beats (more only if an earlier row would still be on screen) before the FIRST kill,
+    kills always play at 1.0x from 0.5 s before the first through the last, short tail (0.3-0.6 s) to the next beat.
+    Speed-ups only in the approach; slow-mo (0.4 s) only right after the last kill, on a beat."""
     lead_t = float(bt[kb] - bt[c])
     D = float(bt[end] - bt[c])
     if lead_t < LEAD_MIN or end - c < MIN_TAKE_BEATS or D < MIN_TAKE_S:
@@ -1657,74 +1913,78 @@ def geom(ev, bt, c, kb, end, ramp, slow):
     times = ev["times"]
     first, last = times[0], times[-1]
     r = 1.0
-    if ramp > 1.0:
-        r = min(ramp, first / lead_t)
+    segs = []
+    if ramp > 1.0 and lead_t >= 1.2:
+        app = lead_t - 0.5
+        r = min(ramp, max(1.0, (first - 0.5) / app))
         r = r if r >= 1.15 else 1.0
-    if first - lead_t * r < -1e-6:
+    if r > 1.0:
+        segs += [(first - 0.5 - app * r, first - 0.5, r), (first - 0.5, first, 1.0)]
+    else:
+        segs.append((first - lead_t, first, 1.0))
+    if segs[0][0] < -1e-6:
         return None
-    segs, kills_out = [], [lead_t]
-    if lead_t * r > 0.03:
-        segs.append((first - lead_t * r, first, r))
-    cur_out, cur_src, snapped = lead_t, first, 0
-    t0 = float(bt[c])
-    for tk in times[1:]:
-        ds = tk - cur_src
-        if ds < 0.04:
-            kills_out.append(cur_out)
-            continue
-        sp, tgt = 1.0, cur_out + ds
-        k = int(np.argmin(np.abs(bt - (t0 + tgt))))
-        cand = float(bt[k] - t0)
-        if cand > cur_out + 0.05 and 0.85 <= ds / (cand - cur_out) <= 1.15:
-            sp, tgt, snapped = ds / (cand - cur_out), cand, snapped + 1
-        segs.append((cur_src, tk, sp))
-        kills_out.append(tgt)
-        cur_out, cur_src = tgt, tk
+    if last - first > 0.03:
+        segs.append((first, last, 1.0))
+    cur_out = lead_t + (last - first)
     post = D - cur_out
-    if post < 0.45:
+    if post < 0.3:
         return None
-    sl = bool(slow) and post >= SLOW_OUT + 0.45
-    src_end = last + post - (0.2 if sl else 0.0)
+    t0 = float(bt[c])
+    slow_start = None
+    if slow:
+        j = next((j for j in range(c + 1, end) if bt[j] - t0 >= cur_out + 0.05), None)
+        if j is not None and D - (bt[j] - t0) >= SLOW_OUT + 0.25:
+            slow_start = float(bt[j] - t0)
+    if slow_start is not None:
+        pre = slow_start - cur_out
+        if pre > 0.02:
+            segs.append((last, last + pre, 1.0))
+        a2 = last + pre
+        rest = D - slow_start - SLOW_OUT
+        segs += [(a2, a2 + 0.2, 0.5), (a2 + 0.2, a2 + 0.2 + rest, 1.0)]
+        src_end = a2 + 0.2 + rest
+    else:
+        src_end = last + post
+        segs.append((last, src_end, 1.0))
     if src_end > ev["rec"]["dur"] - 0.08:
         return None
-    if sl:
-        segs += [(last, last + 0.2, 0.5), (last + 0.2, src_end, 1.0)]
-    else:
-        segs.append((last, src_end, 1.0))
-    return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "dur": D, "segs": segs, "ramp": r, "slow": sl,
-            "kills_out": kills_out, "snapped": snapped}
+    return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "dur": D, "segs": segs, "ramp": r,
+            "slow": slow_start is not None, "snapped": 0}
 
 
 def place(ev, bt, down, c=None, kb=None, end=None, ramp=1.0, slow=False):
-    """Try lead-ins of 1.5-2.5 s (relaxed to 1.2 s only if the clip starts too close), whole-beat lengths,
-    preferring 4-beat multiples and a downbeat for the first kill."""
+    """Lead-in 1-2 beats before the first kill (more only to keep earlier killfeed rows off the first frame), tail 0.3-0.6 s to the
+    next beat, whole-beat length, 4-beat multiples preferred."""
     nb = len(bt) - 1
-    pairs = []
-    for lo, hi in ((LEAD_LO, LEAD_HI), (LEAD_MIN, LEAD_LO - 1e-6)):
-        if kb is not None:
-            pairs = [(kb - k, kb) for k in range(1, kb + 1) if lo <= bt[kb] - bt[kb - k] <= hi]
-        else:
-            for k2 in range(c + 1, nb):
-                lt = bt[k2] - bt[c]
-                if lt > hi:
-                    break
-                if lt >= lo:
-                    pairs.append((c, k2))
-        if pairs:
-            break
-    pairs.sort(key=lambda p: (p[1] not in down, (p[1] - p[0]) % 4 != 0, abs((bt[p[1]] - bt[p[0]]) - 2.0)))
-    span = ev["times"][-1] - ev["times"][0]
-    for cc, kk in pairs:
+    first = ev["times"][0]
+    span = ev["times"][-1] - first
+    if kb is not None:
+        pairs = [(kb - k, kb, k) for k in range(1, min(kb, 16) + 1) if bt[kb] - bt[kb - k] >= LEAD_MIN]
+    else:
+        pairs = [(c, c + k, k) for k in range(1, 17) if c + k < nb and bt[c + k] - bt[c] >= LEAD_MIN]
+    if ramp > 1.0:
+        pairs = [q for q in pairs if bt[q[1]] - bt[q[0]] >= 1.2]
+    pairs = [q for q in pairs if first - (bt[q[1]] - bt[q[0]]) >= -1e-6]
+    good = sorted([q for q in pairs if vis_ok(ev, first - (bt[q[1]] - bt[q[0]]))],
+                  key=lambda q: (0 if q[2] == 2 else 1 if q[2] == 1 else 2 + q[2], q[1] not in down))
+    bad = sorted([q for q in pairs if q not in good], key=lambda q: -(bt[q[1]] - bt[q[0]]))[:2]
+    for cc, kk, _ in good + bad:
         lead = bt[kk] - bt[cc]
+        last_out = lead + span
         if end is not None:
             ends = [end]
         else:
-            j0 = next((j for j in range(kk + 1, nb + 1) if bt[j] - bt[cc] >= lead + span + TAIL_S), nb)
-            jmin = next((j for j in range(kk + 1, nb + 1) if bt[j] - bt[cc] >= lead + span + 0.5), nb)
-            up = list(range(j0, min(nb, j0 + 7) + 1))
-            dn = list(range(j0 - 1, jmin - 1, -1))
-            ends = ([j for j in up if (j - cc) % 4 == 0] + [j for j in up if (j - cc) % 4 and (j - cc) % 2 == 0] +
-                    [j for j in up if (j - cc) % 2] + [j for j in dn if (j - cc) % 4 == 0] + [j for j in dn if (j - cc) % 4])
+            cand = [j for j in range(kk + 1, nb + 1) if bt[j] - bt[cc] - last_out >= 0.3 and bt[j] - bt[cc] >= MIN_TAKE_S and j - cc >= 2]
+            tl = lambda j: bt[j] - bt[cc] - last_out
+            short = [j for j in cand if tl(j) <= 0.6]
+            mid = [j for j in cand if 0.6 < tl(j) <= 1.2]
+            longer = [j for j in cand if tl(j) > 1.2][:6]
+            order = lambda L: ([j for j in L if (j - cc) % 4 == 0] + [j for j in L if (j - cc) % 4 and (j - cc) % 2 == 0] +
+                               [j for j in L if (j - cc) % 2])
+            ends = order(short) + order(mid) + longer
+            if slow:
+                ends = order([j for j in cand if 0.85 <= tl(j) <= 1.8]) + ends
         for j in ends:
             g = geom(ev, bt, cc, kk, j, ramp, slow)
             if g:
@@ -1748,15 +2008,13 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     total_ev = len(ev_sorted)
 
     def nat(e):
-        lead = min(max(int(math.ceil(LEAD_LO / bd)), 2), int(LEAD_HI / bd))
-        if e["times"][0] < lead * bd:
-            lead = max(int(math.ceil(LEAD_MIN / bd)), 2)
+        lead = 2
         span = e["times"][-1] - e["times"][0]
-        L = lead + int(math.ceil((span + TAIL_S) / bd))
+        L = lead + int(math.ceil((span + 0.5) / bd))
         L = ((L + 3) // 4) * 4
         avail = int((e["rec"]["dur"] - 0.1 - e["times"][0]) / bd) + lead
         if L > avail:
-            L = max(avail // 2 * 2, lead + int(math.ceil((span + 0.5) / bd)))
+            L = max(avail // 2 * 2, lead + int(math.ceil((span + 0.4) / bd)))
         return max(L, MIN_TAKE_BEATS)
     usable, skipped = [], []
     for e in ev_sorted:
@@ -1782,22 +2040,19 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     dc8 = [i for i in dc if (i - d0) % 8 == 0]             # drop on an 8-beat phrase boundary
     drop = min(dc8 or dc, key=lambda i: abs(i - dr))
     fx = {}
-    slow_ids = [id(e) for e in sorted(rest, key=lambda e: -e["score"]) if e["score"] >= 30][:rp["slow_max"]]
-    for e in rest:
-        fx[id(e)] = (rng.uniform(1.4, 1.9) if rng.random() < rp["ramp_p"] else 1.0, id(e) in slow_ids)
+    for e in rest:                                         # speed-ups only in the approach; slow-mo only after the headline
+        fx[id(e)] = (rng.uniform(1.4, 1.9) if rng.random() < rp["ramp_p"] else 1.0, False)
 
     def place_fx(e, c=None, kb=None, end=None):
         ramp, sl = fx.get(id(e), (1.0, False))
-        for rr, ss in ((ramp, sl), (1.0, sl), (1.0, False)):
-            t = place(e, bt, down, c=c, kb=kb, end=end, ramp=rr, slow=ss)
+        for rr in (ramp, 1.0):
+            t = place(e, bt, down, c=c, kb=kb, end=end, ramp=rr, slow=sl)
             if t:
-                if t["slow"] and not (lv[t["kb"]] == 0 or en[t["kb"]] < 0.45):
-                    t = place(e, bt, down, c=c, kb=kb, end=end, ramp=rr, slow=False) or t
                 return t
         return None
     head_take = None
     for e in head_cands[:10]:
-        head_take = place(e, bt, down, kb=drop)
+        head_take = (place(e, bt, down, kb=drop, slow=True) if rp["slow_max"] > 0 else None) or place(e, bt, down, kb=drop)
         if head_take:
             if e is not head:
                 rest = [x for x in rest if x is not e] + ([head] if head not in rest else [])
@@ -1902,20 +2157,28 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             if n > 0:
                 segs.append([round(a, 3), round(b, 3), round(sp, 4), n])
         strong = kb in down or en[kb] >= 0.6
-        ko = t["kills_out"]
+        ko = [src_to_out(segs, tk) for tk in ev["times"]]          # kill output times through the ONE mapping function
+        slow_at = None
+        o = 0
+        for sg in segs:
+            if sg[2] == 0.5:
+                slow_at = o / OUT_FPS
+                break
+            o += sg[3]
+        fr = lambda x: round(x * OUT_FPS) / OUT_FPS
         pulses = []
         if role == "headline" or (strong and rng.random() < rp["zoom_p"]):
-            pulses.append(ko[0])
+            pulses.append(fr(ko[0]))
         for k2 in ko[1:]:
             j = int(np.argmin(np.abs(bt - (bt[t["c"]] + k2))))
             if abs(bt[j] - (bt[t["c"]] + k2)) < 0.06 and (j in down or en[j] >= 0.6) and len(pulses) < 3 \
                     and rng.random() < rp["zoom_p"] * 0.6:
-                pulses.append(k2)
+                pulses.append(fr(k2))
         out_takes.append({"path": ev["path"], "rect": content_rect(ev["rec"], cfg), "audio": ev["rec"].get("audio", True),
                           "wh": [ev["rec"]["w"], ev["rec"]["h"]], "segs": segs, "f0": f0, "nf": nf,
                           "out_start": round(f0 / OUT_FPS, 3), "dur": round(nf / OUT_FPS, 3), "role": role,
                           "pulses": [round(p, 3) for p in pulses], "amp": round(rp["zoom_amp"], 3),
-                          "flash": round(ko[0], 3) if role == "headline" and rp["flash"] else None,
+                          "flash": fr(ko[0]) if role == "headline" and rp["flash"] else None, "slow_at": slow_at,
                           "beat0": int(t["c"] - c0), "beat_end": int(t["end"] - c0), "beat_kill": int(kb - c0),
                           "song_beat": int(t["c"]), "kill_down": kb in down,
                           "kills": [round(x, 2) for x in ev["times"]], "kills_out": [round(x, 3) for x in ko],
@@ -1959,7 +2222,7 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     if score_info:
         fp = score_info["fit_parts"]
         L.append(f"SONG SCORE total {score_info['total']} = recency {score_info['recency']} (added {score_info['days']} days ago)"
-                 f" + fit {score_info['fit']} (steady {fp['steady']}, drop {fp['drop']}, bpm {fp['bpm']}) - used-penalty {score_info['penalty']}")
+                 f" + fit {score_info['fit']} (steady {fp['steady']}, drop {fp['drop']}, bpm {fp['bpm']}, energy {fp.get('energy', 0)}) - used-penalty {score_info['penalty']}")
     for s2, sc in runners:
         L.append(f"   runner-up: {s2['artist']} - {s2['title']}  total {sc['total']} (recency {sc['recency']}, fit {sc['fit']}, penalty {sc['penalty']})")
     for n in plan["notes"]:
@@ -2162,6 +2425,9 @@ def sync_report(plan, outfile, cfg):
     beats = np.array(plan["beats_out"])
     rows, errs_first, errs_all = [], [], []
     for i, t in enumerate(plan["takes"], 1):
+        cb = int(np.argmin(np.abs(beats - t["f0"] / OUT_FPS)))
+        rows.append(f"  take {i:2}: CUT at {t['f0'] / OUT_FPS:7.3f}s = beat #{t['beat0']} [song beat {t['song_beat']}], "
+                    f"nearest beat #{cb} error {(t['f0'] / OUT_FPS - beats[cb]) * 1000:+.0f} ms, {t['beat_end'] - t['beat0']} beats")
         for j, ko in enumerate(t["kills_out"]):
             tp = t["f0"] / OUT_FPS + ko
             kb = int(np.argmin(np.abs(beats - tp)))
@@ -2178,6 +2444,16 @@ def sync_report(plan, outfile, cfg):
     out("SYNC REPORT (planned kill times on the output timeline vs beats; detector drift is +-33 ms resolution)")
     for r in rows:
         out(r)
+    out("  effects (placed through the same source->output map as the kills):")
+    for i, t in enumerate(plan["takes"], 1):
+        for kind, vals in (("zoom", t["pulses"]), ("flash", [t["flash"]] if t["flash"] is not None else []),
+                           ("slow-mo start", [t["slow_at"]] if t.get("slow_at") is not None else [])):
+            for v in vals:
+                tp = t["f0"] / OUT_FPS + v
+                kb = int(np.argmin(np.abs(beats - tp)))
+                near = min(abs(tp - (t["f0"] / OUT_FPS + ko)) for ko in t["kills_out"]) * 1000
+                out(f"    take {i:2} {kind:13} at {tp:7.3f}s  nearest beat #{kb} error {(tp - beats[kb]) * 1000:+5.0f} ms"
+                    f"   ({near:.0f} ms from the nearest kill)")
     ok = sum(1 for e in errs_all if e < 40)
     okf = sum(1 for e in errs_first if e < 40)
     out(f"SYNC SUMMARY: first kills within 40 ms of a beat: {okf}/{len(errs_first)}; all kills: {ok}/{len(errs_all)}; "
@@ -2218,10 +2494,10 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     pool, st = game_pool(cfg, game, set(paths) if manual else None)
     au = st["audio"]
     out(f"{game}: {st['tagged']} clips in included folders, {st['scanned']} scanned, {st['with_kills']} with detected kills; "
-        f"gunshot check: {au['raw']} detected kills -> {au['no_shot']} had no gunshot, {au['death_lock']} after my death, {au['kept']} kept")
+        f"{au['raw']} kills found, {au['no_shot']} without a heard gunshot (kept, audio is only a bonus), {au['death_lock']} dropped after my death, {au['kept']} usable")
     if not pool:
         raise RuntimeError(f"{st['tagged']} {game} clips, {st['scanned']} scanned, but 0 usable kills "
-                           f"({au['raw']} detected, {au['no_shot']} without a gunshot, {au['death_lock']} after my death). "
+                           f"({au['raw']} found, {au['death_lock']} dropped after my death; rejected rows are listed above with their reasons). "
                            "Run Troubleshoot > Self-test detection to see the scores, or scan more clips.")
     seed = int(seed) if seed else random.randrange(1, 10 ** 6)
     events = build_events(pool, game, cfg, random.Random(seed))
@@ -2643,6 +2919,44 @@ class CalibDialog:
             messagebox.showerror("Calibrate", str(ex))
 
 
+def apply_theme(root, mode="auto"):
+    """Follow Windows dark/light mode (or force one); consistent fonts, padding and row heights."""
+    dark = mode == "dark"
+    if mode == "auto":
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            dark = winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+        except Exception:
+            dark = False
+    pal = dict(bg="#1f1f1f", fg="#e8e8e8", field="#2b2b2b", acc="#3a78d4", head="#363636", dim="#9a9a9a") if dark else \
+        dict(bg="#f3f3f3", fg="#1a1a1a", field="#ffffff", acc="#2a6edb", head="#e1e1e1", dim="#666666")
+    st = ttk.Style(root)
+    st.theme_use("clam")
+    root.configure(bg=pal["bg"])
+    root.option_add("*Font", ("Segoe UI", 10))
+    st.configure(".", background=pal["bg"], foreground=pal["fg"], fieldbackground=pal["field"], font=("Segoe UI", 10),
+                 bordercolor=pal["head"], lightcolor=pal["bg"], darkcolor=pal["bg"], troughcolor=pal["field"])
+    st.configure("Treeview", background=pal["field"], fieldbackground=pal["field"], foreground=pal["fg"], rowheight=24, borderwidth=0)
+    st.map("Treeview", background=[("selected", pal["acc"])], foreground=[("selected", "#ffffff")])
+    st.configure("Treeview.Heading", background=pal["head"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"), padding=5)
+    st.configure("TLabelframe", background=pal["bg"], bordercolor=pal["head"], padding=8)
+    st.configure("TLabelframe.Label", background=pal["bg"], foreground=pal["fg"], font=("Segoe UI", 10, "bold"))
+    st.configure("TNotebook", background=pal["bg"], borderwidth=0)
+    st.configure("TNotebook.Tab", background=pal["head"], foreground=pal["fg"], padding=(16, 7), font=("Segoe UI", 10, "bold"))
+    st.map("TNotebook.Tab", background=[("selected", pal["acc"])], foreground=[("selected", "#ffffff")])
+    st.configure("TButton", padding=(10, 5), background=pal["head"], foreground=pal["fg"])
+    st.map("TButton", background=[("active", pal["acc"]), ("disabled", pal["bg"])], foreground=[("disabled", pal["dim"])])
+    st.configure("TEntry", padding=4, fieldbackground=pal["field"], foreground=pal["fg"])
+    st.configure("TCombobox", padding=4, fieldbackground=pal["field"], foreground=pal["fg"], arrowcolor=pal["fg"])
+    st.map("TCombobox", fieldbackground=[("readonly", pal["field"])], foreground=[("readonly", pal["fg"])])
+    st.configure("TCheckbutton", background=pal["bg"])
+    st.configure("TRadiobutton", background=pal["bg"])
+    st.configure("TProgressbar", background=pal["acc"], troughcolor=pal["field"])
+    st.configure("Vertical.TScrollbar", background=pal["head"], troughcolor=pal["field"], arrowcolor=pal["fg"])
+    return pal
+
+
 def make_tree(parent, cols, height=10, **kw):
     """Treeview with a vertical scrollbar; returns (frame, tree)."""
     fr = ttk.Frame(parent)
@@ -2668,6 +2982,8 @@ class App:
         LOG_SINK[0] = lambda m: self.q.put(("log", m))
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
+        self.pal = apply_theme(self.root, self.cfg.get("theme", "auto"))
+        self.last_click = None
         # bottom area first so the notebook can expand above it
         bot = ttk.Frame(self.root)
         bot.pack(side="bottom", fill="both", padx=6, pady=4)
@@ -2688,18 +3004,20 @@ class App:
         self.b_folder.pack(side="right", padx=4)
         lf = ttk.Frame(bot)
         lf.pack(fill="both", expand=True)
-        self.log = tk.Text(lf, height=9, wrap="word", bg="#111", fg="#ddd")
+        self.log = tk.Text(lf, height=9, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"],
+                           relief="flat", padx=8, pady=6, font=("Consolas", 10))
         lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=lsb.set)
         self.log.pack(side="left", fill="both", expand=True)
         lsb.pack(side="right", fill="y")
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(side="top", fill="both", expand=True, padx=6, pady=6)
-        self.tabs = {n: ttk.Frame(self.nb) for n in ("Auto", "Manual", "Troubleshoot", "Settings")}
+        self.tabs = {n: ttk.Frame(self.nb, padding=6) for n in ("Auto", "Manual", "Songs", "Troubleshoot", "Settings")}
         for n, f in self.tabs.items():
             self.nb.add(f, text=n)
         self.build_auto()
         self.build_manual()
+        self.build_songs()
         self.build_trouble()
         self.build_settings()
         self.nb.select(start_tab)
@@ -2709,7 +3027,8 @@ class App:
     # ------------------------------------------------------------ plumbing
     def btn(self, parent, text, cmd, big=False, **kw):
         if big:
-            b = tk.Button(parent, text=text, command=self.safe(cmd), font=("Segoe UI", 12, "bold"), height=2, **kw)
+            b = tk.Button(parent, text=text, command=self.safe(cmd), font=("Segoe UI", 12, "bold"), height=2, bg=self.pal["acc"],
+                          fg="#ffffff", activebackground=self.pal["head"], activeforeground=self.pal["fg"], relief="flat", padx=12, **kw)
         else:
             b = ttk.Button(parent, text=text, command=self.safe(cmd), **kw)
         self.buttons.append(b)
@@ -2790,6 +3109,7 @@ class App:
             out("ffmpeg not found. Troubleshoot > Selfcheck explains how to get it without admin.")
         self.cfg = autodetect_dirs(load_config())
         self.run_task("clips", self.load_clips)
+        self.run_task("matches", self.load_matches)
         threading.Thread(target=self.bpm_worker, daemon=True).start()
 
     def fill_chunked(self, tree, rows, chunk=300):
@@ -2906,17 +3226,31 @@ class App:
         cb = ttk.Combobox(top, textvariable=self.m_date, values=list(self.DATES), width=12, state="readonly")
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
+        ttk.Label(top, text="From").pack(side="left", padx=(10, 2))
+        self.m_from = tk.StringVar()
+        ttk.Entry(top, textvariable=self.m_from, width=11).pack(side="left")
+        ttk.Label(top, text="to").pack(side="left", padx=3)
+        self.m_to = tk.StringVar()
+        ttk.Entry(top, textvariable=self.m_to, width=11).pack(side="left")
+        ttk.Label(top, text="(YYYY-MM-DD)").pack(side="left", padx=3)
+        for v in (self.m_from, self.m_to):
+            v.trace_add("write", lambda *a: self.root.after(400, self.apply_filter))
         top2 = ttk.Frame(s1)
         top2.pack(fill="x", pady=2)
-        self.btn(top2, "Tick all", lambda: self.tick("all")).pack(side="left", padx=3)
+        self.btn(top2, "Tick all shown", lambda: self.tick("all")).pack(side="left", padx=3)
         self.btn(top2, "Untick all", lambda: self.tick("none")).pack(side="left", padx=3)
         self.btn(top2, "Tick clips with kills", lambda: self.tick("kills")).pack(side="left", padx=3)
+        self.btn(top2, "Tick newest", lambda: self.tick("newest")).pack(side="left", padx=(12, 2))
+        self.m_n = tk.StringVar(value="15")
+        ttk.Spinbox(top2, from_=1, to=500, textvariable=self.m_n, width=5).pack(side="left")
+        self.btn(top2, "Tick whole folder", lambda: self.tick("folder")).pack(side="left", padx=(12, 3))
+        ttk.Label(top2, text="(Shift+click ticks a range)").pack(side="left", padx=6)
         self.btn(top2, "Reload list", lambda: self.run_task("clips", self.load_clips)).pack(side="left", padx=12)
         self.btn(top2, "Exclude ticked from montages", self.exclude_sel).pack(side="left")
         fr, self.ctree = make_tree(s1, ("date", "len", "kills"), height=9, selectmode="none")
         fr.pack(fill="both", expand=True)
-        for c, w, t in (("#0", 380, "clip"), ("date", 110, "date"), ("len", 60, "length"), ("kills", 90, "kills")):
-            self.ctree.column(c, width=w)
+        for c, w, t in (("#0", 430, "clip"), ("date", 110, "date"), ("len", 70, "length"), ("kills", 110, "kills")):
+            self.ctree.column(c, width=w, minwidth=60, stretch=(c == "#0"))
             self.ctree.heading(c, text=t)
         self.ctree.bind("<Button-1>", self.on_tree_click)
         s2 = ttk.LabelFrame(f, text="Step 2 - choose the song (newest added first)")
@@ -2965,24 +3299,48 @@ class App:
     def on_tree_click(self, e):
         iid = self.ctree.identify_row(e.y)
         if iid:
-            self.ticked.symmetric_difference_update({iid})
-            self.ctree.item(iid, text=self.row_text(iid))
+            if (e.state & 0x1) and self.last_click and self.ctree.exists(self.last_click):
+                vis = list(self.ctree.get_children())
+                lo, hi = sorted((vis.index(self.last_click), vis.index(iid)))
+                for x in vis[lo:hi + 1]:
+                    self.ticked.add(x)
+                    self.ctree.item(x, text=self.row_text(x))
+            else:
+                self.ticked.symmetric_difference_update({iid})
+                self.ctree.item(iid, text=self.row_text(iid))
+            self.last_click = iid
             self.update_status()
         return "break"
 
     def row_text(self, iid):
         c = self.byp.get(iid)
-        return ("☑ " if iid in self.ticked else "☐ ") + (c["name"] if c else Path(iid).name)
+        return ("\u2611 " if iid in self.ticked else "\u2610 ") + (c["name"] if c else Path(iid).name)
 
     def tick(self, how):
-        vis = self.ctree.get_children()
+        vis = list(self.ctree.get_children())
+        if how == "newest":
+            try:
+                vis = vis[:max(1, int(self.m_n.get()))]
+            except ValueError:
+                vis = vis[:15]
+        if how == "folder":
+            fo = self.m_folder.get()
+            if fo == "All folders" and self.last_click in self.byp:
+                fo = self.byp[self.last_click]["folder"]
+            vis = [c["path"] for c in self.clips if c["folder"] == fo]
+            if not vis:
+                messagebox.showinfo("Tick whole folder", "Pick a folder in the Folder box, or click a clip first.")
+                return
         for iid in vis:
             c = self.byp.get(iid)
-            if how == "all" or (how == "kills" and c and c["kills"]):
+            if how in ("all", "newest", "folder") or (how == "kills" and c and c["kills"]):
                 self.ticked.add(iid)
             elif how == "none":
                 self.ticked.discard(iid)
+        for iid in self.ctree.get_children():
             self.ctree.item(iid, text=self.row_text(iid))
+        if how == "none":
+            self.ticked.clear()
         self.update_status()
 
     def load_clips(self):
@@ -3023,9 +3381,19 @@ class App:
     def apply_filter(self):
         fo, days = self.m_folder.get(), self.DATES.get(self.m_date.get())
         lim = time.time() - days * 86400 if days else 0
+        hi = 9e18
+
+        def pd(v, end=False):
+            try:
+                return time.mktime(time.strptime(v.strip(), "%Y-%m-%d")) + (86400 if end else 0)
+            except ValueError:
+                return None
+        lo2, hi2 = pd(self.m_from.get()), pd(self.m_to.get(), True)
+        lim = max(lim, lo2 or 0)
+        hi = hi2 or hi
         rows = []
         for c in self.clips:
-            if (fo != "All folders" and c["folder"] != fo) or c["mtime"] < lim:
+            if (fo != "All folders" and c["folder"] != fo) or c["mtime"] < lim or c["mtime"] > hi:
                 continue
             rows.append((c["path"], self.row_text(c["path"]),
                          (time.strftime("%Y-%m-%d", time.localtime(c["mtime"])), f"{int(c['dur'] // 60)}:{int(c['dur'] % 60):02d}",
@@ -3052,8 +3420,8 @@ class App:
             while self.busy:
                 time.sleep(2)
             try:
-                key = file_key(s["path"]) + SONG_ALGO
-                an = sc.get(key) or analyse_song(s["path"])
+                key = file_key(s["path"]) + SONG_ALGO + f"|{round(s.get('csv_bpm') or 0)}"
+                an = sc.get(key) or analyse_song(s["path"], s.get("csv_bpm"))
                 self.bpm[s["path"]] = an["bpm"]
                 self.q.put(("call", lambda p=s["path"], b=an["bpm"]: self.stree.exists(p) and self.stree.set(p, "bpm", b)))
             except Exception:
@@ -3113,6 +3481,92 @@ class App:
         self.run_task("manual " + mode, self.job_video(
             self.m_game.get(), mode=mode, force=True, paths=paths, song_path=song, target=int(self.m_len.get()),
             style=None if style == "random" else style, seed=seed, maxq=(self.m_q.get() == "max")))
+
+    # ------------------------------------------------------------ Songs tab
+    def build_songs(self):
+        f = self.tabs["Songs"]
+        ttk.Label(f, text="Which MP3 was matched to which playlist track (one-to-one). Rows under 85 are flagged - fix them with Change match. "
+                          "Also saved as montage_data\\song_matches.csv.", wraplength=1100).pack(anchor="w", pady=4)
+        bar = ttk.Frame(f)
+        bar.pack(fill="x", pady=4)
+        self.btn(bar, "Refresh", lambda: self.run_task("matches", self.load_matches)).pack(side="left", padx=3)
+        self.btn(bar, "Change match for selected file...", self.change_match).pack(side="left", padx=3)
+        self.btn(bar, "Play selected file", self.play_match).pack(side="left", padx=3)
+        self.btn(bar, "Open song_matches.csv", lambda: self.open_path(DATA / "song_matches.csv")).pack(side="left", padx=3)
+        self.m_info = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
+        fr, self.mtree = make_tree(f, ("track", "artist", "score", "flag"), height=18, selectmode="browse")
+        fr.pack(fill="both", expand=True)
+        for c, w, t in (("#0", 420, "MP3 file"), ("track", 300, "matched playlist track"), ("artist", 200, "artist"),
+                        ("score", 70, "score"), ("flag", 130, "flag")):
+            self.mtree.column(c, width=w, minwidth=50, stretch=(c in ("#0", "track")))
+            self.mtree.heading(c, text=t)
+        self.mtree.tag_configure("weak", foreground="#e0a030")
+        self.mtree.tag_configure("none", foreground="#e05050")
+        self.match_rows, self.match_audio = [], []
+
+    def load_matches(self):
+        cfg = load_config()
+        audio = scan_audio(cfg)
+        csvp, rows, col = read_playlist(cfg)
+        matched, unmatched = match_playlist(rows, audio, cfg) if rows and audio else ([], rows)
+        write_song_matches(audio, matched)
+        by = {a["path"]: (r, sc) for r, a, sc in matched}
+        items = []
+        for a in sorted(audio, key=lambda a: a["path"].lower()):
+            r, sc = by.get(a["path"], (None, 0))
+            items.append((a["path"], Path(a["path"]).name, r["title"] if r else "", r["artist"] if r else "", sc,
+                          "NO MATCH" if not r else "CHECK (under 85)" if sc < 85 else "ok"))
+        weak = sum(1 for i in items if i[5] != "ok")
+
+        def fill():
+            self.match_rows, self.match_audio = rows, audio
+            self.mtree.delete(*self.mtree.get_children())
+            for pth, nm, tr, ar, sc, fl in items:
+                self.mtree.insert("", "end", iid=pth, text=nm, values=(tr, ar, sc, fl), tags=("none" if fl == "NO MATCH" else "weak" if fl != "ok" else "",))
+            self.m_info.set(f"{len(audio)} MP3 files, {len(rows)} playlist tracks, {len(matched)} matched, {weak} to check, {len(unmatched)} playlist tracks without a file")
+        self.q.put(("call", fill))
+
+    def play_match(self):
+        sel = self.mtree.selection()
+        if sel:
+            self.open_path(sel[0])
+
+    def change_match(self):
+        sel = self.mtree.selection()
+        if not sel or not self.match_rows:
+            messagebox.showinfo("Songs", "Press Refresh, then select a file.")
+            return
+        path = sel[0]
+        w = tk.Toplevel(self.root)
+        w.title("Pick the playlist track for " + Path(path).name)
+        w.geometry("640x520")
+        q = tk.StringVar(value=clean(Path(path).stem))
+        ttk.Entry(w, textvariable=q).pack(fill="x", padx=8, pady=6)
+        fr, tr = make_tree(w, ("artist",), height=18, selectmode="browse")
+        fr.pack(fill="both", expand=True, padx=8)
+        tr.column("#0", width=380)
+        tr.heading("#0", text="playlist track")
+        tr.heading("artist", text="artist")
+        rk = lambda r: r.get("uri") or f"{r['artist']} - {r['title']}"
+
+        def refill(*a):
+            tr.delete(*tr.get_children())
+            qq = q.get().lower().strip()
+            for i, r in enumerate(self.match_rows):
+                if not qq or qq in (r["title"] + " " + r["artist"]).lower():
+                    tr.insert("", "end", iid=str(i), text=r["title"], values=(r["artist"],))
+        q.trace_add("write", refill)
+        refill()
+
+        def ok():
+            if tr.selection():
+                cfg = load_config()
+                cfg.setdefault("song_overrides", {})[path] = rk(self.match_rows[int(tr.selection()[0])])
+                save_json(CONFIG_PATH, cfg)
+                w.destroy()
+                self.run_task("matches", self.load_matches)
+        ttk.Button(w, text="Use this track", command=ok).pack(pady=8)
 
     # ------------------------------------------------------------ Troubleshoot tab
     def build_trouble(self):
@@ -3192,8 +3646,8 @@ class App:
         out(f"{Path(p).name}: {len(ks)} kills (before the gunshot check): " + ", ".join(ts(k['t']) + ("*HS" if k.get("hs") else "") for k in ks) +
             f"; my deaths at {', '.join(ts(d) for d in ds) or '-'}; best name {e['best_name']} hl {e['best_hl']}; scale {e['scale']}")
         pick = ks[0] if ks else None
-        if pick is None and e.get("dets"):
-            best = max(e["dets"], key=lambda d: d[1])
+        if pick is None and e.get("rows"):
+            best = max(e["rows"], key=lambda d: max(d[6], d[8]))
             pick = {"t": best[0] / FPS - 0.3 + e.get("v_off", 0)}
         if pick:
             fr = grab_kill_crop(rec, det, cfg, pick, e["scale"])
@@ -3212,7 +3666,7 @@ class App:
         def job():
             cache = load_kills_cache()
             fk = file_key(p) + "|"
-            save_json(KILLS_CACHE, {k: v for k, v in cache.items() if not k.startswith(fk)})
+            cache.drop_file("|".join(fk.split("|")[:3]))
             run_scan(load_config(), None, [p])
         self.run_task("rescan", job)
 
@@ -3253,7 +3707,8 @@ class App:
 
     def clear_cache(self):
         if messagebox.askyesno("Clear kill cache", "Delete the kill cache? Every clip will be scanned again (slow)."):
-            for pth in (KILLS_CACHE, FLICK_CACHE, ONSET_CACHE, SCALES):
+            load_kills_cache().clear_all()
+            for pth in (FLICK_CACHE, ONSET_CACHE, SCALES):
                 try:
                     pth.unlink()
                 except OSError:
@@ -3284,8 +3739,8 @@ class App:
         for k, lab in (("max_mb", "Skip files larger than (MB)"), ("max_dur_s", "Skip clips longer than (s)"),
                        ("auto_recent_days", "Auto: scan every new clip from the last (days)"),
                        ("auto_old_per_run", "Auto: plus up to this many older clips per run"),
-                       ("thr_name", "Detection: name threshold"), ("thr_hl", "Detection: highlight threshold"),
-                       ("thr_left", "Detection: assist rejection (lower = stricter)"), ("death_lock_s", "No kills for this long after my death (s)"),
+                       ("thr_kill", "Detection: killer-side name score for a kill"), ("thr_death", "Detection: victim-side name score for my death"),
+                       ("death_lock_s", "No kills for this long after my death (s)"),
                        ("week_days", "'This week' means the last N days")):
             ttk.Label(f, text=lab).grid(row=r, column=0, sticky="w", padx=8, pady=3)
             v = tk.StringVar(value=str(self.cfg.get(k, "")))
@@ -3301,6 +3756,7 @@ class App:
             r += 1
         self.set_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
         self.set_sync = tk.BooleanVar(value=self.cfg.get("sync_report", True))
+        self.set_theme = tk.StringVar(value=self.cfg.get("theme", "auto"))
         ttk.Label(f, text="Quality").grid(row=r, column=0, sticky="w", padx=8, pady=4)
         qf = ttk.Frame(f)
         qf.grid(row=r, column=1, sticky="w")
@@ -3308,6 +3764,9 @@ class App:
         ttk.Radiobutton(qf, text="Max quality x264 CRF15", variable=self.set_q, value="max").pack(side="left", padx=10)
         r += 1
         ttk.Checkbutton(f, text="Print a sync report after each render (re-scans the finished montage)", variable=self.set_sync).grid(row=r, column=1, sticky="w")
+        r += 1
+        ttk.Label(f, text="Theme (restart to apply)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        ttk.Combobox(f, textvariable=self.set_theme, values=["auto", "dark", "light"], width=8, state="readonly").grid(row=r, column=1, sticky="w")
         r += 1
         self.btn(f, "Save settings", self.save_settings).grid(row=r, column=1, sticky="w", pady=12)
 
@@ -3324,6 +3783,7 @@ class App:
                 out(f"ignored invalid number for {k}")
         cfg["length_s"], cfg["game_audio_level"] = int(self.set_len.get()), round(self.set_aud.get() / 100, 2)
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
+        cfg["theme"] = self.set_theme.get()
         save_json(CONFIG_PATH, cfg)
         self.cfg = cfg
         out("settings saved")
