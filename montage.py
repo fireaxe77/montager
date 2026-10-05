@@ -34,6 +34,8 @@ CLI (same engine):  python montage.py auto [--game valorant|cs2] [--force] [--dr
 Data: montage_data\ (config.json, caches, calibration, plans, logs\montage.log). Output: E:\Movies\Montages\<Game>\<SONG INITIALS>_<VAL|CS2>_<version>_<date>.mp4 (+ logs\ with its plan .txt/.json).
 """
 import argparse
+import atexit
+import functools
 import base64
 import datetime
 import hashlib
@@ -54,7 +56,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.6"
+APP_VERSION = "V6.0"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6016,6 +6018,8 @@ class App:
         for pw in (self.vpane, self.mpane):
             pw.bind("<ButtonRelease-1>", self.save_layout, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if PERF is not None:
+            PERF.attach(self.root)
         self.prerealize(start_tab, lay)                           # V5.58: every tab is laid out once before the window is visible
         self.switch_ms = []                                       # V5.58: (tab, ms) of every tab switch until the layout is idle again
         self._sw_t0 = None
@@ -6156,6 +6160,8 @@ class App:
             pass
 
     def on_close(self):
+        if PERF is not None:
+            PERF.write()
         self.flush_settings()
         self.save_layout()
         self.root.destroy()
@@ -9037,10 +9043,214 @@ def cmd_cfgdump(args):
     print(json.dumps({"config_path": str(CONFIG_PATH), "exists": CONFIG_PATH.exists(), "cfg": load_config()}, ensure_ascii=False))
 
 
+# ------------------------------------------------------------------ V6.0 perflog (timeline recorder, off unless asked for)
+PERF_T0 = time.perf_counter()                    # ~process start (module import)
+PERF = None
+
+
+class PerfLog:
+    """`python montage.py perflog` or MONTAGE_PERFLOG=1: records WHEN things run (ms since start): window built / first Map / deiconify /
+    first Expose, after / after_idle callbacks, theme + style calls, list fills, update() / update_idletasks() (with caller), tab
+    switches with the widget creates / configures in the 500 ms after, main-loop gaps > 50 ms. Everything after the first main-window
+    <Map> is POST-SHOW. Writes perflog.txt next to montage.py on exit or Ctrl+Shift+P. Nothing is patched without the switch."""
+    CAP = 5000
+
+    def __init__(self):
+        self.ev, self.post, self.sw_until, self.depth, self.dropped = [], False, 0.0, 0, 0
+        self.hb_last, self.root, self.map_t, self.sw_name, self.counts = None, None, None, "", {}
+        self.sw_log = []
+
+    def now(self):
+        return (time.perf_counter() - PERF_T0) * 1000
+
+    def add(self, kind, name, dur=0.0, depth=0, note=""):
+        t = self.now() - dur
+        if len(self.ev) >= self.CAP:
+            self.dropped += 1
+            return
+        self.ev.append((t, kind, name, dur, self.post, depth, note, t < self.sw_until and self.post))
+
+    def timed(self, kind, name_fn, note_fn=None):
+        perf = self
+
+        def deco(fn):
+            @functools.wraps(fn)
+            def w(*a, **k):
+                t = time.perf_counter()
+                perf.depth += 1
+                try:
+                    return fn(*a, **k)
+                finally:
+                    perf.depth -= 1
+                    try:
+                        nm = name_fn(fn, a, k)
+                        perf.add(kind, nm, (time.perf_counter() - t) * 1000, perf.depth, note_fn(a, k) if note_fn else "")
+                    except Exception:
+                        pass
+            return w
+        return deco
+
+    def install(self):
+        perf = self
+        T = self.timed
+        tk.Misc.update = T("update", lambda f, a, k: "update() from " + _perf_caller(3))(tk.Misc.update)
+        tk.Misc.update_idletasks = T("update", lambda f, a, k: "update_idletasks() from " + _perf_caller(3))(tk.Misc.update_idletasks)
+        orig_after = tk.Misc.after
+
+        def after(self_, ms, func=None, *args):
+            if func is None:
+                return orig_after(self_, ms)
+            nm = getattr(func, "__qualname__", None) or getattr(func, "__name__", None) or repr(func)
+
+            @functools.wraps(func)
+            def cb(*a):
+                t = time.perf_counter()
+                perf.depth += 1
+                try:
+                    return func(*a)
+                finally:
+                    perf.depth -= 1
+                    d = (time.perf_counter() - t) * 1000
+                    if d >= 3 or not nm.endswith(("poll", "_hb")):
+                        perf.add("after_idle" if ms == "idle" else "after", f"{nm} (scheduled {ms})", d, perf.depth)
+            return orig_after(self_, ms, cb, *args)
+        tk.Misc.after = after
+        ttk.Style.theme_use = T("style", lambda f, a, k: "Style.theme_use" + (f"({a[1]})" if len(a) > 1 else "()"))(ttk.Style.theme_use)
+        ttk.Style.configure = T("style", lambda f, a, k: f"Style.configure({a[1] if len(a) > 1 else ''})")(ttk.Style.configure)
+        ttk.Style.map = T("style", lambda f, a, k: f"Style.map({a[1] if len(a) > 1 else ''})")(ttk.Style.map)
+        try:
+            import sv_ttk
+            sv_ttk.set_theme = T("style", lambda f, a, k: "sv_ttk.set_theme")(sv_ttk.set_theme)
+        except Exception:
+            pass
+        g = globals()
+        g["apply_theme"] = T("theme", lambda f, a, k: "apply_theme")(apply_theme)
+        for nm_, kind, nf in (("retheme", "theme", None), ("apply_layout", "layout", None), ("prerealize", "layout", None),
+                              ("startup", "after", None), ("on_tab_changed", "tab", None)):
+            setattr(App, nm_, T(kind, (lambda n: lambda f, a, k: "App." + n)(nm_))(getattr(App, nm_)))
+        App.fill_chunked = T("list", lambda f, a, k: "list fill " + (getattr(a[1], "_w", str(a[1])) if len(a) > 1 else "?"),
+                             lambda a, k: f"{len(a[2]) if len(a) > 2 else '?'} rows, container {'MAPPED' if _perf_mapped(a[1]) else 'unmapped'}")(App.fill_chunked)
+        orig_setup = tk.BaseWidget._setup
+
+        def _setup(self_, master, cnf):
+            orig_setup(self_, master, cnf)
+            if perf.post:
+                perf.add("widget+", f"create {self_.winfo_class()} {self_._w}", 0.0, perf.depth)
+        tk.BaseWidget._setup = _setup
+        orig_cfg = tk.Misc._configure
+
+        def _configure(self_, cmd, cnf, kw):
+            r = orig_cfg(self_, cmd, cnf, kw)
+            if perf.post and (cnf or kw) and cmd == "configure":
+                perf.add("configure", f"{self_.winfo_class()} {self_._w}", 0.0, perf.depth, ",".join(map(str, list((kw or {}) if not isinstance(cnf, dict) else cnf)))[:60])
+            return r
+        tk.Misc._configure = _configure
+        orig_dei = tk.Wm.wm_deiconify
+
+        def dei(self_):
+            perf.add("show", "deiconify", 0.0)
+            return orig_dei(self_)
+        tk.Wm.wm_deiconify = tk.Wm.deiconify = dei
+        atexit.register(self.write)
+
+    def attach(self, root):
+        """After the main window exists: Map / Expose / tab switch / heartbeat / Ctrl+Shift+P."""
+        self.root = root
+        self.add("mark", "main window built (widgets created)")
+
+        def on_map(e):
+            if e.widget is root and self.map_t is None:
+                self.map_t = self.now()
+                self.add("mark", "FIRST <Map> of the main window")
+                self.post = True
+
+        def on_expose(e):
+            if e.widget is root and not any(x[2] == "first <Expose>" for x in self.ev):
+                self.add("mark", "first <Expose>")
+        root.bind("<Map>", on_map, add="+")
+        root.bind("<Expose>", on_expose, add="+")
+        root.bind_all("<<NotebookTabChanged>>", self.on_tab, add="+")
+        root.bind_all("<Control-Shift-P>", lambda e: self.write(), add="+")
+        root.bind_all("<Control-Shift-p>", lambda e: self.write(), add="+")
+        self.hb_last = self.now()
+        self._hb()
+
+    def on_tab(self, e):
+        try:
+            self.sw_name = e.widget.tab(e.widget.select(), "text")
+        except Exception:
+            self.sw_name = "?"
+        self.sw_until = self.now() + 500
+        self.add("tab", f"TAB SWITCH to {self.sw_name} (widget creates / configures in the next 500 ms are tagged [switch])")
+
+    def _hb(self):
+        t = self.now()
+        gap = t - self.hb_last - 20
+        if gap > 50:
+            self.add("gap", f"main-loop blocked {gap:.0f} ms", gap)
+        self.hb_last = self.now()
+        try:
+            self.root.after(20, self._hb)
+        except Exception:
+            pass
+
+    def write(self):
+        try:
+            ev = sorted(self.ev, key=lambda x: x[0])
+            post = [x for x in ev if x[4]]
+            top = sorted([x for x in ev if x[3] > 0], key=lambda x: -x[3])[:10]
+            work = sum(x[3] for x in post if x[5] == 0 and x[1] != "gap")
+            cnt = lambda kinds: sum(1 for x in post if x[1] in kinds)
+            gaps = [x[3] for x in ev if x[1] == "gap"]
+            sw = [x for x in post if x[7] and x[1] in ("widget+", "configure")]
+            L = ["PERFLOG " + APP_VERSION + f"  (times in ms since module import; POST-SHOW = after the first main-window <Map> at "
+                 + (f"{self.map_t:.0f} ms)" if self.map_t is not None else "never)"), "", "SUMMARY",
+                 "Top 10 slowest events:"]
+            L += [f"  {x[3]:8.1f} ms  @{x[0]:8.0f}  {x[1]:10} {x[2]} {x[6]}{'  POST-SHOW' if x[4] else ''}" for x in top]
+            L += [f"Total POST-SHOW work: {work:.0f} ms (top-level events only, nested calls not double counted)",
+                  f"POST-SHOW theme/style events: {cnt(('theme', 'style'))}   list fills: {cnt(('list',))}   after/after_idle: "
+                  f"{cnt(('after', 'after_idle'))}   widget creates: {cnt(('widget+',))}   configures: {cnt(('configure',))}   "
+                  f"layout calls: {cnt(('layout',))}   update calls: {cnt(('update',))}",
+                  f"POST-SHOW widget creates/configures within 500 ms of a tab switch: {len(sw)}",
+                  f"Longest main-loop blockage: {max(gaps) if gaps else 0:.0f} ms ({len(gaps)} gaps > 50 ms)", f"Events recorded: {len(ev)}"
+                  + (f" (+{self.dropped} dropped past the cap)" if self.dropped else ""), "", "CHRONOLOGICAL"]
+            body = [f"{x[0]:9.1f}  {'POST ' if x[4] else 'pre  '}{'[switch] ' if x[7] else ''}{x[1]:10} "
+                    f"{(f'{x[3]:7.1f} ms ' if x[3] else '           ')}{'  ' * min(x[5], 4)}{x[2]} {x[6]}" for x in ev]
+            txt = "\n".join(L + body)
+            while len(txt.encode("utf-8", "replace")) > 290_000 and body:
+                body = body[: int(len(body) * 0.9)]
+                txt = "\n".join(L + body + ["... (truncated to stay under 300 KB)"])
+            (HERE / "perflog.txt").write_text(txt, encoding="utf-8")
+            return txt
+        except Exception as ex:
+            print("perflog write failed:", ex)
+
+
+if os.environ.get("MONTAGE_PERFLOG") == "1" or (len(sys.argv) > 1 and sys.argv[1] == "perflog"):
+    PERF = PerfLog()
+
+
+def _perf_caller(depth=3):
+    try:
+        f = sys._getframe(depth)
+        return f"{f.f_code.co_name}:{f.f_lineno}"
+    except Exception:
+        return "?"
+
+
+def _perf_mapped(w):
+    try:
+        return bool(w.winfo_ismapped())
+    except Exception:
+        return False
+
+
 def gui_main(start_tab=0):
     if tk is None:
         raise SystemExit("tkinter is missing. Re-run the python.org installer > Modify > tcl/tk and IDLE.")
     set_app_id()
+    if PERF is not None:
+        PERF.install()
     App(start_tab).root.mainloop()
 
 
@@ -9108,6 +9318,7 @@ def main():
     sp = ap.add_subparsers(dest="cmd")
     sp.add_parser("gui").set_defaults(fn=lambda a: gui_main())
     sp.add_parser("pick").set_defaults(fn=lambda a: gui_main(1))
+    sp.add_parser("perflog", help="V6.0: start the GUI with the timeline recorder; writes perflog.txt on exit / Ctrl+Shift+P").set_defaults(fn=lambda a: gui_main())
     sp.add_parser("setup").set_defaults(fn=cmd_setup)
     sp.add_parser("selfcheck").set_defaults(fn=cmd_selfcheck)
     sp.add_parser("selftest").set_defaults(fn=lambda a: selftest_detection(load_config()))
