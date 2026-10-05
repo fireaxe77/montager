@@ -3908,10 +3908,9 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         e["_allow"] = None if e.get("_no_cuts") else (lambda t, _an=an, _r=rname: gap_allowance(_an, _r, t))
     song_end = float(an.get("dur") or (bt[-1] + bd)) - 0.1     # the montage's last frame stays inside the music
     optimal = target_s in (None, "", "optimal", 0)
-    if optimal and manual:                                 # V5.42B: optimal_fit() below decides (80-150 s, never past the song)
+    fitm = optimal                                         # V6.0: Auto Optimal uses optimal_fit() too (same rule as Manual)
+    if fitm:                                               # V5.42B: optimal_fit() below decides (80-150 s, never past the song)
         target = min(OPT_RANGE[1], song_end - float(bt[0]))
-    elif optimal:
-        target = optimal_length([e for e in evs], bd, notes)
     else:
         target = max(30.0, min(120.0, float(target_s)))
     strong = [e for e in evs if not e.get("plain")]
@@ -3919,13 +3918,15 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     est = lambda e: 2 * bd + e["span"] + 0.4
     if manual:
         strong += plain                                    # Manual: every ticked clip counts
+    elif fitm:
+        pass                                               # V6.0 Auto Optimal: plain singles top up below until 80 s (best first)
     elif sum(est(e) for e in strong) < target and plain:
         strong += plain
         notes.append(f"{len(plain)} plain single kills used (not enough multikills / headshots)")
     elif plain:
         notes.append(f"{len(plain)} plain single kills left out (enough better material)")
     cap_t = int(min(120.0, target * 1.1) / td) if target else 10 ** 9
-    if manual and optimal:                                 # ticked clips: optimal_fit() decides what fits
+    if fitm:                                 # ticked clips: optimal_fit() decides what fits
         cap_t = 10 ** 9
     nm = lambda e: Path(e["path"]).name
     phrase_ticks = {2 * int(b) for b in an.get("phrase4", [])} | {2 * int(x["start"]) for x in an.get("sections", [])}
@@ -3945,8 +3946,19 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     if not usable:
         raise RuntimeError("no kill event has enough footage around it to form a take")
     fit, n_usable = None, len(usable)
-    if manual and optimal:                                 # V5.42B: THE shared Optimal rule picks length, section and clips
+    if fitm:                                 # V5.42B: THE shared Optimal rule picks length, section and clips
         fit = optimal_fit(usable, an, rname)
+        if not manual and plain:                           # V6.0: best multikills first, then best singles, until >= 80 s (never padded)
+            need, added = min(OPT_RANGE[0], fit["max"]) - 0.5, 0
+            for e in sorted(plain, key=lambda e: -e["score"]):
+                if fit["length"] >= need:
+                    break
+                if place(e, U, down, rp, c=16):
+                    usable.append(e)
+                    added += 1
+                    fit = optimal_fit(usable, an, rname)
+            notes.append(f"{added} of {len(plain)} plain single kills added to reach {need + 0.5:.0f} s" if added else
+                         f"{len(plain)} plain single kills left out (enough better material)")
         usable = [e for e in usable if any(e is c_ for c_ in fit["clips"])]
         notes.append(fit["why"])
     head_cands = [e for e in usable if e["path"] not in heads] or usable
@@ -3963,7 +3975,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         e = rest.pop()
         total -= nat(e)
         cut_len.append(e)
-    if cut_len and not (manual and optimal):
+    if cut_len and not (fitm):
         notes.append(f"{len(cut_len)} lowest-ranked events left out to keep the montage near {target:.0f} s: "
                      + ", ".join(nm(e) for e in cut_len))
     nb = len(bt) - 1
@@ -4098,9 +4110,9 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             c = t["end"]
         else:
             left_song.append(e)
-    if left and not (manual and optimal):
+    if left and not (fitm):
         notes.append(f"{len(left)} events left out to keep the montage near {target:.0f} s: " + ", ".join(nm(e) for e in left))
-    if left_song and not (manual and optimal):
+    if left_song and not (fitm):
         notes.append(f"SONG TOO SHORT: {len(left_song)} events did not fit before the song ends: " + ", ".join(nm(e) for e in left_song))
     end_take = None
     if ending is not None:
@@ -4110,7 +4122,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         else:
             notes.append("the planned ending clip could not be placed before the song ends; the last take ends the montage")
             left_song.append(ending)
-    if manual and optimal and (cut_len or left or left_song) and takes:
+    if fitm and (cut_len or left or left_song) and takes:
         # V5.41 Optimal fits the song: clips that did not fit after the drop go in front (the section starts earlier), strongest
         # first, while the montage stays within the 120 s / music-available target; the rest are listed as not fitting
         E = float(U[end_take["fade_end"]]) if end_take else float(U[takes[-1]["end"]])
@@ -4189,8 +4201,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
-                   "left_out": [] if manual and optimal else [nm(e) for e in cut_len + left],
-                   "song_short": [nm(e) for e in (cut_len + left + left_song if manual and optimal else left_song)],
+                   "left_out": [] if fitm else [nm(e) for e in cut_len + left],
+                   "song_short": [nm(e) for e in (cut_len + left + left_song if fitm else left_song)],
                    "section_s": plan["song"]["section_s"], "manual": manual, "optimal": optimal}
     plan["notes"].insert(1, f"{'OPTIMAL' if optimal else 'FIXED'} LENGTH {D:.0f} s = {len(plan['takes'])} "
                          f"{'usable ' if manual else ''}takes{'' if optimal else f' (slider {target:.0f} s)'}, ends on "
