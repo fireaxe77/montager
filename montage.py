@@ -509,24 +509,63 @@ def parse_filename(path):
     return "", stem.strip()
 
 
+AUDIO_MIN_AGE_S = 15.0                         # V6.1.2: a file modified less than this long ago may still be being written
+AUDIO_STABLE_WAIT_S = 0.5
+
+
 def scan_audio(cfg, rescan=False):
+    """V6.1.2: the cache key of every file is computed ONCE (when it is listed) and stored in the record (rec["key"]); the cache is saved
+    with those keys (no second stat, so a file that changes meanwhile can no longer raise). New files that are still being written
+    (modified < 15 s ago, size 0, or size / mtime changing over 0.5 s) are skipped this run and never cached; one unreadable file never aborts."""
     mp3 = cfg.get("mp3_dir")
     paths = sorted(walk_files([mp3], AUDIO_EXT, 0, cfg)) if mp3 and os.path.isdir(mp3) else []
     cache = {} if rescan else load_json(AUDIO_CACHE, {})
-    recs = []
+    listed = []                                    # (path, key, size, mtime)
     for p in paths:
         try:
-            k = file_key(p)
+            st = os.stat(p)
+            listed.append((p, f"{p}|{st.st_size}|{int(st.st_mtime)}", st.st_size, st.st_mtime))
         except OSError:
             continue
-        if k not in cache:
-            a, t, d = read_tags(p)
-            if not t:
-                fa, ft = parse_filename(p)
-                a, t = a or fa, ft
-            cache[k] = {"path": p, "artist": a, "title": t, "dur": d}
-        recs.append(cache[k])
-    save_json(AUDIO_CACHE, {file_key(r["path"]): cache[file_key(r["path"])] for r in recs})
+    now, skipped, fresh, ok = time.time(), 0, [], []
+    for it in listed:
+        if it[1] in cache:
+            ok.append(it)
+        elif it[2] <= 0 or now - it[3] < AUDIO_MIN_AGE_S:
+            skipped += 1
+        else:
+            fresh.append(it)
+    if fresh:
+        time.sleep(AUDIO_STABLE_WAIT_S)
+        for p, k, size, mt in fresh:
+            try:
+                st = os.stat(p)
+            except OSError:
+                skipped += 1
+                continue
+            if st.st_size != size or st.st_mtime != mt:
+                skipped += 1
+            else:
+                ok.append((p, k, size, mt))
+    recs, newc = [], {}
+    for p, k, _, _ in sorted(ok):
+        try:
+            if k not in cache:
+                a, t, d = read_tags(p)
+                if not t:
+                    fa, ft = parse_filename(p)
+                    a, t = a or fa, ft
+                cache[k] = {"path": p, "artist": a, "title": t, "dur": d}
+            newc[k] = cache[k]
+            recs.append(dict(cache[k], key=k))
+        except Exception:
+            skipped += 1
+    if skipped:
+        out(f"songs: {skipped} file(s) still being written, skipped this run")
+    try:
+        save_json(AUDIO_CACHE, newc)
+    except Exception as ex:
+        out(f"songs: cache not saved ({ex})")
     return recs
 
 
@@ -6426,11 +6465,23 @@ class App:
             except tk.TclError:
                 pass
 
+    def snap_vars(self):
+        """V6.1.2: plain values of the Tk variables a worker needs. Workers never call Tk (the main loop may not be running yet: during the
+        splash a worker's Tk call waits ~1 s and fails with "main thread is not in main loop")."""
+        sn = self.__dict__.setdefault("_snap", {})
+        for key, var in (("m_game", "m_game"), ("t_game", "t_game")):
+            try:
+                sn[key] = getattr(self, var).get()
+            except (AttributeError, tk.TclError):
+                sn.setdefault(key, "valorant")
+        return sn
+
     def run_task(self, name, fn, *a):
         if self.busy or getattr(self, "est_running", False):    # never next to the status-line estimate (shared caches)
             self.pending.append((name, fn, a))
             out(f"Queued: {name}")
             return
+        self.snap_vars()                                           # V6.1.2: Tk variables are read here, on the UI thread; workers use the snapshot
         self.busy = True
         self.scan_active = name == "clips"                         # V5.6: no list refills while clips are being scanned
         if self.scan_active:
@@ -6940,8 +6991,7 @@ class App:
         with pstage("load_clips: missing_packages + ensure_bars"):
             if missing_packages() == [] and shutil.which("ffmpeg"):
                 ensure_bars(cfg)
-        with pstage("load_clips: m_game.get() (Tk variable read from the worker thread)"):
-            g = self.m_game.get()
+        g = self._snap.get("m_game", "valorant")                   # V6.1.2: snapshot taken on the UI thread by run_task
         with pstage("load_clips: Detector creation (load_dets)"):
             det = load_dets(g).get(g)
         with pstage("load_clips: read kills cache"):
@@ -7437,7 +7487,7 @@ class App:
                 v.set(str(x))
 
     def load_tclips(self):
-        g = self.t_game.get()
+        g = self._snap.get("t_game", "valorant")
         items = [(r["path"], Path(r["path"]).name) for r in scan_clips(load_config()) if not r.get("error") and r.get("game") == g]
         items.sort(key=lambda x: x[1])
         self.q.put(("call", lambda: self.fill_chunked(self.ttree, [(p, n, ()) for p, n in items])))
