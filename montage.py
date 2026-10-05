@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.5"
+APP_VERSION = "V6.5.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5185,19 +5185,24 @@ def weekly_existing(cfg, game, now=None):
     return [p for p, dt in montage_videos(Path(cfg["output_root"]) / GAME_DIR[game], game) if week_tag(dt) == wk]
 
 
-def weekly_pick(events, cfg, target, style, now_ts=None):
-    """V6.0 weekly / Auto clip pick: clips already used are never reused; this week's (last 7 days) new clips come first; if they
-    do not reach the minimum length, older UNUSED clips of the same game follow - best multikills first, then best singles -
-    only as many as needed. Returns (events, notes). No unused material at all = RuntimeError with the reason (skip)."""
+WEEKLY_MIN_S = 60.0                      # V6.5.1: a weekly / Auto montage is never planned under 60 s while the library can reach it
+
+
+def _ev_paths(e):
+    return {e["path"]} | {x["path"] for x in e.get("srcs", []) if isinstance(x, dict) and x.get("path")}
+
+
+def weekly_pick(events, cfg, target, style, now_ts=None, game=None):
+    """V6.0 weekly / Auto clip pick: this week's (last 7 days) new clips come first; if they do not reach the minimum length, older
+    UNUSED clips of the same game follow - best multikills first, then best singles - only as many as needed. V6.5.1: if the unused
+    material cannot reach the 60 s minimum, previously used events are reused (best-scoring first among those whose last use is the oldest),
+    never a clip of the game's previous montage and never a clip twice. Returns (events, notes)."""
     now_ts = now_ts or time.time()
     used = used_dates()
     unused = [e for e in events if _pkey(e["path"]) not in used]
     notes = []
     if len(unused) < len(events):
         notes.append(f"{len({e['path'] for e in events} - {e['path'] for e in unused})} clips already used in a montage are not reused")
-    if not unused:
-        raise RuntimeError("no unused clips with kills left for this game (every clip with kills is already flagged used) - skipped; "
-                           "scan new clips or use 'Include used clips' in Manual")
 
     def mt(e):
         try:
@@ -5217,10 +5222,52 @@ def weekly_pick(events, cfg, target, style, now_ts=None):
                 break
             pick.append(e)
     n_old = len(pick) - len(new)
+    reused = []
+    floor_need = WEEKLY_MIN_S * 1.1
+    if est(pick) < floor_need:
+        last = hist_list(USED_CLIPS, game)[-1:] if game else []
+        prev = {_pkey(c) for h in last for c in h.get("clips", [])}              # the game's previous montage: never reused
+        taken = set().union(*[_ev_paths(e) for e in pick]) if pick else set()
+        cands = [e for e in events if e not in pick and _pkey(e["path"]) in used and not (_ev_paths(e) & taken)
+                 and not any(_pkey(q) in prev for q in _ev_paths(e))]
+        cands.sort(key=lambda e: (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"]))
+        for e in cands:
+            if est(pick) >= floor_need:
+                break
+            ps = _ev_paths(e)
+            if ps & taken:
+                continue
+            pick.append(e)
+            reused.append(e)
+            taken |= ps
     notes.append(f"weekly pick: {len(new)} new clip event(s) this week + {n_old} older unused (best multikills first, then singles)"
                  + (f"; only ~{est(pick):.0f} s of unused material - the montage is shorter (nothing is padded)"
-                    if est(pick) < (OPT_RANGE[0] if optimal else float(target)) - 0.5 else ""))
+                    if not reused and est(pick) < (OPT_RANGE[0] if optimal else float(target)) - 0.5 else ""))
+    if reused:
+        notes.append(f"reused {len(reused)} previously used clip(s) to reach the {WEEKLY_MIN_S:.0f} s minimum")
+    if est(pick) < WEEKLY_MIN_S:
+        notes.append(f"the whole library only gives ~{est(pick):.0f} s ({len(pick) - len(reused)} unused + {len(reused)} reused usable event(s); "
+                     f"the rest are clips of the previous montage or too short) - below the {WEEKLY_MIN_S:.0f} s minimum, so this is all there is; "
+                     "nothing is padded")
     return pick, notes
+
+
+def weekly_song_fit(song, an, sinfo, runners):
+    """V6.5.1 (weekly / Auto): a chosen song whose section is under the 60 s minimum is replaced by the next best-ranked song that can."""
+    sec = lambda a: float(a.get("dur") or 0) - float((a.get("beats") or [0])[0])
+    if sec(an) >= WEEKLY_MIN_S:
+        return song, an, sinfo, runners
+    for s_, sc_ in runners:
+        try:
+            a2 = analyse_song(s_["path"], s_.get("csv_bpm"))
+        except Exception:
+            continue
+        if sec(a2) >= WEEKLY_MIN_S:
+            out(f"song {song.get('title') or Path(song['path']).stem} has only {sec(an):.0f} s (< {WEEKLY_MIN_S:.0f} s): using the next best-ranked "
+                f"song {s_.get('title') or Path(s_['path']).stem} ({sec(a2):.0f} s)")
+            return s_, a2, sc_, [r for r in runners if r[0] is not s_]
+    out(f"song {song.get('title') or Path(song['path']).stem} has only {sec(an):.0f} s (< {WEEKLY_MIN_S:.0f} s) and no ranked song is longer")
+    return song, an, sinfo, runners
 
 
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True):
@@ -5252,12 +5299,14 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         raise RuntimeError("no usable kill events (utility kills are excluded)")
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
         events, wk_notes = weekly_pick(events, cfg, cfg.get("length_s", "optimal") if target is None else target,
-                                       cfg.get("style", "auto") if style is None else style)
+                                       cfg.get("style", "auto") if style is None else style, game=game)
         notes += wk_notes
         for n_ in wk_notes:
             out(n_)
     songs, unmatched, csvname = song_pool(cfg)
     song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path)
+    if not manual and not song_path:
+        song, an, sinfo, runners = weekly_song_fit(song, an, sinfo, runners)
     placement = placement or cfg.get("placement", "v5")
     if placement == "v4":
         an = analyse_song_v4(song["path"], song.get("csv_bpm"))
@@ -5779,6 +5828,37 @@ def mark_used(paths, date=None):
     for p_ in paths:
         flags[_pkey(p_)] = date
     save_json(USED_FLAGS, flags)
+
+
+def backup_used_flags():
+    """V6.5.1: a dated copy of the used-flags file (and of the montage history that also flags clips) next to it; returns the flags copy's name."""
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    dst = None
+    for src, tag in ((USED_FLAGS, "used_flags"), (USED_CLIPS, "used_clips")):
+        d_ = src.with_name(f"{tag}_backup_{stamp}.json")
+        if src.exists():
+            shutil.copy2(src, d_)
+        elif tag == "used_flags":
+            save_json(d_, {})
+        if tag == "used_flags":
+            dst = d_
+    return dst.name
+
+
+def unflag_clips(paths=None):
+    """V6.5.1: remove the used flag of the given clips (None = every clip), also from the montage history that would flag them again.
+    Returns the number of clips that were flagged and are not any more."""
+    keys = set(used_dates())
+    if paths is not None:
+        keys &= {_pkey(p_) for p_ in paths}
+    flags = load_json(USED_FLAGS, {})
+    save_json(USED_FLAGS, {k: v for k, v in flags.items() if k not in keys})
+    hist = load_json(USED_CLIPS, {})
+    for lst in hist.values():
+        for h in lst if isinstance(lst, list) else []:
+            h["clips"] = [c for c in h.get("clips", []) if _pkey(c) not in keys]
+    save_json(USED_CLIPS, hist)
+    return len(keys)
 
 
 def default_song_map(dur=180.0, bpm=120.0):
@@ -7016,6 +7096,7 @@ class App:
         self.e_rand.pack(side="left")
         self.m_incl_used = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="Include used clips", variable=self.m_incl_used).pack(side="left", padx=(12, 3))
+        self.btn(top2, "Unflag all", self.unflag_all, name="manual:unflag_all").pack(side="left", padx=(12, 3))
         fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used", "open"), height=20, selectmode="none")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 100, "Used"),
@@ -7115,6 +7196,40 @@ class App:
         self.reveal(win)
 
     OPEN_COL = "#5"                                        # the "▶ Open" column (last)
+    USED_COL = "#4"                                        # the Used column (date of the montage the clip was used in)
+
+    def unflag_all(self):
+        """V6.5.1: every used flag (Valorant and CS2) is cleared after a Yes; a dated backup of the flags file is written first."""
+        n = len(used_dates())
+        if not n:
+            out("no used clips to unflag")
+            return
+        if not messagebox.askyesno("Unflag all", f"Unflag all {n} used clips (Valorant and CS2)?"):
+            return
+        try:
+            bk = backup_used_flags()
+            n = unflag_clips()
+        except Exception as ex:
+            out(f"Unflag all failed: {ex}")
+            return
+        for c in self.clips:
+            c["used"] = ""
+        self.apply_filter()
+        out(f"unflagged {n} clips (backup: {bk})")
+
+    def unflag_one(self, iid):
+        c = self.byp.get(iid)
+        if not c or not c.get("used"):
+            return                                         # an empty Used cell does nothing
+        try:
+            unflag_clips([iid])
+        except Exception as ex:
+            out(f"Unflag failed: {ex}")
+            return
+        c["used"] = ""
+        if self.ctree.exists(iid):
+            self.ctree.set(iid, "used", "")
+        out(f"unflagged {c.get('name') or Path(iid).name}")
 
     def open_clip_player(self, path):
         """Opens a clip in the default video player without waiting (Windows: os.startfile, Linux: xdg-open)."""
@@ -7140,6 +7255,9 @@ class App:
         if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
             return None                                    # header click = sort
         iid = self.ctree.identify_row(e.y)
+        if iid and self.ctree.identify_column(e.x) == self.USED_COL:
+            self.unflag_one(iid)                           # the Used cell never ticks or unticks the row
+            return "break"
         if iid and self.ctree.identify_column(e.x) == self.OPEN_COL:
             self.open_clip_player(iid)                     # the Open cell never ticks or unticks the row
             return "break"
