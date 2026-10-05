@@ -5,6 +5,13 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V5.58 - 2026-10-05
+- Live themes: changing Accent colour or Base in Settings applies at once, no restart. The theme is re-applied in the running window (one Sun Valley theme per accent x base, loaded once, then reused) and every classic widget that carried an old palette colour (log, dividers, Settings canvas, drop-down lists, changelog popout and its headings) is recoloured. "Applies after restart" removed for these two options (UI scale still applies after restart). Choice is saved in config as before.
+- Tab switching without visible reloading: all tabs were already built once; now they are also laid out and mapped while the window is still invisible (alpha 0), the Settings page and the divider positions are sized before the window shows, and the clip / song / table lists are not refilled when the data is unchanged. A tab switch only raises an existing frame. Switch time is measured (`App.switch_ms`).
+- Settings audit (no rendering): every Settings and Manual control checked for save + reload, for being read by the code, and for changing the plan or the render parameters. Result in the V5.58 release notes; no dead or mis-wired setting was found among the controls. Detection, planner and render logic are unchanged.
+- Window title shows V5.58.
+- New `test_v558.py` (live theme, tab switching, settings audit). `test_v557.py` still passes.
+
 ## V5.57 - 2026-10-05
 - Mouse wheel never changes a value any more (comboboxes, spinboxes, sliders, option menus on every tab); the wheel scrolls the page instead.
 - Settings rebuilt on one grid: section headers, a fixed label column, uniform row padding and extra space between sections.
