@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.42B"
+APP_VERSION = "V5.43"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -1248,6 +1248,64 @@ def resurrect_rows(tracks, dead_others):
     return res
 
 
+def _killer_leftover(ktext):
+    """V5.43: the killer side with MY name taken out - what is 'stuck' to it (another name read into my row)."""
+    t = (ktext or "").lower()
+    sc, st = name_match(t)
+    if sc >= NAME_MIN:
+        t = t[:st] + t[st + len(MY_NAME):]
+    t = t.replace(MY_NAME_CS2, "")
+    return _alnum(t)
+
+
+def drop_fake_kills(kills, rej, game):
+    """V5.43 (Valorant + CS2): a real kill read again with jumbled text must not count as a new kill. Duplicates:
+      - 1-2 sightings and the row text (killer leftover + victim side) contains a victim I killed in the last 4 s;
+      - 1-2 sightings, an empty victim side and another name stuck to my name;
+      - kills < 0.5 s apart with matching victim text are one kill (the better read stays);
+      - CS2: a round has 5 enemies - 6+ kills of mine inside one round's time, the weakest reads (1-2 sightings) go."""
+    from rapidfuzz import fuzz
+    kills.sort(key=lambda k: k["t"])
+    keep = []
+    for k in kills:
+        v = _alnum(k.get("victim") or "").lower()
+        left = _killer_leftover(k["row"].split("] ")[0][1:] if k.get("row") else "")
+        why = None
+        for q in keep:
+            qv = _alnum(q.get("victim") or "").lower()
+            if k["t"] - q["t"] < 0.5 and v and qv and fuzz.ratio(v, qv) >= 70:
+                why = f"same kill read twice ({q['row']} / {k['row']} {k['t'] - q['t']:.2f} s apart)"
+                break
+        if why is None and k["hits"] <= 2:
+            text = _alnum(left + v).lower()
+            for q in keep:
+                qv = _alnum(q.get("victim") or "").lower()
+                if 0 < k["t"] - q["t"] <= 4.0 and len(qv) >= 3 and text and \
+                        (fuzz.partial_ratio(qv, text) >= 85 or (len(text) >= 4 and fuzz.ratio(qv, text) >= 75)):
+                    why = f"jumbled re-read of my kill on '{q.get('victim')}' {k['t'] - q['t']:.1f} s earlier ({k['row']})"
+                    break
+            if why is None and not v and len(left) >= 3:
+                why = f"empty victim side with another name stuck to mine ({k['row']})"
+        if why:
+            rej.append({"t": k["t"], "reason": f"duplicate kill: {why}", "ks": k["ks"]})
+            continue
+        keep.append(k)
+    if game == "cs2":
+        weak = lambda k: (k["hits"], k["ks"])
+        while True:
+            over = next(([x for x in keep if 0 <= x["t"] - a["t"] <= 115.0] for a in keep
+                         if len([x for x in keep if 0 <= x["t"] - a["t"] <= 115.0]) > 5), None)
+            if not over:
+                break
+            cand = [x for x in over if x["hits"] <= 2]
+            if not cand:
+                break
+            d = min(cand, key=weak)
+            keep.remove(d)
+            rej.append({"t": d["t"], "reason": f"duplicate kill: more than 5 of my kills in one CS2 round ({d['row']})", "ks": d["ks"]})
+    kills[:] = keep
+
+
 def analyse_entry(entry, cfg, game=None):
     """Raw OCR frames -> rows -> verdicts -> content-tracked rows (identity = killer text + victim text + weapon) -> kills /
     deaths / rejected rows with reasons. The ONE implementation behind Dry plan, Render, the sync report, Self-test and the
@@ -1343,7 +1401,7 @@ def analyse_entry(entry, cfg, game=None):
             else:
                 vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
                 rej.append({"t": tt, "reason": why, "ks": t["ks"]})
-    kills.sort(key=lambda k: k["t"])
+    drop_fake_kills(kills, rej, game)                          # V5.43
     return {"kills": kills, "deaths": sorted(deaths), "revives": sorted(revives), "rej": sorted(rej, key=lambda r: r["t"]),
             "vis": vis, "best_k": bk, "best_v": bv, "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(tracks),
             "rows_max": seen_rows, "ocr_calls": len(entry.get("ocr", [])), "cjk": cjk}
@@ -2986,7 +3044,16 @@ def _same_kills(ia, ib, rf, cache):
                                        rf(x))[0]
         except Exception:
             cache[key] = False
-    return o if cache[key] else None
+    if cache[key]:
+        return o
+    # V5.43: frames can differ between two captures of one moment: a 1-2 kill clip whose victims ALL appear (same names, 90+) in
+    # the other clip, recorded within 10 minutes, is that clip's duplicate - one kill is never placed twice
+    small, big = (ia, ib) if len(ia["kills"]) <= len(ib["kills"]) else (ib, ia)
+    names = lambda it: [v(k) for k in it["kills"]]
+    if len(small["kills"]) <= 2 and abs(ia.get("ctime", 0) - ib.get("ctime", 0)) <= 600 and \
+            all(len(x) >= 4 and any(fuzz.ratio(x, y) >= 90 for y in names(big)) for x in names(small)):
+        return o
+    return None
 
 
 FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
@@ -3433,9 +3500,10 @@ def row_tail_window(ev, slow, win, post, ext=True):
     return (lo, max(win[1], lo + ROW_SLACK))
 
 
-def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, ending=False, c_only=None):
+def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, ending=False, c_only=None, ext_only=None):
     """V4 placement on ticks: the first kill on a beat (downbeat preferred), run-up of the recipe's 1-4 beats (more only to keep
-    earlier killfeed rows off the first frame), end tick 0.2-0.5 s after the last kill."""
+    earlier killfeed rows off the first frame), end tick 0.2-0.5 s after the last kill. V5.43: the kill-row tail may only extend
+    the END (ext_only=False: the V5.42 window; True: the extended window) - the start / run-up is never moved later for it."""
     nt = len(U) - 1
     first = ev["times"][0]
     span = ev["times"][-1] - first
@@ -3452,7 +3520,7 @@ def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, endi
     pref = lambda q: (0 if 2 * lo <= q[2] <= 2 * hi else 1, abs(q[2] - (lo + hi)), q[1] // 2 not in down, q[0] % 2)
     good = sorted([q for q in pairs if vis_ok(ev, first - (U[q[1]] - U[q[0]]))], key=pref)
     bad = sorted([q for q in pairs if q not in good], key=lambda q: -(U[q[1]] - U[q[0]]))[:2]
-    for ext, (cc, kk, _) in [(x, q) for x in ((True,) if ending else (False, True)) for q in good + bad]:
+    for ext, (cc, kk, _) in [(x, q) for x in ((True,) if ending else (False, True) if ext_only is None else (ext_only,)) for q in good + bad]:
         if ending:
             g = geom(ev, U, cc, kk, None, ramp, True, ending=True)
             if g:
@@ -3542,10 +3610,10 @@ def optimal_fit(clips, an, style):
         s_t = float(bt[E]) - L
         S = max([d for d in down if bt[d] <= s_t + 1e-6] or [0])
         frac = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
-        inside = [d for d in drops if 0.2 <= frac(d["beat"]) <= 0.8 and d["beat"] < E]
+        inside = [d for d in drops if 0.2 <= frac(d["beat"]) <= 0.6 and d["beat"] < E]
         sc = 0.0
-        if main is not None and 0.25 <= frac(main) <= 0.75 and main < E:
-            sc += 3.0 - 2.0 * abs(frac(main) - 0.5)
+        if main is not None and 0.2 <= frac(main) <= 0.6 and main < E:
+            sc += 3.0 - 4.0 * abs(frac(main) - 0.38)       # V5.43: ~38% build-up before the drop (V5.42 order)
         elif inside:
             sc += 1.5
         sc += 0.5 * (E in sec_b) + 0.3 * (E == last_b) + 0.2 * float(np.mean(an["level"][S:E] if len(an.get("level", [])) >= E else [0]))
@@ -3555,15 +3623,15 @@ def optimal_fit(clips, an, style):
         best = (0.0, 0, last_b, [d for d in drops if d["beat"] < last_b])
     _, S, E, inside = best
     fr = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
-    if main is not None and 0.25 <= fr(main) <= 0.75:
+    if main is not None and 0.2 <= fr(main) <= 0.6:
         drop_b, dwhy = int(main), "the song's main drop"
     elif inside:
         d = max(inside, key=lambda d: d.get("strength", 0))
         drop_b, dwhy = int(d["beat"]), "the strongest drop inside the section"
     else:
-        tgt = bt[S] + 0.45 * (bt[E] - bt[S])
+        tgt = bt[S] + 0.38 * (bt[E] - bt[S])
         drop_b = min([d for d in down if S < d < E] or [S], key=lambda d: abs(bt[d] - tgt))
-        dwhy = "no drop fits inside this section - a downbeat ~45% in"
+        dwhy = "no drop fits inside this section - a downbeat ~38% in"
     end_kind = "the song end" if E == last_b else "a section boundary" if E in sec_b else "a 4-bar phrase"
     rng_txt = (f"range {OPT_RANGE[0]:.0f}-{mx:.0f} s" if mx >= OPT_RANGE[0] else f"at most {mx:.0f} s") + \
         f" ({'the 150 s maximum' if mx >= OPT_RANGE[1] else 'the whole song is ' + format(avail, '.0f') + ' s'})"
@@ -3703,9 +3771,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     jit = {id(e): rng.uniform(0.75, 1.25) for e in rest}  # seeded variety in the order (strong clips stay strong)
     asc = sorted(rest, key=lambda e: e["score"] * jit[id(e)])
     pre, acc = [], 0
-    pre_room = c_h - 2 * fit["start_beat"] if fit else None     # V5.42B: the build-up fills the section up to the drop
     for e in asc:
-        if (acc >= 0.38 * total if fit is None else acc + nat(e) > pre_room) or acc + nat(e) > c_h:
+        if acc >= 0.38 * total or acc + nat(e) > c_h:         # V5.42 order: ~38% build-up before the drop
             break
         pre.append(e)
         acc += nat(e)
@@ -3771,10 +3838,10 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         on a beat; never past the end of the song."""
         lo, hi = rp.get("lead", (1, 2))
         cands = []
-        for kk in range(c + 1, min(nt, c + (33 if fit else 17))):    # V5.42B Optimal: up to one 4-bar phrase of run-up, only
-            if kk % 2:                                                 # to end on a phrase (sped up like an approach if > 4 s)
+        for kk in range(c + 1, min(nt, c + 17)):
+            if kk % 2:
                 continue
-            g = geom(e, U, c, kk, None, 1.6 if kk > c + 16 and U[kk] - U[c] > 4.0 else 1.0, True, ending=True)
+            g = geom(e, U, c, kk, None, 1.0, True, ending=True)
             if not g:
                 continue
             last_out = U[kk] + g.get("ospan", e["times"][-1] - e["times"][0])
@@ -3782,8 +3849,6 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             if not ends:
                 continue
             ph = [j for j in ends if j in phrase_ticks]
-            if kk > c + 16 and not ph:
-                continue
             cands.append(((not vis_ok(e, e["times"][0] - (U[kk] - U[c])), not ph, abs(kk - c - (lo + hi))),
                           dict(g, fade_end=(ph or ends)[0], on_phrase=bool(ph))))
         return min(cands, key=lambda x: x[0])[1] if cands else None
@@ -3827,8 +3892,11 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             c1, got = takes[0]["c"], None
             reach = 48 + (nat(e) + int(e["span"] / td) if fit else 0)     # V5.42B: long fights need more room in front
             cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - reach), -1) if E - U[cc] <= target + 1e-6]
-            for cc in sorted(cc_s, key=lambda cc: (cc % 2, -cc)):
-                got = place(e, U, down, rp, c=cc, end=c1)
+            for xp in (False, True):                       # V5.43: the V5.42 tail window first; extending the end never shortens the run-up
+                for cc in sorted(cc_s, key=lambda cc: (cc % 2, -cc)):
+                    got = place(e, U, down, rp, c=cc, end=c1, ext_only=xp)
+                    if got:
+                        break
                 if got:
                     break
             t0 = takes[0]
@@ -3837,8 +3905,11 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                 g0 = geom(t0["ev"], U, t0["c"] - sh, t0["kb"], t0["end"], t0["ramp"], t0["slow"])
                 if not g0:
                     continue
-                for cc in sorted([cc - sh for cc in cc_s if cc - sh >= 0], key=lambda cc: (cc % 2, -cc)):
-                    got = place(e, U, down, rp, c=cc, end=c1 - sh)
+                for xp in (False, True):
+                    for cc in sorted([cc - sh for cc in cc_s if cc - sh >= 0], key=lambda cc: (cc % 2, -cc)):
+                        got = place(e, U, down, rp, c=cc, end=c1 - sh, ext_only=xp)
+                        if got:
+                            break
                     if got:
                         break
                 if got:
