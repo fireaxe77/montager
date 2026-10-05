@@ -3485,6 +3485,97 @@ def optimal_length(events, bd, notes):
     return L
 
 
+OPT_RANGE = (80.0, 150.0)               # V5.42B Optimal: 80 s minimum (when the material allows), 150 s maximum, never past the song
+
+
+def take_estimate(e, bd, rname):
+    """Seconds one clip takes on screen at a style's pacing: the recipe's run-up, the fight (over-long dead air jump-cut to
+    ~1.4 s), the tail to >= 0.4 s after the last kill row, rounded up to the half-beat grid."""
+    rp = RECIPES.get(rname, RECIPES["hype"])
+    lo, hi = rp.get("lead", (1, 2))
+    allow = GAP_ALLOW[1] + (GAP_ALLOW[2] - GAP_ALLOW[1]) * STYLE_CALM.get(rname, 0.4) * 0.5
+    t = e["times"]
+    fight = sum(min(b - a, max(allow, 1.4)) for a, b in zip(t, t[1:]))
+    rd = max(0.0, max(e.get("rows") or t) - t[-1])
+    tail = max(0.32, rd + ROW_TAIL + 0.1)
+    td = bd / 2
+    return max(MIN_TAKE_S, math.ceil(((lo + hi) / 2 * bd + fight + tail) / td) * td)
+
+
+def optimal_fit(clips, an, style):
+    """V5.42B OPTIMAL - THE length rule, ONE shared function (Manual now; the weekly Auto mode can reuse it unchanged):
+    (clips, song map, style) -> {"length", "start_beat", "end_beat", "drop_beat", "clips", "left", "max", "why"}.
+      - range: 80 s minimum, 150 s maximum, never longer than the whole song;
+      - all usable clips are used when they fit in min(150 s, song); otherwise the WEAKEST are left out (listed), never more;
+      - fewer clips = a shorter montage (80 s+ when the material allows - nothing is padded);
+      - the song section is chosen to fit that length (starting earlier in the song when needed) and ends on a phrase or
+        section boundary (or the song end); the drop is placed inside it when it fits - a preference, never a reason to
+        shorten the section."""
+    import numpy as np
+    rname = style if style in RECIPES else "hype"
+    bt = np.array(an["beats"], float)
+    bd = float(np.median(np.diff(bt)))
+    song_end = float(an.get("dur") or (bt[-1] + bd)) - 0.1
+    avail = song_end - float(bt[0])
+    mx = min(OPT_RANGE[1], avail)
+    est = {id(e): take_estimate(e, bd, rname) for e in clips}
+    end_x = (END_FADE[0] + END_FADE[1]) / 2 - 0.4           # the slow-mo ending runs longer than a normal tail
+    total = lambda lst: sum(est[id(e)] for e in lst) + (end_x if len(lst) >= 3 else 0.0)
+    chosen = sorted(clips, key=lambda e: -e["score"])
+    left = []
+    while len(chosen) > 1 and total(chosen) > mx - bd:         # one beat of room for the drop alignment
+        e = chosen.pop()
+        left.append((e, f"don't fit in {mx:.0f} s ({'the whole song' if mx < OPT_RANGE[1] else 'the 150 s maximum'})"))
+    L = min(mx, total(chosen))
+    # song section: [S, E], E on a phrase / section boundary (or the song end), S = E - L; drop inside it preferred
+    nb = len(bt)
+    last_b = int(np.searchsorted(bt, song_end, side="right") - 1)
+    sec_b = {int(x["start"]) for x in an.get("sections", [])}
+    bounds = sorted({int(b) for b in an.get("phrase4", [])} | sec_b | {last_b})
+    down = sorted(int(d) for d in an.get("down", [])) or list(range(0, nb, 4))
+    drops = an.get("drops") or ([{"beat": an["drop"], "strength": 1.0}] if an.get("drop") is not None else [])
+    main = an.get("drop")
+    best = None
+    for E in bounds:
+        if E > last_b or bt[E] - bt[0] < L - 1e-6:
+            continue
+        s_t = float(bt[E]) - L
+        S = max([d for d in down if bt[d] <= s_t + 1e-6] or [0])
+        frac = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
+        inside = [d for d in drops if 0.2 <= frac(d["beat"]) <= 0.8 and d["beat"] < E]
+        sc = 0.0
+        if main is not None and 0.25 <= frac(main) <= 0.75 and main < E:
+            sc += 3.0 - 2.0 * abs(frac(main) - 0.5)
+        elif inside:
+            sc += 1.5
+        sc += 0.5 * (E in sec_b) + 0.3 * (E == last_b) + 0.2 * float(np.mean(an["level"][S:E] if len(an.get("level", [])) >= E else [0]))
+        if best is None or sc > best[0] + 1e-9:
+            best = (sc, S, E, inside)
+    if best is None:                                       # the material needs the whole song
+        best = (0.0, 0, last_b, [d for d in drops if d["beat"] < last_b])
+    _, S, E, inside = best
+    fr = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
+    if main is not None and 0.25 <= fr(main) <= 0.75:
+        drop_b, dwhy = int(main), "the song's main drop"
+    elif inside:
+        d = max(inside, key=lambda d: d.get("strength", 0))
+        drop_b, dwhy = int(d["beat"]), "the strongest drop inside the section"
+    else:
+        tgt = bt[S] + 0.45 * (bt[E] - bt[S])
+        drop_b = min([d for d in down if S < d < E] or [S], key=lambda d: abs(bt[d] - tgt))
+        dwhy = "no drop fits inside this section - a downbeat ~45% in"
+    end_kind = "the song end" if E == last_b else "a section boundary" if E in sec_b else "a 4-bar phrase"
+    rng_txt = (f"range {OPT_RANGE[0]:.0f}-{mx:.0f} s" if mx >= OPT_RANGE[0] else f"at most {mx:.0f} s") + \
+        f" ({'the 150 s maximum' if mx >= OPT_RANGE[1] else 'the whole song is ' + format(avail, '.0f') + ' s'})"
+    why = (f"OPTIMAL {L:.0f} s ({rname} pacing): {len(chosen)} of {len(clips)} usable clips ~ {total(chosen):.0f} s; {rng_txt}"
+           + (f"; under {OPT_RANGE[0]:.0f} s because that is all the usable material (nothing is padded)"
+              if L < min(OPT_RANGE[0], mx) - 0.5 and not left else "")
+           + (f"; {len(left)} weakest didn't fit: " + ", ".join(Path(e["path"]).name for e, _ in left) if left else "")
+           + f". Song section {ts(bt[S])}-{ts(bt[E])} ends on {end_kind}; drop at {ts(bt[drop_b])} ({dwhy}, {fr(drop_b):.0%} in)")
+    return {"length": round(L, 2), "start_beat": int(S), "end_beat": int(E), "drop_beat": int(drop_b), "clips": chosen,
+            "left": left, "max": mx, "why": why}
+
+
 def why_no_take(ev):
     """Plain-language reason an event cannot form a take."""
     post = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
@@ -3500,9 +3591,9 @@ def why_no_take(ev):
 def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
     """Event-driven, song-anchored layout (V4): the best multikill lands on the biggest drop's downbeat; build-up before it,
     the rest after it, a strong slow-mo ending last; takes on the song's beat grid, first kills on beats.
-    manual=True (ticked clips): every usable event is used; Optimal = all of them within the shorter of 120 s and the music
-    available (the section starts earlier when that fits more), strongest first, the rest listed as not fitting; a fixed
-    length may trim (listed by name). Auto: Optimal / fixed length keeps the best events and leaves the lowest-ranked out.
+    manual=True (ticked clips): every usable event is used; Optimal = optimal_fit() (V5.42B: 80-150 s, never past the song,
+    the section chosen to fit all of them, weakest left out only when they really don't fit, listed); a fixed length may
+    trim (listed by name). Auto: Optimal / fixed length keeps the best events and leaves the lowest-ranked out.
     The montage never runs past the end of the song: the music covers every frame through the final fade."""
     import numpy as np
     rng = random.Random(seed)
@@ -3518,11 +3609,11 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             e["times"] = list(e.get("times_v4") or e["times"])
             e["first"], e["last"], e["span"] = e["times"][0], e["times"][-1], e["times"][-1] - e["times"][0]
     for e in evs:                                          # V5.41: dead air allowed between kills follows the music
-        e["_allow"] = lambda t, _an=an, _r=rname: gap_allowance(_an, _r, t)
+        e["_allow"] = None if e.get("_no_cuts") else (lambda t, _an=an, _r=rname: gap_allowance(_an, _r, t))
     song_end = float(an.get("dur") or (bt[-1] + bd)) - 0.1     # the montage's last frame stays inside the music
     optimal = target_s in (None, "", "optimal", 0)
-    if optimal and manual:                                 # V5.41: the shorter of 120 s and the music there is
-        target = min(120.0, song_end - float(bt[0]))
+    if optimal and manual:                                 # V5.42B: optimal_fit() below decides (80-150 s, never past the song)
+        target = min(OPT_RANGE[1], song_end - float(bt[0]))
     elif optimal:
         target = optimal_length([e for e in evs], bd, notes)
     else:
@@ -3538,8 +3629,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     elif plain:
         notes.append(f"{len(plain)} plain single kills left out (enough better material)")
     cap_t = int(min(120.0, target * 1.1) / td) if target else 10 ** 9
-    if manual and optimal:                                 # ticked clips: only 120 s pre-trims, the song end decides the rest
-        cap_t = int(120.0 / td)
+    if manual and optimal:                                 # ticked clips: optimal_fit() decides what fits
+        cap_t = 10 ** 9
     nm = lambda e: Path(e["path"]).name
     phrase_ticks = {2 * int(b) for b in an.get("phrase4", [])} | {2 * int(x["start"]) for x in an.get("sections", [])}
     heads = {h.get("headline") for h in hist_c[-4:]}
@@ -3557,6 +3648,11 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         notes.append(f"{len(skipped)} events cannot form a take: " + "; ".join(f"{nm(e)} ({why_no_take(e)})" for e in skipped))
     if not usable:
         raise RuntimeError("no kill event has enough footage around it to form a take")
+    fit, n_usable = None, len(usable)
+    if manual and optimal:                                 # V5.42B: THE shared Optimal rule picks length, section and clips
+        fit = optimal_fit(usable, an, rname)
+        usable = [e for e in usable if any(e is c_ for c_ in fit["clips"])]
+        notes.append(fit["why"])
     head_cands = [e for e in usable if e["path"] not in heads] or usable
     head = head_cands[0]
     rest = [e for e in usable if e is not head]
@@ -3566,7 +3662,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     else:
         ending = None
     total = nat(head) + sum(nat(e) for e in rest) + (nat(ending) + 6 if ending else 0)
-    cut_len = []
+    cut_len = [e for e, _ in fit["left"]] if fit else []      # V5.42B: still tried in front below before being listed
     while total > cap_t and rest:                          # length-driven only: drop the lowest-ranked
         e = rest.pop()
         total -= nat(e)
@@ -3580,6 +3676,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     dc = [i for i in sorted(down) if 12 <= i <= nb - 16] or sorted(down)
     dc8 = [i for i in dc if (i - d0) % 8 == 0]
     drop = 2 * min(dc8 or dc, key=lambda i: abs(i - dr))
+    if fit:
+        drop = 2 * fit["drop_beat"]
     fx = {}
     for e in rest:                                         # speed-ups only in the approach; slow-mo only after the headline
         fx[id(e)] = (rng.uniform(1.4, 1.9) if rng.random() < rp["ramp_p"] else 1.0, False)
@@ -3605,8 +3703,9 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     jit = {id(e): rng.uniform(0.75, 1.25) for e in rest}  # seeded variety in the order (strong clips stay strong)
     asc = sorted(rest, key=lambda e: e["score"] * jit[id(e)])
     pre, acc = [], 0
+    pre_room = c_h - 2 * fit["start_beat"] if fit else None     # V5.42B: the build-up fills the section up to the drop
     for e in asc:
-        if acc >= 0.38 * total or acc + nat(e) > c_h:
+        if (acc >= 0.38 * total if fit is None else acc + nat(e) > pre_room) or acc + nat(e) > c_h:
             break
         pre.append(e)
         acc += nat(e)
@@ -3672,10 +3771,10 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         on a beat; never past the end of the song."""
         lo, hi = rp.get("lead", (1, 2))
         cands = []
-        for kk in range(c + 1, min(nt, c + 17)):
-            if kk % 2:
+        for kk in range(c + 1, min(nt, c + (33 if fit else 17))):    # V5.42B Optimal: up to one 4-bar phrase of run-up, only
+            if kk % 2:                                                 # to end on a phrase (sped up like an approach if > 4 s)
                 continue
-            g = geom(e, U, c, kk, None, 1.0, True, ending=True)
+            g = geom(e, U, c, kk, None, 1.6 if kk > c + 16 and U[kk] - U[c] > 4.0 else 1.0, True, ending=True)
             if not g:
                 continue
             last_out = U[kk] + g.get("ospan", e["times"][-1] - e["times"][0])
@@ -3683,6 +3782,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             if not ends:
                 continue
             ph = [j for j in ends if j in phrase_ticks]
+            if kk > c + 16 and not ph:
+                continue
             cands.append(((not vis_ok(e, e["times"][0] - (U[kk] - U[c])), not ph, abs(kk - c - (lo + hi))),
                           dict(g, fade_end=(ph or ends)[0], on_phrase=bool(ph))))
         return min(cands, key=lambda x: x[0])[1] if cands else None
@@ -3690,7 +3791,10 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     c = head_take["end"]
     left, left_song = [], []
     for e in post:
-        if target is not None and U[c] - U[takes[0]["c"]] > target - (6 if ending else 0):
+        if fit and U[c] + nat(e) * td + (8.0 if ending else 0) - U[takes[0]["c"]] > fit["max"]:
+            left.append(e)                                 # V5.42B: never past min(150 s, song); tried in front below
+            continue
+        if target is not None and not fit and U[c] - U[takes[0]["c"]] > target - (6 if ending else 0):
             left.append(e)
             continue
         t = place_fx(e, c=c)
@@ -3717,12 +3821,29 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         # V5.41 Optimal fits the song: clips that did not fit after the drop go in front (the section starts earlier), strongest
         # first, while the montage stays within the 120 s / music-available target; the rest are listed as not fitting
         E = float(U[end_take["fade_end"]]) if end_take else float(U[takes[-1]["end"]])
+        if fit:                                            # V5.42B: within min(150 s, song), never just for a 'nice' length
+            target = fit["max"]
         for e in sorted(cut_len + left + left_song, key=lambda e: -e["score"]):
             c1, got = takes[0]["c"], None
-            cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - 48), -1) if E - U[cc] <= target + 1e-6]
+            reach = 48 + (nat(e) + int(e["span"] / td) if fit else 0)     # V5.42B: long fights need more room in front
+            cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - reach), -1) if E - U[cc] <= target + 1e-6]
             for cc in sorted(cc_s, key=lambda cc: (cc % 2, -cc)):
                 got = place(e, U, down, rp, c=cc, end=c1)
                 if got:
+                    break
+            t0 = takes[0]
+            for sh in ((1, 2, 3) if fit and not got and not t0.get("ending") else ()):
+                # V5.42B repair: shift the neighbouring take's window (a slightly longer run-up) so this clip's tail can land
+                g0 = geom(t0["ev"], U, t0["c"] - sh, t0["kb"], t0["end"], t0["ramp"], t0["slow"])
+                if not g0:
+                    continue
+                for cc in sorted([cc - sh for cc in cc_s if cc - sh >= 0], key=lambda cc: (cc % 2, -cc)):
+                    got = place(e, U, down, rp, c=cc, end=c1 - sh)
+                    if got:
+                        break
+                if got:
+                    takes[0] = g0
+                    head_take = g0 if t0 is head_take else head_take
                     break
             if got:
                 takes.insert(0, got)
@@ -3730,16 +3851,45 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                     if e in lst:
                         lst.remove(e)
         miss = cut_len + left + left_song
-        if miss:
+        if miss and fit:                                   # V5.42B: weakest first, grouped by reason
+            why_m = {id(e): w for e, w in fit["left"]}
+            by = {}
+            for e in sorted(miss, key=lambda e: e["score"]):
+                by.setdefault(why_m.get(id(e), f"no run-up / tail fits in front of the montage within {target:.0f} s, even with "
+                                                "the next take shifted"), []).append(nm(e))
+            notes.append(f"{len(miss)} ticked clips didn't fit in this song (weakest first): " +
+                         "; ".join(f"{', '.join(v)} - {k}" for k, v in by.items()))
+        elif miss:
             notes.append(f"{len(miss)} ticked clips didn't fit in this song: " + ", ".join(nm(e) for e in miss))
     for t in list(takes):
         if not t.get("ending") and (t["end"] - t["c"] < 2 * MIN_TAKE_BEATS or U[t["end"]] - U[t["c"]] < MIN_TAKE_S):
+            i = takes.index(t)
+            if manual:                                     # V5.42B repair: a longer run-up (the take before ends earlier)
+                fixed = None
+                for sh in range(1, 9):
+                    g = geom(t["ev"], U, t["c"] - sh, t["kb"], t["end"], t["ramp"], t["slow"])
+                    gp = geom(takes[i - 1]["ev"], U, takes[i - 1]["c"], takes[i - 1]["kb"], t["c"] - sh, takes[i - 1]["ramp"],
+                              takes[i - 1]["slow"]) if i > 0 else True
+                    if g and gp and (i == 0 or not takes[i - 1].get("ending")):
+                        fixed = (g, gp)
+                        break
+                if fixed:
+                    if t is head_take:
+                        head_take = fixed[0]
+                    elif i > 0 and takes[i - 1] is head_take:
+                        head_take = fixed[1]
+                    takes[i] = fixed[0]
+                    if i > 0:
+                        takes[i - 1] = fixed[1]
+                    notes.append(f"cut list repair: {nm(t['ev'])} take extended to the minimum (longer run-up)")
+                    continue
             takes.remove(t)
-            notes.append("removed a take shorter than the minimum")
+            notes.append(f"removed a take shorter than the minimum: {nm(t['ev'])}" +
+                         (" (no longer run-up fits its footage or the take before)" if manual else ""))
     plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock)
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
-    plan["fit"] = {"usable": len(usable), "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
+    plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
                    "left_out": [] if manual and optimal else [nm(e) for e in cut_len + left],
                    "song_short": [nm(e) for e in (cut_len + left + left_song if manual and optimal else left_song)],
                    "section_s": plan["song"]["section_s"], "manual": manual, "optimal": optimal}
@@ -4439,17 +4589,28 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         target = cfg.get("length_s", "optimal")
     if style is None:
         style = cfg.get("style", "auto")
-    pool_ev, fixes = list(events), []
+    pool_ev, fixes, extended = list(events), [], set()
     for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
         n2 = list(notes)
         plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
                             placement=placement, manual=manual)
         bad = [b_ for b_ in verify_cutlist(plan) if "kill row" in b_]
         idx = {int(m.group(1)) for b_ in bad for m in [re.match(r"take (\d+):", b_)] if m}
+        why_b = {plan["takes"][i - 1]["path"]: b_.split(":", 1)[1].strip() for b_ in bad for m in [re.match(r"take (\d+):", b_)]
+                 if m and 0 < (i := int(m.group(1))) <= len(plan["takes"])}
         gone = {plan["takes"][i - 1]["path"] for i in idx if 0 < i <= len(plan["takes"])}
         if not gone:
             break
-        fixes += [f"cut list repair: dropped {Path(p_).name} (kill row outside its footage), re-planned with the next best events"
+        if manual:                                         # V5.42B: first extend the take's window (no jump-cuts over its fight)
+            ext = {p_ for p_ in gone if p_ not in extended}
+            if ext:
+                extended |= ext
+                fixes += [f"cut list repair: {Path(p_).name} - {why_b.get(p_, 'kill row outside its footage')}; take window "
+                          "extended (its whole fight shown, no jump-cut), re-planned" for p_ in ext]
+                pool_ev = [dict(e, _no_cuts=True) if e["path"] in ext else e for e in pool_ev]
+                continue
+        fixes += [f"cut list repair: dropped {Path(p_).name} ({why_b.get(p_, 'kill row outside its footage')}"
+                  f"{' even with its take window extended' if p_ in extended else ''}), re-planned with the next best events"
                   for p_ in gone]
         pool_ev = [e for e in pool_ev if e["path"] not in gone]
     plan["notes"] = list(plan["notes"]) + fixes
@@ -6047,7 +6208,7 @@ class App:
         ttk.Label(f, text="Default length").grid(row=r, column=0, sticky="w", padx=8, pady=4)
         lf = ttk.Frame(f)
         lf.grid(row=r, column=1, sticky="w")
-        ttk.Checkbutton(lf, text="Optimal (30-120 s, the strong kills decide)", variable=self.set_opt).pack(side="left")
+        ttk.Checkbutton(lf, text="Optimal (Manual: 80-150 s from clips + song + style; Auto: 30-120 s)", variable=self.set_opt).pack(side="left")
         ttk.Scale(lf, from_=30, to=120, variable=self.set_len, length=220,
                   command=lambda v: self.set_len.set(int(float(v)))).pack(side="left", padx=6)
         ttk.Label(lf, textvariable=self.set_len, width=4).pack(side="left")
@@ -6870,7 +7031,8 @@ def planner_selftest(verbose=True):
         sp2 = tmpd / "short test.mp3"
         synth_song(sp2, 128.0, layout=(("intro", 4), ("verse", 8), ("build", 4), ("drop", 8), ("outro", 4)))
         an2 = analyse_song(str(sp2), 128.0)
-        for a_, nm_, ev_, tg_, chk in ((an, "manual optimal, 10 clips", fake_events(10), "optimal", "all"),
+        for a_, nm_, ev_, tg_, chk in ((an, "manual optimal, 26 clips (V5.42B rule)", evs, "optimal", "range"),
+                                       (an, "manual optimal, 10 clips", fake_events(10), "optimal", "all"),
                                        (an, "manual fixed 40 s", evs, 40, "left"), (an2, "manual optimal, short song", evs, "optimal", "short")):
             p_ = plan_montage(dict(DEFAULT_CONFIG), "valorant", ev_, dict(song, path=str(sp2) if a_ is an2 else song["path"]), a_, 5,
                               "auto", tg_, [], [], manual=True)
@@ -6885,6 +7047,15 @@ def planner_selftest(verbose=True):
                 fails.append(f"{nm_}: left-out clips not listed ({f_})")
             if chk == "short" and (not f_["song_short"] or f_["used"] + len(f_["song_short"]) != f_["usable"]):
                 fails.append(f"{nm_}: song-too-short clips not listed ({f_})")
+            if chk == "range":                             # V5.42B: optimal_fit() - all clips unless they really don't fit
+                mx_ = min(OPT_RANGE[1], f_["section_s"])
+                if f_["used"] + len(f_["song_short"]) != f_["usable"] or p_["duration"] > mx_ + 0.05 or \
+                        (f_["song_short"] and p_["duration"] < min(OPT_RANGE[0], mx_) - 8) or \
+                        not any(n.startswith("OPTIMAL ") and "pacing" in n for n in p_["notes"]):
+                    fails.append(f"{nm_}: {p_['duration']:.0f} s, {f_['used']} used, {len(f_['song_short'])} listed of "
+                                 f"{f_['usable']} usable - Optimal must use them all or fill min(150 s, song) and say why")
+                elif verbose:
+                    out("  " + next(n for n in p_["notes"] if n.startswith("OPTIMAL ") and "pacing" in n))
             if verbose:
                 out(f"  {nm_}: {p_['notes'][1]}")
     finally:
