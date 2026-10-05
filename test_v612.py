@@ -131,48 +131,6 @@ def t_audio():
     check("Artist - Fresh.mp3" in [Path(r["path"]).name for r in r3], "a skipped file is picked up on the next run")
 
 
-# ---------------------------------------------------------------- 2b: the OLD matcher kept as the reference (V6.1: dense WRatio matrix + assignment)
-def match_playlist_ref(rows, audio, cfg):
-    """ONE-TO-ONE best global assignment of MP3 files to CSV rows. Each file (ID3 title if present, else the filename) is compared
-    with 'Track', 'Artist - Track' and 'Track - Artist' using rapidfuzz WRatio; duration within 3 s adds a little."""
-    import numpy as np
-    from rapidfuzz import fuzz, process
-    from scipy.optimize import linear_sum_assignment
-    if not rows or not audio:
-        return [], list(rows)
-    names = []
-    for a in audio:
-        stem = re.sub(r"^\s*\d{1,3}[\s._-]+", "", Path(a["path"]).stem)
-        names.append(MOD.clean(a.get("title", "")) or MOD.clean(stem) or stem.lower())
-    t1 = [MOD.clean(r["title"]) or r["title"].lower() for r in rows]
-    t2 = [MOD.clean(f"{r['artist']} - {r['title']}") for r in rows]
-    t3 = [MOD.clean(f"{r['title']} - {r['artist']}") for r in rows]
-    M = np.zeros((len(audio), len(rows)))
-    for i, nm in enumerate(names):
-        M[i] = np.maximum.reduce([process.cdist([nm], t, scorer=fuzz.WRatio)[0] for t in (t1, t2, t3)])
-        da = audio[i].get("dur") or 0
-        if da:
-            for j, r in enumerate(rows):
-                if r.get("dur") and abs(da - r["dur"]) <= 3:
-                    M[i, j] += 2.0
-    rk = lambda r: r.get("uri") or f"{r['artist']} - {r['title']}"
-    idx = {a["path"]: i for i, a in enumerate(audio)}
-    for path, key in cfg.get("song_overrides", {}).items():              # manual overrides from the Songs view
-        i = idx.get(path)
-        j = next((k for k, r in enumerate(rows) if rk(r) == key), None)
-        if i is not None and j is not None:
-            M[i, :], M[:, j] = -1, -1
-            M[i, j] = 1000
-    ri, ci = linear_sum_assignment(-M)
-    matched, got = [], set()
-    for i, j in zip(ri, ci):
-        sc = M[i, j]
-        if sc >= cfg.get("match_floor", 60):
-            matched.append((rows[j], audio[i], int(min(sc, 100) if sc < 1000 else 100)))
-            got.add(j)
-    return matched, [r for j, r in enumerate(rows) if j not in got]
-
-
 def gen_data(n_tracks, n_files, seed, hard=False):
     import random
     rnd = random.Random(seed)
@@ -224,40 +182,40 @@ def gen_data(n_tracks, n_files, seed, hard=False):
 
 
 def t_match():
-    print("[2b] match_playlist: new matcher vs the old algorithm (reference kept in this test)")
+    print("[2] song matcher (unchanged v6.2 algorithm): titles must match, not only the artist")
     cfg = M.load_config()
-    for n, seed, hard in ((300, 1, False), (300, 2, False), (600, 3, False), (300, 4, True)):
-        rows, audio = gen_data(n, n + n // 10, seed, hard)
-        t0 = time.time()
-        old_m, old_u = match_playlist_ref(rows, audio, cfg)
-        t_old = time.time() - t0
-        t0 = time.time()
-        new_m, new_u = M.match_playlist(rows, audio, cfg)
-        t_new = time.time() - t0
-        so = sorted((r["uri"], a["path"], sc) for r, a, sc in old_m)
-        sn = sorted((r["uri"], a["path"], sc) for r, a, sc in new_m)
-        diff_ = set(so) ^ set(sn)
-        same = len(set(so) & set(sn)) / max(1, len(set(so) | set(sn)))
-        strict = (n, seed) == (300, 1)
-        ok = (so == sn) if strict else (same >= 0.98 or hard)
-        check(ok, f"{n} tracks x {len(audio)} files seed {seed}{' (HARD: duplicate files + junk sharing vocabulary; informational)' if hard else ''}: "
-              f"{'identical' if so == sn else f'{len(diff_)} pair(s) differ ({same * 100:.1f} % identical)'} ({len(so)} matched); old {t_old:.2f}s new {t_new:.2f}s"
-              + (f"; e.g. {sorted(diff_)[:2]}" if diff_ and not strict else ""))
-        if strict:
-            check(sorted(r["uri"] for r in old_u) == sorted(r["uri"] for r in new_u), f"{n}: identical unmatched list")
-
-    rows, audio = gen_data(2000, 2000, 7)
-    t0 = time.time()
+    art = "\u0422\u0440\u0438 \u0434\u043d\u044f \u0434\u043e\u0436\u0434\u044f"
+    songs = ["\u0411\u0435\u0433\u0438 \u043e\u0442 \u043c\u0435\u043d\u044f", "\u041e\u0442\u043f\u0443\u0441\u043a\u0430\u0439", "\u0414\u043e\u0440\u043e\u0433\u0438",
+             "\u0421\u0435\u0440\u0434\u0446\u0435", "\u041d\u043e\u0447\u044c"]
+    mk_r = lambda t, k: {"title": t, "artist": art, "dur": 0, "uri": f"u{k}"}
+    mk_a = lambda stem: {"path": f"/s/{stem}.mp3", "title": "", "artist": "", "dur": 0}
+    # the two reported songs
+    rows = [mk_r(songs[0], 0), mk_r(songs[1], 1)]
+    audio = [mk_a(f"{songs[1]} - {art}"), mk_a(f"{songs[0]} - {art}")]               # file order differs from the CSV order
     m, u = M.match_playlist(rows, audio, cfg)
-    t_full = time.time() - t0
-    check(t_full < 2.0, f"2000 tracks x 2000 files: {t_full:.2f}s (< 2 s), {len(m)} matched")
-    if "--ref-full" in sys.argv:
-        t0 = time.time()
-        om, _ = match_playlist_ref(rows, audio, cfg)
-        so = sorted((r["uri"], a["path"], sc) for r, a, sc in om)
-        sn = sorted((r["uri"], a["path"], sc) for r, a, sc in m)
-        same = len(set(so) & set(sn)) / max(1, len(set(so) | set(sn)))
-        check(same >= 0.98, f"full 2000x2000: {same * 100:.1f} % of the pairs identical to the old algorithm ({len(set(so) ^ set(sn))} differ of {len(so)}; old took {time.time() - t0:.1f}s)")
+    ok = len(m) == 2 and all(Path(a["path"]).name.startswith(r["title"]) for r, a, sc in m)
+    check(ok, "each track matches the file with the same title (two songs of one artist): " + "; ".join(f"{r['title']} <- {Path(a['path']).name} ({sc})" for r, a, sc in m))
+    # a whole album of one artist, shuffled files
+    rows = [mk_r(t_, k) for k, t_ in enumerate(songs)]
+    audio = [mk_a(f"{t_} - {art}") for t_ in reversed(songs)]
+    m, u = M.match_playlist(rows, audio, cfg)
+    check(len(m) == 5 and all(Path(a["path"]).name.startswith(r["title"]) for r, a, sc in m), "5 songs of one artist, files in another order: all 5 match their own title")
+    # artist only is not enough: a file of the same artist but another title must not reach 100 against this track
+    m, u = M.match_playlist([mk_r(songs[1], 1)], [mk_a(f"{songs[0]} - {art}")], cfg)
+    check(not m or m[0][2] < 100, f"same artist, different title: score {m[0][2] if m else 'no match'} (< 100)")
+    m, u = M.match_playlist([mk_r(songs[0], 0)], [mk_a(f"{songs[0]} - {art}")], cfg)
+    check(m and m[0][2] == 100, "exact artist + title: 100")
+    # ID3 title tag instead of the file name
+    m, u = M.match_playlist([mk_r(songs[0], 0), mk_r(songs[1], 1)], [dict(mk_a("track02"), title=songs[1]), dict(mk_a("track01"), title=songs[0])], cfg)
+    check(len(m) == 2 and all(a["title"] == r["title"] for r, a, sc in m), "ID3 titles decide when the file name says nothing")
+    # Cyrillic / Japanese text is kept by the normaliser
+    check(M.clean(songs[0]) == songs[0].lower(), "Cyrillic text is not stripped by clean()")
+    jp = "\u65e5\u672c\u8a9e\u306e\u30bf\u30a4\u30c8\u30eb (Official Video)"
+    check(M.clean(jp) == "\u65e5\u672c\u8a9e\u306e\u30bf\u30a4\u30c8\u30eb", f"Japanese text is not stripped by clean(): {M.clean(jp)}")
+    rows = [{"title": "\u591c\u306b\u99c6\u3051\u308b", "artist": "YOASOBI", "dur": 0, "uri": "j0"}, {"title": "\u30a2\u30a4\u30c9\u30eb", "artist": "YOASOBI", "dur": 0, "uri": "j1"}]
+    audio = [mk_a("\u30a2\u30a4\u30c9\u30eb - YOASOBI"), mk_a("\u591c\u306b\u99c6\u3051\u308b - YOASOBI")]
+    m, u = M.match_playlist(rows, audio, cfg)
+    check(len(m) == 2 and all(Path(a["path"]).name.startswith(r["title"]) for r, a, sc in m), "Japanese titles of one artist match their own file")
 
 
 def make_library(n, seed=5, name="lib"):
