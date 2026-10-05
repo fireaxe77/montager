@@ -18,7 +18,7 @@ FIRST 3 THINGS TO CLICK:
      forever), then prints the song + map, recipe, lock level, ranked kills and the cut list. Then "Preview" and "Make this week's montage".
 
 NOTES (V5): clips come from the explicit folder lists in Settings (the list decides the game). Kills are read with OCR (RapidOCR,
-  offline) from the killfeed; KILL = FIREAXE first on the killer side, assists / utility / knife kills never reach a montage, OCR
+  offline) from the killfeed; KILL = FIREAXE first on the killer side, assists / utility kills never reach a montage (knife kills count), OCR
   variants of one row are merged, a single sighting under 90 needs a gunshot. Each kill is refined to the FIRST frame its row is
   visible. Every song gets a cached SONG MAP (beat grid locked to the CSV Tempo, downbeats, 4/8-bar phrases, sections, all drops,
   accents, loudness; Songs tab > Song map). The montage is built FROM the map: first kills land on the beat (how many are locked
@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.43"
+APP_VERSION = "V5.5"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -95,6 +95,7 @@ DEFAULT_CONFIG = {
     "game_overrides": {},           # path prefix -> game
     "match_threshold": 85,
     "length_s": "optimal",          # "optimal" (default) or seconds (30-120)
+    "update_on_start": False,       # V5.5: run `git pull` when the app starts (Settings; off by default)
     "style": "auto",                # auto (default) | hype | aggressive | smooth | cinematic | chill | mix | random
     "placement": "v5",              # v5 = frame-exact kill moments on the song-map grid; v4 = V4 timing (see synccompare)
     "quality": "nvenc",             # nvenc | max
@@ -933,8 +934,6 @@ def classify_row(r, cfg=None, lg=0.0, game=None):
         w = "weapon icon" if r["split"] == "icon" else "gap"
         if not r["gun"]:
             out_.append(("reject", f"utility: small/square {w} (grenade, molotov, ability)"))
-        elif weapon_class(r, game) == "knife":
-            out_.append(("reject", f"knife: long thin blade icon - knife kills are not used"))
         elif r.get("before"):
             out_.append(("reject", f"assist: '{r['before']}' comes before FIREAXE on the killer side"))
         else:
@@ -1052,6 +1051,71 @@ class KillStore:
 
 def load_kills_cache():
     return KillStore()
+
+
+def _cache_index():
+    """V5.5: {(name, size, mtime, game): [(file, dir, path, stamp, algo, bars)]} of every cached kill entry (key read from the
+    first bytes of each file - the OCR payload is never loaded)."""
+    idx = {}
+    for d in DATA.glob("kills_v*"):
+        for p in d.glob("*.json"):
+            try:
+                with open(p, "rb") as f:
+                    head = f.read(3000).decode("utf-8", "ignore")
+                key = json.loads('"' + re.match(r'\{"key": "((?:[^"\\]|\\.)*)"', head).group(1) + '"')
+                path, size, mt, game, tail = key.split("|")[:5]
+                m = re.match(r"(ocr[0-9a-f]{8})v(\d+)(.*)$", tail)
+                idx.setdefault((os.path.basename(path).lower(), size, mt, game), []).append((p, d.name, path, m.group(1), m.group(2), m.group(3)))
+            except Exception:
+                continue
+    return idx
+
+
+def _relink_or_explain(jobs, dets, cache, cfg):
+    """V5.5: a kill cache survives updates. For every clip with no entry under today's key: a cached entry of the same file
+    (name, size, time) with the same calibration + bars (the clip folder moved) is re-linked, not rescanned; the rest are
+    rescanned and the log says WHY (calibration changed / black-bar crop changed / cache format changed / clip file changed /
+    new clip). Returns the jobs that really need a scan."""
+    idx = _cache_index()
+    paths = {e[2].lower() for v in idx.values() for e in v}
+    todo, why, linked = [], {}, 0
+    for r, g in jobs:
+        try:
+            fk = file_key(r["path"])
+        except OSError:
+            todo.append((r, g))
+            continue
+        path, size, mt = fk.split("|")[:3]
+        key = kills_key(r, g, dets[g])
+        tail = key.split("|")[4]
+        st, (algo, bars) = tail[:11], re.match(r"v(\d+)(.*)$", tail[11:]).groups()
+        same = idx.get((os.path.basename(path).lower(), size, mt, g), [])
+        hit = next((e for e in same if e[3] == st and e[4] == algo and e[5] == bars), None)
+        if hit is not None:
+            try:
+                cache.put(key, json.loads(Path(hit[0]).read_text(encoding="utf-8"))["e"])
+                linked += 1
+                continue
+            except Exception:
+                pass
+        if not same:
+            reason = "clip file changed (size / time)" if path.lower() in paths else "new clip, never scanned"
+        elif all(e[3] != st for e in same):
+            reason = "calibration changed (killfeed region)"
+        elif all(e[4] != algo for e in same):
+            reason = f"cache format changed (v{same[0][4]} -> v{algo})"
+        else:
+            reason = "black-bar crop changed"
+        why.setdefault(reason, []).append(Path(path).name)
+        todo.append((r, g))
+    if linked:
+        out(f"kill cache: {linked} clip(s) re-linked (same file, new folder / path) - not rescanned")
+    if why:
+        out("rescanning: " + "; ".join(f"{k} ({len(v)})" for k, v in why.items()))
+        for k, v in why.items():
+            for n in v[:15]:
+                out(f"  rescanning {n}: {k}")
+    return todo
 
 
 def _band_changed(m, last):
@@ -1258,27 +1322,44 @@ def _killer_leftover(ktext):
     return _alnum(t)
 
 
-def drop_fake_kills(kills, rej, game):
+def drop_fake_kills(kills, rej, game, pre=(), revives=()):
     """V5.43 (Valorant + CS2): a real kill read again with jumbled text must not count as a new kill. Duplicates:
       - 1-2 sightings and the row text (killer leftover + victim side) contains a victim I killed in the last 4 s;
       - 1-2 sightings, an empty victim side and another name stuck to my name;
       - kills < 0.5 s apart with matching victim text are one kill (the better read stays);
+      - V5.5: the same victim killed again within one fight (kills <= 10 s apart, pre-clip rows included) with no revive row
+        between = a duplicate, whatever the sightings;
       - CS2: a round has 5 enemies - 6+ kills of mine inside one round's time, the weakest reads (1-2 sightings) go."""
     from rapidfuzz import fuzz
     kills.sort(key=lambda k: k["t"])
     keep = []
+    pre = [dict(p, hits=9) for p in pre]                       # V5.5: kills whose row was already on screen at 0:00 are known kills too
     for k in kills:
         v = _alnum(k.get("victim") or "").lower()
+        seen = pre + keep
         left = _killer_leftover(k["row"].split("] ")[0][1:] if k.get("row") else "")
         why = None
-        for q in keep:
+        fight = []                                             # V5.5: the kills of this fight (each <= 10 s after the one before)
+        edge = k["t"]
+        for q in reversed(seen):
+            if edge - q["t"] > 10.0:
+                break
+            fight.append(q)
+            edge = q["t"]
+        for q in fight:                                        # the same victim killed again = a duplicate, unless a revive came between
+            qv = _alnum(q.get("victim") or "").lower()
+            if v and qv and len(qv) >= 3 and fuzz.ratio(v, qv) >= 85 and k["t"] > q["t"] and \
+                    not any(q["t"] < rv < k["t"] for rv in revives):
+                why = f"'{k.get('victim')}' was already killed {k['t'] - q['t']:.1f} s earlier in this fight, no revive between ({k['row']})"
+                break
+        for q in (seen if why is None else ()):
             qv = _alnum(q.get("victim") or "").lower()
             if k["t"] - q["t"] < 0.5 and v and qv and fuzz.ratio(v, qv) >= 70:
                 why = f"same kill read twice ({q['row']} / {k['row']} {k['t'] - q['t']:.2f} s apart)"
                 break
         if why is None and k["hits"] <= 2:
             text = _alnum(left + v).lower()
-            for q in keep:
+            for q in seen:
                 qv = _alnum(q.get("victim") or "").lower()
                 if 0 < k["t"] - q["t"] <= 4.0 and len(qv) >= 3 and text and \
                         (fuzz.partial_ratio(qv, text) >= 85 or (len(text) >= 4 and fuzz.ratio(qv, text) >= 75)):
@@ -1354,7 +1435,7 @@ def analyse_entry(entry, cfg, game=None):
         prev_f = f
     tracks = merge_variants(tracks)
     res_why = resurrect_rows(tracks, dead_others) if game != "cs2" else {}      # V5.42B: Valorant only
-    kills, deaths, revives, rej, vis, cjk = [], [], [], [], [], {}
+    kills, deaths, revives, rej, vis, cjk, pre = [], [], [], [], [], {}, []
     for t in tracks:
         tt = round(t["first"] / FPS + off, 3)
         tally = {}
@@ -1387,6 +1468,8 @@ def analyse_entry(entry, cfg, game=None):
                     continue
             if t["first"] <= 2:
                 rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(t["ks"], t["vs"])})
+                if a == "kill":
+                    pre.append({"t": tt, "ks": t["ks"], "row": row, "victim": t["vtext"]})
             elif a == "kill":
                 vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
                 kills.append({"t": tt, "ks": t["ks"], "hs": bool(t["hs"]), "row": row, "hits": t["hits"], "victim": t["vtext"],
@@ -1401,7 +1484,7 @@ def analyse_entry(entry, cfg, game=None):
             else:
                 vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
                 rej.append({"t": tt, "reason": why, "ks": t["ks"]})
-    drop_fake_kills(kills, rej, game)                          # V5.43
+    drop_fake_kills(kills, rej, game, pre, revives)            # V5.43 / V5.5
     return {"kills": kills, "deaths": sorted(deaths), "revives": sorted(revives), "rej": sorted(rej, key=lambda r: r["t"]),
             "vis": vis, "best_k": bk, "best_v": bv, "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(tracks),
             "rows_max": seen_rows, "ocr_calls": len(entry.get("ocr", [])), "cjk": cjk}
@@ -1750,6 +1833,10 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
         recs = [r for r in recs if r["path"] in ps]
     cache = load_kills_cache()
     jobs = [(r, r["game"]) for r in recs if rescan or kills_key(r, r["game"], dets[r["game"]]) not in cache]
+    if jobs and rescan:
+        out("rescanning: forced rescan (requested)")
+    elif jobs:
+        jobs = _relink_or_explain(jobs, dets, cache, cfg)
     if limit:
         jobs = jobs[:limit]
     out(f"cached {len(recs) - len(jobs)}, scanning {len(jobs)}  (of {len(recs)} clips in scope)")
@@ -3073,10 +3160,7 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
     notes = []
     items = []
     for it in pool:
-        ks = [k for k in it["kills"] if k.get("weapon", "gun") == "gun"]
-        drop = len(it["kills"]) - len(ks)
-        if drop:
-            notes.append(f"{Path(it['rec']['path']).name}: {drop} knife/utility kill(s) excluded")
+        ks = list(it["kills"])                             # V5.5: Valorant knife kills are normal kills
         if ks:
             items.append(dict(it, kills=sorted(ks, key=lambda k: k["t"]), ctime=clip_time(it["rec"]["path"])))
     # duplicates / continuations
@@ -3238,9 +3322,21 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
             d_ = nshift - spans[i + 1]["shift"]
             spans[i + 1].update(shift=nshift, start=spans[i + 1]["start"] + d_, end=spans[i + 1]["end"] + d_)
         if not ok_all:                                      # fall back to the single clip with the most of these kills
-            best = max(spans, key=lambda s_: sum(1 for t in rows if s_["start"] <= t <= s_["end"]))
-            spans = [best]
-            stitch_note += "stitch rejected - using the single clip with the most kills"
+            # V5.43B: the offsets between the clips are WRONG (that is why the stitch failed), so nothing of the joined timeline may
+            # be kept: re-plan the event from scratch on the single clip, from the kills THAT clip read, in its own time.
+            def own(s_):                                    # the kills of this cluster that THIS clip read itself, in its own time
+                ob = s_["shift"] + moff
+                return [dict(x, tt=x["t"], src=s_["it"], off=0.0) for x in s_["it"]["kills"]
+                        if any(abs(k["tt"] - (x["t"] + ob)) <= 0.5 for k in cl)]
+            best = max(spans, key=lambda s_: len(own(s_)))
+            if own(best):
+                note = stitch_note + "stitch rejected - re-planned on the single clip " + Path(best["path"]).name + \
+                       f" ({len(own(best))} of {len(cl)} kills it shows)"
+                ev = make_event(own(best), [(best["it"], 0.0)], det, cfg, refine, verify)
+                if ev:
+                    ev["stitch_note"] = note
+                return ev
+            return None
     cover_start, cover_end = spans[0]["start"], spans[-1]["end"]
     keep = [i for i, (t, r) in enumerate(zip(times, rows)) if cover_start + 0.05 <= t and r <= cover_end - 0.05]
     if not keep:
@@ -4650,7 +4746,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     seed = int(seed) if seed else random.randrange(1, 10 ** 6)
     events, notes = build_events(pool, game, cfg, random.Random(seed))
     if not events:
-        raise RuntimeError("no usable kill events (knife / utility kills are excluded)")
+        raise RuntimeError("no usable kill events (utility kills are excluded)")
     songs, unmatched, csvname = song_pool(cfg)
     song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path)
     placement = placement or cfg.get("placement", "v5")
@@ -5300,6 +5396,10 @@ class App:
     def __init__(self, start_tab=0, startup=True):
         self.root = tk.Tk()
         self.root.title(f"Montage builder {APP_VERSION} (Valorant / CS2)")
+        try:
+            self.root.iconbitmap(str(HERE / "montage.ico"))      # V5.5 app icon (Windows)
+        except Exception:
+            pass
         sc = UI_SCALE[0]
         self.root.geometry(f"{min(int(1220 * sc), self.root.winfo_screenwidth())}x{min(int(920 * sc), self.root.winfo_screenheight() - 60)}")
         self.root.minsize(920, 640)
@@ -6305,6 +6405,10 @@ class App:
         r += 1
         ttk.Checkbutton(f, text="Print a sync report after each render (re-scans the finished montage)", variable=self.set_sync).grid(row=r, column=1, sticky="w")
         r += 1
+        self.set_upd = tk.BooleanVar(value=bool(self.cfg.get("update_on_start", False)))
+        ttk.Checkbutton(f, text="Check for updates on start (runs 'git pull' once when the app opens; off by default)",
+                        variable=self.set_upd).grid(row=r, column=1, sticky="w")
+        r += 1
         ttk.Label(f, text="Theme (restart to apply)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
         ttk.Combobox(f, textvariable=self.set_theme, values=["light", "dark", "auto"], width=8, state="readonly").grid(row=r, column=1, sticky="w")
         r += 1
@@ -6323,6 +6427,7 @@ class App:
         cfg["style"], cfg["placement"] = self.set_style.get(), self.set_place.get()
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["theme"] = self.set_theme.get()
+        cfg["update_on_start"] = bool(self.set_upd.get())
         save_json(CONFIG_PATH, cfg)
         self.cfg = cfg
         out("settings saved")
@@ -6957,7 +7062,7 @@ def fixture_rows_test(verbose=True):
     import cv2
     import numpy as np
     fails = []
-    want = {"valorant_knife_kill.png": "knife", "valorant_clove_self_revive.png": "revive", "valorant_sage_resurrect.png": "revive"}
+    want = {"valorant_knife_kill.png": "knife kill", "valorant_clove_self_revive.png": "revive", "valorant_sage_resurrect.png": "revive"}
     for nm, w in want.items():
         im = cv2.imread(str(FIXTURES / nm))
         if im is None:
@@ -6970,11 +7075,14 @@ def fixture_rows_test(verbose=True):
         frames = [np.full_like(canvas, (70, 78, 86))] * 12 + [canvas] * 24 + [np.where(kill != (70, 78, 86), kill, canvas)] * 30
         ocr, n = scan_frames(iter(frames))
         a = analyse_entry({"ocr": ocr, "frames": n, "v_off": 0.0}, {})
-        ks = [k for k in a["kills"] if k.get("weapon", "gun") != "knife"]
+        ks = a["kills"] if w == "knife kill" else [k for k in a["kills"] if k.get("weapon", "gun") != "knife"]   # V5.5: knife = a kill
         if verbose:
             out(f"  {nm}: kills {[k['t'] for k in ks]}, knife kills {[k['t'] for k in a['kills'] if k.get('weapon') == 'knife']}, "
                 f"deaths {a['deaths']}, revives {a['revives']}")
-        ok = len(ks) == 1 and ks[0]["t"] > 1.0 and not a["deaths"] and (len(a["revives"]) == 1 if w == "revive" else not a["revives"])
+        if w == "knife kill":
+            ok = len(ks) == 2 and ks[-1]["t"] > 1.0 and not a["deaths"] and not a["revives"]
+        else:
+            ok = len(ks) == 1 and ks[0]["t"] > 1.0 and not a["deaths"] and (len(a["revives"]) == 1 if w == "revive" else not a["revives"])
         if not ok:
             fails.append(f"fixture {nm}: expected {w} row ignored + the later real kill kept, got kills {[k['t'] for k in a['kills']]} "
                          f"deaths {a['deaths']} revives {a['revives']}")
@@ -7365,7 +7473,7 @@ def cmd_smoketest(args):
     try:
         f = fixture_rows_test()
         fails += f
-        out("  OK: knife excluded, both revives ignored, the kill after each row kept" if not f else "\n".join("  FAIL " + x for x in f))
+        out("  OK: knife kill counts, both revives ignored, the kill after each row kept" if not f else "\n".join("  FAIL " + x for x in f))
     except Exception:
         fails.append("fixture test crashed")
         out("  FAIL fixtures: " + traceback.format_exc())
@@ -7443,7 +7551,51 @@ def cmd_auto(args):
             out(f"{g}: {ex}")
 
 
+def _hide_child_consoles():
+    """V5.5: started with pythonw (no console) every ffmpeg / git child would flash a console window - hide them. Only when
+    there is no console of our own; 'python montage.py' is unchanged."""
+    if os.name != "nt" or sys.stdout is not None:
+        return
+    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    orig = subprocess.Popen.__init__
+
+    def init(self, *a, **kw):
+        kw["creationflags"] = kw.get("creationflags", 0) | flag
+        orig(self, *a, **kw)
+    subprocess.Popen.__init__ = init
+
+
+def update_on_start():
+    """V5.5: optional (Settings > Check for updates on start, off by default): `git pull --ff-only` once, before the GUI opens;
+    when the code changed the app restarts itself once on the new code. Nothing runs in the background."""
+    if os.environ.get("MONTAGE_UPDATED") or not (HERE / ".git").exists() or not load_config().get("update_on_start"):
+        return
+    git = shutil.which("git")
+    if not git:
+        out("update on start: git not found - skipped")
+        return
+
+    def run(*a):
+        return subprocess.run([git, "-C", str(HERE)] + list(a), capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+    try:
+        before = run("rev-parse", "HEAD").stdout.strip()
+        r = run("pull", "--ff-only")
+        after = run("rev-parse", "HEAD").stdout.strip()
+        out(f"update on start: git pull {'OK' if r.returncode == 0 else 'FAILED'} - "
+            f"{'updated ' + before[:7] + ' -> ' + after[:7] if before != after else 'already up to date'}"
+            + ("" if r.returncode == 0 else f" ({(r.stderr or r.stdout).strip()[:200]})"))
+        if r.returncode == 0 and before != after:
+            os.environ["MONTAGE_UPDATED"] = "1"
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+    except SystemExit:
+        raise
+    except Exception as ex:
+        out(f"update on start: skipped ({ex})")
+
+
 def main():
+    _hide_child_consoles()
     for s in (sys.stdout, sys.stderr):
         try:
             s.reconfigure(encoding="utf-8", errors="replace")
@@ -7508,6 +7660,8 @@ def main():
     t.add_argument("game", choices=list(GAMES) + ["auto"])
     t.set_defaults(fn=cmd_tag)
     args = ap.parse_args()
+    if not getattr(args, "fn", None) or args.cmd in ("gui", "pick"):
+        update_on_start()
     if not getattr(args, "fn", None):
         gui_main()
         return
