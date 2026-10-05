@@ -6,7 +6,7 @@ GET IT RUNNING (Windows 11, Python 3.12) - in cmd.exe:
     cd C:\Users\fireaxe\Desktop\CLAUDECODE
     git clone https://github.com/fireaxe77/montager.git montager      (later updates: cd montager && git pull origin main)
     cd montager
-    python -m pip install --user numpy opencv-python librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime
+    python -m pip install --user numpy opencv-python librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime sv-ttk
     python montage.py                    <- opens the GUI (the app also offers a one-click install of missing packages)
     ffmpeg missing?  winget install --id Gyan.FFmpeg -e --scope user   (open a new terminal afterwards)
 
@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.5"
+APP_VERSION = "V5.55"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -95,6 +95,7 @@ DEFAULT_CONFIG = {
     "game_overrides": {},           # path prefix -> game
     "match_threshold": 85,
     "length_s": "optimal",          # "optimal" (default) or seconds (30-120)
+    "ui_layout": {},                # V5.55: remembered window size + divider positions (GUI only)
     "update_on_start": False,       # V5.5: run `git pull` when the app starts (Settings; off by default)
     "style": "auto",                # auto (default) | hype | aggressive | smooth | cinematic | chill | mix | random
     "placement": "v5",              # v5 = frame-exact kill moments on the song-map grid; v4 = V4 timing (see synccompare)
@@ -2181,6 +2182,7 @@ def selftest_detection(cfg, per_game=20):
 # ======================================================================= SONGS
 SONG_CACHE = DATA / "song_cache.json"
 USED_CLIPS = DATA / "used_clips.json"
+USED_FLAGS = DATA / "used_flags.json"      # V5.55 (GUI): {clip path: date of the montage it was used in}
 USED_SONGS = DATA / "used_songs.json"
 SONG_ALGO = "s3"
 
@@ -5206,11 +5208,58 @@ class CalibDialog:
             messagebox.showerror("Killfeed region", str(ex))
 
 
-PALETTES = {
-    "light": dict(bg="#eef0f3", fg="#111418", field="#ffffff", acc="#1f6feb", acc_fg="#ffffff", head="#dfe3e8", dim="#5b6370",
-                  border="#8a929e", sel="#c9defc", sel_fg="#0b1f3a", btn="#f8f9fb", btn_act="#e3ecfb", check="#1f6feb"),
-    "dark": dict(bg="#2b2e34", fg="#f1f3f5", field="#3a3e46", acc="#4b8df8", acc_fg="#ffffff", head="#454a53", dim="#b0b6bf",
-                 border="#8d949e", sel="#3d5f99", sel_fg="#ffffff", btn="#3f444d", btn_act="#4f5662", check="#7fb0ff"),
+# ------------------------------------------------------------ V5.55 GUI helpers (used flags, random pick)
+def _pkey(p):
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def used_dates():
+    """{clip path key: date (YYYY-MM-DD) of the last montage that used it}: the flags the GUI writes plus the older history."""
+    d = {}
+    for game_hist in load_json(USED_CLIPS, {}).values():
+        for h in game_hist if isinstance(game_hist, list) else []:
+            for c in h.get("clips", []):
+                d[_pkey(c)] = max(d.get(_pkey(c), ""), h.get("date", ""))
+    for c, dt in load_json(USED_FLAGS, {}).items():
+        d[c] = max(d.get(c, ""), dt)
+    return d
+
+
+def mark_used(paths, date=None):
+    """A montage rendered successfully: every clip in it is 'used' as of that date."""
+    date = date or datetime.datetime.now().strftime("%Y-%m-%d")
+    flags = load_json(USED_FLAGS, {})
+    for p_ in paths:
+        flags[_pkey(p_)] = date
+    save_json(USED_FLAGS, flags)
+
+
+def default_song_map(dur=180.0, bpm=120.0):
+    """A plain song map (steady beat, 4-beat bars, 4-bar phrases) for Optimal sizing when no song is chosen."""
+    import numpy as np
+    bd = 60.0 / bpm
+    n = int(dur / bd)
+    return {"beats": [i * bd for i in range(n)], "dur": dur, "down": list(range(0, n, 4)), "phrase4": list(range(0, n, 16)),
+            "sections": [], "drops": [], "drop": None, "level": [0] * n, "energy": [0.5] * n, "bpm": bpm}
+
+
+def random_pick(cands, an=None, style="auto", rng=None):
+    """V5.55 Random pick: shuffle the candidate clips (dicts with path + ks = kill times), then ask the existing Optimal function
+    (optimal_fit) which of them fit an Optimal-length montage for this song map and style. Returns (paths, fit)."""
+    rng = rng or random.Random()
+    an = an or default_song_map()
+    pool = [{"path": c["path"], "times": list(c["ks"]), "rows": list(c["ks"]), "score": rng.random()} for c in cands if c.get("ks")]
+    if not pool:
+        return [], None
+    fit = optimal_fit(pool, an, style)
+    return [e["path"] for e in fit["clips"]], fit
+
+
+PALETTES = {                                          # V5.55: Sun Valley colours (also used by the plain fallback theme)
+    "light": dict(bg="#fafafa", fg="#1c1c1c", field="#ffffff", acc="#005fb8", acc_fg="#ffffff", head="#f0f0f0", dim="#5f5f5f",
+                  border="#cfcfcf", sel="#cce4f7", sel_fg="#1c1c1c", btn="#fdfdfd", btn_act="#f0f0f0", check="#005fb8"),
+    "dark": dict(bg="#1c1c1c", fg="#fafafa", field="#2b2b2b", acc="#57c8ff", acc_fg="#000000", head="#2b2b2b", dim="#a8a8a8",
+                 border="#454545", sel="#1f4e79", sel_fg="#ffffff", btn="#2f2f2f", btn_act="#3a3a3a", check="#57c8ff"),
 }
 
 
@@ -5222,7 +5271,51 @@ def F(size):
     return max(7, int(round(size * UI_SCALE[0])))
 
 
+SV_THEME = [False]                                    # True when the Sun Valley ttk theme (sv-ttk) is active
+
+
 def apply_theme(root, mode="light", scale=None):
+    """V5.55: Sun Valley ttk theme (pip: sv-ttk, offline) - light by default, dark in Settings, 'auto' follows Windows. Without
+    the package the previous clam theme is used. Returns the palette (log, canvases, tags)."""
+    dark = mode == "dark"
+    if mode == "auto":
+        try:
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            dark = winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+        except Exception:
+            dark = False
+    try:
+        import sv_ttk
+        import tkinter.font as tkfont
+        if scale:
+            UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
+        pal = dict(PALETTES["dark" if dark else "light"])
+        sv_ttk.set_theme("dark" if dark else "light", root)
+        SV_THEME[0] = True
+        for nm, sz, bold in (("TkDefaultFont", 10, 0), ("TkTextFont", 10, 0), ("TkMenuFont", 10, 0), ("TkHeadingFont", 10, 1),
+                             ("SunValleyBodyFont", 10, 0), ("SunValleyBodyStrongFont", 10, 1), ("SunValleyCaptionFont", 9, 0)):
+            try:
+                tkfont.nametofont(nm, root).configure(size=F(sz))
+            except Exception:
+                pass
+        st = ttk.Style(root)
+        st.configure("Treeview", rowheight=int(28 * UI_SCALE[0]))
+        st.configure("Treeview.Heading", font=("Segoe UI", F(10), "bold"))
+        st.configure("TLabelframe.Label", font=("Segoe UI", F(10), "bold"), foreground=pal["acc"])
+        st.configure("TNotebook.Tab", padding=(16, 5), font=("Segoe UI", F(10), "bold"))
+        st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+        st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+        root.configure(bg=pal["bg"])
+        root.option_add("*TCombobox*Listbox.selectBackground", pal["acc"])
+        root.option_add("*TCombobox*Listbox.selectForeground", pal["acc_fg"])
+        return pal
+    except Exception:
+        SV_THEME[0] = False
+        return _apply_theme_clam(root, mode, scale)
+
+
+def _apply_theme_clam(root, mode="light", scale=None):
     """Light by default (clear contrast: visible borders on buttons and inputs, clear selection and checkbox colours).
     'dark' is optional in Settings; 'auto' follows Windows."""
     dark = mode == "dark"
@@ -5275,6 +5368,11 @@ def apply_theme(root, mode="light", scale=None):
     st.configure("TProgressbar", background=pal["acc"], troughcolor=pal["head"], bordercolor=pal["border"])
     st.configure("Vertical.TScrollbar", background=pal["btn"], troughcolor=pal["head"], arrowcolor=pal["fg"], bordercolor=pal["border"])
     st.configure("Horizontal.TScale", background=pal["acc"], troughcolor=pal["head"], bordercolor=pal["border"])
+    st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+    st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6), background=pal["acc"], foreground=pal["acc_fg"],
+                 lightcolor=pal["acc"], darkcolor=pal["acc"], bordercolor=pal["acc"])
+    st.map("Big.Accent.TButton", background=[("disabled", pal["head"]), ("active", pal["sel"]), ("pressed", pal["sel"])],
+           foreground=[("disabled", pal["dim"]), ("active", pal["sel_fg"])])
     return pal
 
 
@@ -5400,8 +5498,6 @@ class App:
             self.root.iconbitmap(str(HERE / "montage.ico"))      # V5.5 app icon (Windows)
         except Exception:
             pass
-        sc = UI_SCALE[0]
-        self.root.geometry(f"{min(int(1220 * sc), self.root.winfo_screenwidth())}x{min(int(920 * sc), self.root.winfo_screenheight() - 60)}")
         self.root.minsize(920, 640)
         self.q, self.busy, self.buttons, self._imgs, self.pending = queue.Queue(), False, [], [], []
         self.named = {}                   # button registry (smoketest checks every required button)
@@ -5412,39 +5508,50 @@ class App:
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
         self.pal = apply_theme(self.root, self.cfg.get("theme", "light"), self.cfg.get("ui_scale", 1.0))
+        sc = UI_SCALE[0]
+        lay = self.cfg.get("ui_layout") or {}
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        w0, h0 = int(1220 * sc), int(920 * sc)
+        m_ = re.fullmatch(r"(\d+)x(\d+)", str(lay.get("geometry", "")))
+        if m_:
+            w0, h0 = int(m_.group(1)), int(m_.group(2))
+        self.root.geometry(f"{max(920, min(w0, sw))}x{max(640, min(h0, sh - 60))}")      # V5.55: the size from the last run
         self.last_click = None
-        # bottom area first so the notebook can expand above it
-        bot = ttk.Frame(self.root)
-        bot.pack(side="bottom", fill="x", padx=6, pady=4)
+        # bottom area first so the panes can expand above it
+        bot = ttk.Frame(self.root, padding=(10, 4))
+        bot.pack(side="bottom", fill="x")
         row = ttk.Frame(bot)
         row.pack(fill="x")
         self.pbar = ttk.Progressbar(row, maximum=1.0)
         self.pbar.pack(side="left", fill="x", expand=True)
         self.plabel = tk.StringVar(value="idle")
-        ttk.Label(row, textvariable=self.plabel, width=34).pack(side="left", padx=6)
+        ttk.Label(row, textvariable=self.plabel, width=34).pack(side="left", padx=8)
         self.named["Cancel"] = ttk.Button(row, text="Cancel", command=stop_all)
         self.named["Cancel"].pack(side="left")
         res = ttk.Frame(bot)
-        res.pack(fill="x", pady=3)
+        res.pack(fill="x", pady=(6, 0))
         self.vlabel = tk.StringVar(value="Last video: none yet")
         ttk.Label(res, textvariable=self.vlabel).pack(side="left")
         self.b_open = ttk.Button(res, text="Open video", command=self.safe(self.open_video), state="disabled")
         self.b_open.pack(side="right")
         self.b_folder = ttk.Button(res, text="Open folder", command=self.safe(self.open_vfolder))
-        self.b_folder.pack(side="right", padx=4)
+        self.b_folder.pack(side="right", padx=6)
         self.named["Open video"], self.named["Open folder"] = self.b_open, self.b_folder
-        lf = ttk.Frame(bot)
-        lf.pack(fill="x")
-        self.log = tk.Text(lf, height=8, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"],
-                           relief="solid", bd=1, highlightthickness=0, padx=8, pady=6, font=("Consolas", F(10)),
-                           selectbackground=self.pal["sel"], selectforeground=self.pal["sel_fg"])
+        # V5.55: tabs above, log below, with a drag divider between them (position remembered)
+        self.vpane = self.make_pane(self.root, "vertical")
+        self.vpane.pack(side="top", fill="both", expand=True, padx=10, pady=(8, 4))
+        self.nb = ttk.Notebook(self.vpane)
+        lf = ttk.Frame(self.vpane)
+        self.log = tk.Text(lf, height=4, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"],
+                           relief="flat", bd=0, highlightthickness=1, highlightbackground=self.pal["border"], padx=10, pady=8,
+                           font=("Consolas", F(10)), selectbackground=self.pal["sel"], selectforeground=self.pal["sel_fg"])
         lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=lsb.set)
         self.log.pack(side="left", fill="both", expand=True)
         lsb.pack(side="right", fill="y")
-        self.nb = ttk.Notebook(self.root)
-        self.nb.pack(side="top", fill="both", expand=True, padx=6, pady=6)
-        self.tabs = {n: ttk.Frame(self.nb, padding=6) for n in ("Auto", "Manual", "Songs", "Troubleshoot", "Settings")}
+        self.vpane.add(self.nb, minsize=int(470 * sc), stretch="always")
+        self.vpane.add(lf, minsize=int(70 * sc), stretch="never")
+        self.tabs = {n: ttk.Frame(self.nb, padding=10) for n in ("Auto", "Manual", "Songs", "Troubleshoot", "Settings")}
         for n, f in self.tabs.items():
             self.nb.add(f, text=n)
         self.build_auto()
@@ -5453,25 +5560,64 @@ class App:
         self.build_trouble()
         self.build_settings()
         self.nb.select(start_tab)
-        self.root.bind("<Configure>", self.fit_log, add="+")
+        for pw in (self.vpane, self.mpane):
+            pw.bind("<ButtonRelease-1>", self.save_layout, add="+")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(150, lambda: self.apply_layout(lay))
         self.root.after(100, self.poll)
         if startup:
             self.root.after(400, self.startup)
 
     # ------------------------------------------------------------ plumbing
-    def fit_log(self, e=None):
-        """Small windows give the log fewer lines so the tabs (and their buttons) keep their room."""
-        h = self.root.winfo_height()
-        lines = 4 if h < 760 else 6 if h < 880 else 8
-        if int(self.log.cget("height")) != lines:
-            self.log.configure(height=lines)
+    def make_pane(self, parent, orient):
+        """A drag divider between two areas (V5.55)."""
+        return tk.PanedWindow(parent, orient=orient, sashwidth=9, sashrelief="flat", sashpad=1, bd=0, bg=self.pal["border"],
+                              opaqueresize=True, showhandle=False)
 
-    def btn(self, parent, text, cmd, big=False, name=None, **kw):
+    def layout_state(self):
+        """Window size + divider positions (as fractions of their pane, so they survive other window sizes)."""
+        self.root.update_idletasks()
+        st = {"geometry": f"{self.root.winfo_width()}x{self.root.winfo_height()}"}
+        for k, pw in (("main", self.vpane), ("manual", getattr(self, "mpane", None))):
+            try:
+                st[k] = round(pw.sash_coord(0)[1] / max(1, pw.winfo_height()), 4)
+            except Exception:
+                pass
+        return st
+
+    def apply_layout(self, lay, tries=0):
+        """Divider positions from the last run (or a default: the log gets ~150 px, the song list ~30% of the Manual tab)."""
+        self.root.update_idletasks()
+        if self.vpane.winfo_height() < 200 and tries < 30:         # the window is not laid out yet: try again shortly
+            self.root.after(100, lambda: self.apply_layout(lay, tries + 1))
+            return
+        for k, pw, dflt in (("main", self.vpane, None), ("manual", getattr(self, "mpane", None), 0.68)):
+            if pw is None:
+                continue
+            try:
+                h = max(1, pw.winfo_height())
+                frac = lay.get(k)
+                y = int(h * frac) if isinstance(frac, (int, float)) and 0.1 < frac < 0.95 else \
+                    (int(h * dflt) if dflt else h - int(160 * UI_SCALE[0]))
+                pw.sash_place(0, 0, y)
+            except Exception:
+                pass
+
+    def save_layout(self, *_):
+        try:
+            cfg = load_config()
+            cfg["ui_layout"] = self.layout_state()
+            save_json(CONFIG_PATH, cfg)
+        except Exception:
+            pass
+
+    def on_close(self):
+        self.save_layout()
+        self.root.destroy()
+
+    def btn(self, parent, text, cmd, big=False, name=None, primary=False, **kw):
         if big:
-            b = tk.Button(parent, text=text, command=self.safe(cmd), font=("Segoe UI", F(12), "bold"), height=2, bg=self.pal["acc"],
-                          fg=self.pal["acc_fg"], activebackground=self.pal["btn_act"], activeforeground=self.pal["fg"],
-                          disabledforeground="#d0d6de", relief="raised", bd=2, highlightthickness=1,
-                          highlightbackground=self.pal["border"], cursor="hand2", padx=14, **kw)
+            b = ttk.Button(parent, text=text, command=self.safe(cmd), style="Big.Accent.TButton" if primary else "Big.TButton", **kw)
         else:
             b = ttk.Button(parent, text=text, command=self.safe(cmd), **kw)
         self.buttons.append(b)
@@ -5592,7 +5738,17 @@ class App:
 
     def job_video(self, game, **kw):
         def go():
+            if kw.get("mode", "render") == "render":
+                out("Render: plan first (same as Dry plan, printed below), then render")
             res = run_job(game, **kw)
+            if isinstance(res, Path) and kw.get("mode", "render") == "render":      # V5.55: a rendered montage marks its clips used
+                try:
+                    pj = load_json(res.parent / "logs" / (res.stem + ".plan.json"), {})
+                    used = {t["path"] for t in pj.get("takes", [])} | {x["path"] for t in pj.get("takes", []) for x in t.get("srcs", [])}
+                    if used:
+                        mark_used(used)
+                except Exception as ex:
+                    out(f"used flags not saved: {ex}")
             if isinstance(res, Path):
                 self.q.put(("call", lambda: self.set_video(res)))
             self.q.put(("call", lambda: self.run_task("clips", self.load_clips)))
@@ -5611,7 +5767,7 @@ class App:
             sv = tk.StringVar()
             self.auto_status[g] = sv
             self.btn(lf, "Make this week's montage", lambda g=g: self.run_task(f"{g} auto", self.job_video(g, weekly=True)),
-                     big=True, name=f"auto:{g}:make").pack(side="left", padx=10, pady=4)
+                     big=True, primary=True, name=f"auto:{g}:make").pack(side="left", padx=10, pady=4)
             col = ttk.Frame(lf)
             col.pack(side="left", fill="x", expand=True, padx=8)
             ttk.Label(col, textvariable=sv, justify="left").pack(anchor="w")
@@ -5654,12 +5810,13 @@ class App:
     # ------------------------------------------------------------ Manual tab
     def build_manual(self):
         f = self.tabs["Manual"]
-        s3 = ttk.LabelFrame(f, text="Step 3 - make it")
-        s3.pack(side="bottom", fill="x", padx=8, pady=4)          # packed FIRST so it can never be pushed off-screen
+        s3 = ttk.LabelFrame(f, text="Step 3 - make it", padding=8)
+        s3.pack(side="bottom", fill="x", padx=2, pady=(6, 2))          # packed FIRST so it can never be pushed off-screen
         bb = ttk.Frame(s3)
         bb.pack(fill="x", pady=(2, 6))
         for text, mode in (("Dry plan", "dry"), ("Preview (720p, 20 s)", "preview"), ("Render", "render")):
-            self.btn(bb, text, lambda m=mode: self.manual(m), big=True, name=f"manual:{mode}").pack(side="left", expand=True, fill="x", padx=6)
+            self.btn(bb, text, lambda m=mode: self.manual(m), big=True, primary=(mode == "render"),
+                     name=f"manual:{mode}").pack(side="left", expand=True, fill="x", padx=6)
         c3 = ttk.Frame(s3)
         c3.pack(fill="x", pady=2)
         ttk.Label(c3, text="Length").pack(side="left")
@@ -5690,13 +5847,9 @@ class App:
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
         self.m_status = tk.StringVar(value="Tick some clips.")
         ttk.Label(s3, textvariable=self.m_status, font=("Segoe UI", F(10), "bold"), wraplength=1100).pack(anchor="w", pady=2)
-        mid = ttk.Frame(f)                                         # grid: steps 1 and 2 shrink instead of being cut off
+        self.mpane = mid = self.make_pane(f, "vertical")           # V5.55: drag divider between the clip list and the song list
         mid.pack(side="top", fill="both", expand=True)
-        mid.columnconfigure(0, weight=1)
-        mid.rowconfigure(0, weight=5)
-        mid.rowconfigure(1, weight=2)
-        s1 = ttk.LabelFrame(mid, text="Step 1 - tick the clips (click a row to tick it)")
-        s1.grid(row=0, column=0, sticky="nsew", padx=8, pady=4)
+        s1 = ttk.LabelFrame(mid, text="Step 1 - tick the clips (click ticks, Shift+click a range)", padding=8)
         top = ttk.Frame(s1)
         top.pack(fill="x", pady=2)
         self.m_game = tk.StringVar(value="valorant")
@@ -5735,16 +5888,26 @@ class App:
         top3.pack(fill="x", pady=2, after=top2)
         self.btn(top3, "Reload list", lambda: self.run_task("clips", self.load_clips)).pack(side="left", padx=3)
         self.btn(top3, "Exclude ticked from montages", self.exclude_sel).pack(side="left", padx=3)
-        ttk.Label(top3, text="(Shift+click ticks a range)").pack(side="left", padx=10)
-        fr, self.ctree = make_tree(s1, ("date", "len", "kills"), height=12, selectmode="none")
+        self.btn(top3, "Random pick", self.random_pick_ticks).pack(side="left", padx=(12, 3))
+        self.m_incl_used = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top3, text="include used clips", variable=self.m_incl_used).pack(side="left", padx=3)
+        ttk.Label(top3, text="Show").pack(side="left", padx=(12, 2))
+        self.m_used = tk.StringVar(value="All clips")
+        cbu = ttk.Combobox(top3, textvariable=self.m_used, values=["All clips", "Used", "Unused"], width=9, state="readonly")
+        cbu.pack(side="left")
+        cbu.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
+        self.named["Used filter"] = cbu
+        fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used"), height=12, selectmode="none")
         fr.pack(fill="both", expand=True)
-        for c, w, t in (("#0", 430, "clip"), ("date", 110, "date"), ("len", 70, "length"), ("kills", 110, "kills")):
-            self.ctree.column(c, width=w, minwidth=60, stretch=(c == "#0"))
+        for c, w, t in (("#0", 400, "clip"), ("date", 100, "date"), ("len", 64, "length"), ("kills", 90, "kills"), ("used", 100, "used")):
+            self.ctree.column(c, width=w, minwidth=56, stretch=(c == "#0"))
             self.ctree.heading(c, text=t)
-        self.make_sortable(self.ctree, self.apply_filter, {"#0": "clip", "date": "date", "len": "length", "kills": "kills"})
+        self.make_sortable(self.ctree, self.apply_filter, {"#0": "clip", "date": "date", "len": "length", "kills": "kills",
+                                                           "used": "used"})
         self.ctree.bind("<Button-1>", self.on_tree_click)
-        s2 = ttk.LabelFrame(mid, text="Step 2 - choose the song (newest added first)")
-        s2.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        s2 = ttk.LabelFrame(mid, text="Step 2 - choose the song (newest added first)", padding=8)
+        mid.add(s1, minsize=int(180 * UI_SCALE[0]), stretch="always", padx=2, pady=2)
+        mid.add(s2, minsize=int(110 * UI_SCALE[0]), stretch="always", padx=2, pady=2)
         r2 = ttk.Frame(s2)
         r2.pack(fill="x", pady=2)
         ttk.Label(r2, text="Search").pack(side="left")
@@ -5820,6 +5983,7 @@ class App:
         g = self.m_game.get()
         det = load_dets(g).get(g)
         kc = load_kills_cache()
+        ud = used_dates()                                          # V5.55: date of the montage each clip was used in
         rows = []
         for r in scan_clips(load_config()):
             if r.get("error") or r.get("game") != g:
@@ -5833,7 +5997,8 @@ class App:
             except OSError:
                 continue
             rows.append({"path": r["path"], "name": Path(r["path"]).name, "folder": clip_folder(r["path"], cfg), "mtime": mt,
-                         "dur": r.get("dur", 0), "kills": None if ks is None else len(ks), "ks": ks or []})
+                         "dur": r.get("dur", 0), "kills": None if ks is None else len(ks), "ks": ks or [],
+                         "used": ud.get(_pkey(r["path"]), "")})
         rows.sort(key=lambda c: -c["mtime"])
         songs, _, _ = song_pool(load_config()) if load_config().get("mp3_dir") else ([], [], None)
         songs.sort(key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
@@ -5864,9 +6029,12 @@ class App:
         for c in self.clips:
             if (fo != "All folders" and c["folder"] != fo) or c["mtime"] < lim or c["mtime"] > hi:
                 continue
+            uf = self.m_used.get()
+            if (uf == "Used" and not c.get("used")) or (uf == "Unused" and c.get("used")):
+                continue
             rows.append((c["path"], self.row_text(c["path"]),
                          (time.strftime("%Y-%m-%d", time.localtime(c["mtime"])), f"{int(c['dur'] // 60)}:{int(c['dur'] % 60):02d}",
-                          "not scanned" if c["kills"] is None else str(c["kills"]))))
+                          "not scanned" if c["kills"] is None else str(c["kills"]), c.get("used", ""))))
         self.fill_chunked(self.ctree, self.sorted_rows(self.ctree, rows))
         self.update_status()
 
@@ -6043,6 +6211,38 @@ class App:
             txt += f"; {len(fit['skipped'])} can't form a take: " + ", ".join(f"{a} ({b})" for a, b in fit["skipped"][:3]) + \
                    (" ..." if len(fit["skipped"]) > 3 else "")
         return txt
+
+    def random_pick_ticks(self):
+        """V5.55: tick a random selection of the clips shown (unused ones unless 'include used clips') that the existing Optimal
+        function says fit one Optimal-length montage for the chosen song + style."""
+        inc = self.m_incl_used.get()
+        cands = [self.byp[i] for i in self.ctree.get_children()
+                 if i in self.byp and self.byp[i].get("kills") and (inc or not self.byp[i].get("used"))]
+        if not cands:
+            messagebox.showinfo("Random pick", "No " + ("" if inc else "unused ") + "clips with kills in the list "
+                                "(game, folder and date filters apply; tick 'include used clips' to allow used ones).")
+            return
+        sel = self.stree.selection()
+        song = next((x for x in self.songs if sel and x["path"] == sel[0]), None)
+        style = self.m_style.get()
+
+        def work():
+            an = None
+            if song:
+                try:
+                    an = analyse_song(song["path"], song.get("csv_bpm"))
+                except Exception as ex:
+                    out(f"random pick: song map unavailable ({ex}) - sizing for a plain 120 BPM song")
+            paths, fit = random_pick(cands, an, style)
+
+            def apply():
+                self.ticked = set(paths)
+                for iid in self.ctree.get_children():
+                    self.ctree.item(iid, text=self.row_text(iid))
+                self.update_status()
+            out(f"Random pick: {len(paths)} of {len(cands)} {'' if inc else 'unused '}clips ticked - " + (fit["why"] if fit else ""))
+            self.q.put(("call", apply))
+        self.run_task("random pick", work)
 
     def manual(self, mode):
         paths = list(self.ticked)
@@ -6440,7 +6640,7 @@ def grab_gray_bgr(path, t, w, h):
     return np.frombuffer(r.stdout[:w * h * 3], np.uint8).reshape(h, w, 3).copy()
 
 
-DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_SONGS",
+DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_SONGS",
                 "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE")
 
 
@@ -7257,6 +7457,7 @@ REQUIRED_BUTTONS.update({
     "manual:render": ("Manual", "task:manual render"),
     "Tick all shown": ("Manual", "ticked"), "Untick all": ("Manual", "unticked"), "Tick clips with kills": ("Manual", "ticked"),
     "Tick newest": ("Manual", "ticked"), "Tick whole folder": ("Manual", "ticked"), "Reload list": ("Manual", "task:clips"),
+    "Random pick": ("Manual", "task:random pick"), "Used filter": ("Manual", None),
     "Play selected song": ("Manual", "open:song.mp3"),
     "Refresh": ("Songs", "task:matches"), "Change match for selected file...": ("Songs", "info"),
     "Play selected file": ("Songs", "open:song.mp3"), "Open song_matches.csv": ("Songs", "open:song_matches.csv"),
@@ -7416,6 +7617,64 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
                 desc = app.sorts[str(tree)][1]
                 if vals != sorted(vals, reverse=desc):
                     fails.append(f"sorting {col}: order {vals} is not {'descending' if desc else 'ascending'}")
+        # V5.55: theme, dividers (move + remembered), used column / filter, Random pick
+        try:
+            import sv_ttk                                          # noqa: F401
+            if not SV_THEME[0] or "sun-valley" not in ttk.Style(root).theme_use():
+                fails.append(f"Sun Valley theme did not load (theme {ttk.Style(root).theme_use()})")
+        except ImportError:
+            out("  (sv-ttk not installed - the plain fallback theme is in use; pip install sv-ttk)")
+        root.geometry("1220x920+0+0")
+        app.nb.select(app.tabs["Manual"])
+        root.update()
+        app.apply_layout({"main": 0.7, "manual": 0.6})
+        root.update()
+        for nm_, pw in (("log", app.vpane), ("song list", app.mpane)):
+            moved = []
+            for dy in (-40, 40):                                   # one direction may be blocked by a pane's minimum size
+                y0 = pw.sash_coord(0)[1]
+                pw.sash_place(0, 0, y0 + dy)
+                root.update()
+                moved.append(pw.sash_coord(0)[1] - y0)
+            if not any(abs(m_ - d_) <= 4 for m_, d_ in zip(moved, (-40, 40))):
+                fails.append(f"divider above the {nm_}: dragging it 40 px moved it {moved} px")
+        st = app.layout_state()
+        if not all(k in st for k in ("geometry", "main", "manual")):
+            fails.append(f"layout state incomplete: {st}")
+        else:
+            app.apply_layout(dict(st, main=0.55, manual=0.5))
+            root.update()
+            for k_, pw in (("main", app.vpane), ("manual", app.mpane)):
+                want_y = (0.55 if k_ == "main" else 0.5) * pw.winfo_height()
+                if abs(pw.sash_coord(0)[1] - want_y) > max(60 * UI_SCALE[0], 0.2 * pw.winfo_height()):
+                    fails.append(f"divider '{k_}' not restored from the saved layout ({pw.sash_coord(0)[1]} vs {want_y:.0f})")
+        now_ = time.time()
+        app.clips = [{"path": f"u{i}.mp4", "name": f"u{i}.mp4", "folder": "V", "mtime": now_ - i * 86400, "dur": 20, "kills": 3,
+                      "ks": [3.0, 4.0, 5.0], "used": "2026-10-01" if i % 2 else ""} for i in range(40)]
+        app.byp = {c["path"]: c for c in app.clips}
+        for uf, want_n in (("All clips", 40), ("Used", 20), ("Unused", 20)):
+            app.m_used.set(uf)
+            app.apply_filter()
+            for _ in range(4):
+                root.update()
+                time.sleep(0.03)
+            if len(app.ctree.get_children()) != want_n:
+                fails.append(f"used filter '{uf}' shows {len(app.ctree.get_children())} clips, expected {want_n}")
+        app.m_used.set("All clips")
+        app.apply_filter()
+        for _ in range(3):
+            root.update()
+            time.sleep(0.03)
+        iid = next(i for i in app.ctree.get_children() if app.byp[i]["used"])
+        if app.ctree.set(iid, "used") != "2026-10-01":
+            fails.append(f"'used' column shows '{app.ctree.set(iid, 'used')}' instead of the montage date")
+        unused = [c for c in app.clips if not c["used"]]
+        for inc, pool in ((False, unused), (True, app.clips)):
+            ps, fit = random_pick(pool, None, "auto", random.Random(7))
+            if not ps or not fit or len(set(ps)) != len(ps) or any(p not in {c["path"] for c in pool} for p in ps):
+                fails.append(f"random pick (include used={inc}) returned {len(ps)} clips")
+            elif fit["length"] > OPT_RANGE[1] + 0.05:
+                fails.append(f"random pick is {fit['length']:.0f} s - longer than the Optimal maximum")
         # song map view on a generated song
         import tempfile
         tmpd = Path(tempfile.mkdtemp(prefix="montage_map_"))
