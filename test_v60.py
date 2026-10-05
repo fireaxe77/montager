@@ -81,8 +81,42 @@ def names_test():
     return fails
 
 
+def weekly_test():
+    import time, os
+    fails = []
+    tmpd = Path(tempfile.mkdtemp(prefix="v60w_"))
+    old = m.use_data_dir(tmpd / "data")
+    evs = m.fake_events(n=60, seed=5)
+    now = time.time()
+    for i, e in enumerate(evs):
+        f = tmpd / f"c{i}.mp4"
+        f.write_bytes(b"x")
+        e["path"] = str(f)
+        t_ = now - (2 * 86400 if i % 10 == 0 else 20 * 86400)
+        os.utime(f, (t_, t_))
+    used = [e["path"] for e in evs[:15]]
+    m.mark_used(used)
+    pick, notes = m.weekly_pick(evs, {}, "optimal", "hype", now)
+    paths = {e["path"] for e in pick}
+    if paths & set(used):
+        fails.append("used clips were reused")
+    new = {e["path"] for e in evs if now - os.path.getmtime(e["path"]) < 7 * 86400 and e["path"] not in used}
+    if not new <= paths:
+        fails.append("this week's unused clips must all be included")
+    if len(pick) >= len(evs) - 15:
+        fails.append("older unused clips must be added only as needed")
+    print("weekly:", notes)
+    m.mark_used([e["path"] for e in evs])
+    try:
+        m.weekly_pick(evs, {}, "optimal", "hype", now)
+        fails.append("all used must raise a stated reason")
+    except RuntimeError as ex:
+        print("all used ->", str(ex)[:60])
+    return fails
+
+
 def main():
-    fails = audio_clip_test() + names_test()
+    fails = audio_clip_test() + names_test() + weekly_test()
     for n, lo, hi in ((60, 80, 150), (2, 0, 80)):
         plan, notes = auto_len(n)
         d = plan["duration"]
