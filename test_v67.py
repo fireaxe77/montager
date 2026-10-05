@@ -24,9 +24,10 @@ def check(ok, msg):
         FAILS.append(msg)
 
 
-def load_old():
-    """The previous version (origin/main) as a second module, with its own empty data folder."""
-    src = subprocess.run(["git", "show", "origin/main:montage.py"], cwd=HERE, capture_output=True, check=True).stdout
+def load_old(ref="031cb64"):
+    """A previous version as a second module, with its own empty data folder. Default: V6.5.2 (031cb64), the version V6.7 was
+    measured against (origin/main now carries V6.7 itself)."""
+    src = subprocess.run(["git", "show", ref + ":montage.py"], cwd=HERE, capture_output=True, check=True).stdout
     d = Path(tempfile.mkdtemp(prefix="montager_v67_old_"))
     (d / "montage_old.py").write_bytes(src)
     keep = os.environ.get("MONTAGER_DATA")
