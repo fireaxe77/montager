@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.7"
+APP_VERSION = "V6.7.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -1530,54 +1530,110 @@ def ocr_ratio(a, b):
 
 
 CS2_SAME_NAME = 82.0            # V6.7: ocr_ratio that joins two reads of one CS2 victim ('Dneelko' / 'Oneelkn' / 'Onee lke' = 86)
+CS2_GAP_S = 1.5                # V6.7.2: a CS2 row track survives OCR misses / misreads this long
 CS2_ROUND_S = 115.0             # V6.5-era round window (see the 5-kills cap): one victim dies once per round
 
 
-def _row_match_cs2(t, r, prev_f, dy=0.0):
-    """V6.7 (CS2 only): _row_match with the names compared after OCR-confusion normalisation and with the row's POSITION as
-    identity. A row that was already on screen in the previous OCR frame at the same height (or at the height every row moved to
-    when a new row pushed the list, dy) is the same kill however it is read; the pixel-appearance check (appear_max) keeps a NEW row
-    that takes over a height from being joined to the row that just left it."""
+def _noisy_name(raw):
+    """A garbled OCR read: digits, spaces or mixed capitals inside the word ('OO TEKAAB', 'due TaKAan', 'aapa3kAeM')."""
+    t = (raw or "").strip()
+    inner = t[1:]
+    return any(c.isdigit() for c in t) or " " in t or (sum(c.isupper() for c in inner) >= 2 and any(c.islower() for c in t))
+
+
+_VOWELS = str.maketrans("aeiouy", "aaaaaa")
+_CORE_MAP = str.maketrans({"3": "e", "з": "e", "З": "e", "4": "a", "ч": "a", "Ч": "a", "6": "b", "б": "b", "9": "a", "0": "o"})
+
+
+def cs2_same_victim(a, b):
+    """V6.7.2 (CS2): two reads of one victim. Clean reads: ocr_ratio >= CS2_SAME_NAME. Garbled reads (at least one is noisy: digits,
+    spaces, mixed capitals): also the same when they share a long common core once vowels and the digit / Cyrillic look-alikes are
+    folded together ('takaab' / 'takaan' / 'takaod'). Clean different names ('Kristof' / 'Kristina', 'Nika' / 'Mika') and names that
+    differ in a digit ('player1' / 'player2') stay different."""
+    if ocr_ratio(a, b) >= CS2_SAME_NAME:
+        return True
+    if not (_noisy_name(a) or _noisy_name(b)):
+        return False
+    from rapidfuzz import fuzz
+    na, nb = ocr_norm(a), ocr_norm(b)
+    if min(len(na), len(nb)) < 6:
+        return False
+    if len(na) == len(nb) and sum(x != y for x, y in zip(na, nb)) == 1 and any(x != y and (x.isdigit() or y.isdigit()) for x, y in zip(na, nb)):
+        return False                                       # 'player1' / 'player2': one different digit = two different players
+    fold = lambda t: t.translate(_CORE_MAP).translate(_VOWELS)
+    fa, fb = fold(na), fold(nb)
+    best = 0
+    for i in range(len(fa)):
+        for j in range(len(fb)):
+            k = 0
+            while i + k < len(fa) and j + k < len(fb) and fa[i + k] == fb[j + k]:
+                k += 1
+            best = max(best, k)
+    return best >= 5 and best >= 0.6 * min(len(fa), len(fb)) and fuzz.ratio(fa, fb) >= 60
+
+
+def _cs2_shift(tracks, cand, f, prev_f):
+    """V6.7.2 (CS2): how far the whole killfeed list moved since the last OCR frame (a new row pushes the rows). Text independent:
+    for every distance, count the live tracks that have a row exactly that far away; 0 only counts rows that were already on screen
+    in the previous frame (a new row at an old height is not 'nothing moved'). A move needs more tracks than 'nothing moved', and
+    two or more tracks - or one track whose text still reads alike. Returns dy (0.0 = no shift)."""
+    from rapidfuzz import fuzz
+    cnt, ds, sim = {}, {}, {}
+    live = [t for t in tracks if f - t["last"] <= CS2_GAP_S * FPS]
+    for ti, t in enumerate(live):
+        for r, _ in cand:
+            th = max(8.0, r["th"])
+            d = r["y"] - t["y"]
+            if abs(d) > 6 * th:
+                continue
+            if abs(d) <= 0.5 * th:
+                if r.get("appear_max", 0) > prev_f:
+                    continue
+                key = 0
+            else:
+                key = round(d / (0.5 * th))
+            if (key, ti) in sim:
+                continue
+            sim[(key, ti)] = True
+            cnt[key] = cnt.get(key, 0) + 1
+            ds.setdefault(key, []).append(d)
+            if key and ocr_norm(t["v"]) and ocr_norm(r["vtext"]) and fuzz.ratio(ocr_norm(t["v"]), ocr_norm(r["vtext"])) >= 60:
+                ds[key].append(d)
+                sim[("txt", key)] = True
+    moves = {k: c for k, c in cnt.items() if k}
+    if not moves:
+        return 0.0
+    best = max(moves, key=lambda k: moves[k])
+    if moves[best] <= cnt.get(0, 0) or (moves[best] < 2 and not sim.get(("txt", best))):
+        return 0.0
+    return float(sum(ds[best]) / len(ds[best]))
+
+
+def _row_match_cs2(t, r, prev_f, f=None, shifted=False):
+    """V6.7.2 (CS2 only): a row is TRACKED BY POSITION. t["y"] has been moved along with the list (see _cs2_shift); a row at the
+    track's height that was already on screen in the previous OCR frame (appear_max <= prev_f) - or that came along with a shift of the
+    whole list - is the same kill however OCR read it, and the track survives OCR misses up to CS2_GAP_S. Otherwise names are compared
+    after OCR-confusion normalisation (cs2_same_victim)."""
+    from rapidfuzz import fuzz
     if t["split"] == r["split"] == "icon" and t["gun"] != r["gun"]:
         return 0.0
     if t["iw"] and r["icon"] and abs(t["iw"] - r["icon"][2]) > 0.3 * max(t["iw"], r["icon"][2]):
         return 0.0
-    from rapidfuzz import fuzz
     th = max(8.0, r["th"])
-    live = t["last"] == prev_f
+    near = f is None or f - t["last"] <= CS2_GAP_S * FPS
     same_y = abs(t["y"] - r["y"]) <= 0.5 * th
-    moved = bool(dy) and abs(t["y"] + dy - r["y"]) <= 0.5 * th
     va, vb = ocr_norm(t["v"]), ocr_norm(r["vtext"])
     ka, kb_ = ocr_norm(t["k"]), ocr_norm(r["ktext"])
-    if ((va and not vb) or (vb and not va) or (ka and not kb_) or (kb_ and not ka)) and not (same_y or moved):
+    if ((va and not vb) or (vb and not va) or (ka and not kb_) or (kb_ and not ka)) and not same_y:
         return 0.0
-    sv = ocr_ratio(va, vb) if (va and vb) else 100.0
+    if near and same_y and (r.get("appear_max", 0) <= prev_f or shifted):
+        return 100.0                                       # already there (or moved with the list): the same row
+    if va and vb and cs2_same_victim(t["v"], r["vtext"]):
+        sv = max(ocr_ratio(va, vb), 85.0)
+    else:
+        sv = ocr_ratio(va, vb) if (va and vb) else 100.0
     sk = float(fuzz.ratio(ka, kb_)) if (ka and kb_) else 100.0
-    sc = min(sk, sv)
-    if live and same_y and r.get("appear_max", 0) <= prev_f:
-        sc = max(sc + 15, 85.0)                            # already there, unchanged position: the same row, whatever OCR read
-    elif live and moved:
-        sc = max(sc, 85.0)                                 # the whole list shifted (anchored on rows that still read alike) and this row went with it
-    return sc
-
-
-def _cs2_shift(tracks, cand, prev_f):
-    """V6.7 (CS2): the vertical distance every killfeed row moved since the previous OCR frame (a new row pushes the list), from
-    the rows whose victim text still reads alike; 0.0 when no row moved."""
-    from rapidfuzz import fuzz
-    ds = []
-    for r, _ in cand:
-        th = max(8.0, r["th"])
-        for t in tracks:
-            d = r["y"] - t["y"]
-            if t["last"] == prev_f and 0.5 * th < abs(d) <= 6 * th and ocr_norm(t["v"]) and ocr_norm(r["vtext"]) and \
-                    fuzz.ratio(ocr_norm(t["v"]), ocr_norm(r["vtext"])) >= 60:
-                ds.append(d)
-    if not ds:
-        return 0.0
-    ds.sort()
-    best = max(ds, key=lambda d: sum(1 for e in ds if abs(e - d) <= 4))
-    return float(sum(e for e in ds if abs(e - best) <= 4) / sum(1 for e in ds if abs(e - best) <= 4))
+    return min(sk, sv)
 
 
 def merge_variants(tracks, game=None):
@@ -1602,7 +1658,7 @@ def merge_variants(tracks, game=None):
                 continue
             same_v = (a == b) or fuzz.ratio(a, b) >= 80 or (min(len(a), len(b)) >= 4 and Levenshtein.distance(a, b) <= 1)
             if game == "cs2" and not same_v:                   # V6.7: OCR look-alike reads of one CS2 victim
-                same_v = ocr_ratio(t["v"], m["v"]) >= CS2_SAME_NAME
+                same_v = cs2_same_victim(t["v"], m["v"])
             same_k = fuzz.ratio(_alnum(t["k"]), _alnum(m["k"])) >= 70 or (t["ks"] >= 0.8 and m["ks"] >= 0.8)
             if a and b and same_v and same_k and (t["ks"] >= 0.8) == (m["ks"] >= 0.8) and (t["vs"] >= 0.8) == (m["vs"] >= 0.8) \
                     and not (t.get("frames", set()) & m.get("frames", set())):
@@ -1693,7 +1749,7 @@ def drop_fake_kills(kills, rej, game, pre=(), revives=()):
             edge = q["t"]
         for q in fight:                                        # the same victim killed again = a duplicate, unless a revive came between
             qv = vname(q.get("victim") or "")
-            if v and qv and len(qv) >= 3 and (ocr_ratio(v, qv) >= CS2_SAME_NAME if cs2 else fuzz.ratio(v, qv) >= 85) and k["t"] > q["t"] and \
+            if v and qv and len(qv) >= 3 and (cs2_same_victim(k.get("victim"), q.get("victim")) if cs2 else fuzz.ratio(v, qv) >= 85) and k["t"] > q["t"] and \
                     not any(q["t"] < rv < k["t"] for rv in revives):
                 why = f"'{k.get('victim')}' was already killed {k['t'] - q['t']:.1f} s earlier in this fight, no revive between ({k['row']})"
                 break
@@ -1762,8 +1818,12 @@ def analyse_entry(entry, cfg, game=None):
                 continue
             cand.append((r, v))
         if game == "cs2":                                      # V6.7: CS2 only - normalised names, position as identity, list shifts
-            dy = _cs2_shift(tracks, cand, prev_f)
-            pairs = sorted(((_row_match_cs2(t, r, prev_f, dy), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
+            dy = _cs2_shift(tracks, cand, f, prev_f)
+            if dy:
+                for t in tracks:                               # the list moved: every live track moves with it
+                    if f - t["last"] <= CS2_GAP_S * FPS:
+                        t["y"] += dy
+            pairs = sorted(((_row_match_cs2(t, r, prev_f, f, bool(dy)), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
                             if f - t["last"] <= TRACK_KEEP_S * FPS), reverse=True)
         else:
             pairs = sorted(((_row_match(t, r, prev_f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
@@ -4212,7 +4272,7 @@ def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, endi
 
 
 def optimal_length(events, bd, notes):
-    """'Optimal': the strong material decides the length (no padding with weak kills), 30-120 s."""
+    """'Optimal': the strong material decides the length (no padding with weak kills), 30-150 s (V6.7.2; unused, optimal_fit decides)."""
     est = lambda e: 2 * bd + e["span"] + 0.4
     strong = [e for e in events if not e.get("plain")]
     L = sum(est(e) for e in strong)
@@ -4220,7 +4280,7 @@ def optimal_length(events, bd, notes):
     if L < 30:
         L = sum(est(e) for e in events)
         used = "all events (little strong material)"
-    L = max(30.0, min(120.0, L))
+    L = max(30.0, min(float(LEN_MAX_S), L))
     notes.append(f"auto target {L:.0f} s from {used}")
     return L
 
@@ -4356,7 +4416,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     if fitm:                                               # V5.42B: optimal_fit() below decides (80-150 s, never past the song)
         target = min(OPT_RANGE[1], song_end - float(bt[0]))
     else:
-        target = max(30.0, min(120.0, float(target_s)))
+        target = max(30.0, min(float(LEN_MAX_S), float(target_s)))      # V6.7.2: the slider's 150 s reaches the planner (was clamped to 120)
     strong = [e for e in evs if not e.get("plain")]
     plain = [e for e in evs if e.get("plain")]
     est = lambda e: 2 * bd + e["span"] + 0.4
@@ -4369,7 +4429,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         notes.append(f"{len(plain)} plain single kills used (not enough multikills / headshots)")
     elif plain:
         notes.append(f"{len(plain)} plain single kills left out (enough better material)")
-    cap_t = int(min(120.0, target * 1.1) / td) if target else 10 ** 9
+    cap_t = int(min(float(LEN_MAX_S), target * 1.1) / td) if target else 10 ** 9      # V6.7.2: was min(120, ...)
     if fitm:                                 # ticked clips: optimal_fit() decides what fits
         cap_t = 10 ** 9
     nm = lambda e: Path(e["path"]).name
@@ -4566,9 +4626,9 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         else:
             notes.append("the planned ending clip could not be placed before the song ends; the last take ends the montage")
             left_song.append(ending)
-    if fitm and (cut_len or left or left_song) and takes:
+    if (fitm or target) and (cut_len or left or left_song) and takes:      # V6.7.2: a fixed length is filled the same way (it stopped at ~70-80% of the slider)
         # V5.41 Optimal fits the song: clips that did not fit after the drop go in front (the section starts earlier), strongest
-        # first, while the montage stays within the 120 s / music-available target; the rest are listed as not fitting
+        # first, while the montage stays within the 150 s / music-available target; the rest are listed as not fitting
         E = float(U[end_take["fade_end"]]) if end_take else float(U[takes[-1]["end"]])
         if fit:                                            # V5.42B: within min(150 s, song), never just for a 'nice' length
             target = fit["max"]
