@@ -79,6 +79,7 @@ BAR_THRESHOLD = 12        # pixel brightness (0-255) counted as content
 BAR_FRAMES = 24
 GAMES = ("valorant", "cs2")
 
+LEN_MIN_S, LEN_MAX_S = 80, 150                      # V6.1.3: fixed-length range = the Optimal rule of V5.42B (80-150 s)
 DEFAULT_CONFIG = {
     "playlist_dir": str(DATA / "playlist"),
     "mp3_dir": "",
@@ -102,7 +103,7 @@ DEFAULT_CONFIG = {
     "gap_s": {"valorant": 6.0, "cs2": 5.0},
     "game_overrides": {},           # path prefix -> game
     "match_threshold": 85,
-    "length_s": "optimal",          # "optimal" (default) or seconds (30-120)
+    "length_s": "optimal",          # "optimal" (default) or seconds (80-150, like Optimal)
     "ui_layout": {},                # V5.55: remembered window size + divider positions (GUI only)
     "update_on_start": False,       # V5.5: run `git pull` when the app starts (Settings; off by default)
     "style": "auto",                # auto (default) | hype | aggressive | smooth | cinematic | chill | mix | random
@@ -204,6 +205,8 @@ def load_config():
     if not isinstance(cfg.get("player_names"), dict):
         cfg["player_names"] = {g: list(v) for g, v in DEFAULT_PLAYER_NAMES.items()}
     set_player_names(cfg)                                          # V6.0
+    if isinstance(cfg.get("length_s"), (int, float)) and not isinstance(cfg.get("length_s"), bool):
+        cfg["length_s"] = max(LEN_MIN_S, min(LEN_MAX_S, int(round(cfg["length_s"]))))      # V6.1.3: fixed length 80-150 s
     if cfg.get("accent") not in ACCENTS:
         cfg["accent"] = "lime"
     if cfg.get("base") not in BASES:
@@ -5718,7 +5721,7 @@ ACCENT_DEF = {"lime": ("#a3e635", "#4c7a14", "#2c3d0c", 42), "yellow": ("#facc15
               "pink": ("#f472b6", "#a3306f", "#521838", 164), "purple": ("#a78bfa", "#5b3fb0", "#2e2060", 129)}
 BASE_DEF = {"grey": dict(bg="#343434", fg="#f2f2f2", field="#454545", head="#3d3d3d", dim="#b4b4b4", border="#5c5c5c", btn="#454545",
                          btn_act="#505050"),
-            "black": dict(bg="#0b0b0b", fg="#f2f2f2", field="#1b1b1b", head="#141414", dim="#a8a8a8", border="#3a3a3a", btn="#1b1b1b",
+            "black": dict(bg="#000000", fg="#f2f2f2", field="#1b1b1b", head="#141414", dim="#a8a8a8", border="#3a3a3a", btn="#1b1b1b",
                           btn_act="#2a2a2a")}
 
 
@@ -5754,7 +5757,7 @@ def F(size):
 
 SIMPLE_THEME = os.environ.get("MONTAGE_SIMPLE_THEME") == "1"      # V6.2: A/B test switch: built-in clam theme instead of Sun Valley
 SV_THEME = [False]                                    # True when the Sun Valley ttk theme (sv-ttk) is active
-THEME_VER = "t3"
+THEME_VER = "t4"
 
 
 def _neutral(v, base):
@@ -5817,6 +5820,11 @@ def lime_theme_dir(accent="lime", base="grey"):
         if f_.name == "sv.tcl":
             txt_ = re.sub(r"^source \[file join \[file dirname \[info script\]\] theme light\.tcl\]\s*$", "", txt_, flags=re.M)
             txt_ = re.sub(r"^font create (.*)$", r"catch {font create \1}", txt_, flags=re.M)
+            # V6.1.3: the <<ThemeChanged>> bindings are added once per window, not once per sourced variant (each extra one ran
+            # configure_colors -> tk_setPalette over every widget again); the handlers themselves are unchanged
+            txt_ = re.sub(r"^bind (\S+(?: \S+)*?) (<<ThemeChanged>>) (\{.*\})$",
+                          lambda m_: "if {![info exists ::mt_bound(%s)]} {set ::mt_bound(%s) 1; bind %s %s %s}" % (
+                              re.sub(r"\W", "_", m_.group(1)), re.sub(r"\W", "_", m_.group(1)), m_.group(1), m_.group(2), m_.group(3)), txt_, flags=re.M)
         f_.write_text(txt_, encoding="utf-8")
     (tmp / "ok").write_text(THEME_VER)
     shutil.rmtree(dst, ignore_errors=True)
@@ -6447,7 +6455,7 @@ class App:
                 cfg[k] = float(v.get()) if "." in v.get() else int(v.get())
             except ValueError:
                 pass                                               # half-typed number: keep the old value
-        cfg["length_s"] = "optimal" if self.set_opt.get() else int(self.set_len.get())
+        cfg["length_s"] = "optimal" if self.set_opt.get() else max(LEN_MIN_S, min(LEN_MAX_S, int(self.set_len.get())))
         cfg["style"], cfg["placement"] = self.set_style.get(), self.set_place.get()
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
@@ -6852,8 +6860,8 @@ class App:
         cb = ttk.Checkbutton(c3, text="Optimal", variable=self.m_opt, command=self.update_status)
         cb.pack(side="left", padx=(4, 2))
         self.named["Optimal length"] = cb
-        self.m_len = tk.IntVar(value=int(L) if isinstance(L, (int, float)) else 60)
-        self.m_len_sc = ttk.Scale(c3, from_=30, to=120, variable=self.m_len, length=150,
+        self.m_len = tk.IntVar(value=int(L) if isinstance(L, (int, float)) else LEN_MIN_S)
+        self.m_len_sc = ttk.Scale(c3, from_=LEN_MIN_S, to=LEN_MAX_S, variable=self.m_len, length=150,
                                   command=lambda v: (self.m_len.set(int(float(v))), self.update_status()))
         self.m_len_sc.pack(side="left", padx=4)
         ttk.Label(c3, textvariable=self.m_len, width=4).pack(side="left")
@@ -7842,7 +7850,7 @@ class App:
         r[0] += 1
         h = ttk.Frame(f)
         h.grid(row=r[0], column=1, sticky="w", padx=(0, PX), pady=PY)
-        ttk.Scale(h, from_=30, to=120, variable=self.set_len, length=180,
+        ttk.Scale(h, from_=LEN_MIN_S, to=LEN_MAX_S, variable=self.set_len, length=180,
                   command=lambda v: self.set_len.set(int(float(v)))).pack(side="left", padx=(0, PX))
         ttk.Label(h, textvariable=self.set_len, width=4).pack(side="left", padx=(0, 6))
         hint(h, "s (used when Optimal is off)")
@@ -7977,7 +7985,7 @@ class App:
                 todo.extend(w.winfo_children())
             except tk.TclError:
                 continue
-            if not w.winfo_class().startswith("T") or w.winfo_class() in ("Toplevel", "Tk", "Text"):
+            if not w.winfo_class().startswith("T") or w.winfo_class() in ("Toplevel", "Tk", "Text", "TLabel"):
                 out_.append(w)
         return out_
 
@@ -7985,6 +7993,16 @@ class App:
         """Apply the current palette to every classic tk widget by role."""
         pal = self.pal
         for w in self._tk_widgets():
+            if w.winfo_class() == "TLabel":
+                # V6.1.3: a ttk Label created while Tk's option database held an old palette ("*background", set by sv.tcl's tk_setPalette)
+                # carries that colour as its own -background, which overrides the theme: after Black -> Grey -> Black these were the
+                # leftover grey / black boxes. Empty = the active Sun Valley variant draws it.
+                try:
+                    if str(w.cget("background")):
+                        w.configure(background="")
+                except tk.TclError:
+                    pass
+                continue
             role = self.role_of(w)
             for opt, key in self.ROLE_OPTS.get(role, {}).items():
                 try:
@@ -9276,11 +9294,11 @@ def settings_persist_test():
     try:
         if not CONFIG_PATH.is_absolute() or not HERE.is_absolute():
             fails.append(f"config path is not absolute: {CONFIG_PATH}")
-        want = {"length_s": 77, "style": "chill", "quality": "max", "update_on_start": True, "sync_report": False, "max_mb": 123,
+        want = {"length_s": 97, "style": "chill", "quality": "max", "update_on_start": True, "sync_report": False, "max_mb": 123,
                 "mp3_dir": str(tmpd / "mp3")}
         app = App(0, startup=False)
         app.m_opt.set(False)
-        app.m_len.set(77)
+        app.m_len.set(97)
         app.m_style.set("chill")
         app.m_q.set("max")
         app.set_upd.set(True)
@@ -9670,14 +9688,21 @@ class PerfLog:
         def _setup(self_, master, cnf):
             orig_setup(self_, master, cnf)
             if perf.post:
-                perf.add("widget+", f"create {self_.winfo_class()} {self_._w}", 0.0, perf.depth)
+                try:                                              # V6.1.3: the Tk window does not exist yet here: no Tk call, never raises
+                    perf.add("widget+", f"create {type(self_).__name__} {getattr(self_, '_w', '?')}", 0.0, perf.depth)
+                except Exception:
+                    pass
         tk.BaseWidget._setup = _setup
         orig_cfg = tk.Misc._configure
 
         def _configure(self_, cmd, cnf, kw):
             r = orig_cfg(self_, cmd, cnf, kw)
             if perf.post and (cnf or kw) and cmd == "configure":
-                perf.add("configure", f"{self_.winfo_class()} {self_._w}", 0.0, perf.depth, ",".join(map(str, list((kw or {}) if not isinstance(cnf, dict) else cnf)))[:60])
+                try:                                              # V6.1.3: the hook can never raise
+                    perf.add("configure", f"{type(self_).__name__} {getattr(self_, '_w', '?')}", 0.0, perf.depth,
+                             ",".join(map(str, list((kw or {}) if not isinstance(cnf, dict) else cnf)))[:60])
+                except Exception:
+                    pass
             return r
         tk.Misc._configure = _configure
         orig_dei = tk.Wm.wm_deiconify
