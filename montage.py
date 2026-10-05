@@ -3113,7 +3113,7 @@ def audio_unusable(rec, au):
 
 def resolve_clip_audio(rec, cfg, game, state):
     """Audio pick for one clip by Settings > Audio mode. state (one per plan) collects 'mode' and 'fallback' reasons.
-    Auto (V5.56) that raises or yields a silent / missing track falls back to the Legacy V5.55 path for that clip - never silent."""
+    Auto (V5.56) that raises or yields a silent / missing track uses the Legacy V5.55 path for THAT clip only (V6.0), logged."""
     mode = cfg.get("audio_mode", "auto")
     if not rec.get("audio"):
         return {"stream": None, "lufs": None}
@@ -3128,9 +3128,8 @@ def resolve_clip_audio(rec, cfg, game, state):
         au, why = None, f"Auto audio path raised {type(ex).__name__}: {ex}"
     if why is None:
         return au
-    state["mode"] = "legacy"
-    state.setdefault("fallback", []).append(f"{Path(rec['path']).name}: {why}")
-    out(f"Auto audio failed, used Legacy V5.55 ({Path(rec['path']).name}: {why})")
+    state.setdefault("clip_fallback", []).append(f"{Path(rec['path']).name}: {why}")      # V6.0: this clip only; Auto stays for the rest
+    out(f"audio fallback for {Path(rec['path']).name}: {why}")
     return clip_audio_legacy(rec)
 
 
@@ -4384,12 +4383,6 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           "snapped": 0, "stitched": ev.get("stitched", False), "stitch_note": ev.get("stitch_note", ""),
                           "death_after": ev.get("death_after"), "lag": ev.get("lag", 0.1), "level": int(lv[min(kb // 2, len(lv) - 1)]),
                           **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {})})
-    if audio_state.get("fallback"):                    # one unusable Auto pick = this whole render uses the Legacy V5.55 path
-        for tkd in out_takes:
-            for sd in tkd["srcs"]:
-                au = clip_audio_legacy({"path": sd["path"], "audio": sd["audio"]})
-                sd["a_stream"], sd["a_note"], sd["lufs"] = au["stream"] or 0, au.get("note", ""), au["lufs"]
-                sd["gain_db"], sd["lift_db"] = _game_gain(cfg, song_lufs, au["lufs"])
     a_mode = audio_state.get("mode") or cfg.get("audio_mode", "auto")
     total_f = out_takes[-1]["f0"] + out_takes[-1]["nf"]
     total_s = total_f / OUT_FPS
@@ -4409,7 +4402,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             "beats_out": [round(float(t) - bt0, 4) for t in bt if bt0 - 1e-6 <= t <= bt0 + total_s + 1e-6],
             "drops_out": [round(d["t"] - bt0, 3) for d in an.get("drops", []) if bt0 <= d["t"] <= bt0 + total_s],
             "beats_n": int(round(total_s / (2 * (U[1] - U[0])))), "headline": head_take["ev"]["path"], "ending": last["ending"],
-            "lock": 1.0, "audio_mode": a_mode, "audio_fallback": audio_state.get("fallback", [])}
+            "lock": 1.0, "audio_mode": a_mode, "audio_fallback": [], "audio_clip_fallback": audio_state.get("clip_fallback", [])}
 
 
 def verify_cutlist(plan):
@@ -4461,7 +4454,9 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     sg = plan["song"]
     L.append(f"GAME     {plan['game']}      seed {plan['seed']}      style recipe: {plan['recipe']} {plan['params']}")
     L.append("AUDIO    " + AUDIO_TAGS.get(plan.get("audio_mode", "auto"), AUDIO_TAGS["auto"]) +
-             ("   Auto audio failed, used Legacy V5.55: " + "; ".join(plan["audio_fallback"][:3]) if plan.get("audio_fallback") else ""))
+             ("   Auto audio failed, used Legacy V5.55: " + "; ".join(plan["audio_fallback"][:3]) if plan.get("audio_fallback") else "") +
+             ("   Legacy audio for single clips (Auto kept for the others): " + "; ".join(plan["audio_clip_fallback"][:3])
+              if plan.get("audio_clip_fallback") else ""))
     if plan.get("recipe_why"):
         L.append(f"AUTO STYLE {plan['recipe_why']}")
     L.append(f"SONG     {sg['artist']} - {sg['title']}   [{Path(sg['path']).name}]   BPM {sg['bpm']}   placement {plan['placement']}")
