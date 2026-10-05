@@ -54,7 +54,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.56"
+APP_VERSION = "V5.57"
+ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
+BASES = ("grey", "black")
+AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
+AUDIO_TAGS = {"auto": "[audio: auto V5.56]", "legacy": "[audio: legacy V5.55]"}
 HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("MONTAGER_DATA") or (HERE / "montage_data")).resolve()    # V5.56: always next to montage.py (absolute), never the working folder (the env var is only for tests)
 CONFIG_PATH = DATA / "config.json"
@@ -107,6 +111,9 @@ DEFAULT_CONFIG = {
                           r"E:\Movies\Movies 2025\Counter-strike 2", r"E:\Movies\LEGACY\Counter-strike 2"]},
     "game_audio_track": {"valorant": "auto", "cs2": "auto"},     # V5.56: which audio track of a clip is the game sound: auto | 1 | 2 | 3
     "ui_scale": 1.0,                # GUI font / row height scale
+    "audio_mode": "auto",           # V5.57: auto = V5.56 track pick | legacy = the exact V5.55 audio path
+    "accent": "lime",               # V5.57: lime | yellow | orange | red | pink | purple
+    "base": "grey",                 # V5.57: grey | black
 }
 
 
@@ -187,6 +194,12 @@ def load_config():
     cfg.pop("game_under_music_db", None)
     if not isinstance(cfg.get("game_audio_track"), dict):
         cfg["game_audio_track"] = dict(DEFAULT_CONFIG["game_audio_track"])
+    if cfg.get("audio_mode") not in ("auto", "legacy"):            # V5.57
+        cfg["audio_mode"] = "auto"
+    if cfg.get("accent") not in ACCENTS:
+        cfg["accent"] = "lime"
+    if cfg.get("base") not in BASES:
+        cfg["base"] = "grey"
     if cfg["cfg_version"] < 5:                        # V5.1: Optimal length + Auto style defaults, game audio slightly louder
         if cfg.get("length_s") in (85, None):
             cfg["length_s"] = "optimal"
@@ -3059,6 +3072,70 @@ def clip_audio(rec, setting="auto"):
     return {"stream": i, "lufs": m["lufs"][i], "n": len(m["lufs"]), "note": note}
 
 
+def clip_audio_legacy(rec):
+    """V5.55 audio path, kept verbatim as a selectable code path (Settings > Audio mode > Legacy): the game sound is the audio track
+    with the highest integrated loudness; the per-game 'game audio track' setting is ignored. Cached under the V5.55 key."""
+    if not rec.get("audio"):
+        return {"stream": None, "lufs": None}
+    cache = load_json(LOUD_CACHE, {})
+    key = file_key(rec["path"])
+    if key in cache and isinstance(cache[key], dict) and "stream" in cache[key]:
+        return {**cache[key], "note": "legacy V5.55: loudest track"}
+    try:
+        j = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "json",
+                            rec["path"]]).stdout or b"{}")
+        ns = len(j.get("streams") or []) or 1
+    except Exception:
+        ns = 1
+    best = {"stream": 0, "lufs": None, "all": []}
+    for i in range(min(ns, 4)):
+        v = ebur128_lufs(rec["path"], i)
+        best["all"].append(v)
+        if v is not None and (best["lufs"] is None or v > best["lufs"]):
+            best.update(stream=i, lufs=v)
+    cache = load_json(LOUD_CACHE, {})
+    cache[key] = best
+    save_json(LOUD_CACHE, cache)
+    return {**best, "note": "legacy V5.55: loudest track"}
+
+
+def audio_unusable(rec, au):
+    """Why an Auto audio pick can't be used (None = fine): a clip with sound must get a real, non-silent track."""
+    if not rec.get("audio"):
+        return None
+    if au.get("stream") is None:
+        return "no audio track chosen for a clip that has sound"
+    if au.get("lufs") is None or au["lufs"] <= SILENT_LUFS:
+        return f"chosen track {au['stream'] + 1} is silent"
+    return None
+
+
+def resolve_clip_audio(rec, cfg, game, state):
+    """Audio pick for one clip by Settings > Audio mode. state (one per plan) collects 'mode' and 'fallback' reasons.
+    Auto (V5.56) that raises or yields a silent / missing track falls back to the Legacy V5.55 path for that clip - never silent."""
+    mode = cfg.get("audio_mode", "auto")
+    if not rec.get("audio"):
+        return {"stream": None, "lufs": None}
+    if mode == "legacy":
+        state["mode"] = "legacy"
+        return clip_audio_legacy(rec)
+    state.setdefault("mode", "auto")
+    try:
+        au = clip_audio_auto(rec, (cfg.get("game_audio_track") or {}).get(game, "auto"))
+        why = audio_unusable(rec, au)
+    except Exception as ex:
+        au, why = None, f"Auto audio path raised {type(ex).__name__}: {ex}"
+    if why is None:
+        return au
+    state["mode"] = "legacy"
+    state.setdefault("fallback", []).append(f"{Path(rec['path']).name}: {why}")
+    out(f"Auto audio failed, used Legacy V5.55 ({Path(rec['path']).name}: {why})")
+    return clip_audio_legacy(rec)
+
+
+clip_audio_auto = lambda rec, setting="auto": clip_audio(rec, setting)      # V5.56 path (looked up at call time: tests may swap clip_audio)
+
+
 def refine_shot(rec, t_hint, row_t, cache):
     """Sample-exact time of the FATAL SHOT = the moment the kill happens on screen (the killfeed row appears ~0.1-0.2 s later).
     The last strong attack in the clip's game audio between 0.7 s before the row and the row itself. None = no shot heard."""
@@ -4222,6 +4299,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
     sec = an.get("section_of_beat") or []
     song_lufs = an.get("lufs")
     out_takes = []
+    audio_state = {}                     # V5.57: audio mode used + Auto -> Legacy fallback reasons
     for i, tk in enumerate(takes):
         ev = tk["ev"]
         kb = tk["kb"]
@@ -4273,7 +4351,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         srcs = []
         for p in parts:
             r = p["rec"]
-            au = clip_audio(r, (cfg.get("game_audio_track") or {}).get(game, "auto")) if r.get("audio") else {"stream": None, "lufs": None}
+            au = resolve_clip_audio(r, cfg, game, audio_state)
             gdb, lift = _game_gain(cfg, song_lufs, au["lufs"])
             srcs.append({"path": p["path"], "shift": p.get("shift", 0.0), "rect": content_rect(r, cfg), "wh": [r["w"], r["h"]],
                          "audio": bool(r.get("audio")), "a_stream": au["stream"] or 0, "a_note": au.get("note", ""), "lufs": au["lufs"], "gain_db": gdb,
@@ -4293,6 +4371,13 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           "snapped": 0, "stitched": ev.get("stitched", False), "stitch_note": ev.get("stitch_note", ""),
                           "death_after": ev.get("death_after"), "lag": ev.get("lag", 0.1), "level": int(lv[min(kb // 2, len(lv) - 1)]),
                           **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {})})
+    if audio_state.get("fallback"):                    # one unusable Auto pick = this whole render uses the Legacy V5.55 path
+        for tkd in out_takes:
+            for sd in tkd["srcs"]:
+                au = clip_audio_legacy({"path": sd["path"], "audio": sd["audio"]})
+                sd["a_stream"], sd["a_note"], sd["lufs"] = au["stream"] or 0, au.get("note", ""), au["lufs"]
+                sd["gain_db"], sd["lift_db"] = _game_gain(cfg, song_lufs, au["lufs"])
+    a_mode = audio_state.get("mode") or cfg.get("audio_mode", "auto")
     total_f = out_takes[-1]["f0"] + out_takes[-1]["nf"]
     total_s = total_f / OUT_FPS
     last = out_takes[-1]
@@ -4311,7 +4396,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             "beats_out": [round(float(t) - bt0, 4) for t in bt if bt0 - 1e-6 <= t <= bt0 + total_s + 1e-6],
             "drops_out": [round(d["t"] - bt0, 3) for d in an.get("drops", []) if bt0 <= d["t"] <= bt0 + total_s],
             "beats_n": int(round(total_s / (2 * (U[1] - U[0])))), "headline": head_take["ev"]["path"], "ending": last["ending"],
-            "lock": 1.0}
+            "lock": 1.0, "audio_mode": a_mode, "audio_fallback": audio_state.get("fallback", [])}
 
 
 def verify_cutlist(plan):
@@ -4362,6 +4447,8 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     L = []
     sg = plan["song"]
     L.append(f"GAME     {plan['game']}      seed {plan['seed']}      style recipe: {plan['recipe']} {plan['params']}")
+    L.append("AUDIO    " + AUDIO_TAGS.get(plan.get("audio_mode", "auto"), AUDIO_TAGS["auto"]) +
+             ("   Auto audio failed, used Legacy V5.55: " + "; ".join(plan["audio_fallback"][:3]) if plan.get("audio_fallback") else ""))
     if plan.get("recipe_why"):
         L.append(f"AUTO STYLE {plan['recipe_why']}")
     L.append(f"SONG     {sg['artist']} - {sg['title']}   [{Path(sg['path']).name}]   BPM {sg['bpm']}   placement {plan['placement']}")
@@ -4858,6 +4945,36 @@ def record_history(plan):
     save_json(USED_SONGS, us)
 
 
+def fmt_plan_audio(text, plan):
+    """Plan text with the AUDIO line replaced after a fallback."""
+    new = "AUDIO    " + AUDIO_TAGS["legacy"] + "   Auto audio failed, used Legacy V5.55: " + "; ".join(plan.get("audio_fallback", [])[:3])
+    return re.sub(r"^AUDIO .*$", lambda m: new, text, count=1, flags=re.M)
+
+
+def audio_guard(plan, outfile, cfg, redo):
+    """V5.57: an Auto-audio render whose output is silent / has no audio stream is redone once on the Legacy V5.55 path.
+    redo() re-renders the same plan (already switched to legacy). Returns True when the fallback ran."""
+    if plan.get("audio_mode") != "auto" or not any(sd.get("audio") for tk in plan["takes"] for sd in tk["srcs"]):
+        return False
+    try:
+        v = ebur128_lufs(str(outfile))
+    except Exception:
+        v = None
+    if v is not None and v > SILENT_LUFS:
+        return False
+    why = "output has no audio" if v is None else f"output is silent ({v:.1f} LUFS)"
+    for tk in plan["takes"]:
+        for sd in tk["srcs"]:
+            au = clip_audio_legacy({"path": sd["path"], "audio": sd["audio"]})
+            sd["a_stream"], sd["a_note"], sd["lufs"] = au["stream"] or 0, au.get("note", ""), au["lufs"]
+            sd["gain_db"], sd["lift_db"] = _game_gain(cfg, plan["song"].get("lufs"), au["lufs"])
+    plan["audio_mode"] = "legacy"
+    plan.setdefault("audio_fallback", []).append(why)
+    out(f"Auto audio failed, used Legacy V5.55 ({why})")
+    redo()
+    return True
+
+
 def run_job(game, mode="render", force=False, paths=None, song_path=None, target=None, style=None,
             seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True):
     """mode: dry | preview | render. weekly=True is Auto. Always prints a plan or a plain-language reason."""
@@ -4890,6 +5007,11 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
         odir.mkdir(parents=True, exist_ok=True)
         outfile = Path(outfile) if outfile else odir / (montage_name(odir, plan, now) + ".mp4")
         render_plan(plan, outfile, cfg, maxq, False, encoder, effects)
+        try:
+            if audio_guard(plan, outfile, cfg, lambda: render_plan(plan, outfile, cfg, maxq, False, encoder, effects)):
+                text = fmt_plan_audio(text, plan)
+        except Exception as ex:
+            out(f"Audio check skipped: {ex}")
         try:
             quality_check(plan, outfile, cfg)
         except Exception as ex:
@@ -5307,8 +5429,36 @@ def random_pick(cands, an=None, style="auto", rng=None):
     return [e["path"] for e in fit["clips"]], fit
 
 
-PAL = dict(bg="#343434", fg="#f2f2f2", field="#454545", acc="#a3e635", acc_fg="#10200a", head="#3d3d3d", dim="#b4b4b4",
-           border="#5c5c5c", sel="#4c7a14", sel_fg="#ffffff", btn="#454545", btn_act="#505050", check="#a3e635")   # V5.56: the one theme
+# V5.57: accent colour (main, dark = selection / pressed, darkest, OpenCV hue 0-179) x base (grey | black)
+ACCENT_DEF = {"lime": ("#a3e635", "#4c7a14", "#2c3d0c", 42), "yellow": ("#facc15", "#8a6d0a", "#4a3a05", 24),
+              "orange": ("#fb923c", "#9a4f12", "#4f2808", 14), "red": ("#f87171", "#a62b2b", "#561515", 0),
+              "pink": ("#f472b6", "#a3306f", "#521838", 164), "purple": ("#a78bfa", "#5b3fb0", "#2e2060", 129)}
+BASE_DEF = {"grey": dict(bg="#343434", fg="#f2f2f2", field="#454545", head="#3d3d3d", dim="#b4b4b4", border="#5c5c5c", btn="#454545",
+                         btn_act="#505050"),
+            "black": dict(bg="#0b0b0b", fg="#f2f2f2", field="#1b1b1b", head="#141414", dim="#a8a8a8", border="#3a3a3a", btn="#1b1b1b",
+                          btn_act="#2a2a2a")}
+
+
+def _lum(h):
+    c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def contrast(a, b):
+    """WCAG contrast ratio of two #rrggbb colours (4.5 = readable text)."""
+    la, lb = sorted((_lum(a), _lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def make_palette(accent="lime", base="grey"):
+    acc, dark, _, _ = ACCENT_DEF.get(accent, ACCENT_DEF["lime"])
+    pal = dict(BASE_DEF.get(base, BASE_DEF["grey"]))
+    pal.update(acc=acc, sel=dark, sel_fg="#ffffff", check=acc, acc_fg="#10200a" if contrast(acc, "#10200a") >= contrast(acc, "#ffffff") else "#ffffff")
+    return pal
+
+
+PAL = make_palette("lime", "grey")                  # the default theme (grey + lime)
 
 
 UI_SCALE = [1.0]
@@ -5320,70 +5470,81 @@ def F(size):
 
 
 SV_THEME = [False]                                    # True when the Sun Valley ttk theme (sv-ttk) is active
-THEME_VER = "lime1"
+THEME_VER = "t2"
 
 
-def _tint_hex(m):
-    """Sun Valley dark -> medium grey + lime (colours in the theme's tcl files): neutrals are lifted, blues turn lime."""
+def _neutral(v, base):
+    """Sun Valley dark neutral grey level -> the grey (lifted) or black base."""
+    if base == "black":
+        return max(0, min(255, int(round((v - 28) * 250 / 222)))) if v > 28 else 0
+    return max(0, min(255, int(round(52 + (v - 28) * (250 - 52) / (250 - 28))) if v > 28 else 52 - (28 - v) // 2))
+
+
+def _tint_hex(m, accent="lime", base="grey"):
+    """Sun Valley dark -> the chosen base + accent (colours in the theme's tcl files): neutrals are re-levelled, blues turn accent."""
     h = m.group(1)
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     if max(r, g, b) - min(r, g, b) < 12:
-        v = int(round(52 + (r - 28) * (250 - 52) / (250 - 28))) if r > 28 else 52 - (28 - r) // 2
-        v = max(0, min(255, v))
+        v = _neutral(r, base)
         return f'"#{v:02x}{v:02x}{v:02x}"'
-    return {"57c8ff": '"#a3e635"', "2f60d8": '"#4c7a14"', "25536a": '"#2c3d0c"'}.get(h.lower(), m.group(0))
+    acc, dark, darkest, _ = ACCENT_DEF[accent]
+    return {"57c8ff": f'"{acc}"', "2f60d8": f'"{dark}"', "25536a": f'"{darkest}"'}.get(h.lower(), m.group(0))
 
 
-def lime_theme_dir():
-    """A copy of the sv-ttk package whose dark theme is medium grey with lime accents (checkboxes, sliders, tabs, Accent buttons):
-    the sprite sheet is recoloured once (cached in montage_data\\theme_cache) and the colour constants of dark.tcl are replaced."""
+def lime_theme_dir(accent="lime", base="grey"):
+    """A copy of the sv-ttk package whose dark theme has the chosen base (grey | black) and accent colour (checkboxes, sliders, tabs,
+    Accent buttons): the sprite sheet is recoloured once per combination (cached in montage_data\\theme_cache) and the colour
+    constants of dark.tcl are replaced."""
     import sv_ttk
     import cv2
     import numpy as np
     src = Path(sv_ttk.__file__).parent
-    dst = DATA / "theme_cache" / f"sv_{THEME_VER}"
+    dst = DATA / "theme_cache" / f"sv_{THEME_VER}_{accent}_{base}"
     if (dst / "ok").exists():
         return dst
-    tmp = DATA / "theme_cache" / f"tmp_{os.getpid()}"
+    tmp = DATA / "theme_cache" / f"tmp_{os.getpid()}_{accent}_{base}"
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.copytree(src, tmp, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.py", "py.typed"))
     im = cv2.imread(str(tmp / "theme" / "spritesheet_dark.png"), cv2.IMREAD_UNCHANGED)
     bgr, alpha = im[:, :, :3].astype(np.float32), im[:, :, 3:]
     mx, mn = bgr.max(axis=2), bgr.min(axis=2)
     grey = (mx - mn) < 12
-    lifted = np.where(bgr[:, :, 0] > 28, 52 + (bgr[:, :, 0] - 28) * (250 - 52) / (250 - 28), 52 - (28 - bgr[:, :, 0]) / 2)
+    v0 = bgr[:, :, 0]
+    if base == "black":
+        lifted = np.where(v0 > 28, (v0 - 28) * 250 / 222, 0)
+    else:
+        lifted = np.where(v0 > 28, 52 + (v0 - 28) * (250 - 52) / (250 - 28), 52 - (28 - v0) / 2)
     out_ = bgr.copy()
     out_[grey] = lifted[grey][:, None]
     hsv = cv2.cvtColor(np.clip(bgr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2HSV)
     blue = (~grey) & (hsv[:, :, 0] >= 85) & (hsv[:, :, 0] <= 135)
     hsv2 = hsv.copy()
-    hsv2[:, :, 0] = np.where(blue, 42, hsv[:, :, 0])                 # hue 84 deg = lime
-    lime = cv2.cvtColor(hsv2, cv2.COLOR_HSV2BGR).astype(np.float32)
-    out_[blue] = lime[blue]
+    hsv2[:, :, 0] = np.where(blue, ACCENT_DEF[accent][3], hsv[:, :, 0])
+    tinted = cv2.cvtColor(hsv2, cv2.COLOR_HSV2BGR).astype(np.float32)
+    out_[blue] = tinted[blue]
     cv2.imwrite(str(tmp / "theme" / "spritesheet_dark.png"), np.concatenate([np.clip(out_, 0, 255).astype(np.uint8), alpha], axis=2))
-    tcl = tmp / "theme" / "dark.tcl"
-    tcl.write_text(re.sub(r'"#([0-9a-fA-F]{6})"', _tint_hex, tcl.read_text(encoding="utf-8")), encoding="utf-8")
-    sv = tmp / "sv.tcl"
-    sv.write_text(re.sub(r'"#([0-9a-fA-F]{6})"', _tint_hex, sv.read_text(encoding="utf-8")), encoding="utf-8")
+    sub = lambda m: _tint_hex(m, accent, base)
+    for f_ in (tmp / "theme" / "dark.tcl", tmp / "sv.tcl"):
+        f_.write_text(re.sub(r'"#([0-9a-fA-F]{6})"', sub, f_.read_text(encoding="utf-8")), encoding="utf-8")
     (tmp / "ok").write_text(THEME_VER)
     shutil.rmtree(dst, ignore_errors=True)
     os.replace(tmp, dst)
     return dst
 
 
-def apply_theme(root, scale=None):
-    """V5.56: ONE theme - Sun Valley dark (pip: sv-ttk, offline) recoloured to a medium grey with lime accents; the plain clam
-    fallback uses the same colours. Returns the palette (log, canvases, tags)."""
+def apply_theme(root, scale=None, accent="lime", base="grey"):
+    """V5.57: Sun Valley dark (pip: sv-ttk, offline) recoloured to a base (grey | black) and an accent colour; the plain clam
+    fallback uses the same palette. Returns the palette (log, canvases, tags)."""
     if scale:
         UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
+    pal = make_palette(accent, base)
     try:
         import tkinter.font as tkfont
-        d = lime_theme_dir()
+        d = lime_theme_dir(accent, base)
         root.tk.call("source", str(d / "sv.tcl"))
         root._sv_ttk_loaded = True                                 # sv_ttk itself must not load its blue copy
         ttk.Style(root).theme_use("sun-valley-dark")
         SV_THEME[0] = True
-        pal = dict(PAL)
         for nm, sz, bold in (("TkDefaultFont", 10, 0), ("TkTextFont", 10, 0), ("TkMenuFont", 10, 0), ("TkHeadingFont", 10, 1),
                              ("SunValleyBodyFont", 10, 0), ("SunValleyBodyStrongFont", 10, 1), ("SunValleyCaptionFont", 9, 0)):
             try:
@@ -5397,6 +5558,8 @@ def apply_theme(root, scale=None):
         st.configure("TNotebook.Tab", padding=(16, 5), font=("Segoe UI", F(10), "bold"))
         st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
         st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+        st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
+        st.configure("Dim.TLabel", foreground=pal["dim"])
         root.configure(bg=pal["bg"])
         root.option_add("*TCombobox*Listbox.background", pal["field"])
         root.option_add("*TCombobox*Listbox.foreground", pal["fg"])
@@ -5406,12 +5569,12 @@ def apply_theme(root, scale=None):
     except Exception as ex:
         SV_THEME[0] = False
         LOGONLY(f"Sun Valley theme not available ({ex}) - plain dark theme")
-        return _apply_theme_clam(root, scale)
+        return _apply_theme_clam(root, scale, pal)
 
 
-def _apply_theme_clam(root, scale=None):
-    """Plain dark theme with the same grey + lime colours (used when sv-ttk is not installed)."""
-    pal = dict(PAL)
+def _apply_theme_clam(root, scale=None, pal=None):
+    """Plain dark theme with the same palette (used when sv-ttk is not installed)."""
+    pal = dict(pal or PAL)
     if scale:
         UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
     st = ttk.Style(root)
@@ -5458,6 +5621,12 @@ def _apply_theme_clam(root, scale=None):
                  lightcolor=pal["acc"], darkcolor=pal["acc"], bordercolor=pal["acc"])
     st.map("Big.Accent.TButton", background=[("disabled", pal["head"]), ("active", pal["sel"]), ("pressed", pal["sel"])],
            foreground=[("disabled", pal["dim"]), ("active", pal["sel_fg"])])
+    st.configure("Accent.TButton", background=pal["acc"], foreground=pal["acc_fg"], lightcolor=pal["acc"], darkcolor=pal["acc"],
+                 bordercolor=pal["acc"])
+    st.map("Accent.TButton", background=[("disabled", pal["head"]), ("active", pal["sel"]), ("pressed", pal["sel"])],
+           foreground=[("disabled", pal["dim"]), ("active", pal["sel_fg"])])
+    st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
+    st.configure("Dim.TLabel", foreground=pal["dim"])
     return pal
 
 
@@ -5602,6 +5771,9 @@ def set_window_icon(root):
         pass
 
 
+MORE_LABEL = "More filters & actions"
+
+
 class App:
     DATES = {"All dates": None, "Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90}
 
@@ -5614,13 +5786,14 @@ class App:
         self._resizing, self._rs_after, self._last_size, self._save_after, self._loading = False, None, None, None, False
         self.q, self.busy, self.buttons, self._imgs, self.pending = queue.Queue(), False, [], [], []
         self.named = {}                   # button registry (smoketest checks every required button)
+        self._busy_btn, self._result = None, None
         self.sorts, self.sort_refill, self.sort_labels = {}, {}, {}
         self.clips, self.ticked, self.songs, self.bpm, self.last_video, self.byp = [], set(), [], {}, None, {}
         self._fill_token = {}
         LOG_SINK[0] = lambda m: self.q.put(("log", m))
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
-        self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0))
+        self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0), self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"))
         sc = UI_SCALE[0]
         lay = self.cfg.get("ui_layout") or {}
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -5637,7 +5810,7 @@ class App:
         row.pack(fill="x")
         self.pbar = ttk.Progressbar(row, maximum=1.0)
         self.pbar.pack(side="left", fill="x", expand=True)
-        self.plabel = tk.StringVar(value="idle")
+        self.plabel = tk.StringVar(value="Idle")
         ttk.Label(row, textvariable=self.plabel, width=34).pack(side="left", padx=8)
         self.named["Cancel"] = ttk.Button(row, text="Cancel", command=stop_all)
         self.named["Cancel"].pack(side="left")
@@ -5673,6 +5846,7 @@ class App:
         self.build_trouble()
         self.build_settings()
         self.nb.select(start_tab)
+        self.install_wheel_guard()
         for pw in (self.vpane, self.mpane):
             pw.bind("<ButtonRelease-1>", self.save_layout, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -5681,6 +5855,48 @@ class App:
         self.root.after(100, self.poll)
         if startup:
             self.root.after(400, self.startup)
+
+    # ---- mouse wheel (V5.57): never changes a value; scrolls the nearest scrollable container instead
+    WHEEL_GUARDED = ("TCombobox", "TSpinbox", "TScale", "TMenubutton", "Spinbox", "Scale", "Menubutton")
+    WHEEL_SELF = ("Treeview", "Text", "Listbox", "Scrollbar", "TScrollbar")
+    WHEEL_SEQS = ("<MouseWheel>", "<Shift-MouseWheel>", "<Control-MouseWheel>", "<Button-4>", "<Button-5>", "<Shift-Button-4>",
+                  "<Shift-Button-5>", "<Control-Button-4>", "<Control-Button-5>")
+
+    def install_wheel_guard(self):
+        for cls in self.WHEEL_GUARDED:
+            for seq in self.WHEEL_SEQS:
+                self.root.bind_class(cls, seq, self.on_wheel_guarded)       # replaces the class's own wheel-changes-value binding
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_all(seq, self.on_wheel, add="+")
+
+    @staticmethod
+    def wheel_dir(e):
+        return -1 if (getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4) else 1
+
+    def scroll_container(self, w, e):
+        """Scroll the nearest scrollable container (a Canvas page) above widget w by one wheel step. Returns True when one scrolled."""
+        while w is not None:
+            try:
+                if w.winfo_class() == "Canvas" and str(w.cget("yscrollcommand")):
+                    w.yview_scroll(self.wheel_dir(e), "units")
+                    return True
+            except (tk.TclError, AttributeError):
+                pass
+            w = getattr(w, "master", None)
+        return False
+
+    def on_wheel_guarded(self, e):
+        self.scroll_container(e.widget, e)
+        return "break"                                                     # the combobox / spinbox / slider keeps its value
+
+    def on_wheel(self, e):
+        try:
+            if e.widget.winfo_class() in self.WHEEL_SELF:                 # lists and the log scroll themselves
+                return None
+        except (tk.TclError, AttributeError):
+            return None
+        self.scroll_container(e.widget, e)
+        return None
 
     # ------------------------------------------------------------ plumbing
     def make_pane(self, parent, orient):
@@ -5761,6 +5977,9 @@ class App:
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
+        cfg["audio_mode"] = next((k for k, lab in AUDIO_MODES.items() if lab == self.set_audio.get()), "auto")
+        cfg["accent"] = next((k for k, lab in ACCENT_NAMES.items() if lab == self.set_accent.get()), "lime")
+        cfg["base"] = "black" if self.set_base.get().lower() == "black" else "grey"
         return cfg
 
     def autosave(self, *_):
@@ -5769,6 +5988,8 @@ class App:
         if self._save_after:
             self.root.after_cancel(self._save_after)
         self._save_after = self.root.after(200, self.flush_settings)
+        if hasattr(self, "save_status"):
+            self.save_status.set("Saving...")
 
     def flush_settings(self):
         if self._save_after:
@@ -5783,17 +6004,49 @@ class App:
             cfg = self.collect_settings(load_config())
             save_json(CONFIG_PATH, cfg)
             self.cfg = cfg
+            if hasattr(self, "save_status"):
+                self.save_status.set("All changes saved")
         except Exception as ex:
-            out(f"settings not saved: {ex}")
+            out(f"Settings not saved: {ex}")
+            if hasattr(self, "save_status"):
+                self.save_status.set("Not saved: see the log")
 
     def btn(self, parent, text, cmd, big=False, name=None, primary=False, **kw):
-        if big:
-            b = ttk.Button(parent, text=text, command=self.safe(cmd), style="Big.Accent.TButton" if primary else "Big.TButton", **kw)
-        else:
-            b = ttk.Button(parent, text=text, command=self.safe(cmd), **kw)
+        """A button with feedback (V5.57): hover / pressed come from the theme; while its action runs the button shows a busy
+        state (all buttons are disabled, so no double clicks); afterwards it shows 'Done \u2713' (or the action's own short result)
+        for about 1.5 s, and the full message goes to the status line."""
+        st = ("Big.Accent.TButton" if primary else "Big.TButton") if big else None
+        b = ttk.Button(parent, text=text, command=self.safe(lambda: self.click(b, text, cmd)), **({"style": st} if st else {}), **kw)
         self.buttons.append(b)
         self.named[name or text] = b
         return b
+
+    def click(self, b, label, cmd):
+        was_busy, self._result = self.busy, None
+        cmd()
+        if self.busy and not was_busy:                             # the action runs in the background: busy state until it is done
+            self._busy_btn = (b, label)
+            if len(label) >= 8:
+                b.configure(text="Working...")
+        else:
+            self.flash_button(b, label, self._result)
+
+    def flash_button(self, b, label, msg=None, ms=1500):
+        """Short result on the button itself ('Done \u2713' / 'Ticked 12 clips'), restored after ~1.5 s; the longer text goes to the status line."""
+        msg = msg or "Done \u2713"
+        short = msg if len(msg) <= max(len(label), 8) else "Done \u2713"
+        if msg != "Done \u2713":
+            self.status_flash(msg)
+        try:
+            b.configure(text=short)
+            self.root.after(ms, lambda: b.winfo_exists() and str(b.cget("text")) == short and b.configure(text=label))
+        except tk.TclError:
+            pass
+
+    def status_flash(self, msg, ms=2500):
+        """A short message in the status line (bottom bar), then back to 'Idle' unless a job is running."""
+        self.plabel.set(msg)
+        self.root.after(ms, lambda: None if self.busy else (self.plabel.get() == msg and self.plabel.set("Idle")))
 
     def safe(self, fn):
         def w(*a):
@@ -5816,7 +6069,7 @@ class App:
     def run_task(self, name, fn, *a):
         if self.busy or getattr(self, "est_running", False):    # never next to the status-line estimate (shared caches)
             self.pending.append((name, fn, a))
-            out(f"queued: {name}")
+            out(f"Queued: {name}")
             return
         self.busy = True
         CANCEL.clear()
@@ -5838,6 +6091,8 @@ class App:
                 if k == "log":
                     self.log.insert("end", v + "\n")
                     self.log.see("end")
+                    if "Auto audio failed, used Legacy V5.55" in v:
+                        self.status_flash("Auto audio failed, used Legacy V5.55", 12000)
                 elif k == "prog":
                     self.pbar["value"] = v[0]
                     self.plabel.set(v[1])
@@ -5846,8 +6101,11 @@ class App:
                 elif k == "done":
                     self.busy = False
                     self.pbar["value"] = 0
-                    self.plabel.set("idle")
+                    self.plabel.set("Idle")
                     self.set_buttons(True)
+                    bb_, self._busy_btn = self._busy_btn, None
+                    if bb_:
+                        self.flash_button(*bb_)
                     self.refresh_auto()
                     if self.pending:
                         n, fn, a = self.pending.pop(0)
@@ -5860,10 +6118,10 @@ class App:
         miss = missing_packages()
         if miss and messagebox.askyesno("Missing packages", "Install now (user scope, no admin)?\n\n" + ", ".join(miss)):
             def inst():
-                out("installing: " + " ".join(miss))
+                out("Installing: " + " ".join(miss))
                 r = subprocess.run([sys.executable, "-m", "pip", "install", "--user"] + miss, capture_output=True, text=True)
                 out((r.stdout + r.stderr)[-1500:])
-                out("done - close and reopen this program.")
+                out("Done. Close and reopen this program.")
             self.run_task("pip", inst)
             return
         if not shutil.which("ffmpeg"):
@@ -5922,7 +6180,7 @@ class App:
                     if used:
                         mark_used(used)
                 except Exception as ex:
-                    out(f"used flags not saved: {ex}")
+                    out(f"Used flags not saved: {ex}")
             if isinstance(res, Path):
                 self.q.put(("call", lambda: self.set_video(res)))
             self.q.put(("call", lambda: self.run_task("clips", self.load_clips)))
@@ -5931,7 +6189,7 @@ class App:
     # ------------------------------------------------------------ Auto tab
     def build_auto(self):
         f = self.tabs["Auto"]
-        ttk.Label(f, text="One montage per game per week from all your clips - nothing to pick. Kills are read from the killfeed "
+        ttk.Label(f, text="One montage per game per week from all your clips, nothing to pick. Kills are read from the killfeed "
                           "with OCR (no calibration needed; the killfeed region can be adjusted in Troubleshoot).",
                   font=("Segoe UI", F(10)), wraplength=1100).pack(anchor="w", padx=8, pady=4)
         self.auto_status = {}
@@ -5979,12 +6237,12 @@ class App:
                     f"This week ({week_tag(datetime.datetime.now())}): {ex[-1].name if ex else 'no montage yet'}    "
                     f"Last montage: {allv[-1].name if allv else '-'}")
         except Exception:
-            out("status refresh failed: " + traceback.format_exc()[-300:])
+            out("Status refresh failed: " + traceback.format_exc()[-300:])
 
     # ------------------------------------------------------------ Manual tab
     def build_manual(self):
         f = self.tabs["Manual"]
-        s3 = ttk.LabelFrame(f, text="Step 3 - make it", padding=4)
+        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=4)
         s3.pack(side="bottom", fill="x", padx=2, pady=(6, 2))          # packed FIRST so it can never be pushed off-screen
         bb = ttk.Frame(s3)
         bb.pack(fill="x", pady=(2, 6))
@@ -6023,7 +6281,7 @@ class App:
         ttk.Label(s3, textvariable=self.m_status, font=("Segoe UI", F(10), "bold"), wraplength=1100).pack(anchor="w", pady=2)
         self.mpane = mid = self.make_pane(f, "vertical")           # V5.55: drag divider between the clip list and the song list
         mid.pack(side="top", fill="both", expand=True)
-        s1 = ttk.LabelFrame(mid, text="Step 1 - tick the clips (click ticks, Shift+click a range)", padding=4)
+        s1 = ttk.LabelFrame(mid, text="Step 1: tick the clips (click ticks, Shift+click a range)", padding=4)
         top = ttk.Frame(s1)
         top.pack(fill="x", pady=2)
         self.m_game = tk.StringVar(value="valorant")
@@ -6031,63 +6289,48 @@ class App:
             ttk.Radiobutton(top, text=GAME_DIR[g], variable=self.m_game, value=g,
                             command=lambda: self.run_task("clips", self.load_clips)).pack(side="left", padx=4)
         self.btn(top, "Reload list", lambda: self.run_task("clips", self.load_clips)).pack(side="left", padx=(12, 3))
-        ttk.Label(top, text="Show").pack(side="left", padx=(12, 2))
+        ttk.Label(top, text="Show").pack(side="left", padx=(12, 6))
         self.m_used = tk.StringVar(value="All clips")
         cbu = ttk.Combobox(top, textvariable=self.m_used, values=["All clips", "Used", "Unused"], width=9, state="readonly")
         cbu.pack(side="left")
         cbu.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
         self.named["Used filter"] = cbu
+        # V5.57: the less used filters / actions are one dropdown (same widget + style as 'Show'); its list opens over the layout
+        self.folder_names = ["All folders"]
+        self.m_more = tk.StringVar(value=MORE_LABEL)
+        self.b_more = ttk.Combobox(top, textvariable=self.m_more, values=[MORE_LABEL], width=24, state="readonly", height=14,
+                                   postcommand=self.fill_more)
+        self.b_more.pack(side="right", padx=3)
+        self.b_more.bind("<<ComboboxSelected>>", self.more_selected)
+        self.named["More filters"] = self.b_more
+        self.m_folder = tk.StringVar(value="All folders")
+        self.m_date = tk.StringVar(value="All dates")
+        self.m_from, self.m_to = tk.StringVar(), tk.StringVar()
+        for v in (self.m_from, self.m_to):
+            v.trace_add("write", lambda *a: self.root.after(400, self.apply_filter))
         top2 = ttk.Frame(s1)
         top2.pack(fill="x", pady=2)
         self.btn(top2, "Tick all shown", lambda: self.tick("all")).pack(side="left", padx=3)
         self.btn(top2, "Untick all", lambda: self.tick("none")).pack(side="left", padx=3)
         self.btn(top2, "Tick clips with kills", lambda: self.tick("kills")).pack(side="left", padx=3)
-        self.btn(top2, "Tick newest", lambda: self.tick("newest")).pack(side="left", padx=(12, 2))
-        self.m_n = tk.StringVar(value="15")
+        self.btn(top2, "Tick newest", lambda: self.tick("newest")).pack(side="left", padx=(12, 6))
+        self.m_n = tk.StringVar(value="15")                         # 'Tick newest' count
         ttk.Spinbox(top2, from_=1, to=500, textvariable=self.m_n, width=5).pack(side="left")
-        self.btn(top2, "Random pick", self.random_pick_ticks).pack(side="left", padx=(12, 3))
+        self.btn(top2, "Random pick", self.random_pick_ticks).pack(side="left", padx=(12, 6))
+        self.m_rand_n = tk.StringVar(value="15")                    # V5.57: 'Random pick' has its own count (never shared with Tick newest)
+        self.e_rand = ttk.Spinbox(top2, from_=1, to=500, textvariable=self.m_rand_n, width=5)
+        self.e_rand.pack(side="left")
         self.m_incl_used = tk.BooleanVar(value=False)
-        ttk.Checkbutton(top2, text="include used clips", variable=self.m_incl_used).pack(side="left", padx=3)
-        # V5.56: the less used filters / actions live in a collapsible section (collapsed by default)
-        self.more_open = False
-        self.b_more = ttk.Button(s1, text="\u25b8  More filters & actions", command=self.toggle_more)
-        self.b_more.pack(anchor="w", padx=3, pady=(2, 0))
-        self.named["More filters"] = self.b_more
-        self.more = ttk.Frame(s1)
-        mr1 = ttk.Frame(self.more)
-        mr1.pack(fill="x", pady=2)
-        ttk.Label(mr1, text="Folder").pack(side="left", padx=(3, 2))
-        self.m_folder = tk.StringVar(value="All folders")
-        self.cb_folder = ttk.Combobox(mr1, textvariable=self.m_folder, values=["All folders"], width=18, state="readonly")
-        self.cb_folder.pack(side="left")
-        self.cb_folder.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
-        ttk.Label(mr1, text="Date").pack(side="left", padx=(8, 2))
-        self.m_date = tk.StringVar(value="All dates")
-        cb = ttk.Combobox(mr1, textvariable=self.m_date, values=list(self.DATES), width=12, state="readonly")
-        cb.pack(side="left")
-        cb.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
-        ttk.Label(mr1, text="From").pack(side="left", padx=(10, 2))
-        self.m_from = tk.StringVar()
-        ttk.Entry(mr1, textvariable=self.m_from, width=11).pack(side="left")
-        ttk.Label(mr1, text="to").pack(side="left", padx=3)
-        self.m_to = tk.StringVar()
-        ttk.Entry(mr1, textvariable=self.m_to, width=11).pack(side="left")
-        ttk.Label(mr1, text="(YYYY-MM-DD)").pack(side="left", padx=3)
-        for v in (self.m_from, self.m_to):
-            v.trace_add("write", lambda *a: self.root.after(400, self.apply_filter))
-        mr2 = ttk.Frame(self.more)
-        mr2.pack(fill="x", pady=2)
-        self.btn(mr2, "Tick whole folder", lambda: self.tick("folder")).pack(side="left", padx=3)
-        self.btn(mr2, "Exclude ticked from montages", self.exclude_sel).pack(side="left", padx=3)
+        ttk.Checkbutton(top2, text="Include used clips", variable=self.m_incl_used).pack(side="left", padx=(12, 3))
         fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used"), height=20, selectmode="none")
         fr.pack(fill="both", expand=True)
-        for c, w, t in (("#0", 400, "clip"), ("date", 100, "date"), ("len", 64, "length"), ("kills", 90, "kills"), ("used", 100, "used")):
+        for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 100, "Used")):
             self.ctree.column(c, width=w, minwidth=56, stretch=(c == "#0"))
             self.ctree.heading(c, text=t)
-        self.make_sortable(self.ctree, self.apply_filter, {"#0": "clip", "date": "date", "len": "length", "kills": "kills",
-                                                           "used": "used"})
+        self.make_sortable(self.ctree, self.apply_filter, {"#0": "Clip", "date": "Date", "len": "Length", "kills": "Kills",
+                                                           "used": "Used"})
         self.ctree.bind("<Button-1>", self.on_tree_click)
-        s2 = ttk.LabelFrame(mid, text="Step 2 - choose the song (newest added first)", padding=4)
+        s2 = ttk.LabelFrame(mid, text="Step 2: choose the song (newest added first)", padding=4)
         mid.add(s1, minsize=int(180 * UI_SCALE[0]), stretch="always", padx=2, pady=2)
         mid.add(s2, minsize=int(84 * UI_SCALE[0]), stretch="never", padx=2, pady=2)
         r2 = ttk.Frame(s2)
@@ -6103,25 +6346,75 @@ class App:
         self.stree.column("#0", width=520)
         self.stree.column("bpm", width=70)
         self.stree.column("added", width=110)
-        self.stree.heading("#0", text="song")
+        self.stree.heading("#0", text="Song")
         self.stree.heading("bpm", text="BPM")
-        self.stree.heading("added", text="added")
-        self.make_sortable(self.stree, self.refresh_songs, {"#0": "song", "bpm": "BPM", "added": "added"})
+        self.stree.heading("added", text="Added")
+        self.make_sortable(self.stree, self.refresh_songs, {"#0": "Song", "bpm": "BPM", "added": "Added"})
         self.stree.bind("<<TreeviewSelect>>", lambda e: self.update_status())
 
-    def toggle_more(self, open_=None):
-        self.more_open = (not self.more_open) if open_ is None else bool(open_)
-        if self.more_open:
-            self.more.pack(fill="x", after=self.b_more)
-            self.root.update_idletasks()
-            need = self.more.winfo_reqheight() + 4
-            if self.root.state() == "normal" and self.ctree.winfo_ismapped() and self.ctree.winfo_height() - need < 120:
-                H = self.root.winfo_height()                       # small window: the section gets its own room, the clip list keeps its height
-                if H + need <= self.root.winfo_screenheight() - 60:
-                    self.root.geometry(f"{self.root.winfo_width()}x{H + need}")
-        else:
-            self.more.pack_forget()
-        self.b_more.config(text=("\u25be" if self.more_open else "\u25b8") + "  More filters & actions")
+    DATE_ITEMS = tuple(DATES)
+
+    def fill_more(self):
+        """Items of the 'More filters & actions' dropdown (a tick marks the active filter)."""
+        def mark(on, text):
+            return ("\u2713 " if on else "    ") + text
+        items = [mark(self.m_date.get() == d, f"Date: {d}") for d in self.DATE_ITEMS]
+        rng = bool(self.m_from.get().strip() or self.m_to.get().strip())
+        items.append(mark(rng, "Date range..."))
+        if rng:
+            items.append("    Clear date range")
+        items += [mark(self.m_folder.get() == fo, f"Folder: {fo}") for fo in self.folder_names]
+        items += ["    Tick whole folder", "    Exclude ticked from montages"]
+        self.b_more.configure(values=items)
+
+    def more_selected(self, _e=None):
+        """A dropdown item was chosen: run the action / set the filter, then show the plain label again (the list closes by itself)."""
+        item = self.b_more.get().strip().lstrip("\u2713").strip()
+        self.m_more.set(MORE_LABEL)
+        self.b_more.selection_clear()
+        self.root.focus_set()
+        self.more_pick(item)
+
+    def more_pick(self, item):
+        if item.startswith("Date: "):
+            self.m_date.set(item[6:])
+            self.apply_filter()
+        elif item.startswith("Folder: "):
+            self.m_folder.set(item[8:])
+            self.apply_filter()
+        elif item == "Date range...":
+            self.date_range_dialog()
+        elif item == "Clear date range":
+            self.m_from.set("")
+            self.m_to.set("")
+        elif item == "Tick whole folder":
+            self.tick("folder")
+        elif item == "Exclude ticked from montages":
+            self.exclude_sel()
+
+    def date_range_dialog(self):
+        """Small window for the custom date range (From / to, YYYY-MM-DD)."""
+        win = tk.Toplevel(self.root)
+        win.title("Date range")
+        win.transient(self.root)
+        win.configure(bg=self.pal["bg"])
+        fr = ttk.Frame(win, padding=14)
+        fr.pack(fill="both", expand=True)
+        va, vb = tk.StringVar(value=self.m_from.get()), tk.StringVar(value=self.m_to.get())
+        ttk.Label(fr, text="From").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=6)
+        ttk.Entry(fr, textvariable=va, width=14).grid(row=0, column=1, pady=6)
+        ttk.Label(fr, text="To").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=6)
+        ttk.Entry(fr, textvariable=vb, width=14).grid(row=1, column=1, pady=6)
+        ttk.Label(fr, text="Format: YYYY-MM-DD", style="Dim.TLabel").grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        def ok():
+            self.m_from.set(va.get().strip())
+            self.m_to.set(vb.get().strip())
+            win.destroy()
+        bb = ttk.Frame(fr)
+        bb.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(bb, text="Cancel", command=win.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(bb, text="Apply", style="Accent.TButton", command=ok).pack(side="left")
 
     def on_tree_click(self, e):
         if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
@@ -6171,6 +6464,7 @@ class App:
         if how == "none":
             self.ticked.clear()
         self.update_status()
+        self._result = "Unticked all" if how == "none" else f"Ticked {len(self.ticked)} clips"
 
     def load_clips(self):
         cfg = load_config()
@@ -6203,7 +6497,7 @@ class App:
             self.clips, self.songs = rows, songs
             self.byp = {c["path"]: c for c in rows}
             self.ticked &= set(self.byp)
-            self.cb_folder.config(values=["All folders"] + sorted({c["folder"] for c in rows}))
+            self.folder_names = ["All folders"] + sorted({c["folder"] for c in rows})
             self.apply_filter()
             self.refresh_songs()
         self.q.put(("call", fill))
@@ -6319,7 +6613,7 @@ class App:
         with open(DATA / "exclude.txt", "a", encoding="utf-8") as f:
             for p in self.ticked:
                 f.write(p + "\n")
-        out(f"excluded {len(self.ticked)} clip(s) from montages (montage_data\\exclude.txt, one path per line)")
+        out(f"Excluded {len(self.ticked)} clip(s) from montages (montage_data\\exclude.txt, one path per line)")
 
     def update_status(self):
         """Status line. The length comes from the REAL planner (make_plan on the already-scanned ticked clips, same song, style
@@ -6409,25 +6703,27 @@ class App:
         return txt
 
     def pick_count(self):
-        """N from the number box next to 'Tick newest' (the same box); None = empty / not a number (then the Optimal estimate decides)."""
-        t = self.m_n.get().strip()
+        """N from the number box next to 'Random pick' (its own box, never the 'Tick newest' one); None = empty / not a number
+        (then the Optimal estimate decides)."""
+        t = self.m_rand_n.get().strip()
         if not t:
             return None
         try:
             return max(1, int(float(t)))
         except ValueError:
-            out(f"Random pick: '{t}' is not a number - using the Optimal estimate")
+            out(f"Random pick: '{t}' is not a number, using the Optimal estimate")
             return None
 
     def random_pick_ticks(self):
-        """V5.56 Random pick: tick N random clips from the list as shown (game, folder / date / used filters; unused clips unless
-        'include used clips'), N = the number box next to 'Tick newest'. Empty box: the Optimal estimate decides how many (V5.55)."""
+        """V5.57 Random pick: tick exactly N random clips from the list as shown (game, folder / date / used filters; unused clips
+        unless 'Include used clips'). N = its own number box (never the 'Tick newest' box). Fewer eligible than N: tick all of them and
+        say so in the status line. Empty box: the Optimal estimate decides how many (V5.55)."""
         inc = self.m_incl_used.get()
         cands = [self.byp[i] for i in self.ctree.get_children()
                  if i in self.byp and self.byp[i].get("kills") and (inc or not self.byp[i].get("used"))]
         if not cands:
             messagebox.showinfo("Random pick", "No " + ("" if inc else "unused ") + "clips with kills in the list "
-                                "(game, folder and date filters apply; tick 'include used clips' to allow used ones).")
+                                "(the game, folder and date filters apply; tick 'Include used clips' to allow used ones).")
             return
         n = self.pick_count()
         sel = self.stree.selection()
@@ -6436,24 +6732,26 @@ class App:
 
         def work():
             if n:
-                paths, why = [c["path"] for c in random.sample(cands, min(n, len(cands)))], \
-                    (f"you asked for {n}" + (f", only {len(cands)} available" if n > len(cands) else ""))
+                paths = [c["path"] for c in random.sample(cands, min(n, len(cands)))]
+                why = f"you asked for {n}" if n <= len(cands) else f"you asked for {n}, only {len(cands)} eligible, so all were ticked"
             else:
                 an = None
                 if song:
                     try:
                         an = analyse_song(song["path"], song.get("csv_bpm"))
                     except Exception as ex:
-                        out(f"random pick: song map unavailable ({ex}) - sizing for a plain 120 BPM song")
+                        out(f"Random pick: song map unavailable ({ex}), sizing for a plain 120 BPM song")
                 paths, fit = random_pick(cands, an, style)
                 why = fit["why"] if fit else ""
+            msg = f"Random pick: {len(paths)} of {len(cands)} {'' if inc else 'unused '}clips ticked ({why})"
 
             def apply():
                 self.ticked = set(paths)
                 for iid in self.ctree.get_children():
                     self.ctree.item(iid, text=self.row_text(iid))
                 self.update_status()
-            out(f"Random pick: {len(paths)} of {len(cands)} {'' if inc else 'unused '}clips ticked - " + why)
+                self.status_flash(msg, 4000)
+            out(msg)
             self.q.put(("call", apply))
         self.run_task("random pick", work)
 
@@ -6487,12 +6785,12 @@ class App:
         ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
         fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "score", "flag"), height=18, selectmode="browse")
         fr.pack(fill="both", expand=True)
-        for c, w, t in (("#0", 420, "MP3 file"), ("track", 300, "matched playlist track"), ("artist", 200, "artist"),
-                        ("bpm", 60, "BPM"), ("score", 70, "score"), ("flag", 130, "flag")):
+        for c, w, t in (("#0", 420, "MP3 file"), ("track", 300, "Matched playlist track"), ("artist", 200, "Artist"),
+                        ("bpm", 60, "BPM"), ("score", 70, "Score"), ("flag", 130, "Flag")):
             self.mtree.column(c, width=w, minwidth=50, stretch=(c in ("#0", "track")))
             self.mtree.heading(c, text=t)
-        self.make_sortable(self.mtree, self.fill_matches, {"#0": "MP3 file", "track": "matched playlist track", "artist": "artist",
-                                                            "bpm": "BPM", "score": "score", "flag": "flag"})
+        self.make_sortable(self.mtree, self.fill_matches, {"#0": "MP3 file", "track": "Matched playlist track", "artist": "Artist",
+                                                            "bpm": "BPM", "score": "Score", "flag": "Flag"})
         self.mtree.tag_configure("weak", foreground="#ffc65c")
         self.mtree.tag_configure("none", foreground="#ff8a80")
         self.match_rows, self.match_audio = [], []
@@ -6565,8 +6863,8 @@ class App:
         fr, tr = make_tree(w, ("artist",), height=18, selectmode="browse")
         fr.pack(fill="both", expand=True, padx=8)
         tr.column("#0", width=380)
-        tr.heading("#0", text="playlist track")
-        tr.heading("artist", text="artist")
+        tr.heading("#0", text="Playlist track")
+        tr.heading("artist", text="Artist")
         rk = lambda r: r.get("uri") or f"{r['artist']} - {r['title']}"
 
         def refill(*a):
@@ -6664,7 +6962,7 @@ class App:
         rec["game"] = g
         e = load_kills_cache().get(kills_key(rec, g, det))
         if not e:
-            out("not scanned yet: press Rescan this clip")
+            out("Not scanned yet: press Rescan this clip")
             return
         a = analyse_entry(e, cfg, g)
         ks, ds = a["kills"], a["deaths"]
@@ -6712,7 +7010,7 @@ class App:
         cfg["bar"] = {"src": [info["w"], info["h"]], "rect": [int(v.get()) & ~1 for v in self.bar_e]}
         cfg["bar_checked"] = True
         save_json(CONFIG_PATH, cfg)
-        out(f"bar override saved: {cfg['bar']}")
+        out(f"Bar override saved: {cfg['bar']}")
         self.refresh_bar()
 
     def bar_off(self):
@@ -6746,21 +7044,37 @@ class App:
                     pth.unlink()
                 except OSError:
                     pass
-            out("kill cache cleared")
+            out("Kill cache cleared")
 
     # ------------------------------------------------------------ Settings tab
     def build_settings(self):
+        """V5.57 Settings: a fixed footer (Save settings + status) below a scrolled page laid out on one grid: section headers, a fixed
+        label column, uniform row padding (6 px vertical, 12 px horizontal), extra space between sections."""
         host = self.tabs["Settings"]
-        # V5.56: the whole tab scrolls (everything down to the last setting is reachable at any window size)
-        self.set_canvas = cv = tk.Canvas(host, bg=self.pal["bg"], highlightthickness=0, bd=0)
-        vs = ttk.Scrollbar(host, orient="vertical", command=cv.yview)
-        hs = ttk.Scrollbar(host, orient="horizontal", command=cv.xview)
+        sc = UI_SCALE[0]
+        foot = ttk.Frame(host)
+        foot.pack(side="bottom", fill="x")                          # packed first: always visible, outside the scrolled area
+        ttk.Separator(foot, orient="horizontal").pack(side="top", fill="x")
+        fi = ttk.Frame(foot, padding=(12, 8))
+        fi.pack(fill="x")
+        self.b_save = self.btn(fi, "Save settings", self.save_settings, style="Accent.TButton")
+        self.b_save.pack(side="right")
+        self.save_status = tk.StringVar(value="All changes saved")
+        self.save_label = ttk.Label(fi, textvariable=self.save_status, style="Dim.TLabel")
+        self.save_label.pack(side="right", padx=(0, 12))
+        self.btn(fi, "Changelog", self.show_changelog, name="Changelog").pack(side="left")     # always visible, next to Save
+        body = ttk.Frame(host)
+        body.pack(side="top", fill="both", expand=True)
+        self.set_canvas = cv = tk.Canvas(body, bg=self.pal["bg"], highlightthickness=0, bd=0)
+        vs = ttk.Scrollbar(body, orient="vertical", command=cv.yview)
+        hs = ttk.Scrollbar(body, orient="horizontal", command=cv.xview)
         cv.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
         vs.pack(side="right", fill="y")
         hs.pack(side="bottom", fill="x")
         cv.pack(side="left", fill="both", expand=True)
         f = self.set_inner = ttk.Frame(cv)
         win = cv.create_window((0, 0), window=f, anchor="nw")
+        f.columnconfigure(0, minsize=int(340 * sc))               # fixed label column
         f.columnconfigure(1, weight=1)
         pend = []
 
@@ -6770,108 +7084,212 @@ class App:
             cv.itemconfigure(win, width=w_)
             cv.configure(scrollregion=(0, 0, w_, max(f.winfo_reqheight(), 1)))
             cv.yview_moveto(cv.yview()[0])                           # force a redraw so the embedded frame is mapped again
+
         def later(_e=None):                                          # debounced: one re-layout ~100 ms after the last resize event
             if not pend:
                 pend.append(cv.after(100, relayout))
         cv.bind("<Configure>", later)
         f.bind("<Configure>", later)
+        self.sv, self.sl, self.sn, self.set_track = {}, {}, {}, {}
+        r = [0]
+        LW = int(300 * sc)
+        PX, PY = 12, 6
 
-        def wheel(e):
-            if self.nb.select() == str(self.tabs["Settings"]) and cv.winfo_exists():
-                cv.yview_scroll(-1 if (getattr(e, "delta", 0) > 0 or getattr(e, "num", 0) == 4) else 1, "units")
-        self.root.bind_all("<MouseWheel>", wheel, add="+")
-        self.root.bind_all("<Button-4>", wheel, add="+")
-        self.root.bind_all("<Button-5>", wheel, add="+")
-        self.sv = {}
-        self.btn(f, "Save settings", self.save_settings).grid(row=0, column=1, sticky="w", pady=6)
-        ttk.Label(f, text="Every change is saved at once (montage_data\\config.json next to montage.py).").grid(
-            row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
-        r = 2
-        for k, lab in (("mp3_dir", "MP3 folder"),
-                       ("playlist_dir", "Exportify CSV folder"), ("output_root", "Output folder")):
-            ttk.Label(f, text=lab).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+        def section(title):
+            ttk.Label(f, text=title, style="Section.TLabel").grid(row=r[0], column=0, columnspan=3, sticky="w", padx=PX,
+                                                                  pady=(6 if r[0] == 0 else 24, 2))
+            ttk.Separator(f, orient="horizontal").grid(row=r[0] + 1, column=0, columnspan=3, sticky="ew", padx=PX, pady=(2, 4))
+            r[0] += 2
+
+        def label(text):
+            ttk.Label(f, text=text, wraplength=LW).grid(row=r[0], column=0, sticky="w", padx=PX, pady=PY)
+
+        def holder():
+            """The cell of the current row (column 1) as a frame; its children are packed left with 12 px gaps."""
+            h = ttk.Frame(f)
+            h.grid(row=r[0], column=1, sticky="w", padx=(0, PX), pady=PY)
+            return h
+
+        def hint(parent, text):
+            ttk.Label(parent, text=text, style="Dim.TLabel").pack(side="left", padx=(0, 0))
+
+        def folder_row(text, var, btn_text, cmd):
+            label(text)
+            ttk.Entry(f, textvariable=var, width=12).grid(row=r[0], column=1, sticky="ew", padx=(0, PX), pady=PY)
+            ttk.Button(f, text=btn_text, command=cmd, width=10).grid(row=r[0], column=2, padx=(0, PX), pady=PY, sticky="ew")
+            r[0] += 1
+
+        section("Folders")
+        for k, lab in (("mp3_dir", "MP3 folder"), ("playlist_dir", "Exportify CSV folder"), ("output_root", "Output folder")):
             v = tk.StringVar(value=self.cfg.get(k, ""))
             self.sv[k] = v
-            ttk.Entry(f, textvariable=v, width=12).grid(row=r, column=1, padx=4, sticky="ew")
-            ttk.Button(f, text="Browse", command=lambda v=v: v.set(filedialog.askdirectory(initialdir=v.get() or None) or v.get())).grid(row=r, column=2)
-            r += 1
-        self.sl = {}
-        for g, lab in (("valorant", "Valorant clip folders (; separated)"), ("cs2", "CS2 clip folders (; separated)")):
-            ttk.Label(f, text=lab).grid(row=r, column=0, sticky="w", padx=8, pady=4)
+            folder_row(lab, v, "Browse", lambda v=v: v.set(filedialog.askdirectory(initialdir=v.get() or None) or v.get()))
+        for g, lab in (("valorant", "Valorant clip folders (separated by ;)"), ("cs2", "CS2 clip folders (separated by ;)")):
             v = tk.StringVar(value="; ".join((self.cfg.get("clip_dirs") or {}).get(g, [])))
             self.sl[g] = v
-            ttk.Entry(f, textvariable=v, width=12).grid(row=r, column=1, padx=4, sticky="ew")
-            ttk.Button(f, text="Add folder", command=lambda v=v: v.set("; ".join([x for x in v.get().split(";") if x.strip()] +
-                                                                                   [filedialog.askdirectory() or ""]).strip("; "))).grid(row=r, column=2)
-            r += 1
-        self.sn = {}
+            folder_row(lab, v, "Add folder", lambda v=v: v.set("; ".join([x for x in v.get().split(";") if x.strip()] +
+                                                                           [filedialog.askdirectory() or ""]).strip("; ")))
+        section("Scanning and detection")
         for k, lab in (("max_mb", "Skip files larger than (MB)"), ("max_dur_s", "Skip clips longer than (s)"),
-                       ("auto_recent_days", "Auto: scan every new clip from the last (days)"),
+                       ("auto_recent_days", "Auto: scan new clips from the last (days)"),
                        ("auto_old_per_run", "Auto: plus up to this many older clips per run"),
-                       ("name_match", "Detection: FIREAXE OCR fuzzy match needed (0-100)"),
+                       ("name_match", "Detection: fuzzy name match needed (0-100)"),
                        ("death_lock_s", "No kills for this long after my death (s)"),
-                       ("game_audio_level", "Game audio level under the music (0-1)"),
-                       ("ui_scale", "UI scale (font + row height, restart to apply)"),
                        ("week_days", "'This week' means the last N days")):
-            ttk.Label(f, text=lab, wraplength=int(330 * UI_SCALE[0])).grid(row=r, column=0, sticky="w", padx=8, pady=3)
+            label(lab)
             v = tk.StringVar(value=str(self.cfg.get(k, "")))
             self.sn[k] = v
-            ttk.Entry(f, textvariable=v, width=10).grid(row=r, column=1, sticky="w", padx=4)
-            r += 1
-        self.set_track = {}
+            ttk.Entry(f, textvariable=v, width=10).grid(row=r[0], column=1, sticky="w", padx=(0, PX), pady=PY)
+            r[0] += 1
+        section("Game audio")
+        label("Game audio level under the music (0-1)")
+        v = tk.StringVar(value=str(self.cfg.get("game_audio_level", "")))
+        self.sn["game_audio_level"] = v
+        ttk.Entry(f, textvariable=v, width=10).grid(row=r[0], column=1, sticky="w", padx=(0, PX), pady=PY)
+        r[0] += 1
         for g in GAMES:
-            ttk.Label(f, text=f"Game audio track - {GAME_DIR[g]}").grid(row=r, column=0, sticky="w", padx=8, pady=4)
+            label(f"Game audio track: {GAME_DIR[g]}")
             cur = str((self.cfg.get("game_audio_track") or {}).get(g, "auto"))
             v = tk.StringVar(value=cur if cur in ("auto", "1", "2", "3") else "auto")
             self.set_track[g] = v
-            tf = ttk.Frame(f)
-            tf.grid(row=r, column=1, sticky="w")
-            ttk.Combobox(tf, textvariable=v, values=["auto", "1", "2", "3"], width=8, state="readonly").pack(side="left", padx=4)
-            ttk.Label(tf, text="auto = most gunshots; 1 / 2 / 3 = fixed").pack(side="left")
-            r += 1
+            h = holder()
+            ttk.Combobox(h, textvariable=v, values=["auto", "1", "2", "3"], width=8, state="readonly").pack(side="left", padx=(0, PX))
+            hint(h, "Auto = most gunshots; 1, 2 or 3 = fixed (ignored in Legacy audio mode)")
+            r[0] += 1
+        section("Montage")
         self.set_opt, self.set_len, self.set_style, self.set_q = self.m_opt, self.m_len, self.m_style, self.m_q    # shared with the Manual tab
-        ttk.Label(f, text="Default length").grid(row=r, column=0, sticky="w", padx=8, pady=4)
-        lf = ttk.Frame(f)
-        lf.grid(row=r, column=1, sticky="w")
-        ttk.Checkbutton(lf, text="Optimal (from clips + song + style)", variable=self.set_opt, command=self.update_status).pack(side="left")
-        r += 1
-        lf2 = ttk.Frame(f)
-        lf2.grid(row=r, column=1, sticky="w")
-        ttk.Scale(lf2, from_=30, to=120, variable=self.set_len, length=180,
-                  command=lambda v: self.set_len.set(int(float(v)))).pack(side="left", padx=(4, 6))
-        ttk.Label(lf2, textvariable=self.set_len, width=4).pack(side="left")
-        ttk.Label(lf2, text="s (used when Optimal is off)").pack(side="left")
-        r += 1
-        ttk.Label(f, text="Default style (auto = from the song)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
-        ttk.Combobox(f, textvariable=self.set_style, values=STYLE_CHOICES, width=10, state="readonly").grid(row=r, column=1, sticky="w", padx=4)
-        r += 1
+        label("Default length")
+        h = holder()
+        ttk.Checkbutton(h, text="Optimal (from clips + song + style)", variable=self.set_opt, command=self.update_status).pack(side="left")
+        r[0] += 1
+        h = ttk.Frame(f)
+        h.grid(row=r[0], column=1, sticky="w", padx=(0, PX), pady=PY)
+        ttk.Scale(h, from_=30, to=120, variable=self.set_len, length=180,
+                  command=lambda v: self.set_len.set(int(float(v)))).pack(side="left", padx=(0, PX))
+        ttk.Label(h, textvariable=self.set_len, width=4).pack(side="left", padx=(0, 6))
+        hint(h, "s (used when Optimal is off)")
+        r[0] += 1
+        label("Default style (auto = from the song)")
+        ttk.Combobox(holder(), textvariable=self.set_style, values=STYLE_CHOICES, width=10, state="readonly").pack(side="left")
+        r[0] += 1
         self.set_place = tk.StringVar(value=self.cfg.get("placement", "v5"))
-        ttk.Label(f, text="Kill placement (see synccompare)").grid(row=r, column=0, sticky="w", padx=8, pady=4)
-        ttk.Combobox(f, textvariable=self.set_place, values=["v5", "v4"], width=10, state="readonly").grid(row=r, column=1, sticky="w", padx=4)
-        r += 1
+        label("Kill placement (see synccompare)")
+        ttk.Combobox(holder(), textvariable=self.set_place, values=["v5", "v4"], width=10, state="readonly").pack(side="left")
+        r[0] += 1
+        am = self.cfg.get("audio_mode", "auto")
+        self.set_audio = tk.StringVar(value=AUDIO_MODES.get(am, AUDIO_MODES["auto"]))
+        label("Audio mode")
+        h = holder()
+        ttk.Combobox(h, textvariable=self.set_audio, values=list(AUDIO_MODES.values()), width=16, state="readonly").pack(side="left")
+        r[0] += 1
         self.set_sync = tk.BooleanVar(value=self.cfg.get("sync_report", True))
-        ttk.Label(f, text="Quality").grid(row=r, column=0, sticky="w", padx=8, pady=4)
-        qf = ttk.Frame(f)
-        qf.grid(row=r, column=1, sticky="w")
-        ttk.Radiobutton(qf, text="NVENC p7 cq18 (fast)", variable=self.set_q, value="nvenc").pack(side="left")
-        ttk.Radiobutton(qf, text="Max quality x264 CRF15", variable=self.set_q, value="max").pack(side="left", padx=10)
-        r += 1
-        ttk.Checkbutton(f, text="Print a sync report after each render", variable=self.set_sync).grid(row=r, column=1, sticky="w", pady=2)
-        r += 1
+        label("Quality")
+        h = holder()
+        ttk.Radiobutton(h, text="NVENC p7 cq18 (fast)", variable=self.set_q, value="nvenc").pack(side="left", padx=(0, PX))
+        ttk.Radiobutton(h, text="Max quality x264 CRF15", variable=self.set_q, value="max").pack(side="left")
+        r[0] += 1
+        label("Reports")
+        ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
+        r[0] += 1
+        section("Appearance")
+        self.set_accent = tk.StringVar(value=ACCENT_NAMES.get(self.cfg.get("accent", "lime"), "Lime green"))
+        self.set_base = tk.StringVar(value=str(self.cfg.get("base", "grey")).capitalize())
+        label("Accent colour")
+        h = holder()
+        ttk.Combobox(h, textvariable=self.set_accent, values=list(ACCENT_NAMES.values()), width=14, state="readonly").pack(side="left", padx=(0, PX))
+        hint(h, "Applies after restart")
+        r[0] += 1
+        label("Base")
+        h = holder()
+        ttk.Combobox(h, textvariable=self.set_base, values=["Grey", "Black"], width=14, state="readonly").pack(side="left", padx=(0, PX))
+        hint(h, "Applies after restart")
+        r[0] += 1
+        label("UI scale (font + row height)")
+        h = holder()
+        v = tk.StringVar(value=str(self.cfg.get("ui_scale", 1.0)))
+        self.sn["ui_scale"] = v
+        ttk.Entry(h, textvariable=v, width=10).pack(side="left", padx=(0, PX))
+        hint(h, "Applies after restart")
+        r[0] += 1
+        section("General")
         self.set_upd = tk.BooleanVar(value=bool(self.cfg.get("update_on_start", False)))
-        ttk.Checkbutton(f, text="Check for updates on start ('git pull' once; off by default)",
-                        variable=self.set_upd).grid(row=r, column=1, sticky="w", pady=2)
-        r += 1
-        ttk.Label(f, text=f"{APP_NAME} {APP_VERSION}   |   config: {CONFIG_PATH}").grid(row=r, column=0, columnspan=3, sticky="w", padx=8, pady=(12, 8))
-        self.set_last = f.grid_slaves(row=r, column=0)[0]
+        label("Updates")
+        ttk.Checkbutton(holder(), text="Check for updates on start ('git pull' once; off by default)", variable=self.set_upd).pack(side="left")
+        r[0] += 1
+        ttk.Label(f, text=f"{APP_NAME} {APP_VERSION}   |   Config: {CONFIG_PATH}", style="Dim.TLabel").grid(
+            row=r[0], column=0, columnspan=3, sticky="w", padx=PX, pady=(24, 12))
+        self.set_last = f.grid_slaves(row=r[0], column=0)[0]
+        ttk.Label(f, text="Every change is saved at once (montage_data\\config.json next to montage.py).", style="Dim.TLabel").grid(
+            row=r[0] + 1, column=0, columnspan=3, sticky="w", padx=PX, pady=(0, 12))
+        self.set_last = f.grid_slaves(row=r[0] + 1, column=0)[0]
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_upd]:
+                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def save_settings(self):
         self.flush_settings()
-        out("settings saved")
+        self.save_status.set("Saved \u2713")
+        self.root.after(1500, lambda: self.save_status.set("All changes saved"))
+        out("Settings saved")
         self.run_task("clips", self.load_clips)
+
+    # ---- changelog popout (V5.57)
+    def show_changelog(self):
+        old = getattr(self, "cl_win", None)
+        if old is not None and old.winfo_exists():
+            old.deiconify()
+            old.lift()
+            return
+        win = self.cl_win = tk.Toplevel(self.root)
+        win.title(f"{APP_NAME} changelog")
+        win.configure(bg=self.pal["bg"])
+        win.geometry("780x640")
+        win.minsize(420, 300)
+        set_window_icon(win)
+        fr = ttk.Frame(win, padding=(12, 12, 12, 8))
+        fr.pack(side="top", fill="both", expand=True)
+        txt = tk.Text(fr, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"], relief="flat", bd=0,
+                      highlightthickness=1, highlightbackground=self.pal["border"], padx=16, pady=12, font=("Segoe UI", F(10)),
+                      selectbackground=self.pal["sel"], selectforeground=self.pal["sel_fg"], spacing1=2, spacing3=2)
+        sb = ttk.Scrollbar(fr, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.tag_configure("ver", font=("Segoe UI", F(14), "bold"), foreground=self.pal["acc"], spacing1=16, spacing3=4)
+        txt.tag_configure("sub", font=("Segoe UI", F(10), "bold"), spacing1=6)
+        txt.tag_configure("bul", lmargin1=14, lmargin2=28)
+        for kind, line in changelog_lines():
+            txt.insert("end", line + "\n", {"ver": "ver", "sub": "sub", "bul": "bul"}.get(kind, ""))
+        txt.configure(state="disabled")
+        bar = ttk.Frame(win, padding=(12, 0, 12, 12))
+        bar.pack(side="bottom", fill="x")
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        self.cl_text = txt
+
+
+ACCENT_NAMES = {"lime": "Lime green", "yellow": "Yellow", "orange": "Orange", "red": "Red", "pink": "Pink", "purple": "Purple"}
+CHANGELOG_PATH = HERE / "CHANGELOG.md"          # next to montage.py (absolute): works from any working folder
+
+
+def changelog_lines(path=None):
+    """CHANGELOG.md as (kind, text) lines for the popout: ver = '## ' version heading, sub = '### ', bul = '- ' bullet, '' = text."""
+    try:
+        raw = Path(path or CHANGELOG_PATH).read_text(encoding="utf-8").splitlines()
+    except OSError as ex:
+        return [("", f"CHANGELOG.md was not found next to montage.py ({ex}).")]
+    res = []
+    for ln in raw:
+        if not res and not ln.startswith("## "):
+            continue                                              # the file title and intro; the popout starts at the newest version
+        if ln.startswith("## "):
+            res.append(("ver", ln[3:].strip()))
+        elif ln.startswith("### "):
+            res.append(("sub", ln[4:].strip()))
+        elif ln.lstrip().startswith(("- ", "* ")):
+            res.append(("bul", "\u2022 " + ln.lstrip()[2:].strip()))
+        elif ln.strip():
+            res.append(("", ln.strip()))
+    return res
 
 
 def grab_gray_bgr(path, t, w, h):
@@ -7692,11 +8110,10 @@ for _g in GAMES:
     REQUIRED_BUTTONS[f"auto:{_g}:Dry plan"] = ("Auto", f"task:{_g} Dry plan")
     REQUIRED_BUTTONS[f"auto:{_g}:Preview 720p / 20 s"] = ("Auto", f"task:{_g} Preview 720p / 20 s")
 REQUIRED_BUTTONS.update({
-    "Exclude ticked from montages": ("Manual", "write:exclude.txt"),
     "manual:dry": ("Manual", "task:manual dry"), "manual:preview": ("Manual", "task:manual preview"),
     "manual:render": ("Manual", "task:manual render"),
     "Tick all shown": ("Manual", "ticked"), "Untick all": ("Manual", "unticked"), "Tick clips with kills": ("Manual", "ticked"),
-    "Tick newest": ("Manual", "ticked"), "Tick whole folder": ("Manual", "ticked"), "Reload list": ("Manual", "task:clips"),
+    "Tick newest": ("Manual", "ticked"), "Reload list": ("Manual", "task:clips"),
     "Random pick": ("Manual", "task:random pick"), "Used filter": ("Manual", None),
     "Play selected song": ("Manual", "open:song.mp3"),
     "Refresh": ("Songs", "task:matches"), "Change match for selected file...": ("Songs", "info"),
@@ -7709,7 +8126,7 @@ REQUIRED_BUTTONS.update({
     "Rescan this clip": ("Troubleshoot", "info"), "Before/after preview": ("Troubleshoot", "info"),
     "Re-measure": ("Troubleshoot", "task:bars"),
     "Song map (Manual)": ("Manual", "window"), "Song map of selected file...": ("Songs", "window"),
-    "Save settings": ("Settings", "write:config.json"),
+    "Save settings": ("Settings", "write:config.json"), "Changelog": ("Settings", "window"),
     "Optimal length": ("Manual", None), "Style": ("Manual", None),
     "Open folder": (None, "open:"), "Open video": (None, None), "Cancel": (None, None),
 })
@@ -7744,10 +8161,8 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
             return None
         app.nb.select(app.tabs["Manual"])
         root.update()
-        if app.more_open or app.named["Tick whole folder"].winfo_viewable() or app.named["Exclude ticked from montages"].winfo_viewable():
-            fails.append("'More filters & actions' is not collapsed by default")
-        if "More filters" not in app.named:
-            fails.append("button missing: More filters & actions")
+        if "More filters" not in app.named or app.named["More filters"].winfo_class() != "TCombobox":
+            fails.append("'More filters & actions' is not a dropdown like 'Show'")
         root.geometry(f"{sizes[0][0]}x{sizes[0][1]}+0+0")
         for _ in range(8):
             root.update()
@@ -7759,16 +8174,10 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
         if app.ctree.winfo_height() < 260:
             fails.append(f"{sizes[0][0]}x{sizes[0][1]}: the clip list is only {app.ctree.winfo_height()} px high by default")
         for W, H in sizes:
-            app.toggle_more(False)
             root.geometry(f"{W}x{H}+0+0")
             for tname in app.tabs:
                 app.nb.select(app.tabs[tname])
                 root.update()
-                if tname == "Manual":
-                    app.toggle_more(True)                          # the section's buttons are checked while it is open
-                    for _ in range(3):
-                        root.update()
-                        time.sleep(0.05)
                 if tname == "Settings":
                     for _ in range(3):                             # the canvas lays itself out ~100 ms after a resize
                         root.update()
@@ -7802,7 +8211,6 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
                         fails.append(f"{W}x{H} Settings: the last setting is not reachable by scrolling (bottom at {ly}, view ends {cy})")
                     cv.yview_moveto(0.0)
                     root.update()
-        app.toggle_more(False)
         root.geometry(f"{sizes[0][0]}x{sizes[0][1]}+0+0")
         # wiring: fake one clip and one song so the Manual buttons have something to act on
         fake = {"path": "x/clip.mp4", "name": "clip.mp4", "folder": "VALORANT", "mtime": time.time(), "dur": 20, "kills": 2, "ks": [3.0, 4.0]}
@@ -7827,7 +8235,7 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
             if name == "Play selected file":
                 app.mtree.insert("", "end", iid="x/song.mp3", text="song.mp3", values=("t", "a", "128", 100, "ok"))
                 app.mtree.selection_set("x/song.mp3")
-            if name in ("Tick all shown", "Tick clips with kills", "Tick newest", "Tick whole folder"):
+            if name in ("Tick all shown", "Tick clips with kills", "Tick newest"):
                 app.ticked = set()
                 app.m_folder.set("VALORANT")
             root.update()
@@ -7855,6 +8263,19 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
             app.m_folder.set("All folders")
             if name == "Untick all":
                 app.ticked = {fake["path"]}
+        # V5.57: the dropdown items run their actions (Tick whole folder, Exclude ticked) and set filters
+        app.nb.select(app.tabs["Manual"])
+        app.ticked = set()
+        app.m_folder.set("VALORANT")
+        app.more_pick("Tick whole folder")
+        if app.ticked != {fake["path"]}:
+            fails.append("dropdown item 'Tick whole folder' did not tick the folder")
+        calls.clear()
+        app.more_pick("Exclude ticked from montages")
+        if "write:exclude.txt" not in calls:
+            fails.append("dropdown item 'Exclude ticked from montages' is not wired")
+        app.m_folder.set("All folders")
+        app.ticked = set()
         # Optimal length + Auto style: offered, default in a fresh config, and passed to the job by the Manual buttons
         if DEFAULT_CONFIG.get("length_s") != "optimal" or DEFAULT_CONFIG.get("style") != "auto":
             fails.append("defaults are not length Optimal + style Auto")
@@ -7967,14 +8388,14 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
         try:
             for inc, n_txt, want in ((False, "7", 7), (True, "7", 7), (False, "50", 20), (True, "50", 40)):
                 app.m_incl_used.set(inc)
-                app.m_n.set(n_txt)
+                app.m_rand_n.set(n_txt)
                 app.ticked = set()
                 app.random_pick_ticks()
                 pump()
                 if len(app.ticked) != want or (not inc and any(app.byp[p_]["used"] for p_ in app.ticked)):
                     fails.append(f"random pick N={n_txt} include used={inc}: ticked {len(app.ticked)} (expected {want}, unused only: {not inc})")
             app.m_incl_used.set(False)
-            app.m_n.set("")
+            app.m_rand_n.set("")
             app.ticked = set()
             app.random_pick_ticks()
             pump()
@@ -7982,7 +8403,7 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
                 fails.append("random pick with an empty number box did not use the Optimal estimate")
         finally:
             app.run_task = logged_rt
-            app.m_n.set("15")
+            app.m_rand_n.set("15")
             app.m_incl_used.set(False)
             app.ticked = set()
         # V5.56: no list refills while the window is being resized; dividers redraw on release only

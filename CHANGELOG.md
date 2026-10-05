@@ -1,0 +1,134 @@
+# Changelog
+
+Newest first. Rebuilt from the git history (commit messages and diffs); nothing here is guessed. Where the history does not say what a
+version contained, the entry says "Details not recorded". Dates are the commit dates.
+
+**Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
+
+## V5.57 - 2026-10-05
+- Mouse wheel never changes a value any more (comboboxes, spinboxes, sliders, option menus on every tab); the wheel scrolls the page instead.
+- Settings rebuilt on one grid: section headers, a fixed label column, uniform row padding and extra space between sections.
+- "Save settings" moved to a fixed footer bar at the bottom of the Settings tab with a status label ("All changes saved" / "Saved ✓"). Autosave stays on.
+- Themes are back: accent colour (Lime green, Yellow, Orange, Red, Pink, Purple) and base (Grey, Black), 12 combinations. Default stays grey + lime. Applies after restart.
+- "More filters & actions" is now a dropdown (same widget and style as "Show"); its list opens over the layout and never changes the window or clip list size.
+- Button feedback: hover and pressed look, busy state while an action runs (no double clicks), short result on the button ("Done ✓", "Ticked 12 clips") and in the status line.
+- Random pick fixed: it has its own number box (default 15) that is never shared with "Tick newest", ticks exactly N random clips (all of them, with a status message, if fewer are eligible), respects the filters and "Include used clips".
+- Changelog button in Settings opens this file in a popout window.
+- Cleanup of GUI labels, messages and column headings (sentence case, typos, alignment).
+- New Settings > Audio mode: "Auto (V5.56)" (default) or "Legacy (V5.55)" (the V5.55 audio path: loudest track, per-game "game audio track" ignored). The plan log shows `[audio: auto V5.56]` or `[audio: legacy V5.55]`. If the Auto path fails or gives silent / missing audio, that render falls back to Legacy and shows "Auto audio failed, used Legacy V5.55".
+- Detection, planner and render logic are unchanged.
+
+## V5.56 - 2026-10-05
+- Montager name and its own taskbar identity.
+- Game audio track pick per game (auto / 1 / 2 / 3); audio track choice now uses gunshot onsets and never picks a silent track (replaces "loudest track").
+- Settings autosave; scrollable Settings tab.
+- Grey + lime theme as the single theme (the theme option, `duck_db` and `game_under_music_db` config keys were removed).
+- Collapsible "More filters & actions" section in Manual.
+- Resize debounce (no list refills while the window is resized).
+- Random pick uses the number box (N).
+
+## V5.55 - 2026-10-05
+- Frontend only: Sun Valley theme (fallback: clam), drag dividers with remembered layout, "used" column and filter, Random pick via Optimal, Render shows the plan first.
+
+## V5.5 - 2026-10-05
+- pythonw launcher and icon.
+- Optional `git pull` on start.
+- Kill cache survives updates (re-link + rescan reasons).
+- Valorant knife kills count.
+- Pre-clip / same-victim duplicate check.
+- A rejected stitch is re-planned on the single clip.
+
+## V5.44
+Details not recorded. No commit, tag or note in the repository carries this version number.
+
+## V5.43 - 2026-10-05
+- Tail rule extends the end only.
+- V5.42 ending and order restored.
+- No kill in two takes.
+- Fake duplicate kills dropped (Valorant + CS2).
+
+## V5.42B - 2026-10-05
+Five items, one commit each:
+- Item 1: knife and revive/resurrect rules are Valorant-only; CS2 weapon icon = largest long icon (modifier icons never taken for it). The V5.42 green-victim-side revive rule had read CS2 CT-blue names as green and the 5:1 knife rule caught AWP/rifle icons, so CS2 gun kills (including a smoke kill) were dropped. The game is passed through analyse_entry / ocr_rows / classify_row; the smoketest gained a CS2 row check.
+- Item 2: CS2 '火斧' counts as my name on either side (kill/death/assist rules unchanged); the plan prints how many rows it recovered.
+- Item 3: two files showing the same kills (same victims at matching times) are one event, whatever their file times (2+ shared victims at one consistent offset, or one shared victim whose kill frame is the same footage). Before, only clips recorded within about 60 s of each other were compared, so a re-export or copy was placed twice.
+- Item 4: never cut before the kill is seen: a take's tail runs at least 0.4 s after my last kill row appears (measured from the row, not the estimated shot); dead-air jump-cuts also wait for each row; verify_cutlist checks the row tail (death / clip end excepted).
+- Item 5: Optimal = optimal_fit(clips, song, style): 80-150 s, never past the song, all usable ticked clips unless they really don't fit (weakest first, listed with why); section chosen to fit, ending on a phrase; a drop is a preference; Manual cut-list repair extends / shifts before dropping.
+- Also in this version: `out()` never crashes on a non-UTF-8 console.
+
+## V5.42 - 2026-10-05
+- Killfeed colour first: a green victim side is a revive / resurrect, never a kill or death.
+- Knife blade excluded.
+- Real-row fixtures in the smoketest.
+
+## V5.41 - 2026-10-05
+- Adaptive multikill dead-air jump-cuts (the music decides the allowance).
+- Optimal fits the song (120 s / music available, lists clips that didn't fit).
+- Sage resurrect rows are revives, never kills or deaths.
+
+## V5.4 - 2026-10-05
+- Montage never longer than the song section.
+- Status estimate = the real planner.
+- Manual uses every usable clip.
+- Optimal fits the song.
+- Auto style from song map + material.
+- Length / style WHY in the plan.
+
+## V5.3 - 2026-10-05
+- Clove self-revive rows are never kills and end the death lock.
+- One fight = one event = one take.
+
+## V5.2 - 2026-10-05
+- Effects: V4 centred zoom punches only, no flashes, no zoom/flash cuts.
+- Output: `<SONG>_<GAME>_<version>_<date>.mp4` names, plan txt/json in `logs\`, APP_VERSION in the window title.
+
+## Between V5.1 and V5.2 (no version label) - 2026-10-04
+- Render never aborts on a kill row outside the take; smooth float zoom, no shake.
+
+## V5.1 - 2026-10-04
+- V4 engine (planner, effects, render graph, audio mix) as the base with frame-exact kill placement; game audio 0.6 (V4 0.5); no ducking, no music automation except the 0.3 s fade-in and the final fade-out.
+- Clean start (music from frame 0), slow-mo ending with music + video fade from the final kill, output duration = plan.
+- Kill moment = refined gunshot (V4 anchored the shot, V5 the killfeed row).
+- Ported from V5: OCR upgrades, clip folders, no reuse, UI scale, sorting, Song map, SSIM, light theme, CLI, smoketest; stitch verification with single-clip fallback.
+- Song map: selective drops (sustained >= 4 bars, >= 16 bars apart); `songcheck` command.
+- `synccompare`, `rendercheck` (detector + barcode 1.0x check on the rendered file).
+- Optimal length (30-120 s) and Auto style as defaults, in Manual and Settings.
+- Smoketest: GUI Optimal/Auto wiring, audio tone check (steady tone within 1 dB).
+
+## V5 - 2026-10-04
+- Clip folders: explicit Valorant / CS2 folder lists (Settings); the list decides the game.
+- Song map per song (cached by mtime): beat grid locked to the CSV tempo, downbeats, 4/8-bar phrases, sections (intro / verse / build / drop / breakdown / outro), every drop, accents, rhythm strength, loudness. Songs tab > Song map view draws it.
+- Planner built from the map: first kills on the beat, a strong clip on every drop, calm sections with longer run-ups, ramped approaches in builds, soft start, slow-mo ending with the music and video fades starting at the final kill.
+- Frame-exact kills (first visible frame at native fps) and timestamp-exact render.
+- Effects: zoom punch, shake on bass hits, flash on drops, ramps before kills, slow-mo, ace freeze, transitions (hard, whip, zoom, flash, crossfade in calm sections only), subtle per-montage grade. Five recipes: hype, smooth, cinematic, aggressive, chill.
+- Take quality: 0.2-0.5 s tails, never into my death, 1.0x from 1 s before the first kill through the last kill, a kill frame in every take.
+- Duplicate and continuation clips merged; a multikill split across clips is stitched into one take. No clip is used twice.
+- Knife and utility kills excluded; ranking: ace > 4k > 3k > fast double > flick/HS single > plain.
+- Sound: per-clip loudness normalising (picks the loudest audio stream), game audio 4 dB under the music, music ducked 4 dB around kills, limiter with latency compensation.
+- Detection: merges OCR variants of the same row, a single sighting under 90 needs a gunshot; `detectcheck` compares V4 and V5 rules on cached data.
+- Quality: 1080p clips pass through pixel-exact, NVENC p7 / hq / spatial AQ / cq16, SSIM check after every render.
+- GUI: UI scale, taller clip list, click-to-sort columns, Song map buttons.
+- Smoketest adds the planner checks and an end-to-end render whose kill-to-beat sync is measured from the output file.
+
+## V4 - 2026-10-04
+- Detection: RapidOCR on the killfeed region replaces template and scale matching (15 fps sampling, OCR only when the bright-text mask changed, rows grouped by y-centre and split at the weapon icon). KILL = FIREAXE first on the killer side (rapidfuzz partial_ratio >= 80), assist and utility rejected, DEATH = FIREAXE on the victim side. Rows tracked by content; each row's first visible frame refined by a pixel diff. Raw OCR boxes cached per clip, so rule changes need no rescan.
+- Calibration is optional: only the killfeed region per game, with top-right defaults.
+- Manual Step 3: Dry plan / Preview / Render packed first and always visible; Steps 1 and 2 shrink instead of clipping.
+- BPM: the CSV Tempo is the primary value and shows immediately; Energy and Danceability come from the CSV; librosa only refines the grid.
+- Light theme by default; dark stays available in Settings.
+- New `smoketest` command (GUI buttons exist, are visible and wired; OCR on generated KILL/DEATH frames). Selfcheck also runs the OCR test.
+
+## V3 - 2026-10-04
+- Row-first killer / victim detection, shared kill logic, per-clip atomic cache, real-time kills, one-to-one song matching, CSV tempo, GUI selection tools and theme. (Commit message only; no further details recorded.)
+
+## Megafix (no version number) - 2026-10-04
+- Folder-only clips, real multi-scale detection with raw-frame cache, killer-only / gunshot / death rules, song-anchored frame-exact planner, effect fallbacks, sync report, rebuilt GUI. (Commit message only; no further details recorded.)
+
+## First builder (no version number) - 2026-10-04
+- "Complete montage builder": GUI, kill detection, song analysis, planner, render engine. (Commit message only; no further details recorded.)
+
+## Stage 0 - 2026-10-04
+- `montage.py` with setup, selfcheck, inventory, tag.
+
+## Initial commit - 2026-10-04
+Details not recorded.
