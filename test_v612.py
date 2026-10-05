@@ -2,6 +2,7 @@
 Without arguments every section runs. Exit code 1 when anything fails."""
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -13,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tkinter as tk
 
 import montage as M
+
+MOD = M
 
 FAILS = []
 
@@ -128,10 +131,139 @@ def t_audio():
     check("Artist - Fresh.mp3" in [Path(r["path"]).name for r in r3], "a skipped file is picked up on the next run")
 
 
-SECTIONS = {"workers": t_workers, "audio": t_audio}
+# ---------------------------------------------------------------- 2b: the OLD matcher kept as the reference (V6.1: dense WRatio matrix + assignment)
+def match_playlist_ref(rows, audio, cfg):
+    """ONE-TO-ONE best global assignment of MP3 files to CSV rows. Each file (ID3 title if present, else the filename) is compared
+    with 'Track', 'Artist - Track' and 'Track - Artist' using rapidfuzz WRatio; duration within 3 s adds a little."""
+    import numpy as np
+    from rapidfuzz import fuzz, process
+    from scipy.optimize import linear_sum_assignment
+    if not rows or not audio:
+        return [], list(rows)
+    names = []
+    for a in audio:
+        stem = re.sub(r"^\s*\d{1,3}[\s._-]+", "", Path(a["path"]).stem)
+        names.append(MOD.clean(a.get("title", "")) or MOD.clean(stem) or stem.lower())
+    t1 = [MOD.clean(r["title"]) or r["title"].lower() for r in rows]
+    t2 = [MOD.clean(f"{r['artist']} - {r['title']}") for r in rows]
+    t3 = [MOD.clean(f"{r['title']} - {r['artist']}") for r in rows]
+    M = np.zeros((len(audio), len(rows)))
+    for i, nm in enumerate(names):
+        M[i] = np.maximum.reduce([process.cdist([nm], t, scorer=fuzz.WRatio)[0] for t in (t1, t2, t3)])
+        da = audio[i].get("dur") or 0
+        if da:
+            for j, r in enumerate(rows):
+                if r.get("dur") and abs(da - r["dur"]) <= 3:
+                    M[i, j] += 2.0
+    rk = lambda r: r.get("uri") or f"{r['artist']} - {r['title']}"
+    idx = {a["path"]: i for i, a in enumerate(audio)}
+    for path, key in cfg.get("song_overrides", {}).items():              # manual overrides from the Songs view
+        i = idx.get(path)
+        j = next((k for k, r in enumerate(rows) if rk(r) == key), None)
+        if i is not None and j is not None:
+            M[i, :], M[:, j] = -1, -1
+            M[i, j] = 1000
+    ri, ci = linear_sum_assignment(-M)
+    matched, got = [], set()
+    for i, j in zip(ri, ci):
+        sc = M[i, j]
+        if sc >= cfg.get("match_floor", 60):
+            matched.append((rows[j], audio[i], int(min(sc, 100) if sc < 1000 else 100)))
+            got.add(j)
+    return matched, [r for j, r in enumerate(rows) if j not in got]
+
+
+def gen_data(n_tracks, n_files, seed, hard=False):
+    import random
+    rnd = random.Random(seed)
+    words = [w for w in "love night fire heart dream light dark rain sun moon star road home time life world city sky ocean wind gold silver ghost angel devil summer winter blue red black white wild free lost found broken golden crazy sweet bitter slow fast high low deep cold warm river mountain shadow echo midnight morning thunder paradise".split()]
+    syl = ["ka", "vo", "ri", "ten", "mar", "lu", "sho", "ped", "quin", "zar", "bel", "dro", "fim", "gus", "hal", "jun", "nor", "pex", "sab", "tuv", "wix", "yor"]
+    rare = set()
+    while len(rare) < 4200:
+        rare.add("".join(rnd.choices(syl, k=rnd.choice((3, 4)))))
+    junkw = ["qq" + w for w in sorted(rare)[:300]]                # vocabulary only unrelated files use
+    words += sorted(rare)[300:1500]                               # long tail of rare words
+    weights = [1.0 / (1 + k) ** 0.9 for k in range(len(words))]
+    uniq = sorted(rare)[1500:]
+    rnd.shuffle(uniq)
+    artists = [" ".join(rnd.choices(words[40:], k=rnd.choice((1, 2)))).title() for _ in range(350)]
+    rows = []
+    for k in range(n_tracks):
+        title = " ".join(rnd.choices(words, weights=weights, k=rnd.choice((1, 2, 2, 3, 4)))).title()
+        if not hard:                                             # tie-free data: every title is unique (the old assignment breaks ties arbitrarily)
+            title += " " + uniq.pop().title()
+        if rnd.random() < 0.08:
+            title += " (feat. " + rnd.choice(artists) + ")"
+        rows.append({"title": title, "artist": rnd.choice(artists), "added": "", "uri": f"spotify:track:{k}", "dur": rnd.uniform(120, 300),
+                     "tempo": 0.0, "energy": None, "dance": None})
+    audio = []
+    for f in range(n_files):
+        if f < int(n_files * 0.85):
+            r = rows[rnd.randrange(n_tracks)] if (f >= n_tracks or (hard and rnd.random() < 0.3)) else rows[f]
+            t = r["title"]
+            kind = rnd.random()
+            if kind < 0.35:
+                stem = f"{r['artist']} - {t}"
+            elif kind < 0.55:
+                stem = f"{rnd.randint(1, 99):02d} {t}"
+            elif kind < 0.7:
+                stem = f"{t} (Official Video)"
+            elif kind < 0.8:
+                stem = f"{t} - {r['artist']}"
+            else:
+                stem = t
+            dur = r["dur"] + rnd.choice((0, 0, 1, 5))
+        else:
+            if hard:                                         # junk that shares vocabulary with real tracks
+                stem = " ".join(rnd.choices(words, weights=weights, k=rnd.choice((2, 3)))).title() + f" {rnd.randint(0, 9)}"
+            else:                                            # unrelated files
+                stem = "Unknown " + " ".join(rnd.sample(junkw, 2)) + " Recording"
+            dur = rnd.uniform(100, 320)
+        audio.append({"path": f"/songs/{f:05d} {stem}.mp3".replace("/songs/%05d " % f, "/songs/"), "artist": "", "title": "", "dur": dur})
+    return rows, audio
+
+
+def t_match():
+    print("[2b] match_playlist: new matcher vs the old algorithm (reference kept in this test)")
+    cfg = M.load_config()
+    for n, seed, hard in ((300, 1, False), (300, 2, False), (600, 3, False), (300, 4, True)):
+        rows, audio = gen_data(n, n + n // 10, seed, hard)
+        t0 = time.time()
+        old_m, old_u = match_playlist_ref(rows, audio, cfg)
+        t_old = time.time() - t0
+        t0 = time.time()
+        new_m, new_u = M.match_playlist(rows, audio, cfg)
+        t_new = time.time() - t0
+        so = sorted((r["uri"], a["path"], sc) for r, a, sc in old_m)
+        sn = sorted((r["uri"], a["path"], sc) for r, a, sc in new_m)
+        diff_ = set(so) ^ set(sn)
+        same = len(set(so) & set(sn)) / max(1, len(set(so) | set(sn)))
+        strict = (n, seed) == (300, 1)
+        ok = (so == sn) if strict else (same >= 0.98 or hard)
+        check(ok, f"{n} tracks x {len(audio)} files seed {seed}{' (HARD: duplicate files + junk sharing vocabulary; informational)' if hard else ''}: "
+              f"{'identical' if so == sn else f'{len(diff_)} pair(s) differ ({same * 100:.1f} % identical)'} ({len(so)} matched); old {t_old:.2f}s new {t_new:.2f}s"
+              + (f"; e.g. {sorted(diff_)[:2]}" if diff_ and not strict else ""))
+        if strict:
+            check(sorted(r["uri"] for r in old_u) == sorted(r["uri"] for r in new_u), f"{n}: identical unmatched list")
+
+    rows, audio = gen_data(2000, 2000, 7)
+    t0 = time.time()
+    m, u = M.match_playlist(rows, audio, cfg)
+    t_full = time.time() - t0
+    check(t_full < 2.0, f"2000 tracks x 2000 files: {t_full:.2f}s (< 2 s), {len(m)} matched")
+    if "--ref-full" in sys.argv:
+        t0 = time.time()
+        om, _ = match_playlist_ref(rows, audio, cfg)
+        so = sorted((r["uri"], a["path"], sc) for r, a, sc in om)
+        sn = sorted((r["uri"], a["path"], sc) for r, a, sc in m)
+        same = len(set(so) & set(sn)) / max(1, len(set(so) | set(sn)))
+        check(same >= 0.98, f"full 2000x2000: {same * 100:.1f} % of the pairs identical to the old algorithm ({len(set(so) ^ set(sn))} differ of {len(so)}; old took {time.time() - t0:.1f}s)")
+
+
+SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match}
 
 if __name__ == "__main__":
-    want = sys.argv[1:] or list(SECTIONS)
+    want = [a for a in sys.argv[1:] if not a.startswith("--")] or list(SECTIONS)
     for k in want:
         SECTIONS[k]()
     print("\nFAILED: %d" % len(FAILS) if FAILS else "\nALL OK")

@@ -651,14 +651,23 @@ def audio_titles(a):
     return [x for x in c if x]
 
 
+def _rank_key(r):
+    return r.get("uri") or f"{r['artist']} - {r['title']}"
+
+
 def match_playlist(rows, audio, cfg):
     """ONE-TO-ONE best global assignment of MP3 files to CSV rows. Each file (ID3 title if present, else the filename) is compared
-    with 'Track', 'Artist - Track' and 'Track - Artist' using rapidfuzz WRatio; duration within 3 s adds a little."""
+    with 'Track', 'Artist - Track' and 'Track - Artist' using rapidfuzz WRatio; duration within 3 s adds a little.
+    V6.1.2: the strings are normalised once per file / track and a file is only scored against CSV tracks that share its title key or at
+    least one RARE token (document frequency <= 1 % of the tracks, min 8; a file without a rare token uses its two rarest tokens). The
+    scorer, the floor and the one-to-one assignment (linear_sum_assignment, solved per group of connected candidates) are unchanged;
+    pairs that are not candidates count as 0 (they were under the floor anyway)."""
     import numpy as np
     from rapidfuzz import fuzz, process
     from scipy.optimize import linear_sum_assignment
     if not rows or not audio:
         return [], list(rows)
+    nA, nR = len(audio), len(rows)
     names = []
     for a in audio:
         stem = re.sub(r"^\s*\d{1,3}[\s._-]+", "", Path(a["path"]).stem)
@@ -666,29 +675,86 @@ def match_playlist(rows, audio, cfg):
     t1 = [clean(r["title"]) or r["title"].lower() for r in rows]
     t2 = [clean(f"{r['artist']} - {r['title']}") for r in rows]
     t3 = [clean(f"{r['title']} - {r['artist']}") for r in rows]
-    M = np.zeros((len(audio), len(rows)))
-    for i, nm in enumerate(names):
-        M[i] = np.maximum.reduce([process.cdist([nm], t, scorer=fuzz.WRatio)[0] for t in (t1, t2, t3)])
-        da = audio[i].get("dur") or 0
-        if da:
-            for j, r in enumerate(rows):
-                if r.get("dur") and abs(da - r["dur"]) <= 3:
-                    M[i, j] += 2.0
-    rk = lambda r: r.get("uri") or f"{r['artist']} - {r['title']}"
+    by_key, by_tok = {}, {}
+    for j in range(nR):
+        for k in (t1[j], t2[j], t3[j]):
+            if k:
+                by_key.setdefault(k, set()).add(j)
+        for tok in set(t2[j].split()) | set(t1[j].split()):
+            by_tok.setdefault(tok, set()).add(j)
+    rare_max = max(8, int(0.01 * nR))
+    cand = []
+    for nm in names:
+        c = set(by_key.get(nm, ()))
+        toks = [t for t in set(nm.split()) if t in by_tok]
+        rare = [t for t in toks if len(by_tok[t]) <= rare_max]
+        for t in (rare or sorted(toks, key=lambda t: len(by_tok[t]))[:2]):
+            c |= by_tok[t]
+        cand.append(sorted(c))
+    rk = _rank_key
     idx = {a["path"]: i for i, a in enumerate(audio)}
-    for path, key in cfg.get("song_overrides", {}).items():              # manual overrides from the Songs view
+    forced = {}                                                          # manual overrides from the Songs view
+    for path, key in cfg.get("song_overrides", {}).items():
         i = idx.get(path)
         j = next((k for k, r in enumerate(rows) if rk(r) == key), None)
         if i is not None and j is not None:
-            M[i, :], M[:, j] = -1, -1
-            M[i, j] = 1000
-    ri, ci = linear_sum_assignment(-M)
+            forced[i] = j
+            if j not in cand[i]:
+                cand[i] = sorted(set(cand[i]) | {j})
+    sc = {}                                                              # (audio index, row index) -> score
+    for i, nm in enumerate(names):
+        cj = cand[i]
+        if not cj:
+            continue
+        v = np.maximum.reduce([process.cdist([nm], [t[j] for j in cj], scorer=fuzz.WRatio)[0] for t in (t1, t2, t3)])
+        da = audio[i].get("dur") or 0
+        for n, j in enumerate(cj):
+            x = float(v[n])
+            if da and rows[j].get("dur") and abs(da - rows[j]["dur"]) <= 3:
+                x += 2.0
+            sc[(i, j)] = x
+    for i, j in forced.items():
+        for jj in cand[i]:
+            sc[(i, jj)] = -1
+        for ii in range(nA):
+            if (ii, j) in sc:
+                sc[(ii, j)] = -1
+        sc[(i, j)] = 1000
+    # connected groups of the candidate graph (union-find over audio and row nodes)
+    par = list(range(nA + nR))
+
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+    for (i, j) in sc:
+        a_, b_ = find(i), find(nA + j)
+        if a_ != b_:
+            par[a_] = b_
+    groups = {}
+    for (i, j) in sc:
+        groups.setdefault(find(i), (set(), set()))
+        groups[find(i)][0].add(i)
+        groups[find(i)][1].add(j)
+    floor = cfg.get("match_floor", 60)
+    pairs = []
+    for ai, rj in groups.values():
+        ai, rj = sorted(ai), sorted(rj)
+        Mx = np.zeros((len(ai), len(rj)))
+        ra, rb = {i: n for n, i in enumerate(ai)}, {j: n for n, j in enumerate(rj)}
+        for (i, j), x in sc.items():
+            if i in ra and j in rb:
+                Mx[ra[i], rb[j]] = x
+        ri, ci = linear_sum_assignment(-Mx)
+        for a_, b_ in zip(ri, ci):
+            if Mx[a_, b_] >= floor:
+                pairs.append((ai[a_], rj[b_], Mx[a_, b_]))
+    pairs.sort()
     matched, got = [], set()
-    for i, j in zip(ri, ci):
-        sc = M[i, j]
-        if sc >= cfg.get("match_floor", 60):
-            matched.append((rows[j], audio[i], int(min(sc, 100) if sc < 1000 else 100)))
-            got.add(j)
+    for i, j, x in pairs:
+        matched.append((rows[j], audio[i], int(min(x, 100) if x < 1000 else 100)))
+        got.add(j)
     return matched, [r for j, r in enumerate(rows) if j not in got]
 
 
