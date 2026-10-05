@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.1.3"
+APP_VERSION = "V6.1.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6880,8 +6880,12 @@ class App:
         ttk.Entry(c3, textvariable=self.m_seed, width=8).pack(side="left")
         for v_ in (self.m_seed, self.m_style):
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
-        self.m_status = tk.StringVar(value="Tick some clips.")
-        ttk.Label(s3, textvariable=self.m_status, font=("Segoe UI", F(10), "bold"), wraplength=1100).pack(anchor="w", pady=2)
+        self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
+        self.m_status_disp = tk.StringVar(value="Tick some clips.")
+        self.m_status_lbl = ttk.Label(s3, textvariable=self.m_status_disp, font=("Segoe UI", F(10), "bold"), width=1, anchor="w")
+        self.m_status_lbl.pack(anchor="w", fill="x", pady=2)
+        self.m_status.trace_add("write", self.fit_status)
+        self.m_status_lbl.bind("<Configure>", self.fit_status)
         self.mpane = mid = self.make_pane(f, "vertical")           # V5.55: drag divider between the clip list and the song list
         mid.pack(side="top", fill="both", expand=True)
         s1 = ttk.LabelFrame(mid, text="Step 1: tick the clips (click ticks, Shift+click a range)", padding=4)
@@ -7272,6 +7276,40 @@ class App:
                 f.write(p + "\n")
         out(f"Excluded {len(self.ticked)} clip(s) from montages (montage_data\\exclude.txt, one path per line)")
 
+    def fit_status(self, *_):
+        """V6.1.5: the Manual status is exactly one line: the short text is cut with an ellipsis to the width the label has."""
+        try:
+            import tkinter.font as tkfont
+            full = self.m_status.get().replace("\n", " ")
+            w = self.m_status_lbl.winfo_width() - 8
+            if w > 40:
+                f = tkfont.Font(root=self.root, font=self.m_status_lbl.cget("font"))
+                if f.measure(full) > w:
+                    lo, hi = 0, len(full)
+                    while lo < hi:                                 # longest prefix that fits together with the ellipsis
+                        mid = (lo + hi + 1) // 2
+                        if f.measure(full[:mid].rstrip() + "\u2026") <= w:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    full = full[:lo].rstrip() + "\u2026"
+            if self.m_status_disp.get() != full:
+                self.m_status_disp.set(full)
+        except tk.TclError:
+            pass
+
+    def log_summary(self, head, msg=None):
+        """V6.1.5: the full Manual summary (clips that didn't fit, clips that can't form a take and why, song section, usable events) as
+        normal log lines each time it changes; an identical summary is not written twice in a row."""
+        full = head if not msg else f"{head}, {msg}"
+        if full == getattr(self, "_last_summary", None):
+            return
+        self._last_summary = full
+        parts = re.split(r"  \|  |; (?=\d+ can't form|fixed length)", msg) if msg else []
+        out("Manual: " + head)
+        for p_ in parts:
+            out("   " + p_)
+
     def update_status(self):
         """Status line. The length comes from the REAL planner (make_plan on the already-scanned ticked clips, same song, style
         and seed as the render), run quietly in the background after a short pause, so the estimate is the plan."""
@@ -7289,7 +7327,11 @@ class App:
         if uns:
             txt += f" ({uns} not scanned yet - they get scanned first; the estimate leaves them out)"
         self.m_head = txt
-        self.m_status.set(txt + (", montage length: estimating ..." if kills else "") + f", song: {song}")
+        short = f"{len(tk_)} clips ticked \u00b7 {kills} kills" + (f" \u00b7 {uns} not scanned" if uns else "")
+        self.m_short = short
+        self.m_status.set(short + (" \u00b7 estimating ..." if kills else "") + f" \u00b7 song: {song}")
+        if not kills:
+            self.log_summary(txt + f", song: {song}")
         if getattr(self, "_est_after", None):
             self.root.after_cancel(self._est_after)
             self._est_after = None
@@ -7315,7 +7357,7 @@ class App:
         sel = self.stree.selection()
         args = dict(paths=paths, song_path=None if not sel or sel[0] == "auto" else sel[0],
                     target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=self.m_style.get(), seed=self.est_seed())
-        game, head = self.m_game.get(), self.m_head
+        game, head, short = self.m_game.get(), self.m_head, getattr(self, "m_short", "")
         self.est_gen = getattr(self, "est_gen", 0) + 1
         gen = self.est_gen
         self.est_running = True
@@ -7325,15 +7367,19 @@ class App:
             try:
                 plan, _ = make_plan(load_config(), game, scan=False, **args)
                 msg = self.estimate_text(plan, len(paths))
+                sg_ = plan["song"]
+                msg_short = f"montage {plan['duration']:.0f} s \u00b7 song: {sg_['title'] or Path(sg_['path']).stem} \u00b7 {plan['recipe']}"
             except Exception as ex:
                 msg = f"cannot plan yet: {ex}"
+                msg_short = "cannot plan yet (see log)"
             finally:
                 QUIET.on = False
 
             def show():
                 self.est_running = False
                 if gen == self.est_gen:
-                    self.m_status.set(f"{head}, {msg}")
+                    self.m_status.set(f"{short} \u00b7 {msg_short}")
+                    self.log_summary(head, msg)
                 if self.pending and not self.busy:
                     n, fn, a = self.pending.pop(0)
                     self.run_task(n, fn, *a)
