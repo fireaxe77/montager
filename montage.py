@@ -643,6 +643,7 @@ TRACK_KEEP_S = 8.0              # a killfeed row is remembered this long (so it 
 CACHE_V = 5                     # bump when the cached per-frame format changes (5 = raw OCR boxes)
 ALGO = f"v{CACHE_V}"
 MY_NAME = "fireaxe"
+MY_NAME_CS2 = "火斧"               # V5.42B: CS2 renders my name 'fireaxe火斧'; OCR garbles 'fireaxe' but reads these two reliably
 NAME_MIN = 80                   # rapidfuzz partial_ratio needed for FIREAXE
 DEFAULT_REGION = {"valorant": [0.58, 0.05, 1.0, 0.42], "cs2": [0.58, 0.03, 1.0, 0.40]}   # fractions of the content rect
 
@@ -885,6 +886,18 @@ def ocr_rows(boxes, blobs, game=None):
         d["vtext"] = " ".join(b[4] for b in d["victim"])
         d["ks"], kpos = name_match(d["ktext"]) if d["killer"] else (0.0, 0)
         d["vs"], _ = name_match(d["vtext"]) if d["victim"] else (0.0, 0)
+        if game == "cs2":                                  # V5.42B: '火斧' is my name too (garbled 'fireaxe' before it is part of it)
+            for side in ("k", "v"):
+                txt = d[side + "text"]
+                i = txt.find(MY_NAME_CS2)
+                if i < 0 or d[side + "s"] >= 100:
+                    continue
+                if d[side + "s"] < NAME_MIN:
+                    d["cjk"] = True                        # only '火斧' makes this row mine
+                    if side == "k":
+                        j = txt.rfind("+", 0, i)           # 'killer + fireaxe火斧' = my assist; otherwise all of it is my name
+                        kpos = j + 1 if j >= 0 else 0
+                d[side + "s"] = 100.0
         pre = d["ktext"][:kpos]
         d["before"] = pre.strip() if ("+" in pre or len(_alnum(pre)) >= 3) else ""
     return res
@@ -1196,6 +1209,7 @@ def merge_variants(tracks):
         if not _alnum(hit["v"]) and _alnum(t["v"]):
             hit.update(v=t["v"], vtext=t["vtext"])
         hit["hs"] = hit["hs"] or t["hs"]
+        hit["cjk"] = hit.get("cjk", False) and t.get("cjk", False)
         hit["ks"], hit["vs"] = max(hit["ks"], t["ks"]), max(hit["vs"], t["vs"])
     return out_
 
@@ -1265,6 +1279,7 @@ def analyse_entry(entry, cfg, game=None):
             hit = got.get(i)
             if hit:
                 hit.update(last=f, y=r["y"], hits=hit["hits"] + 1, hs=hit["hs"] or (r["hs"] and f - hit["first"] <= 20))
+                hit["cjk"] = hit.get("cjk", False) and bool(r.get("cjk"))         # recovered only if no frame read 'fireaxe'
                 hit["votes"].append(v)
                 hit["frames"].add(f)
             else:
@@ -1272,12 +1287,12 @@ def analyse_entry(entry, cfg, game=None):
                 tracks.append({"first": first, "seen": f, "last": f, "y": r["y"], "hits": 1, "k": r["ktext"].lower(), "v": r["vtext"].lower(),
                                "gun": r["gun"], "split": r["split"], "iw": r["icon"][2] if r["icon"] else 0, "hs": r["hs"],
                                "ks": r["ks"] / 100, "vs": r["vs"] / 100, "votes": [v], "ktext": r["ktext"], "vtext": r["vtext"], "frames": {f},
-                               "weapon": weapon_class(r, game), "box": [min(b[0] for b in r["boxes"]), min(b[1] for b in r["boxes"]),
+                               "cjk": bool(r.get("cjk")), "weapon": weapon_class(r, game), "box": [min(b[0] for b in r["boxes"]), min(b[1] for b in r["boxes"]),
                                                                   max(b[2] for b in r["boxes"]), max(b[3] for b in r["boxes"])]})
         prev_f = f
     tracks = merge_variants(tracks)
     res_why = resurrect_rows(tracks, dead_others) if game != "cs2" else {}      # V5.42B: Valorant only
-    kills, deaths, revives, rej, vis = [], [], [], [], []
+    kills, deaths, revives, rej, vis, cjk = [], [], [], [], [], {}
     for t in tracks:
         tt = round(t["first"] / FPS + off, 3)
         tally = {}
@@ -1295,6 +1310,9 @@ def analyse_entry(entry, cfg, game=None):
         if "revive" in tally:                                  # a self-revive row misread now and then stays a revive
             verdicts = [a for a in verdicts if tally[a][0] > tally["revive"][0]] or ["revive"]
         row = f"[{t['ktext'] or '-'}] {'gun' if t['gun'] else 'util'} [{t['vtext'] or '-'}]"
+        if t.get("cjk"):
+            cjk[verdicts[0]] = cjk.get(verdicts[0], 0) + 1
+            row += f" (my name by '{MY_NAME_CS2}')"
         for a in verdicts:
             why = tally[a][1]
             mine.append({"t": tt, "row": row, "verdict": a, "why": why, "hits": t["hits"]})
@@ -1311,7 +1329,7 @@ def analyse_entry(entry, cfg, game=None):
                 vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
                 kills.append({"t": tt, "ks": t["ks"], "hs": bool(t["hs"]), "row": row, "hits": t["hits"], "victim": t["vtext"],
                               "weapon": t.get("weapon", "gun"), "box": t.get("box"), "t_last": round(t["last"] / FPS + off, 3),
-                              "needs_shot": need_shot})
+                              "needs_shot": need_shot, **({"cjk": True} if t.get("cjk") else {})})
             elif a == "death":
                 deaths.append(tt)
                 rej.append({"t": tt, "reason": f"{why} - not a kill", "ks": t["vs"]})
@@ -1324,7 +1342,7 @@ def analyse_entry(entry, cfg, game=None):
     kills.sort(key=lambda k: k["t"])
     return {"kills": kills, "deaths": sorted(deaths), "revives": sorted(revives), "rej": sorted(rej, key=lambda r: r["t"]),
             "vis": vis, "best_k": bk, "best_v": bv, "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(tracks),
-            "rows_max": seen_rows, "ocr_calls": len(entry.get("ocr", []))}
+            "rows_max": seen_rows, "ocr_calls": len(entry.get("ocr", [])), "cjk": cjk}
 
 
 def _analyse_entry_v4(entry, cfg):
@@ -1728,7 +1746,7 @@ def game_pool(cfg, game, paths=None):
         pass
     ps = set(paths) if paths is not None else None
     stats = {"tagged": 0, "scanned": 0, "with_kills": 0}
-    pool, allrej = [], []
+    pool, allrej, cjk = [], [], {}
     for r in scan_clips(cfg):
         if r.get("error") or not r.get("w") or r.get("game") != game or (ps is not None and r["path"] not in ps):
             continue
@@ -1740,11 +1758,17 @@ def game_pool(cfg, game, paths=None):
             continue
         stats["scanned"] += 1
         a = analyse_entry(e, cfg, game)
+        for k_, v_ in a.get("cjk", {}).items():
+            cjk[k_] = cjk.get(k_, 0) + v_
         for j in a["rej"]:
             allrej.append((Path(r["path"]).name, j))
         if a["kills"]:
             pool.append({"rec": r, "kills": a["kills"], "deaths": a["deaths"], "revives": a["revives"], "vis": a["vis"], "rej": []})
     stats["with_kills"] = len(pool)
+    if game == "cs2":
+        stats["cjk"] = cjk
+        out(f"CS2 name '{MY_NAME_CS2}': {sum(cjk.values())} rows recovered that 'fireaxe' alone missed"
+            + (" (" + ", ".join(f"{v} {k}" for k, v in sorted(cjk.items())) + ")" if cjk else ""))
     stats["audio"] = verified_kills(pool, cfg) if pool else {"raw": 0, "no_shot": 0, "death_lock": 0, "kept": 0}
     for it in pool:
         nm = Path(it["rec"]["path"]).name
@@ -6694,6 +6718,22 @@ def cs2_rows_test(verbose=True):
             out(f"  CS2 {nm}: " + "; ".join(f"{v.upper()} ({why})" for v, why in vs) + f" | weapon {wc}")
         if [v for v, _ in vs] != ["kill"] or wc != ["gun"]:
             fails.append(f"CS2 {nm}: expected one gun KILL, got {vs} weapon {wc}")
+    # my CS2 name 'fireaxe火斧' with the latin part garbled by OCR: '火斧' alone makes it my row (OCR boxes as the scanner stores them)
+    for ktext, vtext, want in (("froxo火斧", "enemy", "kill"), ("enemy", "froxo火斧", "death"), ("enemy + froxo火斧", "victim", "reject")):
+        boxes = lambda f: [[60, 20, 260, 50, ktext, 0.9, 12, ""], [420, 20, 540, 50, vtext, 0.9, 12, ""]]
+        blobs = [[290, 24, 110, 22, 0.6]]
+        rows = ocr_rows(boxes(0), blobs, "cs2")
+        vs = [v for r in rows for v, _ in classify_row(r)]
+        a = analyse_entry({"ocr": [[f, f, boxes(f), blobs] for f in range(12, 60, 4)], "frames": 60, "v_off": 0.0}, {}, "cs2")
+        got = {"kill": len(a["kills"]), "death": len(a["deaths"])}
+        if verbose:
+            out(f"  CS2 name '{ktext}' -> '{vtext}': {vs}; scanned: kills {[k['t'] for k in a['kills']]} deaths {a['deaths']} "
+                f"| recovered by '{MY_NAME_CS2}': {a['cjk']}")
+        if vs != [want] or (want != "reject" and got[want] != 1) or a["cjk"] != {want: 1}:
+            fails.append(f"CS2 name '{ktext}' -> '{vtext}': expected {want.upper()} via '{MY_NAME_CS2}', got {vs} {got} {a['cjk']}")
+        if ocr_rows(boxes(0), blobs, "valorant") and any(v != "none" for r in ocr_rows(boxes(0), blobs, "valorant")
+                                                          for v, _ in classify_row(r)):
+            fails.append(f"Valorant: '{ktext}' must not count as my name")
     return fails
 
 
@@ -7016,7 +7056,7 @@ def cmd_smoketest(args):
     try:
         f = cs2_rows_test()
         fails += f
-        out("  OK: every CS2 row is a gun kill (no knife / utility / revive in CS2)" if not f else "\n".join("  FAIL " + x for x in f))
+        out("  OK: every CS2 row is a gun kill (no knife / utility / revive in CS2); '火斧' rows are mine" if not f else "\n".join("  FAIL " + x for x in f))
     except Exception:
         fails.append("CS2 row test crashed")
         out("  FAIL CS2 rows: " + traceback.format_exc())
