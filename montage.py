@@ -56,7 +56,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V6.1"
+PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
+
+APP_VERSION = "V6.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5626,6 +5628,7 @@ def F(size):
     return max(7, int(round(size * UI_SCALE[0])))
 
 
+SIMPLE_THEME = os.environ.get("MONTAGE_SIMPLE_THEME") == "1"      # V6.2: A/B test switch: built-in clam theme instead of Sun Valley
 SV_THEME = [False]                                    # True when the Sun Valley ttk theme (sv-ttk) is active
 THEME_VER = "t3"
 
@@ -5703,29 +5706,37 @@ def apply_theme(root, scale=None, accent="lime", base="grey"):
     if scale:
         UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
     pal = make_palette(accent, base)
+    if SIMPLE_THEME:                                               # V6.2 A/B: ttk "clam" + the same palette, no sv_ttk image elements
+        SV_THEME[0] = False
+        with pstage("apply_theme: clam theme_use + style configure/map"):
+            return _apply_theme_clam(root, scale, pal)
     try:
         import tkinter.font as tkfont
         tname = f"mt-{accent}_{base}"
         if tname not in ttk.Style(root).theme_names():             # V5.58: every combination is sourced once per window, then reused
-            root.tk.call("source", str(lime_theme_dir(accent, base) / "sv.tcl"))
+            with pstage("apply_theme: build/read theme dir + source sv.tcl"):
+                root.tk.call("source", str(lime_theme_dir(accent, base) / "sv.tcl"))
         root._sv_ttk_loaded = True                                 # sv_ttk itself must not load its blue copy
-        ttk.Style(root).theme_use(tname)
+        with pstage("apply_theme: ttk theme_use"):
+            ttk.Style(root).theme_use(tname)
         SV_THEME[0] = True
-        for nm, sz, bold in (("TkDefaultFont", 10, 0), ("TkTextFont", 10, 0), ("TkMenuFont", 10, 0), ("TkHeadingFont", 10, 1),
-                             ("SunValleyBodyFont", 10, 0), ("SunValleyBodyStrongFont", 10, 1), ("SunValleyCaptionFont", 9, 0)):
-            try:
-                tkfont.nametofont(nm, root).configure(size=F(sz))
-            except Exception:
-                pass
+        with pstage("apply_theme: named fonts configure"):
+            for nm, sz, bold in (("TkDefaultFont", 10, 0), ("TkTextFont", 10, 0), ("TkMenuFont", 10, 0), ("TkHeadingFont", 10, 1),
+                                 ("SunValleyBodyFont", 10, 0), ("SunValleyBodyStrongFont", 10, 1), ("SunValleyCaptionFont", 9, 0)):
+                try:
+                    tkfont.nametofont(nm, root).configure(size=F(sz))
+                except Exception:
+                    pass
         st = ttk.Style(root)
-        st.configure("Treeview", rowheight=int(26 * UI_SCALE[0]))
-        st.configure("Treeview.Heading", font=("Segoe UI", F(10), "bold"))
-        st.configure("TLabelframe.Label", font=("Segoe UI", F(10), "bold"), foreground=pal["acc"])
-        st.configure("TNotebook.Tab", padding=(16, 5), font=("Segoe UI", F(10), "bold"))
-        st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
-        st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
-        st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
-        st.configure("Dim.TLabel", foreground=pal["dim"])
+        with pstage("apply_theme: ttk style configure (10 calls)"):
+            st.configure("Treeview", rowheight=int(26 * UI_SCALE[0]))
+            st.configure("Treeview.Heading", font=("Segoe UI", F(10), "bold"))
+            st.configure("TLabelframe.Label", font=("Segoe UI", F(10), "bold"), foreground=pal["acc"])
+            st.configure("TNotebook.Tab", padding=(16, 5), font=("Segoe UI", F(10), "bold"))
+            st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+            st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+            st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
+            st.configure("Dim.TLabel", foreground=pal["dim"])
         root.configure(bg=pal["bg"])
         root.option_add("*TCombobox*Listbox.background", pal["field"])
         root.option_add("*TCombobox*Listbox.foreground", pal["fg"])
@@ -7777,19 +7788,22 @@ class App:
         accent = accent or cfg.get("accent", "lime")
         base = base or cfg.get("base", "grey")
         old, tagsnap = dict(self.pal), []
-        for w in self._tk_widgets():
-            if w.winfo_class() == "Text":
-                tags = {}
-                for t in w.tag_names():
-                    for opt in ("foreground", "background", "selectbackground", "selectforeground"):
-                        v = str(w.tag_cget(t, opt)).lower()
-                        if v:
-                            tags[(t, opt)] = v
-                tagsnap.append((w, tags))
-        self.pal = apply_theme(self.root, UI_SCALE[0], accent, base)         # the scale in use (a changed scale applies after restart)
+        with pstage("retheme: snapshot Text tag colours"):
+            for w in self._tk_widgets():
+                if w.winfo_class() == "Text":
+                    tags = {}
+                    for t in w.tag_names():
+                        for opt in ("foreground", "background", "selectbackground", "selectforeground"):
+                            v = str(w.tag_cget(t, opt)).lower()
+                            if v:
+                                tags[(t, opt)] = v
+                    tagsnap.append((w, tags))
+        with pstage("retheme: apply_theme (total)"):
+            self.pal = apply_theme(self.root, UI_SCALE[0], accent, base)     # the scale in use (a changed scale applies after restart)
         PAL.clear()
         PAL.update(self.pal)
-        self.recolour()
+        with pstage("retheme: registry recolour (classic tk widgets)"):
+            self.recolour()
         old_to_key = {}
         for k, v in old.items():
             old_to_key.setdefault(str(v).lower(), k)
@@ -7801,7 +7815,8 @@ class App:
                         w.tag_configure(t, **{opt: self.pal[k]})
                     except tk.TclError:
                         pass
-        self.root.update_idletasks()
+        with pstage("retheme: update_idletasks that follows"):
+            self.root.update_idletasks()
 
     def on_theme_pick(self, *_):
         """Accent colour / base picked in Settings: switch the running window at once."""
@@ -9247,8 +9262,32 @@ def cmd_cfgdump(args):
     print(json.dumps({"config_path": str(CONFIG_PATH), "exists": CONFIG_PATH.exists(), "cfg": load_config()}, ensure_ascii=False))
 
 
+class _Stage:
+    """V6.2: `with pstage("name"):` records the duration of a startup / theme stage in perflog (no-op without the perflog switch)."""
+    __slots__ = ("n", "t")
+
+    def __init__(self, n):
+        self.n = n
+
+    def __enter__(self):
+        self.t = time.perf_counter()
+        return self
+
+    def __exit__(self, *a):
+        if PERF is not None:
+            PERF.stage(self.n, self.t)
+
+
+def pstage(name):
+    return _Stage(name)
+
+
+def pmark(name):
+    if PERF is not None:
+        PERF.mark(name)
+
+
 # ------------------------------------------------------------------ V6.0 perflog (timeline recorder, off unless asked for)
-PERF_T0 = time.perf_counter()                    # ~process start (module import)
 PERF = None
 
 
@@ -9263,9 +9302,70 @@ class PerfLog:
         self.ev, self.post, self.sw_until, self.depth, self.dropped = [], False, 0.0, 0, 0
         self.hb_last, self.root, self.map_t, self.sw_name, self.counts = None, None, None, "", {}
         self.sw_log = []
+        self.stages, self.marks, self.switches = [], [], []     # V6.2: stage table, absolute marks, theme-switch records
+        self.samples, self.gap_stacks, self.main_id, self._lock = [], [], None, threading.Lock()
+        self._th_pending = None
 
     def now(self):
         return (time.perf_counter() - PERF_T0) * 1000
+
+    # ---- V6.2: stage table
+    def stage(self, name, t0):
+        d = (time.perf_counter() - t0) * 1000
+        self.stages.append(((t0 - PERF_T0) * 1000, d, name, threading.current_thread().name))
+
+    def mark(self, name):
+        self.marks.append((self.now(), name))
+
+    # ---- V6.2: stack sampler (daemon thread, every 10 ms, main thread only)
+    def start_sampler(self):
+        self.main_id = threading.get_ident()
+        threading.Thread(target=self._sample_loop, daemon=True, name="perf-sampler").start()
+
+    def _sample_loop(self):
+        while True:
+            time.sleep(0.01)
+            try:
+                f = sys._current_frames().get(self.main_id)
+                st = []
+                while f is not None and len(st) < 24:
+                    st.append((f.f_code.co_name, f.f_code.co_filename, f.f_lineno))
+                    f = f.f_back
+                with self._lock:
+                    self.samples.append((self.now(), tuple(st)))
+                    if len(self.samples) > 40000:
+                        del self.samples[:10000]
+            except Exception:
+                pass
+
+    @staticmethod
+    def _is_tk_file(fn):
+        fn = fn.replace("\\", "/")
+        return fn.endswith(("tkinter/__init__.py", "tkinter/ttk.py", "tkinter/simpledialog.py", "tkinter/filedialog.py", "tkinter/messagebox.py"))
+
+    def _gap_stack(self, t0, t1):
+        """Most frequent stack sampled in [t0, t1]: (key, label, share)."""
+        with self._lock:
+            inside = [s for t, s in self.samples if t0 <= t <= t1]
+        if not inside:
+            return None
+        cnt = {}
+        for s in inside:
+            k = tuple(s[:6])
+            cnt[k] = cnt.get(k, 0) + 1
+        k, n = max(cnt.items(), key=lambda kv: kv[1])
+        short = lambda fr: f"{fr[0]} ({os.path.basename(fr[1])}:{fr[2]})"
+        top = k[0] if k else None
+        c_level = bool(top) and (top[0] in ("mainloop", "update", "update_idletasks") or self._is_tk_file(top[1]))
+        last_py = next((fr for fr in k if not self._is_tk_file(fr[1])), None)
+        if c_level:
+            lab = "[Tk C-level] last Python frame: " + (short(last_py) if last_py else "(none in top 6)")
+            if top[0] not in ("mainloop", "update", "update_idletasks"):
+                lab += f"  via tk call {top[0]}"
+        else:
+            lab = "[Python] "
+        lab += "  <-  " + " < ".join(short(fr) for fr in k)
+        return k, lab, n / len(inside)
 
     def add(self, kind, name, dur=0.0, depth=0, note=""):
         t = self.now() - dur
@@ -9297,6 +9397,7 @@ class PerfLog:
     def install(self):
         perf = self
         T = self.timed
+        self.start_sampler()
         tk.Misc.update = T("update", lambda f, a, k: "update() from " + _perf_caller(3))(tk.Misc.update)
         tk.Misc.update_idletasks = T("update", lambda f, a, k: "update_idletasks() from " + _perf_caller(3))(tk.Misc.update_idletasks)
         orig_after = tk.Misc.after
@@ -9329,9 +9430,27 @@ class PerfLog:
             pass
         g = globals()
         g["apply_theme"] = T("theme", lambda f, a, k: "apply_theme")(apply_theme)
-        for nm_, kind, nf in (("retheme", "theme", None), ("apply_layout", "layout", None), ("prerealize", "layout", None),
+        for nm_, kind, nf in (("apply_layout", "layout", None), ("prerealize", "layout", None),
                               ("startup", "after", None), ("on_tab_changed", "tab", None)):
             setattr(App, nm_, T(kind, (lambda n: lambda f, a, k: "App." + n)(nm_))(getattr(App, nm_)))
+        orig_retheme = T("theme", lambda f, a, k: "App.retheme")(App.retheme)
+
+        def retheme(app, *a, **k):
+            """V6.2: stage timing of one theme switch + the main-loop gaps in the 2 s after it."""
+            i0, t0 = len(perf.stages), time.perf_counter()
+            try:
+                return orig_retheme(app, *a, **k)
+            finally:
+                t1 = time.perf_counter()
+                sw = {"t": (t0 - PERF_T0) * 1000, "total": (t1 - t0) * 1000, "stages": [(x[2], x[1]) for x in perf.stages[i0:]],
+                      "t_end": (t1 - PERF_T0) * 1000, "idle": None, "expose": None, "gaps": [], "args": a}
+                perf.switches.append(sw)
+                perf._th_pending = sw
+                try:
+                    app.root.after_idle(lambda: sw.__setitem__("idle", perf.now() - sw["t_end"]))
+                except Exception:
+                    pass
+        App.retheme = retheme
         App.fill_chunked = T("list", lambda f, a, k: "list fill " + (getattr(a[1], "_w", str(a[1])) if len(a) > 1 else "?"),
                              lambda a, k: f"{len(a[2]) if len(a) > 2 else '?'} rows, container {'MAPPED' if _perf_mapped(a[1]) else 'unmapped'}")(App.fill_chunked)
         orig_setup = tk.BaseWidget._setup
@@ -9371,6 +9490,12 @@ class PerfLog:
         def on_expose(e):
             if e.widget is root and not any(x[2] == "first <Expose>" for x in self.ev):
                 self.add("mark", "first <Expose>")
+
+        def th_expose(e):
+            sw = self._th_pending
+            if sw is not None and sw["expose"] is None:
+                sw["expose"] = self.now() - sw["t_end"]
+        root.bind_all("<Expose>", th_expose, add="+")
         root.bind("<Map>", on_map, add="+")
         root.bind("<Expose>", on_expose, add="+")
         root.bind_all("<<NotebookTabChanged>>", self.on_tab, add="+")
@@ -9392,11 +9517,100 @@ class PerfLog:
         gap = t - self.hb_last - 20
         if gap > 50:
             self.add("gap", f"main-loop blocked {gap:.0f} ms", gap)
+            try:
+                gs = self._gap_stack(self.hb_last + 20, t)
+                self.gap_stacks.append((gap, gs, t, self.sw_name if t < self.sw_until else ""))
+                for sw in self.switches:
+                    if sw["t_end"] - 50 <= t <= sw["t_end"] + 2000:
+                        sw["gaps"].append((gap, gs[1] if gs else "(no samples)"))
+            except Exception:
+                pass
         self.hb_last = self.now()
         try:
             self.root.after(20, self._hb)
         except Exception:
             pass
+
+    def header(self):
+        """V6.2: one line with the environment facts that decide Tk drawing cost."""
+        import platform
+        r, bits = self.root, []
+        def add(k, fn):
+            try:
+                bits.append(f"{k}={fn()}")
+            except Exception as ex:
+                bits.append(f"{k}=? ({type(ex).__name__})")
+        add("OS", lambda: platform.platform() + (f" build {sys.getwindowsversion().build}" if os.name == "nt" else ""))
+        add("Python", lambda: sys.version.split()[0] + f" {platform.architecture()[0]}")
+        add("Tk", lambda: r.tk.call("info", "patchlevel"))
+        def svv():
+            import sv_ttk
+            try:
+                from importlib.metadata import version
+                return version("sv-ttk")
+            except Exception:
+                return getattr(sv_ttk, "__version__", "installed")
+        add("sv_ttk", svv)
+        add("window", lambda: f"{r.winfo_width()}x{r.winfo_height()}")
+        add("screen", lambda: f"{r.winfo_screenwidth()}x{r.winfo_screenheight()}")
+        add("tk_scaling", lambda: r.tk.call("tk", "scaling"))
+        add("ui_scale", lambda: UI_SCALE[0])
+        add("theme", lambda: ("SIMPLE clam (MONTAGE_SIMPLE_THEME=1)" if SIMPLE_THEME else "Sun Valley") + f" [{ttk.Style(r).theme_use()}]")
+        def dpi():
+            if os.name != "nt":
+                return "n/a (not Windows)"
+            import ctypes
+            names = {0: "UNAWARE", 1: "SYSTEM_AWARE", 2: "PER_MONITOR_AWARE"}
+            out_ = []
+            try:
+                v = ctypes.c_int(-1)
+                ctypes.windll.shcore.GetProcessDpiAwareness(0, ctypes.byref(v))
+                out_.append("process=" + names.get(v.value, str(v.value)))
+            except Exception as ex:
+                out_.append(f"process=? ({type(ex).__name__})")
+            try:
+                out_.append("window_dpi=" + str(ctypes.windll.user32.GetDpiForWindow(r.winfo_id())))
+            except Exception:
+                pass
+            try:
+                out_.append("system_dpi=" + str(ctypes.windll.user32.GetDpiForSystem()))
+            except Exception:
+                pass
+            return " ".join(out_)
+        add("dpi_awareness", dpi)
+        return "ENV  " + "   ".join(bits)
+
+    def stage_table(self):
+        L = ["STAGE TABLE (ms; start = ms since process start; thread shown; indent = nested inside the stage above)"]
+        L += [f"  @{t:8.0f}  {d:8.1f} ms  {th:12.12}  {nm}" for t, d, nm, th in sorted(self.stages, key=lambda x: x[0])]
+        L += ["MARKS (ms since process start)"] + [f"  @{t:8.0f}  {nm}" for t, nm in sorted(self.marks)]
+        ocr = [x for x in self.stages if x[2].startswith("OCR engine creation")]
+        L.append("OCR engine created before the window was shown: " + (
+            "YES " + ", ".join(f"{x[1]:.0f} ms @{x[0]:.0f}" for x in ocr) if ocr and (self.map_t is None or ocr[0][0] < self.map_t) else "NO"))
+        return L
+
+    def gap_summary(self):
+        agg = {}
+        for gap, gs, t, swn in self.gap_stacks:
+            k, lab = (gs[0], gs[1]) if gs else (None, "(no samples)")
+            e = agg.setdefault(k, [0.0, 0, lab, []])
+            e[0] += gap
+            e[1] += 1
+            if swn and swn not in e[3]:
+                e[3].append(swn)
+        L = [f"TOP 10 MAIN-LOOP GAP STACKS by total blocked time ({len(self.gap_stacks)} gaps > 50 ms; most frequent 10 ms sample in each gap, top 6 Python frames)"]
+        for tot, n, lab, sw in sorted(agg.values(), key=lambda e: -e[0])[:10]:
+            L.append(f"  {tot:7.0f} ms in {n:3d} gap(s){('  during tab switch to ' + '/'.join(sw)) if sw else ''}\n      {lab}")
+        return L
+
+    def switch_summary(self):
+        L = ["THEME SWITCHES (stage durations in ms; 'idle' = first idle callback after retheme returned, 'Expose' = first <Expose> after it)"]
+        for i, sw in enumerate(self.switches, 1):
+            L.append(f"  #{i} @{sw['t']:.0f}: retheme total {sw['total']:.0f} ms; first idle after {sw['idle'] if sw['idle'] is None else round(sw['idle'])} ms; "
+                     f"first Expose after {sw['expose'] if sw['expose'] is None else round(sw['expose'])} ms")
+            L += [f"        {d:8.1f}  {nm}" for nm, d in sw["stages"]]
+            L += [f"      gap in the 2 s after: {g:.0f} ms  {lab}" for g, lab in sw["gaps"]] or ["      (no main-loop gap > 50 ms in the 2 s after)"]
+        return L if self.switches else L + ["  (none recorded: change accent / base in Settings while perflog runs)"]
 
     def write(self):
         try:
@@ -9408,8 +9622,8 @@ class PerfLog:
             gaps = [x[3] for x in ev if x[1] == "gap"]
             sw = [x for x in post if x[7] and x[1] in ("widget+", "configure")]
             L = ["PERFLOG " + APP_VERSION + f"  (times in ms since module import; POST-SHOW = after the first main-window <Map> at "
-                 + (f"{self.map_t:.0f} ms)" if self.map_t is not None else "never)"), "", "SUMMARY",
-                 "Top 10 slowest events:"]
+                 + (f"{self.map_t:.0f} ms)" if self.map_t is not None else "never)"), self.header(), "", "SUMMARY"]
+            L += self.stage_table() + [""] + self.gap_summary() + [""] + self.switch_summary() + ["", "Top 10 slowest events:"]
             L += [f"  {x[3]:8.1f} ms  @{x[0]:8.0f}  {x[1]:10} {x[2]} {x[6]}{'  POST-SHOW' if x[4] else ''}" for x in top]
             L += [f"Total POST-SHOW work: {work:.0f} ms (top-level events only, nested calls not double counted)",
                   f"POST-SHOW theme/style events: {cnt(('theme', 'style'))}   list fills: {cnt(('list',))}   after/after_idle: "
