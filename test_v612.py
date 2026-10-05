@@ -206,8 +206,8 @@ def t_match():
     m, u = M.match_playlist([mk_r(songs[0], 0)], [mk_a(f"{songs[0]} - {art}")], cfg)
     check(m and m[0][2] == 100, "exact artist + title: 100")
     # ID3 title tag instead of the file name
-    m, u = M.match_playlist([mk_r(songs[0], 0), mk_r(songs[1], 1)], [dict(mk_a("track02"), title=songs[1]), dict(mk_a("track01"), title=songs[0])], cfg)
-    check(len(m) == 2 and all(a["title"] == r["title"] for r, a, sc in m), "ID3 titles decide when the file name says nothing")
+    m, u = M.match_playlist([mk_r(songs[0], 0), mk_r(songs[1], 1)], [dict(mk_a("track02"), title=songs[1], artist=art), dict(mk_a("track01"), title=songs[0], artist=art)], cfg)
+    check(len(m) == 2 and all(a["title"] == r["title"] and sc == 100 for r, a, sc in m), "ID3 title + artist tags decide (exact rule) when the file name cannot be parsed")
     # Cyrillic / Japanese text is kept by the normaliser
     check(M.clean(songs[0]) == songs[0].lower(), "Cyrillic text is not stripped by clean()")
     jp = "\u65e5\u672c\u8a9e\u306e\u30bf\u30a4\u30c8\u30eb (Official Video)"
@@ -258,7 +258,9 @@ def t_cache():
         t0 = time.time()
         s1, _, _ = M.song_pool(cfg)
         t1 = time.time() - t0
-        check(M.SONG_STATE[0] == "full" and len(calls) == 1 and len(s1) > 200, f"first run: full match ({calls[-1]}), {len(s1)} songs, {t1:.2f}s")
+        exact_ok = all(re.sub(r'[\\/:*?"<>|]', "", f"{x['title']} - {x['artist']}") == Path(x["path"]).stem for x in s1)
+        check(M.SONG_STATE[0] == "full" and len(calls) == 1 and len(s1) > 0 and exact_ok,
+              f"first run: full match ({calls[-1]}), {len(s1)} songs, every one is a file named 'Title - Artist' of its own track ({t1:.2f}s)")
         calls.clear()
         t0 = time.time()
         s2, _, _ = M.song_pool(cfg)
@@ -274,8 +276,8 @@ def t_cache():
         s3, _, _ = M.song_pool(cfg, cached_only=True)
         check(M.SONG_STATE[0] == "stale" and not calls and len(s3) == len(s1), "files added: cached_only shows the cached matches (stale), no matching")
         s4, _, _ = M.song_pool(cfg)
-        check(M.SONG_STATE[0] == "incremental" and len(calls) == 1 and calls[0][1] < 100 and calls[0][0] < 100,
-              f"files added: only new / unmatched files are matched (rows x files = {calls[-1] if calls else None} instead of {len(rows)} x {len(paths) + 3})")
+        check(M.SONG_STATE[0] == "full" and calls == [(len(rows), len(paths) + 3)],
+              f"files added: the exact matcher recomputes every match once (rows x files = {calls[-1] if calls else None})")
         old_map = {x["path"]: x["title"] for x in s1}
         check(all(old_map[p_] == t_ for p_, t_ in ((x["path"], x["title"]) for x in s4) if p_ in old_map), "incremental run keeps the earlier matches")
         calls.clear()
