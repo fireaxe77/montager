@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.5.1"
+APP_VERSION = "V6.5.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -7219,8 +7219,21 @@ class App:
 
     def unflag_one(self, iid):
         c = self.byp.get(iid)
-        if not c or not c.get("used"):
-            return                                         # an empty Used cell does nothing
+        if not c:
+            return
+        if not c.get("used"):                              # V6.5.2: an empty Used cell flags the clip (today, like a finished render)
+            today = datetime.datetime.now().strftime("%Y-%m-%d")
+            try:
+                mark_used([iid], today)
+            except Exception as ex:
+                out(f"Flag failed: {ex}")
+                return
+            c["used"] = today
+            if self.ctree.exists(iid):
+                self.ctree.set(iid, "used", today)
+            getattr(self, "_fill_sig", {}).pop(self.ctree, None)     # the cell changed by hand: the next refill must not be skipped as "same data"
+            out(f"flagged {c.get('name') or Path(iid).name}")
+            return
         try:
             unflag_clips([iid])
         except Exception as ex:
@@ -7229,6 +7242,7 @@ class App:
         c["used"] = ""
         if self.ctree.exists(iid):
             self.ctree.set(iid, "used", "")
+        getattr(self, "_fill_sig", {}).pop(self.ctree, None)
         out(f"unflagged {c.get('name') or Path(iid).name}")
 
     def open_clip_player(self, path):
