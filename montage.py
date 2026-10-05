@@ -4968,6 +4968,44 @@ def weekly_existing(cfg, game, now=None):
     return [p for p, dt in montage_videos(Path(cfg["output_root"]) / GAME_DIR[game], game) if week_tag(dt) == wk]
 
 
+def weekly_pick(events, cfg, target, style, now_ts=None):
+    """V6.0 weekly / Auto clip pick: clips already used are never reused; this week's (last 7 days) new clips come first; if they
+    do not reach the minimum length, older UNUSED clips of the same game follow - best multikills first, then best singles -
+    only as many as needed. Returns (events, notes). No unused material at all = RuntimeError with the reason (skip)."""
+    now_ts = now_ts or time.time()
+    used = used_dates()
+    unused = [e for e in events if _pkey(e["path"]) not in used]
+    notes = []
+    if len(unused) < len(events):
+        notes.append(f"{len({e['path'] for e in events} - {e['path'] for e in unused})} clips already used in a montage are not reused")
+    if not unused:
+        raise RuntimeError("no unused clips with kills left for this game (every clip with kills is already flagged used) - skipped; "
+                           "scan new clips or use 'Include used clips' in Manual")
+
+    def mt(e):
+        try:
+            return os.path.getmtime(e["path"])
+        except OSError:
+            return 0.0
+    new = [e for e in unused if now_ts - mt(e) <= 7 * 86400]
+    old = sorted([e for e in unused if e not in new], key=lambda e: (bool(e.get("plain")), -e["score"]))
+    optimal = target in (None, "", "optimal", 0)
+    need = OPT_RANGE[0] + 8.0 if optimal else float(target) * 1.1
+    rn = style if style in RECIPES else "hype"
+    est = lambda lst: sum(take_estimate(e, 0.47, rn) for e in lst)
+    pick = list(new)
+    if est(pick) < need:
+        for e in old:
+            if est(pick) >= need:
+                break
+            pick.append(e)
+    n_old = len(pick) - len(new)
+    notes.append(f"weekly pick: {len(new)} new clip event(s) this week + {n_old} older unused (best multikills first, then singles)"
+                 + (f"; only ~{est(pick):.0f} s of unused material - the montage is shorter (nothing is padded)"
+                    if est(pick) < (OPT_RANGE[0] if optimal else float(target)) - 0.5 else ""))
+    return pick, notes
+
+
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True):
     """scan=False: plan from what is already scanned (the Manual status-line estimate runs exactly this, quietly)."""
     cfg = autodetect_dirs(cfg)
@@ -4995,6 +5033,12 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     events, notes = build_events(pool, game, cfg, random.Random(seed))
     if not events:
         raise RuntimeError("no usable kill events (utility kills are excluded)")
+    if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
+        events, wk_notes = weekly_pick(events, cfg, cfg.get("length_s", "optimal") if target is None else target,
+                                       cfg.get("style", "auto") if style is None else style)
+        notes += wk_notes
+        for n_ in wk_notes:
+            out(n_)
     songs, unmatched, csvname = song_pool(cfg)
     song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path)
     placement = placement or cfg.get("placement", "v5")
@@ -5128,6 +5172,10 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
         (logs / (outfile.stem + ".plan.txt")).write_text(text, encoding="utf-8")
         save_json(logs / (outfile.stem + ".plan.json"), plan)
         record_history(plan)
+        try:                                               # V6.0: flagged used only now, after the render succeeded
+            mark_used({t["path"] for t in plan["takes"]} | {x["path"] for t in plan["takes"] for x in t.get("srcs", [])})
+        except Exception as ex:
+            out(f"Used flags not saved: {ex}")
         if cfg.get("sync_report", True):
             try:
                 sync_report(plan, outfile, cfg)
