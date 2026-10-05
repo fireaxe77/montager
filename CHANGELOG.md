@@ -5,6 +5,9 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V6.1.5 - 2026-10-05
+- Manual tab: the long multi-line summary above the log is now ONE fixed-height line without wrapping ("30 clips ticked \u00b7 100 kills \u00b7 montage 150 s \u00b7 song: Atlantis \u00b7 hype"), cut with "\u2026" when it does not fit the width, so it never changes the height of anything around it. The full summary (clips that didn't fit, clips that can't form a take and why, song section, usable events) is written to the log as normal lines each time it changes; an identical summary is not written twice in a row. New `test_v615.py`.
+
 ## V6.1.3 - 2026-10-05
 - Recovery build: starts from V6.2 and carries over only the good fixes of V6.1.2. **The V6.1.2 theme rework is not included** (no theme engine setting, no Fast restyle, no Sun Valley Lite, no shared palette rework): the Sun Valley theme files, fonts, colours, paddings and layout are those of V6.2. `MONTAGE_SIMPLE_THEME=1` works as in V6.2.
 - Startup: worker threads use a snapshot of the Tk variables taken on the UI thread (`App.snap_vars`, taken in `run_task`); before, `load_clips` read `m_game` from its worker while the splash ran without a main loop and failed with "main thread is not in main loop", so the first clip load never ran.
