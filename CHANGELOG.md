@@ -5,6 +5,13 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V6.7 - 2026-10-05
+- CS2 kill registration only (Valorant results are byte-identical; detection/OCR, planner, effects, zoom, render, theme, song matching and settings untouched; every change is a `game == "cs2"` branch). Knife and revive/resurrect stay Valorant-only.
+- Over-count: CS2 victim names are now compared after OCR-confusion normalisation (Latin/Cyrillic look-alikes, l/I/1/|, O/0/D, rn/m, vv/w, case, spaces and punctuation ignored; a difference touching a digit means a different player; similarity >= 82 = the same player). A killfeed row that was already on screen in the previous OCR frame at the same height - or at the height the whole list shifted to when a new row pushed it - is the same kill however it is read; the same victim cannot be killed twice within one round (115 s); duplicate / jumbled re-read and variant merging use the normalised names. Applied from the cached raw OCR rows, so existing clips update without a rescan.
+- Under-count: the gunshot check of a CS2 clip now analyses the audio track the clip has sound on (the same pick as the plan: Settings > Audio mode / game audio track, a silent track is never chosen) instead of always track 1 (cached under `o1c<track>`; Valorant keeps `o1`). A CS2 clip with no gunshot on any track no longer rejects a read kill for "no gunshot to confirm it" (the kill is kept, logged as "no gunshot heard (kept)").
+- Killfeed region: unchanged. It is a fraction of the content rectangle (CS2 0.58-1.0 x 0.03-0.40), so 1280x960 and 1920x1080 clips crop the same part of the picture.
+- New `test_v67.py` (fixtures from the reported reads; compares with origin/main; Valorant kill counts and timestamps must be identical).
+
 ## V6.5.2 - 2026-10-05
 - Manual clip list: clicking an EMPTY Used cell now flags that clip as used with today's date (the same flag a finished render writes, so the weekly pick - including its reuse of previously used clips - the Used filter and "Include used clips" treat it as used), saves it, refreshes the row and logs "flagged <clip>". Clicking a filled Used cell still unflags it. The click never ticks or unticks the row. New `test_v652.py`.
 
