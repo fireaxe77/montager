@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.3"
+APP_VERSION = "V5.4"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -127,7 +127,12 @@ def LOGONLY(msg):
         pass
 
 
+QUIET = threading.local()               # QUIET.on = True: this thread logs nothing (the Manual status-line estimate)
+
+
 def out(*a):
+    if getattr(QUIET, "on", False):
+        return
     msg = " ".join(str(x) for x in a)
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -142,7 +147,7 @@ def out(*a):
 
 
 def progress(frac, text=""):
-    if PROGRESS[0]:
+    if PROGRESS[0] and not getattr(QUIET, "on", False):
         PROGRESS[0](frac, text)
 
 
@@ -3063,31 +3068,43 @@ RECIPES = {                             # all within V4's effect strength; they 
 STYLE_CHOICES = ["auto"] + list(RECIPES) + ["mix", "random"]
 
 
-def auto_style(an, song, rng):
-    """Auto: the recipe that fits the song (CSV Energy / Danceability, BPM, drop strength); the seed picks between close fits."""
+def auto_style(an, song, rng, events=None):
+    """Auto: the recipe that fits THIS song's map (energy, BPM, strong drops, how steady the rhythm is) and the material (how
+    many multikills vs singles); the seed picks between close fits. Energy: the CSV value when present, else the song map."""
     e = song.get("energy")
-    e = float(e) if e is not None else float(sum(an.get("energy", [0.5])) / max(1, len(an.get("energy", [1]))))
-    d = song.get("dance")
-    d = float(d) if d is not None else 0.5
+    e_src = "CSV"
+    if e is None:
+        e, e_src = float(sum(an.get("energy", [0.5])) / max(1, len(an.get("energy", [1])))), "map"
+    e = float(e)
     bpm = float(an.get("bpm") or 120)
     drop = min(1.0, float(an.get("drop_strength") or 0.0) / 0.6)
-    sc = {"aggressive": 2.0 * max(0, e - 0.7) + 1.2 * max(0, min(1, (bpm - 130) / 30)) + 0.6 * drop,
-          "hype": 1.5 * max(0, 1 - abs(e - 0.75) / 0.25) + 0.8 * drop + 0.3 * d,
-          "cinematic": 1.2 * drop * max(0, 1 - abs(e - 0.6) / 0.3) + 0.8 * max(0, (105 - bpm) / 30),
-          "smooth": 1.2 * max(0, 1 - abs(e - 0.55) / 0.2) + 0.8 * max(0, d - 0.55) * 2,
-          "chill": 2.0 * max(0, 0.5 - e) / 0.5 + 0.6 * max(0, (100 - bpm) / 30)}
+    n_drops = sum(1 for d in an.get("drops", []) if d.get("strength", 0) >= 1.5)
+    steady = float(an.get("steady", 0.5))
+    evs = events or []
+    multi = sum(1 for x in evs if x.get("n", 1) >= 2)
+    mr = multi / max(1, len(evs)) if evs else 0.3
+    sc = {"aggressive": 2.0 * max(0, e - 0.7) + 1.2 * max(0, min(1, (bpm - 130) / 30)) + 0.6 * drop + 0.8 * max(0, mr - 0.4)
+                        + 0.3 * steady,
+          "hype": 1.5 * max(0, 1 - abs(e - 0.75) / 0.25) + 0.8 * drop + 0.6 * mr + 0.4 * steady,
+          "cinematic": 1.2 * drop * max(0, 1 - abs(e - 0.6) / 0.3) + 0.8 * max(0, (105 - bpm) / 30) + 0.4 * (1 - steady)
+                       + 0.2 * min(2, n_drops),
+          "smooth": 1.2 * max(0, 1 - abs(e - 0.55) / 0.2) + 0.6 * (1 - mr) + 0.3 * steady,
+          "chill": 2.0 * max(0, 0.5 - e) / 0.5 + 0.6 * max(0, (100 - bpm) / 30) + 0.4 * (1 - mr)}
     ranked = sorted(sc.items(), key=lambda x: -x[1])
     close = [n for n, v in ranked[:2] if v >= ranked[0][1] * 0.75]
     name = rng.choice(close) if close else ranked[0][0]
-    why = ", ".join(f"{n} {v:.2f}" for n, v in ranked)
-    return name, f"energy {e:.2f}, danceability {d:.2f}, {bpm:.0f} BPM, drop {drop:.2f} -> {why}"
+    runner = next(n for n, _ in ranked if n != name)
+    why = (f"{name} (song energy {e:.2f} ({e_src}), {bpm:.0f} BPM, {n_drops} strong drop{'s' * (n_drops != 1)}, rhythm steady "
+           f"{steady:.2f}, {multi} multikills / {len(evs) - multi} singles; runner-up: {runner}) - scores "
+           + ", ".join(f"{n} {v:.2f}" for n, v in ranked))
+    return name, why
 
 
-def pick_recipe(rng, style, avoid, an=None, song=None):
+def pick_recipe(rng, style, avoid, an=None, song=None, events=None):
     names = list(RECIPES)
     why = ""
     if style in (None, "", "auto") and an is not None:
-        name, why = auto_style(an, song or {}, rng)
+        name, why = auto_style(an, song or {}, rng, events)
     elif style == "mix":
         rp = {"zoom_p": rng.uniform(.2, .9), "zoom_amp": rng.uniform(.05, .10), "ramp_p": rng.uniform(0, .5),
               "flash": rng.random() < .5, "slow_max": rng.randint(1, 2), "lead": rng.choice([(1, 2), (2, 3)]),
@@ -3216,16 +3233,31 @@ def optimal_length(events, bd, notes):
         L = sum(est(e) for e in events)
         used = "all events (little strong material)"
     L = max(30.0, min(120.0, L))
-    notes.append(f"OPTIMAL LENGTH {L:.0f} s from {used}")
+    notes.append(f"auto target {L:.0f} s from {used}")
     return L
 
 
-def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5"):
+def why_no_take(ev):
+    """Plain-language reason an event cannot form a take."""
+    post = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
+    if ev.get("death_after") is not None and ev["death_after"] < TAIL[0] + 0.05:
+        return f"my death {ev['death_after']:.2f} s after the kill"
+    if ev["pre"] < LEAD_MIN:
+        return f"only {max(0.0, ev['pre']):.2f} s of footage before the kill"
+    if post < TAIL[0]:
+        return f"only {max(0.0, post):.2f} s of footage after the kill"
+    return "no run-up / tail fits the song's beats"
+
+
+def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
     """Event-driven, song-anchored layout (V4): the best multikill lands on the biggest drop's downbeat; build-up before it,
-    the rest after it, a strong slow-mo ending last; takes on the song's beat grid, first kills on beats."""
+    the rest after it, a strong slow-mo ending last; takes on the song's beat grid, first kills on beats.
+    manual=True (ticked clips): every usable event is used; Optimal = all of them, limited only by the song; a fixed length
+    may trim (listed by name). Auto: Optimal / fixed length keeps the best events and leaves the lowest-ranked out.
+    The montage never runs past the end of the song: the music covers every frame through the final fade."""
     import numpy as np
     rng = random.Random(seed)
-    rname, rp, why = pick_recipe(rng, style, hist_c[-1].get("recipe") if hist_c else None, an, song)
+    rname, rp, why = pick_recipe(rng, style, hist_c[-1].get("recipe") if hist_c else None, an, song, events)
     bt = np.array(an["beats"], float)
     U = _ticks(bt)
     down = set(an["down"])
@@ -3236,19 +3268,25 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         for e in evs:
             e["times"] = list(e.get("times_v4") or e["times"])
             e["first"], e["last"], e["span"] = e["times"][0], e["times"][-1], e["times"][-1] - e["times"][0]
-    if target_s in (None, "", "optimal", 0):
-        target = optimal_length([e for e in evs], bd, notes)
+    song_end = float(an.get("dur") or (bt[-1] + bd)) - 0.1     # the montage's last frame stays inside the music
+    optimal = target_s in (None, "", "optimal", 0)
+    if optimal:
+        target = None if manual else optimal_length([e for e in evs], bd, notes)
     else:
         target = max(30.0, min(120.0, float(target_s)))
     strong = [e for e in evs if not e.get("plain")]
     plain = [e for e in evs if e.get("plain")]
     est = lambda e: 2 * bd + e["span"] + 0.4
-    if sum(est(e) for e in strong) < target and plain:
+    if manual:
+        strong += plain                                    # Manual: every ticked clip counts
+    elif sum(est(e) for e in strong) < target and plain:
         strong += plain
         notes.append(f"{len(plain)} plain single kills used (not enough multikills / headshots)")
     elif plain:
         notes.append(f"{len(plain)} plain single kills left out (enough better material)")
-    cap_t = int(min(120.0, target * 1.1) / td)
+    cap_t = int(min(120.0, target * 1.1) / td) if target else 10 ** 9
+    nm = lambda e: Path(e["path"]).name
+    phrase_ticks = {2 * int(b) for b in an.get("phrase4", [])} | {2 * int(x["start"]) for x in an.get("sections", [])}
     heads = {h.get("headline") for h in hist_c[-4:]}
     ev_sorted = sorted(strong, key=lambda e: -e["score"])
     total_ev = len(events)
@@ -3261,7 +3299,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     for e in ev_sorted:
         (usable if place(e, U, down, rp, c=16) else skipped).append(e)
     if skipped:
-        notes.append(f"{len(skipped)} events cannot form a take (not enough footage around the kills, or my death right after)")
+        notes.append(f"{len(skipped)} events cannot form a take: " + "; ".join(f"{nm(e)} ({why_no_take(e)})" for e in skipped))
     if not usable:
         raise RuntimeError("no kill event has enough footage around it to form a take")
     head_cands = [e for e in usable if e["path"] not in heads] or usable
@@ -3279,7 +3317,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         total -= nat(e)
         cut_len.append(e)
     if cut_len:
-        notes.append(f"{len(cut_len)} lowest-ranked events left out to keep the montage near {target:.0f} s")
+        notes.append(f"{len(cut_len)} lowest-ranked events left out to keep the montage near {target:.0f} s: "
+                     + ", ".join(nm(e) for e in cut_len))
     nb = len(bt) - 1
     d0 = min(down)
     dr = an["drop"] if an.get("drop") is not None else int(0.45 * nb)
@@ -3373,32 +3412,68 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                 if t0 is head_take:
                     head_take = g
                 break
+    def place_end(e, c):
+        """The ending take from tick c: its 2-3 s fade ends on a song phrase / section boundary when a run-up allows it, else
+        on a beat; never past the end of the song."""
+        span = e["times"][-1] - e["times"][0]
+        lo, hi = rp.get("lead", (1, 2))
+        cands = []
+        for kk in range(c + 1, min(nt, c + 17)):
+            if kk % 2:
+                continue
+            g = geom(e, U, c, kk, None, 1.0, True, ending=True)
+            if not g:
+                continue
+            last_out = U[kk] + span
+            ends = [j for j in range(kk, len(U)) if END_FADE[0] <= U[j] - last_out <= END_FADE[1] and U[j] <= song_end]
+            if not ends:
+                continue
+            ph = [j for j in ends if j in phrase_ticks]
+            cands.append(((not vis_ok(e, e["times"][0] - (U[kk] - U[c])), not ph, abs(kk - c - (lo + hi))),
+                          dict(g, fade_end=(ph or ends)[0], on_phrase=bool(ph))))
+        return min(cands, key=lambda x: x[0])[1] if cands else None
+    nt = len(U) - 1
     c = head_take["end"]
-    left = []
+    left, left_song = [], []
     for e in post:
-        if U[c] - U[takes[0]["c"]] > target - (6 if ending else 0):
+        if target is not None and U[c] - U[takes[0]["c"]] > target - (6 if ending else 0):
             left.append(e)
             continue
         t = place_fx(e, c=c)
+        if t and ending is not None and place_end(ending, t["end"]) is None:
+            t = None                                       # keep room for the ending before the song ends
         if t:
             takes.append(t)
             c = t["end"]
         else:
-            left.append(e)
+            left_song.append(e)
     if left:
-        notes.append(f"{len(left)} events did not fit (length / song end)")
+        notes.append(f"{len(left)} events left out to keep the montage near {target:.0f} s: " + ", ".join(nm(e) for e in left))
+    if left_song:
+        notes.append(f"SONG TOO SHORT: {len(left_song)} events did not fit before the song ends: " + ", ".join(nm(e) for e in left_song))
     end_take = None
     if ending is not None:
-        end_take = place(ending, U, down, rp, c=c, ending=True)
+        end_take = place_end(ending, c)
         if end_take:
             takes.append(end_take)
         else:
-            notes.append("the planned ending clip could not be placed; the last take ends the montage")
+            notes.append("the planned ending clip could not be placed before the song ends; the last take ends the montage")
+            left_song.append(ending)
     for t in list(takes):
         if not t.get("ending") and (t["end"] - t["c"] < 2 * MIN_TAKE_BEATS or U[t["end"]] - U[t["c"]] < MIN_TAKE_S):
             takes.remove(t)
             notes.append("removed a take shorter than the minimum")
-    return finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock)
+    plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock)
+    D, S0 = plan["duration"], plan["song"]["start_t"]
+    on_ph = bool(end_take and end_take.get("on_phrase"))
+    plan["fit"] = {"usable": len(usable), "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
+                   "left_out": [nm(e) for e in cut_len + left], "song_short": [nm(e) for e in left_song],
+                   "section_s": plan["song"]["section_s"], "manual": manual, "optimal": optimal}
+    plan["notes"].insert(1, f"{'OPTIMAL' if optimal else 'FIXED'} LENGTH {D:.0f} s = {len(plan['takes'])} "
+                         f"{'usable ' if manual else ''}takes{'' if optimal else f' (slider {target:.0f} s)'}, ends on "
+                         f"{'song phrase' if on_ph else 'a beat'} at {ts(S0 + D)} (song section {ts(S0)}-{ts(S0 + plan['song']['section_s'])} "
+                         f"= {plan['song']['section_s']:.0f} s available)")
+    return plan
 
 
 def take_segments(tk, f_c, f_k, f_x):
@@ -3491,8 +3566,11 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         if tk.get("ending"):
             last_k = f_k + int(round(ev["span"] * OUT_FPS))
             # fade 2-3 s from the final kill, ending on a beat tick when one falls inside that window
-            cand = [j for j in range(kb, len(U)) if END_FADE[0] <= U[j] - (U[kb] + ev["span"]) <= END_FADE[1]]
-            fade = (U[cand[0]] - (U[kb] + ev["span"])) if cand else 2.5
+            room = float(an.get("dur") or 1e9) - 0.1 - (U[kb] + ev["span"])     # never past the end of the song
+            cand = [j for j in range(kb, len(U)) if END_FADE[0] <= U[j] - (U[kb] + ev["span"]) <= min(END_FADE[1], room)]
+            if tk.get("fade_end") is not None:
+                cand = [tk["fade_end"]]
+            fade = (U[cand[0]] - (U[kb] + ev["span"])) if cand else min(2.5, room)
             f_x = last_k + int(round(fade * OUT_FPS))
         else:
             f_x = fr(U[tk["end"]])
@@ -3559,7 +3637,8 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             "params": {k: (round(v, 3) if isinstance(v, float) else v) for k, v in rp.items()},
             "song": {"path": song["path"], "artist": song["artist"], "title": song["title"], "bpm": an["bpm"],
                      "start_t": round(bt0, 6), "drop_t": None if drop_beat is None else round(float(bt[drop_beat]) - bt0, 3),
-                     "drop_beat": drop_beat, "fade_in": FADE_IN, "fade_out_start": fade_st, "lufs": an.get("lufs")},
+                     "drop_beat": drop_beat, "fade_in": FADE_IN, "fade_out_start": fade_st, "lufs": an.get("lufs"),
+                     "section_s": round(float(an.get("dur") or (bt[-1] + U[1] - U[0])) - bt0, 3)},
             "takes": out_takes, "duration": round(total_s, 4), "total_frames": total_f, "notes": notes,
             "beats_out": [round(float(t) - bt0, 4) for t in bt if bt0 - 1e-6 <= t <= bt0 + total_s + 1e-6],
             "drops_out": [round(d["t"] - bt0, 3) for d in an.get("drops", []) if bt0 <= d["t"] <= bt0 + total_s],
@@ -4020,7 +4099,8 @@ def weekly_existing(cfg, game, now=None):
     return [p for p, dt in montage_videos(Path(cfg["output_root"]) / GAME_DIR[game], game) if week_tag(dt) == wk]
 
 
-def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None):
+def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True):
+    """scan=False: plan from what is already scanned (the Manual status-line estimate runs exactly this, quietly)."""
     cfg = autodetect_dirs(cfg)
     if not load_dets(game).get(game):
         raise RuntimeError("OCR detector unavailable: Troubleshoot > Selfcheck (pip install rapidocr-onnxruntime)")
@@ -4029,10 +4109,10 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         raise RuntimeError(f"No {game} clips found in {[d for d, _ in clip_dirs(cfg, game)]} "
                            f"(or clips are over {cfg['max_mb']} MB / {cfg['max_dur_s']} s). Check Settings > clip folders.")
     manual = paths is not None
-    if paths is None:
+    if paths is None and scan:
         paths = auto_scan_set(cfg, game)
         out(f"auto: {len(paths)} uncached clips to scan this run (last {cfg['auto_recent_days']} days + up to {cfg['auto_old_per_run']} older)")
-    if paths:
+    if paths and scan:
         run_scan(cfg, [game], paths)
     pool, st = game_pool(cfg, game, set(paths) if manual else None)
     au = st["audio"]
@@ -4059,7 +4139,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
         n2 = list(notes)
         plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
-                            placement=placement)
+                            placement=placement, manual=manual)
         bad = [b_ for b_ in verify_cutlist(plan) if "kill row" in b_]
         idx = {int(m.group(1)) for b_ in bad for m in [re.match(r"take (\d+):", b_)] if m}
         gone = {plan["takes"][i - 1]["path"] for i in idx if 0 < i <= len(plan["takes"])}
@@ -4071,8 +4151,12 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     plan["notes"] = list(plan["notes"]) + fixes
     for f_ in fixes:
         out(f_)
+    if plan["duration"] > plan["song"]["section_s"] + 1e-3:              # never render past the end of the music
+        raise RuntimeError(f"plan is {plan['duration']:.1f} s but the song only has {plan['song']['section_s']:.1f} s from "
+                           f"{ts(plan['song']['start_t'])} - not rendered")
     plan["song_score"] = sinfo
-    LAST_PLAN[game] = plan
+    if scan:
+        LAST_PLAN[game] = plan
     return plan, fmt_plan(plan, events, sinfo, runners, unmatched, csvname)
 
 
@@ -4777,7 +4861,7 @@ class App:
                 pass
 
     def run_task(self, name, fn, *a):
-        if self.busy:
+        if self.busy or getattr(self, "est_running", False):    # never next to the status-line estimate (shared caches)
             self.pending.append((name, fn, a))
             out(f"queued: {name}")
             return
@@ -4966,6 +5050,8 @@ class App:
         ttk.Label(c3, text="Seed").pack(side="left", padx=(12, 2))
         self.m_seed = tk.StringVar()
         ttk.Entry(c3, textvariable=self.m_seed, width=8).pack(side="left")
+        for v_ in (self.m_seed, self.m_style):
+            v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
         self.m_status = tk.StringVar(value="Tick some clips.")
         ttk.Label(s3, textvariable=self.m_status, font=("Segoe UI", F(10), "bold"), wraplength=1100).pack(anchor="w", pady=2)
         mid = ttk.Frame(f)                                         # grid: steps 1 and 2 shrink instead of being cut off
@@ -5236,27 +5322,12 @@ class App:
         out(f"excluded {len(self.ticked)} clip(s) from montages (montage_data\\exclude.txt, one path per line)")
 
     def update_status(self):
-        cfg = self.cfg
-        gap = fight_gap(cfg, self.m_game.get())
+        """Status line. The length comes from the REAL planner (make_plan on the already-scanned ticked clips, same song, style
+        and seed as the render), run quietly in the background after a short pause, so the estimate is the plan."""
         tk_ = [self.byp[p] for p in self.ticked if p in getattr(self, "byp", {})]
         kills = sum(c["kills"] or 0 for c in tk_)
         uns = sum(1 for c in tk_ if c["kills"] is None)
-        est = 0.0
-        for c in tk_:
-            ks = c["ks"]
-            i = 0
-            while i < len(ks):
-                j = i
-                while j + 1 < len(ks) and ks[j + 1] - ks[j] <= gap:
-                    j += 1
-                est += 2.0 + (ks[j] - ks[i]) + 1.0
-                i = j + 1
-        if self.m_opt.get():
-            self.m_len_sc.state(["disabled"])
-            est = min(max(est, 30.0), 120.0) if est else 0     # Optimal: the strong material decides, 30-120 s
-        else:
-            self.m_len_sc.state(["!disabled"])
-            est = min(est, int(self.m_len.get()) * 1.1) if est else 0
+        self.m_len_sc.state(["disabled"] if self.m_opt.get() else ["!disabled"])
         sel = self.stree.selection()
         song = "auto pick"
         if sel and sel[0] != "auto":
@@ -5265,11 +5336,74 @@ class App:
                 song = f"{s['title']} ({self.song_bpm(s) or '?'} BPM)"
         txt = f"{len(tk_)} clips ticked, {kills} kills found"
         if uns:
-            txt += f" ({uns} not scanned yet - they get scanned first)"
-        txt += f", montage will be about {est:.0f} s" if est else ""
-        if est and est < 60:
-            txt += " (under 60 s: little material)"
-        self.m_status.set(txt + f", song: {song}")
+            txt += f" ({uns} not scanned yet - they get scanned first; the estimate leaves them out)"
+        self.m_head = txt
+        self.m_status.set(txt + (", montage length: estimating ..." if kills else "") + f", song: {song}")
+        if getattr(self, "_est_after", None):
+            self.root.after_cancel(self._est_after)
+            self._est_after = None
+        if kills:
+            self._est_after = self.root.after(700, self.start_estimate)
+
+    def est_seed(self):
+        """The seed the estimate AND the render use (typed seed, else one kept until the next render)."""
+        if self.m_seed.get().strip().isdigit():
+            return int(self.m_seed.get())
+        if not getattr(self, "_est_seed", None):
+            self._est_seed = random.randrange(1, 10 ** 6)
+        return self._est_seed
+
+    def start_estimate(self):
+        self._est_after = None
+        if self.busy or getattr(self, "est_running", False):  # never next to a running job: retry shortly
+            self._est_after = self.root.after(1500, self.start_estimate)
+            return
+        paths = [p for p in self.ticked if p in getattr(self, "byp", {}) and self.byp[p]["kills"]]
+        if not paths:
+            return
+        sel = self.stree.selection()
+        args = dict(paths=paths, song_path=None if not sel or sel[0] == "auto" else sel[0],
+                    target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=self.m_style.get(), seed=self.est_seed())
+        game, head = self.m_game.get(), self.m_head
+        self.est_gen = getattr(self, "est_gen", 0) + 1
+        gen = self.est_gen
+        self.est_running = True
+
+        def go():
+            QUIET.on = True
+            try:
+                plan, _ = make_plan(load_config(), game, scan=False, **args)
+                msg = self.estimate_text(plan, len(paths))
+            except Exception as ex:
+                msg = f"cannot plan yet: {ex}"
+            finally:
+                QUIET.on = False
+
+            def show():
+                self.est_running = False
+                if gen == self.est_gen:
+                    self.m_status.set(f"{head}, {msg}")
+                if self.pending and not self.busy:
+                    n, fn, a = self.pending.pop(0)
+                    self.run_task(n, fn, *a)
+            self.q.put(("call", show))
+        threading.Thread(target=go, daemon=True).start()
+
+    @staticmethod
+    def estimate_text(plan, n_clips):
+        fit, sg = plan.get("fit", {}), plan["song"]
+        used = len({p["path"] for t in plan["takes"] for p in (t.get("srcs") or [t])})
+        txt = (f"montage {plan['duration']:.0f} s from {used} of {n_clips} clips ({fit.get('usable', '?')} usable events, "
+               f"song section {sg['section_s']:.0f} s), song: {sg['title'] or Path(sg['path']).stem}, style: {plan['recipe']}")
+        if fit.get("song_short"):
+            txt = (f"song too short: fits {fit['used']} of {fit['usable']} clips; pick a longer song or untick some  |  " + txt)
+        if fit.get("left_out"):
+            txt += f"; fixed length leaves out {len(fit['left_out'])}: " + ", ".join(fit["left_out"][:4]) + \
+                   (" ..." if len(fit["left_out"]) > 4 else "")
+        if fit.get("skipped"):
+            txt += f"; {len(fit['skipped'])} can't form a take: " + ", ".join(f"{a} ({b})" for a, b in fit["skipped"][:3]) + \
+                   (" ..." if len(fit["skipped"]) > 3 else "")
+        return txt
 
     def manual(self, mode):
         paths = list(self.ticked)
@@ -5278,7 +5412,8 @@ class App:
             return
         sel = self.stree.selection()
         song = None if not sel or sel[0] == "auto" else sel[0]
-        seed = int(self.m_seed.get()) if self.m_seed.get().strip().isdigit() else None
+        seed = self.est_seed()                                     # the same plan the status line showed
+        self._est_seed = None
         style = self.m_style.get()
         self.run_task("manual " + mode, self.job_video(
             self.m_game.get(), mode=mode, force=True, paths=paths, song_path=song,
@@ -5964,6 +6099,9 @@ def render_check(outfile, plan, cfg, verbose=True):
     fails = []
     if abs(m["duration"] - m["planned"]) > 1.5 / OUT_FPS:
         fails.append(f"duration {m['duration']:.3f} s != plan {m['planned']:.3f} s")
+    sec = plan["song"].get("section_s")
+    if sec is not None and m["duration"] > sec + 1.5 / OUT_FPS:
+        fails.append(f"duration {m['duration']:.3f} s is longer than the song section ({sec:.3f} s from {ts(plan['song']['start_t'])})")
     if m["start_db"] < -40:
         fails.append(f"music not audible at 0.3-0.5 s ({m['start_db']:.1f} dBFS)")
     if m["gaps"]:
@@ -5986,7 +6124,7 @@ def render_check(outfile, plan, cfg, verbose=True):
             fails.append("the ending fade does not run from the final kill to the end (2-3 s)")
     if verbose:
         print_measure(m, f"RENDER CHECK {Path(outfile).name}")
-        out("  " + ("OK: duration = plan, music audible from the start, no gaps, every take shows its kills, tails <= 0.5 s, "
+        out("  " + ("OK: duration = plan and <= the song section, music audible from the start, no gaps, every take shows its kills, tails <= 0.5 s, "
                     "slow-mo ending + fades from the final kill" + (", 1.0x frame-by-frame (barcode) from 1 s before each first kill "
                     "through the last kill" if m["speed_checked"] else "") if not fails else "FAIL: " + "; ".join(fails)))
     return fails, m
@@ -6324,6 +6462,28 @@ def planner_selftest(verbose=True):
                     f"{max(errs):.1f} ms off the beat, tails max {max(t['dur'] - t['kills_out'][-1] for t in takes[:-1]):.2f} s")
         if len({s[1] for s in sigs}) < 2 or len({s[1:] for s in sigs}) < 3:
             fails.append("variety: different seeds did not give clearly different montages")
+        # V5.4 length rules: Manual uses every usable clip; a fixed length lists what it leaves out; a short song lists what
+        # did not fit; never longer than the song section
+        sp2 = tmpd / "short test.mp3"
+        synth_song(sp2, 128.0, layout=(("intro", 4), ("verse", 8), ("build", 4), ("drop", 8), ("outro", 4)))
+        an2 = analyse_song(str(sp2), 128.0)
+        for a_, nm_, ev_, tg_, chk in ((an, "manual optimal, 10 clips", fake_events(10), "optimal", "all"),
+                                       (an, "manual fixed 40 s", evs, 40, "left"), (an2, "manual optimal, short song", evs, "optimal", "short")):
+            p_ = plan_montage(dict(DEFAULT_CONFIG), "valorant", ev_, dict(song, path=str(sp2) if a_ is an2 else song["path"]), a_, 5,
+                              "auto", tg_, [], [], manual=True)
+            f_ = p_["fit"]
+            if p_["duration"] > p_["song"]["section_s"]:
+                fails.append(f"{nm_}: {p_['duration']:.1f} s is longer than the song section {p_['song']['section_s']:.1f} s")
+            if verify_cutlist(p_):
+                fails.append(f"{nm_}: " + "; ".join(verify_cutlist(p_)))
+            if chk == "all" and f_["used"] != f_["usable"]:
+                fails.append(f"{nm_}: only {f_['used']} of {f_['usable']} usable clips used")
+            if chk == "left" and (not f_["left_out"] or f_["used"] + len(f_["left_out"]) != f_["usable"]):
+                fails.append(f"{nm_}: left-out clips not listed ({f_})")
+            if chk == "short" and (not f_["song_short"] or f_["used"] + len(f_["song_short"]) != f_["usable"]):
+                fails.append(f"{nm_}: song-too-short clips not listed ({f_})")
+            if verbose:
+                out(f"  {nm_}: {p_['notes'][1]}")
     finally:
         globals()["clip_audio"] = real_ca
         restore_data_dir(old)
