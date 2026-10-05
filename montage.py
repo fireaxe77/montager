@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.57"
+APP_VERSION = "V5.58"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5470,7 +5470,7 @@ def F(size):
 
 
 SV_THEME = [False]                                    # True when the Sun Valley ttk theme (sv-ttk) is active
-THEME_VER = "t2"
+THEME_VER = "t3"
 
 
 def _neutral(v, base):
@@ -5524,8 +5524,16 @@ def lime_theme_dir(accent="lime", base="grey"):
     out_[blue] = tinted[blue]
     cv2.imwrite(str(tmp / "theme" / "spritesheet_dark.png"), np.concatenate([np.clip(out_, 0, 255).astype(np.uint8), alpha], axis=2))
     sub = lambda m: _tint_hex(m, accent, base)
+    tag = f"{accent}_{base}"
     for f_ in (tmp / "theme" / "dark.tcl", tmp / "sv.tcl"):
-        f_.write_text(re.sub(r'"#([0-9a-fA-F]{6})"', sub, f_.read_text(encoding="utf-8")), encoding="utf-8")
+        txt_ = re.sub(r'"#([0-9a-fA-F]{6})"', sub, f_.read_text(encoding="utf-8"))
+        # V5.58: a unique theme + namespace name per combination, fonts created once only: the running window can source another
+        # combination (live theme switching) without "theme already exists" / "font already exists" errors
+        txt_ = txt_.replace("sun-valley-dark", f"mt-{tag}").replace("sv_dark", f"sv_{tag}")
+        if f_.name == "sv.tcl":
+            txt_ = re.sub(r"^source \[file join \[file dirname \[info script\]\] theme light\.tcl\]\s*$", "", txt_, flags=re.M)
+            txt_ = re.sub(r"^font create (.*)$", r"catch {font create \1}", txt_, flags=re.M)
+        f_.write_text(txt_, encoding="utf-8")
     (tmp / "ok").write_text(THEME_VER)
     shutil.rmtree(dst, ignore_errors=True)
     os.replace(tmp, dst)
@@ -5540,10 +5548,11 @@ def apply_theme(root, scale=None, accent="lime", base="grey"):
     pal = make_palette(accent, base)
     try:
         import tkinter.font as tkfont
-        d = lime_theme_dir(accent, base)
-        root.tk.call("source", str(d / "sv.tcl"))
+        tname = f"mt-{accent}_{base}"
+        if tname not in ttk.Style(root).theme_names():             # V5.58: every combination is sourced once per window, then reused
+            root.tk.call("source", str(lime_theme_dir(accent, base) / "sv.tcl"))
         root._sv_ttk_loaded = True                                 # sv_ttk itself must not load its blue copy
-        ttk.Style(root).theme_use("sun-valley-dark")
+        ttk.Style(root).theme_use(tname)
         SV_THEME[0] = True
         for nm, sz, bold in (("TkDefaultFont", 10, 0), ("TkTextFont", 10, 0), ("TkMenuFont", 10, 0), ("TkHeadingFont", 10, 1),
                              ("SunValleyBodyFont", 10, 0), ("SunValleyBodyStrongFont", 10, 1), ("SunValleyCaptionFont", 9, 0)):
@@ -5845,16 +5854,52 @@ class App:
         self.build_songs()
         self.build_trouble()
         self.build_settings()
-        self.nb.select(start_tab)
         self.install_wheel_guard()
         for pw in (self.vpane, self.mpane):
             pw.bind("<ButtonRelease-1>", self.save_layout, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.prerealize(start_tab, lay)                           # V5.58: every tab is laid out once before the window is visible
+        self.switch_ms = []                                       # V5.58: (tab, ms) of every tab switch until the layout is idle again
+        self._sw_t0 = None
+        self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed, add="+")
         self.root.bind("<Configure>", self.on_root_configure, add="+")
-        self.root.after(150, lambda: self.apply_layout(lay))
         self.root.after(100, self.poll)
         if startup:
             self.root.after(400, self.startup)
+
+    # ---- tab switching (V5.58): all tabs are built once in __init__ and only shown / hidden afterwards
+    def prerealize(self, start_tab, lay):
+        """Lay out and map every tab (and the dividers) while the window is still invisible (alpha 0), so a later tab switch only raises
+        an already laid-out frame: no widgets popping in, no re-layout after the tab is visible."""
+        try:
+            self.root.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        try:
+            self.root.update_idletasks()
+            for f in self.tabs.values():
+                self.nb.select(f)
+                self.root.update()
+            if hasattr(self, "set_relayout"):
+                self.set_relayout()                               # the Settings page is sized now, not 100 ms after it is first shown
+            self.nb.select(start_tab)
+            self.apply_layout(lay)
+            self.root.update()
+        finally:
+            try:
+                self.root.attributes("-alpha", 1.0)
+            except tk.TclError:
+                pass
+
+    def on_tab_changed(self, _e=None):
+        self._sw_t0 = time.perf_counter()
+        self.root.after_idle(self._tab_idle)
+
+    def _tab_idle(self):
+        if self._sw_t0 is not None:
+            self.switch_ms.append((self.nb.tab(self.nb.select(), "text"), (time.perf_counter() - self._sw_t0) * 1000))
+            del self.switch_ms[:-200]
+            self._sw_t0 = None
 
     # ---- mouse wheel (V5.57): never changes a value; scrolls the nearest scrollable container instead
     WHEEL_GUARDED = ("TCombobox", "TSpinbox", "TScale", "TMenubutton", "Spinbox", "Scale", "Menubutton")
@@ -6133,6 +6178,12 @@ class App:
 
     def fill_chunked(self, tree, rows, chunk=300):
         """Insert thousands of rows without freezing the window."""
+        sig = getattr(self, "_fill_sig", None)
+        if sig is None:
+            sig = self._fill_sig = {}
+        if sig.get(tree) == rows and self._fill_token.get(tree) is not None:     # V5.58: same data as the last fill: leave the list alone
+            return
+        sig[tree] = list(rows)
         token = object()
         self._fill_token[tree] = token
         tree.delete(*tree.get_children())
@@ -7090,6 +7141,7 @@ class App:
                 pend.append(cv.after(100, relayout))
         cv.bind("<Configure>", later)
         f.bind("<Configure>", later)
+        self.set_relayout = relayout
         self.sv, self.sl, self.sn, self.set_track = {}, {}, {}, {}
         r = [0]
         LW = int(300 * sc)
@@ -7196,13 +7248,13 @@ class App:
         self.set_base = tk.StringVar(value=str(self.cfg.get("base", "grey")).capitalize())
         label("Accent colour")
         h = holder()
-        ttk.Combobox(h, textvariable=self.set_accent, values=list(ACCENT_NAMES.values()), width=14, state="readonly").pack(side="left", padx=(0, PX))
-        hint(h, "Applies after restart")
+        cb_ = ttk.Combobox(h, textvariable=self.set_accent, values=list(ACCENT_NAMES.values()), width=14, state="readonly")
+        cb_.pack(side="left", padx=(0, PX))
         r[0] += 1
         label("Base")
         h = holder()
-        ttk.Combobox(h, textvariable=self.set_base, values=["Grey", "Black"], width=14, state="readonly").pack(side="left", padx=(0, PX))
-        hint(h, "Applies after restart")
+        cb_ = ttk.Combobox(h, textvariable=self.set_base, values=["Grey", "Black"], width=14, state="readonly")
+        cb_.pack(side="left", padx=(0, PX))
         r[0] += 1
         label("UI scale (font + row height)")
         h = holder()
@@ -7222,6 +7274,8 @@ class App:
         ttk.Label(f, text="Every change is saved at once (montage_data\\config.json next to montage.py).", style="Dim.TLabel").grid(
             row=r[0] + 1, column=0, columnspan=3, sticky="w", padx=PX, pady=(0, 12))
         self.set_last = f.grid_slaves(row=r[0] + 1, column=0)[0]
+        self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
+        self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), self.set_opt, self.set_len,
                   self.set_style, self.set_q, self.set_place, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
@@ -7232,6 +7286,80 @@ class App:
         self.root.after(1500, lambda: self.save_status.set("All changes saved"))
         out("Settings saved")
         self.run_task("clips", self.load_clips)
+
+    # ---- live theme (V5.58): accent / base change applies at once, no restart
+    COLOR_OPTS = {"bg": "bg", "background": "bg", "fg": "fg", "foreground": "fg", "highlightbackground": "bg", "highlightcolor": "acc",
+                  "insertbackground": "fg", "selectbackground": "sel", "selectforeground": "sel_fg", "activebackground": "btn_act",
+                  "activeforeground": "fg", "troughcolor": "head", "disabledforeground": "dim", "selectcolor": "field"}
+
+    def _tk_widgets(self):
+        """Every classic tk widget of the app (all windows, the pop-downs of the comboboxes included)."""
+        out_, todo = [], [self.root]
+        while todo:
+            w = todo.pop()
+            todo.extend(w.winfo_children())
+            if not w.winfo_class().startswith("T") or w.winfo_class() in ("Toplevel", "Tk", "Text"):
+                out_.append(w)
+        return out_
+
+    def retheme(self, accent=None, base=None):
+        """Re-apply the Sun Valley theme (a unique theme per accent x base, sourced into the running window) and recolour every widget:
+        ttk styles (buttons, checkboxes, sliders, tabs, selection, progress, dropdowns, footer) come from the theme; the classic tk widgets
+        (log, canvases, dividers, pop-downs, changelog popout) that still carry a colour of the old palette get the matching new one."""
+        cfg = self.cfg
+        accent = accent or cfg.get("accent", "lime")
+        base = base or cfg.get("base", "grey")
+        old, snap = dict(self.pal), []
+        for w in self._tk_widgets():
+            vals = {}
+            for opt in self.COLOR_OPTS:
+                try:
+                    vals[opt] = str(w.cget(opt)).lower()
+                except tk.TclError:
+                    pass
+            tags = {}
+            if w.winfo_class() == "Text":
+                for t in w.tag_names():
+                    for opt in ("foreground", "background", "selectbackground", "selectforeground"):
+                        v = str(w.tag_cget(t, opt)).lower()
+                        if v:
+                            tags[(t, opt)] = v
+            snap.append((w, vals, tags))
+        self.pal = apply_theme(self.root, UI_SCALE[0], accent, base)         # the scale in use (a changed scale applies after restart)
+        PAL.clear()
+        PAL.update(self.pal)
+        old_to_key = {}
+        for k, v in old.items():
+            old_to_key.setdefault(str(v).lower(), k)
+        for w, vals, tags in snap:
+            for opt, v in vals.items():
+                k = old_to_key.get(v)
+                if k is not None and self.pal[k].lower() != v:
+                    try:
+                        w.configure(**{opt: self.pal[k]})
+                    except tk.TclError:
+                        pass
+            for (t, opt), v in tags.items():
+                k = old_to_key.get(v)
+                if k is not None:
+                    try:
+                        w.tag_configure(t, **{opt: self.pal[k]})
+                    except tk.TclError:
+                        pass
+        self.root.update_idletasks()
+
+    def on_theme_pick(self, *_):
+        """Accent colour / base picked in Settings: switch the running window at once."""
+        acc = next((k for k, lab in ACCENT_NAMES.items() if lab == self.set_accent.get()), "lime")
+        base = "black" if self.set_base.get().lower() == "black" else "grey"
+        if (acc, base) == (self.cfg.get("accent", "lime"), self.cfg.get("base", "grey")):
+            return
+        self.cfg["accent"], self.cfg["base"] = acc, base
+        try:
+            self.retheme(acc, base)
+        except Exception as ex:
+            out(f"Theme not applied: {ex}")
+        self.autosave()
 
     # ---- changelog popout (V5.57)
     def show_changelog(self):
@@ -8318,7 +8446,7 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
         # V5.55: theme, dividers (move + remembered), used column / filter, Random pick
         try:
             import sv_ttk                                          # noqa: F401
-            if not SV_THEME[0] or "sun-valley" not in ttk.Style(root).theme_use():
+            if not SV_THEME[0] or "mt-" not in ttk.Style(root).theme_use():
                 fails.append(f"Sun Valley theme did not load (theme {ttk.Style(root).theme_use()})")
         except ImportError:
             out("  (sv-ttk not installed - the plain fallback theme is in use; pip install sv-ttk)")
