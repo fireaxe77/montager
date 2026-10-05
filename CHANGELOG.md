@@ -6,6 +6,7 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
 ## V6.1 - 2026-10-05
+- Poll cost (~140 ms on the UI thread): the "done" step of App.poll ran refresh_auto on the UI thread: it re-read the clip and kills caches, built a Detector per game, stat()ed every clip and listed the output folders. It now runs in a worker thread that hands the finished status texts to the UI through the queue, and is skipped when none of the files it reads changed.
 - Priority (Windows): ffmpeg / ffprobe child processes start with BELOW_NORMAL_PRIORITY_CLASS so the window stays responsive during scans and renders. Linux unchanged; worker counts and encoder settings unchanged.
 - Smoketest (Windows): settings_persist_test and the other smoketest child processes now read UTF-8 (`encoding="utf-8", errors="replace"`, `PYTHONIOENCODING=utf-8`) and the failure message no longer crashes on missing output; the rendercheck docstring no longer raises a SyntaxWarning.
 
