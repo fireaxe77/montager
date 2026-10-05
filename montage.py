@@ -143,7 +143,11 @@ def out(*a):
     if LOG_SINK[0]:
         LOG_SINK[0](msg)
     else:
-        print(msg, flush=True)
+        try:
+            print(msg, flush=True)
+        except UnicodeEncodeError:                         # a console without UTF-8 ('火斧' in CS2 rows)
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(msg.encode(enc, errors="replace").decode(enc, errors="replace"), flush=True)
 
 
 def progress(frac, text=""):
