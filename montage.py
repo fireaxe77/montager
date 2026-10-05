@@ -9280,6 +9280,25 @@ def _hide_child_consoles():
     subprocess.Popen.__init__ = init
 
 
+def _lower_child_priority():
+    """V6.1 (Windows only): ffmpeg / ffprobe children run at below-normal priority so the GUI stays responsive while a scan or render
+    runs. No change on Linux, no change to worker counts or encoder settings."""
+    flag = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+    if os.name != "nt":
+        return
+    orig = subprocess.Popen.__init__
+
+    def init(self, args, *a, **kw):
+        try:
+            exe = os.path.basename(str(args[0] if isinstance(args, (list, tuple)) else str(args).split()[0])).lower()
+            if exe.startswith(("ffmpeg", "ffprobe")):
+                kw["creationflags"] = kw.get("creationflags", 0) | flag
+        except Exception:
+            pass
+        orig(self, args, *a, **kw)
+    subprocess.Popen.__init__ = init
+
+
 def update_on_start():
     """V5.5: optional (Settings > Check for updates on start, off by default): `git pull --ff-only` once, before the GUI opens;
     when the code changed the app restarts itself once on the new code. Nothing runs in the background."""
@@ -9311,6 +9330,7 @@ def update_on_start():
 
 def main():
     _hide_child_consoles()
+    _lower_child_priority()
     for s in (sys.stdout, sys.stderr):
         try:
             s.reconfigure(encoding="utf-8", errors="replace")
