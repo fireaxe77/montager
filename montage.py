@@ -3214,6 +3214,7 @@ LEAD_MIN = 0.3                          # run-up before the first kill (V4: 1-2 
 SLOW_OUT = 0.4
 MIN_TAKE_BEATS, MIN_TAKE_S, OUT_FPS = 2, 1.2, 60
 TAIL = (0.2, 0.5)                       # after the last kill (no dead air)
+ROW_TAIL, ROW_SLACK = 0.4, 0.3          # V5.42B: the take lasts >= 0.4 s after my last kill ROW appears (+ up to 0.3 s to a tick)
 FADE_IN = 0.3                           # music + video fade-in at the very start
 END_FADE = (2.0, 3.0)                   # final slow-mo + music + video fade, from the final kill
 RECIPES = {                             # all within V4's effect strength; they change pacing, run-ups, zooms, slow-mo, transitions
@@ -3343,12 +3344,14 @@ def dead_air_cuts(ev, U, kb):
     import bisect
     cuts, o = [], 0.0                                      # o = output time of kill i, from the first kill
     T0, nt = float(U[kb]), len(U)
-    for a, b in zip(times, times[1:]):
+    rows = ev.get("rows") or times
+    for i, (a, b) in enumerate(zip(times, times[1:])):
         g = b - a
         if g <= allow(T0 + o):
             o += g
             continue
-        j0 = bisect.bisect_left(U, T0 + o + 0.4 - 1e-6)
+        rd = max(0.0, rows[i] - a) if i < len(rows) else 0.0             # V5.42B: never cut before this kill's row is seen
+        j0 = bisect.bisect_left(U, T0 + o + max(0.4, rd + ROW_TAIL) - 1e-6)
         ok = [j for j in range(j0, nt) if U[j] - (T0 + o) <= g - 1.0 - 0.25 and U[j] - (T0 + o) <= 2.5]
         cj = next((j for j in ok if j % 2 == 0), ok[0] if ok else None)
         if cj is None:
@@ -3364,7 +3367,7 @@ def dead_air_cuts(ev, U, kb):
     return cuts, (o if cuts else span)
 
 
-def geom(ev, U, c, kb, end, ramp, slow, ending=False):
+def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True):
     """One continuous take (ticks = beats + half-beats; kb = the beat tick where the first kill lands): run-up from tick c,
     1.0x from 1.0 s before the first kill through the last, speed-ups only before that, tail 0.2-0.5 s to the end tick
     (never into my death), slow-mo starts ON the last kill. ending=True: slow-mo from the final kill for the 2-3 s fade."""
@@ -3396,6 +3399,9 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False):
     win = (0.3, 0.5) if slow else TAIL
     if dmax < win[0]:
         win = (0.08, dmax)
+    win = row_tail_window(ev, slow, win, post, ext)
+    if win is None:
+        return None
     if not (win[0] - 1e-6 <= tail <= win[1] + 1e-6):
         return None
     src_tail = tail * (0.5 if slow else 1.0)
@@ -3405,6 +3411,26 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False):
         return None
     return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "ramp": r, "slow": slow, "ending": False, "dur": D,
             **({"cuts": cuts, "ospan": span} if cuts else {})}
+
+
+def row_tail_window(ev, slow, win, post, ext=True):
+    """V5.42B: a take's tail is measured from the moment my last kill ROW appears on screen (not the estimated shot): it lasts
+    >= 0.4 s after the row (up to 0.3 s more to reach a beat tick). If my death or the clip end comes sooner, as long as the
+    footage allows - but the row is always seen. None = the row cannot be shown. Rows within the old window: unchanged.
+    ext=False: only the old window's upper end (place() tries that first, so takes that already showed the row stay as they were)."""
+    last = ev["times"][-1]
+    spd = 0.5 if slow else 1.0
+    rdo = max(0.0, max(ev.get("rows") or ev["times"]) - last) / spd      # output s from the last kill to its row
+    need = rdo + ROW_TAIL
+    if need <= win[0] + 1e-6:
+        return win
+    cap = max(0.0, post) / spd
+    if cap < rdo + 0.05:
+        return None
+    lo = min(need, cap)
+    if not ext:
+        return (lo, win[1]) if lo <= win[1] + 1e-6 else None
+    return (lo, max(win[1], lo + ROW_SLACK))
 
 
 def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, ending=False, c_only=None):
@@ -3426,19 +3452,20 @@ def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, endi
     pref = lambda q: (0 if 2 * lo <= q[2] <= 2 * hi else 1, abs(q[2] - (lo + hi)), q[1] // 2 not in down, q[0] % 2)
     good = sorted([q for q in pairs if vis_ok(ev, first - (U[q[1]] - U[q[0]]))], key=pref)
     bad = sorted([q for q in pairs if q not in good], key=lambda q: -(U[q[1]] - U[q[0]]))[:2]
-    for cc, kk, _ in good + bad:
+    for ext, (cc, kk, _) in [(x, q) for x in ((True,) if ending else (False, True)) for q in good + bad]:
         if ending:
             g = geom(ev, U, cc, kk, None, ramp, True, ending=True)
             if g:
                 return g
             continue
         last_out = U[kk] + dead_air_cuts(ev, U, kk)[1]
+        hi = max(TAIL[1], 2 * max(0.0, max(ev.get("rows") or ev["times"]) - ev["times"][-1]) + ROW_TAIL + ROW_SLACK)
         ends = [end] if end is not None else \
             sorted([j for j in range(kk + 1, min(nt + 1, kk + 40 + int(span / max(1e-3, float(U[1] - U[0]))) + 1))   # long fights too
-                    if TAIL[0] - 0.12 <= U[j] - last_out <= TAIL[1] + 0.01],
+                    if TAIL[0] - 0.12 <= U[j] - last_out <= hi + 0.01],
                    key=lambda j: (j % 2, abs(U[j] - last_out - 0.32)))
         for j in ends:
-            g = geom(ev, U, cc, kk, j, ramp, slow)
+            g = geom(ev, U, cc, kk, j, ramp, slow, ext=ext)
             if g:
                 return g
     return None
@@ -3942,8 +3969,15 @@ def verify_cutlist(plan):
             if src.get("dur") and (b - src["shift"] > src["dur"] - 0.02 or a - src["shift"] < -0.01):
                 bad.append(f"take {i}: footage {a:.2f}-{b:.2f}s is outside its clip")
         tail = t["dur"] - t["kills_out"][-1]
-        if not t.get("ending") and tail > TAIL[1] + 1.0 / OUT_FPS:
-            bad.append(f"take {i}: tail {tail:.2f} s after the last kill (max {TAIL[1]})")
+        row_tail = t["dur"] - max(t.get("rows_out") or t["kills_out"])
+        tmax = max(TAIL[1], t["dur"] - row_tail - t["kills_out"][-1] + ROW_TAIL + ROW_SLACK)
+        if not t.get("ending") and tail > tmax + 1.0 / OUT_FPS:
+            bad.append(f"take {i}: tail {tail:.2f} s after the last kill (max {tmax:.2f})")
+        sg_l = [sg for sg in t["segs"] if sg[2] > 0][-1:]                   # my death or the clip end may come sooner
+        src_l = t["srcs"][sg_l[0][4] if sg_l and len(sg_l[0]) > 4 else 0] if sg_l else {}
+        clip_end = bool(sg_l) and (src_l.get("dur") or 1e9) - (sg_l[0][1] - src_l.get("shift", 0.0)) <= 0.15
+        if not t.get("ending") and row_tail < ROW_TAIL - 1.0 / OUT_FPS and t.get("death_after") is None and not clip_end:
+            bad.append(f"take {i}: only {row_tail:.2f} s after the last kill row appears (min {ROW_TAIL})")
         if t["path"] in seen_clips:
             bad.append(f"take {i}: clip {Path(t['path']).name} used twice")
         seen_clips.add(t["path"])
@@ -3972,7 +4006,7 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     for n in plan["notes"]:
         L.append(f"NOTE     {n}")
     bad = verify_cutlist(plan)
-    L.append("CUT LIST CHECK: " + ("OK - contiguous, kills inside every take, 1.0x through the kills, tails 0.2-0.5 s, no clip twice"
+    L.append("CUT LIST CHECK: " + ("OK - contiguous, kills inside every take, 1.0x through the kills, tails >= 0.4 s after the kill row, no clip twice"
                                    if not bad else "PROBLEMS: " + "; ".join(bad)))
     L.append("\nRANKED KILL EVENTS (top 20)")
     for i, ev in enumerate(events[:20], 1):
