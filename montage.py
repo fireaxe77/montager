@@ -31,7 +31,7 @@ NOTES (V5): clips come from the explicit folder lists in Settings (the list deci
 CLI (same engine):  python montage.py auto [--game valorant|cs2] [--force] [--dry] [--preview] [--max-quality] [--seed N]
                     python montage.py plan --game cs2        (dry plan only)     python montage.py pick   (GUI, Manual tab)
                     python montage.py selfcheck | selftest | smoketest | detectcheck | inventory | scan | verify <game> | calibrate-bars | tag <path> <game>
-Data: montage_data\ (config.json, caches, calibration, plans, logs\montage.log). Output: E:\Movies\Montages\<Game>\.
+Data: montage_data\ (config.json, caches, calibration, plans, logs\montage.log). Output: E:\Movies\Montages\<Game>\<SONG INITIALS>_<VAL|CS2>_<version>_<date>.mp4 (+ logs\ with its plan .txt/.json).
 """
 import argparse
 import base64
@@ -54,6 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+APP_VERSION = "V5.2"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -3955,10 +3956,48 @@ def week_tag(now):
     return f"{y}-W{w:02d}"
 
 
+GAME_CODE = {"valorant": "VAL", "cs2": "CS2"}
+
+
+def song_initials(title):
+    """First letters of the song title's words (bracketed parts like '(feat. X)' dropped), max 5 characters."""
+    words = re.findall(r"[^\W_]+", re.sub(r"[(\[].*?[)\]]", " ", title or ""))
+    return "".join(w[0] for w in words).upper()[:5] or "SONG"
+
+
+def montage_name(odir, plan, now):
+    """<SONG INITIALS>_<GAME>_<APP VERSION>_<YYYY-MM-DD>, plus _2, _3 ... when that video already exists."""
+    base = f"{song_initials(plan['song'].get('title') or Path(plan['song']['path']).stem)}_{GAME_CODE[plan['game']]}_" \
+           f"{APP_VERSION}_{now.strftime('%Y-%m-%d')}"
+    name, n = base, 1
+    while (odir / (name + ".mp4")).exists():
+        n += 1
+        name = f"{base}_{n}"
+    return name
+
+
+def montage_videos(d, game):
+    """Finished montages of a game in its output folder: V5.2 names (..._VAL_V5.2_2026-10-06[_2].mp4) and older
+    ones (Valorant_2026-W40_<seed>.mp4), each with the date it was made."""
+    vids = []
+    if d.is_dir():
+        new = re.compile(rf"_{GAME_CODE[game]}_[^_]+_(\d{{4}}-\d{{2}}-\d{{2}})(_\d+)?\.mp4$", re.I)
+        old = re.compile(rf"^{GAME_DIR[game]}_(\d{{4}})-W(\d{{2}})_.*\.mp4$", re.I)
+        for p in d.glob("*.mp4"):
+            m, mo = new.search(p.name), old.match(p.name)
+            try:
+                if m:
+                    vids.append((p, datetime.datetime.strptime(m.group(1), "%Y-%m-%d")))
+                elif mo:
+                    vids.append((p, datetime.datetime.fromisocalendar(int(mo.group(1)), int(mo.group(2)), 1)))
+            except ValueError:
+                pass
+    return sorted(vids, key=lambda v: v[0].stat().st_mtime)
+
+
 def weekly_existing(cfg, game, now=None):
-    d = Path(cfg["output_root"]) / GAME_DIR[game]
-    pat = f"{GAME_DIR[game]}_{week_tag(now or datetime.datetime.now())}_*.mp4"
-    return sorted(d.glob(pat)) if d.is_dir() else []
+    wk = week_tag(now or datetime.datetime.now())
+    return [p for p, dt in montage_videos(Path(cfg["output_root"]) / GAME_DIR[game], game) if week_tag(dt) == wk]
 
 
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None):
@@ -4058,17 +4097,17 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             pv = render_plan(plan, odir / f"preview_{GAME_DIR[game]}.mp4", cfg, maxq, True, encoder)
             quality_check(slice_plan(plan), pv, cfg, preview=True)
             return pv
-        outfile = Path(outfile) if outfile else odir / (base + ".mp4")
         odir.mkdir(parents=True, exist_ok=True)
+        outfile = Path(outfile) if outfile else odir / (montage_name(odir, plan, now) + ".mp4")
         render_plan(plan, outfile, cfg, maxq, False, encoder, effects)
         try:
             quality_check(plan, outfile, cfg)
         except Exception as ex:
             out(f"quality check skipped: {ex}")
-        (odir / (base + ".plan.txt")).write_text(text, encoding="utf-8")
-        save_json(odir / (base + ".plan.json"), plan)
-        if outfile.stem != base:
-            save_json(outfile.with_suffix(".plan.json"), plan)
+        logs = outfile.parent / "logs"                     # only the video stays in the output folder
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / (outfile.stem + ".plan.txt")).write_text(text, encoding="utf-8")
+        save_json(logs / (outfile.stem + ".plan.json"), plan)
         record_history(plan)
         if cfg.get("sync_report", True):
             try:
@@ -4620,7 +4659,7 @@ class App:
 
     def __init__(self, start_tab=0, startup=True):
         self.root = tk.Tk()
-        self.root.title("Montage builder (Valorant / CS2)")
+        self.root.title(f"Montage builder {APP_VERSION} (Valorant / CS2)")
         sc = UI_SCALE[0]
         self.root.geometry(f"{min(int(1220 * sc), self.root.winfo_screenwidth())}x{min(int(920 * sc), self.root.winfo_screenheight() - 60)}")
         self.root.minsize(920, 640)
@@ -4860,7 +4899,7 @@ class App:
                             done += 1
                 ex = weekly_existing(cfg, g)
                 d = Path(cfg["output_root"]) / GAME_DIR[g]
-                allv = sorted([p for p in d.glob(f"{GAME_DIR[g]}_*.mp4")], key=lambda p: p.stat().st_mtime) if d.is_dir() else []
+                allv = [p for p, _ in montage_videos(d, g)]
                 lp = LAST_PLAN.get(g)
                 song = f"{lp['song']['artist']} - {lp['song']['title']} ({lp['song']['bpm']} BPM)" if lp else "chosen when the montage is made (newest week first)"
                 self.auto_status[g].set(
@@ -5931,14 +5970,15 @@ def render_check(outfile, plan, cfg, verbose=True):
 
 
 def cmd_rendercheck(args):
-    """rendercheck <montage.mp4>: uses the .plan.json saved next to it."""
+    """rendercheck <montage.mp4>: uses the .plan.json saved in logs\ next to it (older montages: next to the video)."""
     f = Path(args.file)
-    pj = f.with_suffix(".plan.json")
-    if not pj.exists():
-        cands = sorted(f.parent.glob("*.plan.json"), key=lambda p: p.stat().st_mtime)
+    pj = next((q for q in (f.parent / "logs" / (f.stem + ".plan.json"), f.with_suffix(".plan.json")) if q.exists()), None)
+    if not pj:
+        cands = sorted(list(f.parent.glob("*.plan.json")) + list((f.parent / "logs").glob("*.plan.json")),
+                       key=lambda p: p.stat().st_mtime)
         pj = cands[-1] if cands else None
     if not pj:
-        raise SystemExit("no .plan.json next to the video")
+        raise SystemExit("no .plan.json for the video (looked in logs\\ and next to it)")
     fails, _ = render_check(f, load_json(pj, {}), load_config())
     if fails:
         sys.exit(1)
