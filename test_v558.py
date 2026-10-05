@@ -123,8 +123,8 @@ def test_tabs():
     try:
         T.fake_clips(app, 60)
         T.pump(app.root, 4, 0.05)
-        if M.APP_VERSION != "V5.58" or M.APP_VERSION not in app.root.title():
-            fails.append(f"window title '{app.root.title()}' does not show V5.58")
+        if M.APP_VERSION not in app.root.title():
+            fails.append(f"window title '{app.root.title()}' does not show {M.APP_VERSION}")
         ids = {n: {id(w) for w in T.walk(f)} | {id(f)} for n, f in app.tabs.items()}
         before = list(app.nb.tabs())
         calls = {"apply_filter": 0, "fill_chunked": 0, "refresh_songs": 0, "load_clips": 0}

@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.58"
+APP_VERSION = "V5.6"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -457,6 +457,7 @@ def scan_clips(cfg, rescan=False):
     with ThreadPoolExecutor(max_workers=6) as ex:
         for i, (p, rec) in enumerate(ex.map(lambda p: analyse_clip(p, cache, rescan, cfg["bar"]), paths), 1):
             recs.append(rec)
+            progress(i / max(1, len(paths)), f"Scanning {i} / {len(paths)}")
             if todo and i % 50 == 0:
                 out(f"    {i}/{len(paths)}")
     live = {file_key(p) for p in paths}
@@ -5789,6 +5790,7 @@ class App:
     def __init__(self, start_tab=0, startup=True):
         set_app_id()
         self.root = tk.Tk()
+        self.root.withdraw()                                       # V5.6: built hidden, shown once when every tab is laid out
         self.root.title(f"{APP_NAME} {APP_VERSION}")
         set_window_icon(self.root)
         self.root.minsize(920, 640)
@@ -5799,6 +5801,8 @@ class App:
         self.sorts, self.sort_refill, self.sort_labels = {}, {}, {}
         self.clips, self.ticked, self.songs, self.bpm, self.last_video, self.byp = [], set(), [], {}, None, {}
         self._fill_token = {}
+        self.scan_active, self._fill_pending = False, {}
+        self._log_buf, self._log_flush_at, self._prog_val, self._prog_at = [], 0.0, None, 0.0
         LOG_SINK[0] = lambda m: self.q.put(("log", m))
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
@@ -5872,10 +5876,6 @@ class App:
         """Lay out and map every tab (and the dividers) while the window is still invisible (alpha 0), so a later tab switch only raises
         an already laid-out frame: no widgets popping in, no re-layout after the tab is visible."""
         try:
-            self.root.attributes("-alpha", 0.0)
-        except tk.TclError:
-            pass
-        try:
             self.root.update_idletasks()
             for f in self.tabs.values():
                 self.nb.select(f)
@@ -5886,10 +5886,23 @@ class App:
             self.apply_layout(lay)
             self.root.update()
         finally:
-            try:
-                self.root.attributes("-alpha", 1.0)
-            except tk.TclError:
-                pass
+            self.root.deiconify()                                 # V5.6: first and only time the window becomes visible
+
+    def reveal(self, win, over=None):
+        """Popups are created withdrawn; lay them out, centre over the main window, then show once."""
+        try:
+            win.update_idletasks()
+            over = over or self.root
+            w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+            m = re.fullmatch(r"(\d+)x(\d+)", win.geometry().split("+")[0])
+            if m and int(m.group(1)) > 1:
+                w, h = int(m.group(1)), int(m.group(2))
+            x = over.winfo_rootx() + max(0, (over.winfo_width() - w) // 2)
+            y = over.winfo_rooty() + max(0, (over.winfo_height() - h) // 3)
+            win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except tk.TclError:
+            pass
+        win.deiconify()
 
     def on_tab_changed(self, _e=None):
         self._sw_t0 = time.perf_counter()
@@ -6117,6 +6130,9 @@ class App:
             out(f"Queued: {name}")
             return
         self.busy = True
+        self.scan_active = name == "clips"                         # V5.6: no list refills while clips are being scanned
+        if self.scan_active:
+            self.plabel.set("Scanning ...")
         CANCEL.clear()
         self.set_buttons(False)
 
@@ -6129,35 +6145,64 @@ class App:
                 self.q.put(("done", None))
         threading.Thread(target=target, daemon=True).start()
 
+    def flush_log(self):
+        """V5.6: log lines are collected and inserted as one block every 250 ms; the log keeps the last 2000 lines."""
+        self._log_flush_at = time.monotonic()
+        if not self._log_buf:
+            return
+        lines, self._log_buf = self._log_buf, []
+        self.log.insert("end", "\n".join(lines) + "\n")
+        n = int(self.log.index("end-1c").split(".")[0])
+        if n > 2000:
+            self.log.delete("1.0", f"{n - 2000}.0")
+        self.log.see("end")
+
+    def flush_prog(self, force=False):
+        now = time.monotonic()
+        if self._prog_val is not None and (force or now - self._prog_at >= 0.25):
+            self.pbar["value"], txt = self._prog_val
+            self.plabel.set(txt)
+            self._prog_val, self._prog_at = None, now
+
     def poll(self):
         try:
             for _ in range(200):
                 k, v = self.q.get_nowait()
                 if k == "log":
-                    self.log.insert("end", v + "\n")
-                    self.log.see("end")
+                    self._log_buf.append(v)
                     if "Auto audio failed, used Legacy V5.55" in v:
                         self.status_flash("Auto audio failed, used Legacy V5.55", 12000)
                 elif k == "prog":
-                    self.pbar["value"] = v[0]
-                    self.plabel.set(v[1])
+                    self._prog_val = v
                 elif k == "call":
                     self.safe(v)()
                 elif k == "done":
-                    self.busy = False
+                    self.flush_log()
+                    self._prog_val = None
+                    self.busy = self.scan_active = False
                     self.pbar["value"] = 0
                     self.plabel.set("Idle")
                     self.set_buttons(True)
                     bb_, self._busy_btn = self._busy_btn, None
                     if bb_:
                         self.flash_button(*bb_)
+                    self.flush_fills()
                     self.refresh_auto()
                     if self.pending:
                         n, fn, a = self.pending.pop(0)
                         self.run_task(n, fn, *a)
         except queue.Empty:
             pass
+        self.flush_prog()
+        if time.monotonic() - self._log_flush_at >= 0.25:
+            self.flush_log()
         self.root.after(80, self.poll)
+
+    def flush_fills(self):
+        """Lists whose refill was held back during a scan are refilled once now (the latest data only)."""
+        pend, self._fill_pending = self._fill_pending, {}
+        for tree, rows in pend.items():
+            self.fill_chunked(tree, rows)
 
     def startup(self):
         miss = missing_packages()
@@ -6177,28 +6222,39 @@ class App:
         threading.Thread(target=self.bpm_worker, daemon=True).start()
 
     def fill_chunked(self, tree, rows, chunk=300):
-        """Insert thousands of rows without freezing the window."""
+        """V5.6: build every row while the list is unmapped, then show it once (no row-by-row growth in a visible list).
+        Held back (latest rows kept) while a clip scan runs; refilled once when it ends."""
         sig = getattr(self, "_fill_sig", None)
         if sig is None:
             sig = self._fill_sig = {}
         if sig.get(tree) == rows and self._fill_token.get(tree) is not None:     # V5.58: same data as the last fill: leave the list alone
+            self._fill_pending.pop(tree, None)
+            return
+        if self.scan_active:
+            self._fill_pending[tree] = list(rows)
+            return
+        if self._resizing:                                         # V5.56: no list refills while the window is being resized
+            self.root.after(100, self.fill_chunked, tree, rows)
             return
         sig[tree] = list(rows)
-        token = object()
-        self._fill_token[tree] = token
-        tree.delete(*tree.get_children())
-
-        def step(i=0):
-            if self._fill_token.get(tree) is not token:
-                return
-            if self._resizing:                                     # V5.56: no list refills while the window is being resized
-                self.root.after(100, step, i)
-                return
-            for iid, text, vals in rows[i:i + chunk]:
+        self._fill_token[tree] = object()
+        self._fill_pending.pop(tree, None)
+        mgr = tree.winfo_manager()
+        info = getattr(tree, f"{mgr}_info")() if mgr in ("pack", "grid", "place") else None
+        if info:
+            getattr(tree, f"{mgr}_forget" if mgr != "grid" else "grid_remove")()
+        try:
+            tree.delete(*tree.get_children())
+            for iid, text, vals in rows:
                 tree.insert("", "end", iid=iid, text=text, values=vals)
-            if i + chunk < len(rows):
-                self.root.after(5, step, i + chunk)
-        step()
+        finally:
+            if info:
+                if mgr == "pack":
+                    tree.pack(**info)
+                elif mgr == "grid":
+                    tree.grid()
+                else:
+                    tree.place(**info)
 
     def open_path(self, p):
         p = Path(p)
@@ -6446,6 +6502,7 @@ class App:
     def date_range_dialog(self):
         """Small window for the custom date range (From / to, YYYY-MM-DD)."""
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title("Date range")
         win.transient(self.root)
         win.configure(bg=self.pal["bg"])
@@ -6466,6 +6523,7 @@ class App:
         bb.grid(row=3, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(bb, text="Cancel", command=win.destroy).pack(side="left", padx=(0, 8))
         ttk.Button(bb, text="Apply", style="Accent.TButton", command=ok).pack(side="left")
+        self.reveal(win)
 
     def on_tree_click(self, e):
         if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
@@ -6545,6 +6603,7 @@ class App:
         songs.sort(key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
 
         def fill():
+            self.scan_active = False                                # scan finished: the lists are filled exactly once, now
             self.clips, self.songs = rows, songs
             self.byp = {c["path"]: c for c in rows}
             self.ticked &= set(self.byp)
@@ -6907,6 +6966,7 @@ class App:
             return
         path = sel[0]
         w = tk.Toplevel(self.root)
+        w.withdraw()
         w.title("Pick the playlist track for " + Path(path).name)
         w.geometry("640x520")
         q = tk.StringVar(value=clean(Path(path).stem))
@@ -6935,6 +6995,7 @@ class App:
                 w.destroy()
                 self.run_task("matches", self.load_matches)
         ttk.Button(w, text="Use this track", command=ok).pack(pady=8)
+        self.reveal(w)
 
     # ------------------------------------------------------------ Troubleshoot tab
     def build_trouble(self):
@@ -7369,6 +7430,7 @@ class App:
             old.lift()
             return
         win = self.cl_win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(f"{APP_NAME} changelog")
         win.configure(bg=self.pal["bg"])
         win.geometry("780x640")
@@ -7393,6 +7455,7 @@ class App:
         bar.pack(side="bottom", fill="x")
         ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
         self.cl_text = txt
+        self.reveal(win)
 
 
 ACCENT_NAMES = {"lime": "Lime green", "yellow": "Yellow", "orange": "Orange", "red": "Red", "pink": "Pink", "purple": "Purple"}

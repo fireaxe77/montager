@@ -5,6 +5,12 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V5.6 - 2026-10-05
+- GUI only, no more widgets or lists appearing one after another. The main window stays withdrawn while every tab is built and laid out once, then it is shown in one step (no alpha trick). Popups (changelog, date range, playlist track picker) are created withdrawn, laid out, centred over the main window and then shown.
+- Lists (clips, songs, tables) are filled in one pass while the list is unmapped and shown once; no row-by-row growth. While clips are being scanned the lists are not refilled at all: the status line shows "Scanning 51 / 210" and the lists are refilled once when the scan ends.
+- Scan progress label and bar update at most 4 times per second (final value always shown). Log lines are collected and inserted every 250 ms in one block; the log keeps the last 2000 lines.
+- Tab switching only shows the existing frame (unchanged from V5.58). Detection, planner and render logic are untouched; the clip scan only reports its progress now.
+
 ## V5.58 - 2026-10-05
 - Live themes: changing Accent colour or Base in Settings applies at once, no restart. The theme is re-applied in the running window (one Sun Valley theme per accent x base, loaded once, then reused) and every classic widget that carried an old palette colour (log, dividers, Settings canvas, drop-down lists, changelog popout and its headings) is recoloured. "Applies after restart" removed for these two options (UI scale still applies after restart). Choice is saved in config as before.
 - Tab switching without visible reloading: all tabs were already built once; now they are also laid out and mapped while the window is still invisible (alpha 0), the Settings page and the divider positions are sized before the window shows, and the clip / song / table lists are not refilled when the data is unchanged. A tab switch only raises an existing frame. Switch time is measured (`App.switch_ms`).
