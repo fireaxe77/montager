@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.5.2"
+APP_VERSION = "V6.7"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -1499,7 +1499,88 @@ def weapon_class(r, game=None):
     return "gun"
 
 
-def merge_variants(tracks):
+_OCR_CASE = {"I": "l", "|": "l", "1": "l", "O": "o", "0": "o", "D": "o"}          # V6.7 (CS2): OCR swaps l/I/1/| and O/0/D
+_OCR_CYR = {"а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "х": "x", "у": "y", "к": "k", "т": "t", "н": "h", "м": "m", "в": "b"}   # Cyrillic look-alikes
+
+
+def ocr_norm(s):
+    """V6.7 (CS2): a name after OCR-confusion normalisation: l/I/1/| -> l, O/0/D -> o, Cyrillic look-alikes -> Latin, rn -> m,
+    vv -> w, case folded, spaces and punctuation dropped."""
+    t = "".join(_OCR_CASE.get(c, c) for c in (s or ""))
+    t = "".join(_OCR_CYR.get(c, c) for c in t.lower())
+    return _alnum(t.replace("rn", "m").replace("vv", "w"))
+
+
+def ocr_ratio(a, b):
+    """Similarity 0-100 of two names after ocr_norm (inputs may be raw or already normalised). 0 when the difference touches a
+    digit (two players called 'player1' / 'player2' are different players) or either name is shorter than 4 letters and not equal."""
+    from rapidfuzz import fuzz
+    from rapidfuzz.distance import Levenshtein
+    a, b = ocr_norm(a), ocr_norm(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 100.0
+    if min(len(a), len(b)) < 4:
+        return 0.0
+    for tag, i1, i2, j1, j2 in Levenshtein.opcodes(a, b):
+        if tag != "equal" and any(c.isdigit() for c in a[i1:i2] + b[j1:j2]):
+            return 0.0
+    return float(fuzz.ratio(a, b))
+
+
+CS2_SAME_NAME = 82.0            # V6.7: ocr_ratio that joins two reads of one CS2 victim ('Dneelko' / 'Oneelkn' / 'Onee lke' = 86)
+CS2_ROUND_S = 115.0             # V6.5-era round window (see the 5-kills cap): one victim dies once per round
+
+
+def _row_match_cs2(t, r, prev_f, dy=0.0):
+    """V6.7 (CS2 only): _row_match with the names compared after OCR-confusion normalisation and with the row's POSITION as
+    identity. A row that was already on screen in the previous OCR frame at the same height (or at the height every row moved to
+    when a new row pushed the list, dy) is the same kill however it is read; the pixel-appearance check (appear_max) keeps a NEW row
+    that takes over a height from being joined to the row that just left it."""
+    if t["split"] == r["split"] == "icon" and t["gun"] != r["gun"]:
+        return 0.0
+    if t["iw"] and r["icon"] and abs(t["iw"] - r["icon"][2]) > 0.3 * max(t["iw"], r["icon"][2]):
+        return 0.0
+    from rapidfuzz import fuzz
+    th = max(8.0, r["th"])
+    live = t["last"] == prev_f
+    same_y = abs(t["y"] - r["y"]) <= 0.5 * th
+    moved = bool(dy) and abs(t["y"] + dy - r["y"]) <= 0.5 * th
+    va, vb = ocr_norm(t["v"]), ocr_norm(r["vtext"])
+    ka, kb_ = ocr_norm(t["k"]), ocr_norm(r["ktext"])
+    if ((va and not vb) or (vb and not va) or (ka and not kb_) or (kb_ and not ka)) and not (same_y or moved):
+        return 0.0
+    sv = ocr_ratio(va, vb) if (va and vb) else 100.0
+    sk = float(fuzz.ratio(ka, kb_)) if (ka and kb_) else 100.0
+    sc = min(sk, sv)
+    if live and same_y and r.get("appear_max", 0) <= prev_f:
+        sc = max(sc + 15, 85.0)                            # already there, unchanged position: the same row, whatever OCR read
+    elif live and moved:
+        sc = max(sc, 85.0)                                 # the whole list shifted (anchored on rows that still read alike) and this row went with it
+    return sc
+
+
+def _cs2_shift(tracks, cand, prev_f):
+    """V6.7 (CS2): the vertical distance every killfeed row moved since the previous OCR frame (a new row pushes the list), from
+    the rows whose victim text still reads alike; 0.0 when no row moved."""
+    from rapidfuzz import fuzz
+    ds = []
+    for r, _ in cand:
+        th = max(8.0, r["th"])
+        for t in tracks:
+            d = r["y"] - t["y"]
+            if t["last"] == prev_f and 0.5 * th < abs(d) <= 6 * th and ocr_norm(t["v"]) and ocr_norm(r["vtext"]) and \
+                    fuzz.ratio(ocr_norm(t["v"]), ocr_norm(r["vtext"])) >= 60:
+                ds.append(d)
+    if not ds:
+        return 0.0
+    ds.sort()
+    best = max(ds, key=lambda d: sum(1 for e in ds if abs(e - d) <= 4))
+    return float(sum(e for e in ds if abs(e - best) <= 4) / sum(1 for e in ds if abs(e - best) <= 4))
+
+
+def merge_variants(tracks, game=None):
     """OCR variants of one row ('ap15'/'apT5', 'Ryuk' seen twice) become one track: same killer side, victim names fuzzy >= 80
     or one edit apart, first sightings within 1.5 s - and NEVER seen in the same OCR frame (two rows on screen at the same
     time are two different kills, e.g. 'clean' and 'clean2')."""
@@ -1520,6 +1601,8 @@ def merge_variants(tracks):
             if abs(t["first"] - m["first"]) > 1.5 * FPS:
                 continue
             same_v = (a == b) or fuzz.ratio(a, b) >= 80 or (min(len(a), len(b)) >= 4 and Levenshtein.distance(a, b) <= 1)
+            if game == "cs2" and not same_v:                   # V6.7: OCR look-alike reads of one CS2 victim
+                same_v = ocr_ratio(t["v"], m["v"]) >= CS2_SAME_NAME
             same_k = fuzz.ratio(_alnum(t["k"]), _alnum(m["k"])) >= 70 or (t["ks"] >= 0.8 and m["ks"] >= 0.8)
             if a and b and same_v and same_k and (t["ks"] >= 0.8) == (m["ks"] >= 0.8) and (t["vs"] >= 0.8) == (m["vs"] >= 0.8) \
                     and not (t.get("frames", set()) & m.get("frames", set())):
@@ -1591,11 +1674,13 @@ def drop_fake_kills(kills, rej, game, pre=(), revives=()):
         between = a duplicate, whatever the sightings;
       - CS2: a round has 5 enemies - 6+ kills of mine inside one round's time, the weakest reads (1-2 sightings) go."""
     from rapidfuzz import fuzz
+    cs2 = game == "cs2"                                        # V6.7: CS2 compares victims after OCR-confusion normalisation
+    vname = (lambda x: ocr_norm(x)) if cs2 else (lambda x: _alnum(x).lower())
     kills.sort(key=lambda k: k["t"])
     keep = []
     pre = [dict(p, hits=9) for p in pre]                       # V5.5: kills whose row was already on screen at 0:00 are known kills too
     for k in kills:
-        v = _alnum(k.get("victim") or "").lower()
+        v = vname(k.get("victim") or "")
         seen = pre + keep
         left = _killer_leftover(k["row"].split("] ")[0][1:] if k.get("row") else "")
         why = None
@@ -1607,20 +1692,26 @@ def drop_fake_kills(kills, rej, game, pre=(), revives=()):
             fight.append(q)
             edge = q["t"]
         for q in fight:                                        # the same victim killed again = a duplicate, unless a revive came between
-            qv = _alnum(q.get("victim") or "").lower()
-            if v and qv and len(qv) >= 3 and fuzz.ratio(v, qv) >= 85 and k["t"] > q["t"] and \
+            qv = vname(q.get("victim") or "")
+            if v and qv and len(qv) >= 3 and (ocr_ratio(v, qv) >= CS2_SAME_NAME if cs2 else fuzz.ratio(v, qv) >= 85) and k["t"] > q["t"] and \
                     not any(q["t"] < rv < k["t"] for rv in revives):
                 why = f"'{k.get('victim')}' was already killed {k['t'] - q['t']:.1f} s earlier in this fight, no revive between ({k['row']})"
                 break
+        if why is None and cs2:                                # V6.7: within one round the same victim cannot be killed twice
+            for q in seen:
+                qv = vname(q.get("victim") or "")
+                if v and qv and len(qv) >= 4 and 0 < k["t"] - q["t"] <= CS2_ROUND_S and ocr_ratio(v, qv) >= 85:
+                    why = f"'{k.get('victim')}' was already killed {k['t'] - q['t']:.1f} s earlier in this CS2 round ({k['row']})"
+                    break
         for q in (seen if why is None else ()):
-            qv = _alnum(q.get("victim") or "").lower()
-            if k["t"] - q["t"] < 0.5 and v and qv and fuzz.ratio(v, qv) >= 70:
+            qv = vname(q.get("victim") or "")
+            if k["t"] - q["t"] < 0.5 and v and qv and (ocr_ratio(v, qv) >= 65 if cs2 else fuzz.ratio(v, qv) >= 70):
                 why = f"same kill read twice ({q['row']} / {k['row']} {k['t'] - q['t']:.2f} s apart)"
                 break
         if why is None and k["hits"] <= 2:
             text = _alnum(left + v).lower()
             for q in seen:
-                qv = _alnum(q.get("victim") or "").lower()
+                qv = vname(q.get("victim") or "")
                 if 0 < k["t"] - q["t"] <= 4.0 and len(qv) >= 3 and text and \
                         (fuzz.partial_ratio(qv, text) >= 85 or (len(text) >= 4 and fuzz.ratio(qv, text) >= 75)):
                     why = f"jumbled re-read of my kill on '{q.get('victim')}' {k['t'] - q['t']:.1f} s earlier ({k['row']})"
@@ -1670,8 +1761,13 @@ def analyse_entry(entry, cfg, game=None):
                     dead_others.setdefault(_alnum(r["vtext"]).lower(), f)
                 continue
             cand.append((r, v))
-        pairs = sorted(((_row_match(t, r, prev_f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
-                        if f - t["last"] <= TRACK_KEEP_S * FPS), reverse=True)
+        if game == "cs2":                                      # V6.7: CS2 only - normalised names, position as identity, list shifts
+            dy = _cs2_shift(tracks, cand, prev_f)
+            pairs = sorted(((_row_match_cs2(t, r, prev_f, dy), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
+                            if f - t["last"] <= TRACK_KEEP_S * FPS), reverse=True)
+        else:
+            pairs = sorted(((_row_match(t, r, prev_f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
+                            if f - t["last"] <= TRACK_KEEP_S * FPS), reverse=True)
         used_r, used_t, got = set(), set(), {}
         for sc, i, j in pairs:                                 # one-to-one: two rows in one frame are never the same row
             if sc >= 80 and i not in used_r and j not in used_t:
@@ -1693,7 +1789,7 @@ def analyse_entry(entry, cfg, game=None):
                                "cjk": bool(r.get("cjk")), "weapon": weapon_class(r, game), "box": [min(b[0] for b in r["boxes"]), min(b[1] for b in r["boxes"]),
                                                                   max(b[2] for b in r["boxes"]), max(b[3] for b in r["boxes"])]})
         prev_f = f
-    tracks = merge_variants(tracks)
+    tracks = merge_variants(tracks, game)
     res_why = resurrect_rows(tracks, dead_others) if game != "cs2" else {}      # V5.42B: Valorant only
     kills, deaths, revives, rej, vis, cjk, pre = [], [], [], [], [], {}, []
     for t in tracks:
@@ -1832,17 +1928,49 @@ def compute_kills(entry, cfg, game=None):
     return a["kills"], a["deaths"]
 
 
-def gun_onsets(rec, cache=None):
+_CS2_STREAM = {}
+
+
+def _cs2_stream(rec, cfg):
+    """V6.7 (CS2 only): the audio track the clip actually has sound on - the very pick the plan uses (Settings > Audio mode and
+    game audio track, a silent track is never chosen) - instead of track 1, which many CS2 replays leave silent."""
+    key = (rec.get("path"), str((cfg or {}).get("audio_mode", "auto")), str(((cfg or {}).get("game_audio_track") or {}).get("cs2", "auto")))
+    if key not in _CS2_STREAM:
+        try:
+            _CS2_STREAM[key] = int(resolve_clip_audio(rec, cfg or {}, "cs2", {}).get("stream") or 0)
+        except Exception:
+            _CS2_STREAM[key] = int(rec.get("a_stream", 0))
+    return _CS2_STREAM[key]
+
+
+def _onset_key(rec, cfg=None):
+    """Onset-cache key. Valorant (and every other caller): unchanged '<file>o1' (track a_stream). CS2: '<file>o1c<track>'."""
+    if rec.get("game") == "cs2":
+        return file_key(rec["path"]) + f"o1c{_cs2_stream(rec, cfg)}"
+    return file_key(rec["path"]) + "o1"
+
+
+def cs2_no_gunshots(rec, ons):
+    """V6.7 (CS2): True when no audio track of the clip has gunshots (no audio, every track silent, or none with an onset), so a
+    missing gunshot says nothing about the kill."""
+    if ons:
+        return False
+    m = load_json(LOUD_CACHE, {}).get(file_key(rec["path"]) + "|t2") or {}
+    return not any((x or 0) > 0 for x in m.get("ons", []))
+
+
+def gun_onsets(rec, cache=None, cfg=None):
     """Gunshot-like transients in the clip's game audio: [[t, strength], ...] on the container timeline. None = no audio."""
     if not rec.get("audio"):
         return None
     import numpy as np
-    key = file_key(rec["path"]) + "o1"
+    key = _onset_key(rec, cfg)
+    stream = _cs2_stream(rec, cfg) if rec.get("game") == "cs2" else int(rec.get("a_stream", 0))
     cache = cache if cache is not None else load_json(ONSET_CACHE, {})
     if key in cache:
         return cache[key]
     import librosa
-    r = subprocess.run(["ffmpeg", "-v", "error", "-i", rec["path"], "-map", f"0:a:{int(rec.get('a_stream', 0))}", "-vn", "-ac", "1", "-ar", "22050",
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", rec["path"], "-map", f"0:a:{stream}", "-vn", "-ac", "1", "-ar", "22050",
                         "-f", "f32le", "-"], capture_output=True, timeout=120)
     y = np.frombuffer(r.stdout, np.float32)
     ons = []
@@ -1861,20 +1989,21 @@ def verified_kills(pool_items, cfg):
     """Gunshot audio is a SOFT signal now: it refines each kill to the shot time and adds a score bonus, never rejects.
     The only hard rule here is the death lock. Returns stats; every rejection is logged with its reason."""
     cache = load_json(ONSET_CACHE, {})
-    todo = [it["rec"] for it in pool_items if it["rec"].get("audio") and file_key(it["rec"]["path"]) + "o1" not in cache]
+    todo = [it["rec"] for it in pool_items if it["rec"].get("audio") and _onset_key(it["rec"], cfg) not in cache]
     if todo:
         out(f"  analysing gunshots in {len(todo)} clips ...")
         res = {}
         with ThreadPoolExecutor(max_workers=4) as ex:
-            for i, (r, o) in enumerate(zip(todo, ex.map(lambda r: gun_onsets(r, {}), todo)), 1):
-                res[file_key(r["path"]) + "o1"] = o
+            for i, (r, o) in enumerate(zip(todo, ex.map(lambda r: gun_onsets(r, {}, cfg), todo)), 1):
+                res[_onset_key(r, cfg)] = o
                 progress(i / len(todo), "gunshot analysis")
         cache.update(res)
         save_json(ONSET_CACHE, cache)
     st = {"raw": 0, "no_shot": 0, "death_lock": 0, "kept": 0}
     lock = float(cfg.get("death_lock_s", 8.0))
     for it in pool_items:
-        ons = gun_onsets(it["rec"], cache)
+        ons = gun_onsets(it["rec"], cache, cfg)
+        no_shots = it["rec"].get("game") == "cs2" and cs2_no_gunshots(it["rec"], ons)       # V6.7: nothing to confirm with
         keep = []
         name = Path(it["rec"]["path"]).name
         for k in it["kills"]:
@@ -1886,7 +2015,7 @@ def verified_kills(pool_items, cfg):
                     shot = max(cand, key=lambda o: o[0])[0]
             if shot is None:
                 st["no_shot"] += 1
-                if k.get("needs_shot"):
+                if k.get("needs_shot") and not (no_shots and len(_alnum(k.get("victim"))) >= 3):      # V6.7: CS2 clip without any gunshot: nothing to confirm with
                     it["rej"].append({"t": k["t"], "reason": "1 sighting, name < 90 and no gunshot to confirm it", "ks": k["ks"]})
                     continue
                 it["rej"].append({"t": k["t"], "reason": "no gunshot heard (kept - audio is only a bonus)", "ks": k["ks"], "soft": True})
