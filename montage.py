@@ -451,25 +451,30 @@ def scan_clips(cfg, rescan=False):
     out(f"Scanning {'; '.join(roots) or '(no clip folder found - check Settings)'} ...")
     max_b = int(cfg.get("max_mb", 60)) * 1024 * 1024
     paths = []
-    for p in sorted(set(walk_files(roots, VIDEO_EXT, MIN_VIDEO, cfg))):
-        try:
-            if tag_game(p, cfg)[0] and os.path.getsize(p) <= max_b:
-                paths.append(p)
-        except OSError:
-            pass
-    paths.sort()
-    cache = {} if rescan else load_json(CLIPS_CACHE, {})
-    todo = [p for p in paths if rescan or file_key(p) not in cache or cache[file_key(p)].get("bar_sig") != json.dumps(cfg["bar"])]
+    with pstage("  scan_clips: walk + stat clips + tag_game"):
+        for p in sorted(set(walk_files(roots, VIDEO_EXT, MIN_VIDEO, cfg))):
+            try:
+                if tag_game(p, cfg)[0] and os.path.getsize(p) <= max_b:
+                    paths.append(p)
+            except OSError:
+                pass
+        paths.sort()
+    with pstage("  scan_clips: read clips cache"):
+        cache = {} if rescan else load_json(CLIPS_CACHE, {})
+    with pstage("  scan_clips: cache check (file_key stat per clip)"):
+        todo = [p for p in paths if rescan or file_key(p) not in cache or cache[file_key(p)].get("bar_sig") != json.dumps(cfg["bar"])]
     out(f"  {len(paths)} clips found" + (f", {len(todo)} new/changed to probe" if todo else " (all cached)"))
     recs = []
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        for i, (p, rec) in enumerate(ex.map(lambda p: analyse_clip(p, cache, rescan, cfg["bar"]), paths), 1):
-            recs.append(rec)
-            progress(i / max(1, len(paths)), f"Scanning {i} / {len(paths)}")
-            if todo and i % 50 == 0:
-                out(f"    {i}/{len(paths)}")
-    live = {file_key(p) for p in paths}
-    save_json(CLIPS_CACHE, {k: v for k, v in cache.items() if k in live})
+    with pstage("  scan_clips: analyse_clip loop (6 threads)"):
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for i, (p, rec) in enumerate(ex.map(lambda p: analyse_clip(p, cache, rescan, cfg["bar"]), paths), 1):
+                recs.append(rec)
+                progress(i / max(1, len(paths)), f"Scanning {i} / {len(paths)}")
+                if todo and i % 50 == 0:
+                    out(f"    {i}/{len(paths)}")
+    with pstage("  scan_clips: save clips cache"):
+        live = {file_key(p) for p in paths}
+        save_json(CLIPS_CACHE, {k: v for k, v in cache.items() if k in live})
     maxd = float(cfg.get("max_dur_s", 60))
     keep = []
     for r in recs:
@@ -771,7 +776,8 @@ def ocr_engine():
             raise RuntimeError("RapidOCR missing: python -m pip install --user rapidocr-onnxruntime")
         import logging
         logging.getLogger("RapidOCR").setLevel(logging.ERROR)
-        _OCR.e = RapidOCR()
+        with pstage("OCR engine creation (RapidOCR())"):
+            _OCR.e = RapidOCR()
     return _OCR.e
 
 
@@ -5375,7 +5381,8 @@ def missing_packages():
     miss = []
     for mod, pipname in PIP_PKGS:
         try:
-            __import__(mod)
+            with pstage(f"  import {mod}"):
+                __import__(mod)
         except Exception:
             miss.append(pipname)
     return miss
@@ -5955,8 +5962,10 @@ class App:
     DATES = {"All dates": None, "Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90}
 
     def __init__(self, start_tab=0, startup=True):
+        pmark("App.__init__ start")
         set_app_id()
-        self.root = tk.Tk()
+        with pstage("tk.Tk() creation"):
+            self.root = tk.Tk()
         self.root.withdraw()                                       # V5.6: built hidden, shown once when every tab is laid out
         self.root.title(f"{APP_NAME} {APP_VERSION}")
         set_window_icon(self.root)
@@ -5973,10 +5982,12 @@ class App:
         LOG_SINK[0] = lambda m: self.q.put(("log", m))
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
-        self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0), self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"))
+        with pstage("apply_theme (App.__init__)"):
+            self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0), self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"))
         sc = UI_SCALE[0]
         self._shown = False                                        # V6.1: the main window is shown once, after the first fill
-        self._splash_make()
+        with pstage("splash build + paint"):
+            self._splash_make()
         lay = self.cfg.get("ui_layout") or {}
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         w0, h0 = int(1220 * sc), int(920 * sc)
@@ -6023,11 +6034,13 @@ class App:
         self.tabs = {n: ttk.Frame(self.nb, padding=10) for n in ("Auto", "Manual", "Songs", "Troubleshoot", "Settings")}
         for n, f in self.tabs.items():
             self.nb.add(f, text=n)
-        self.build_auto()
-        self.build_manual()
-        self.build_songs()
-        self.build_trouble()
-        self.build_settings()
+        _wb = time.perf_counter()
+        for _n, _b in (("Auto", self.build_auto), ("Manual", self.build_manual), ("Songs", self.build_songs),
+                       ("Troubleshoot", self.build_trouble), ("Settings", self.build_settings)):
+            with pstage(f"  widget build: {_n} tab"):
+                _b()
+        if PERF is not None:
+            PERF.stage("widget build (all five tabs)", _wb)
         self.install_wheel_guard()
         for pw in (self.vpane, self.mpane):
             pw.bind("<ButtonRelease-1>", self.save_layout, add="+")
@@ -6035,7 +6048,8 @@ class App:
         if PERF is not None:
             PERF.attach(self.root)
         self._lay = lay
-        self.prerealize(start_tab, lay)                           # V5.58: every tab is laid out once before the window is visible
+        with pstage("prerealize (layout of every tab)"):
+            self.prerealize(start_tab, lay)                       # V5.58: every tab is laid out once before the window is visible
         self.switch_ms = []                                       # V5.58: (tab, ms) of every tab switch until the layout is idle again
         self._sw_t0 = None
         self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed, add="+")
@@ -6078,6 +6092,7 @@ class App:
         sp.geometry(f"+{(sp.winfo_screenwidth() - w) // 2}+{(sp.winfo_screenheight() - h) // 3}")
         sp.deiconify()
         sp.update()                                               # painted now; the main window stays withdrawn
+        pmark("splash painted")
 
     def splash_set(self, frac=None, text=None):
         try:
@@ -6097,7 +6112,8 @@ class App:
                 self.splash_set(0.05, f"{APP_NAME} - checking setup ...")
                 self._splash.update()
                 self._startup_t0 = time.monotonic()
-                self.startup()
+                with pstage("App.startup (UI thread; run_task starts the scan threads)"):
+                    self.startup()
                 self.splash_set(0.15, f"{APP_NAME} - loading clips and songs ...")
                 while not self.first_fill_done():
                     if time.monotonic() - self._startup_t0 > 12:
@@ -6108,7 +6124,10 @@ class App:
         except tk.TclError:
             pass
         finally:
-            self.show_main(late)
+            pmark("first fill done" + (" (TIMEOUT 12 s)" if late else ""))
+            with pstage("show_main"):
+                self.show_main(late)
+            pmark("main window shown")
 
     def first_fill_done(self):
         return (not self.busy and not self.pending and not getattr(self, "_auto_busy", False) and not self._fill_pending
@@ -6624,7 +6643,8 @@ class App:
         def work():
             res = None
             try:
-                res = self._auto_collect()
+                with pstage("refresh_auto: _auto_collect (worker)"):
+                    res = self._auto_collect()
             except Exception:
                 out("Status refresh failed: " + traceback.format_exc()[-300:])
             self.q.put(("call", lambda: self._auto_apply(res)))
@@ -6915,15 +6935,24 @@ class App:
         self._result = "Unticked all" if how == "none" else f"Ticked {len(self.ticked)} clips"
 
     def load_clips(self):
+        _t0 = time.perf_counter()
         cfg = load_config()
-        if missing_packages() == [] and shutil.which("ffmpeg"):
-            ensure_bars(cfg)
-        g = self.m_game.get()
-        det = load_dets(g).get(g)
-        kc = load_kills_cache()
-        ud = used_dates()                                          # V5.55: date of the montage each clip was used in
+        with pstage("load_clips: missing_packages + ensure_bars"):
+            if missing_packages() == [] and shutil.which("ffmpeg"):
+                ensure_bars(cfg)
+        with pstage("load_clips: m_game.get() (Tk variable read from the worker thread)"):
+            g = self.m_game.get()
+        with pstage("load_clips: Detector creation (load_dets)"):
+            det = load_dets(g).get(g)
+        with pstage("load_clips: read kills cache"):
+            kc = load_kills_cache()
+        with pstage("load_clips: used_dates"):
+            ud = used_dates()                                      # V5.55: date of the montage each clip was used in
         rows = []
-        for r in scan_clips(load_config()):
+        with pstage("load_clips: scan_clips (total)"):
+            scanned = scan_clips(load_config())
+        _t1 = time.perf_counter()
+        for r in scanned:
             if r.get("error") or r.get("game") != g:
                 continue
             e = kc.get(kills_key(r, g, det)) if det else None
@@ -6938,10 +6967,18 @@ class App:
                          "dur": r.get("dur", 0), "kills": None if ks is None else len(ks), "ks": ks or [],
                          "used": ud.get(_pkey(r["path"]), "")})
         rows.sort(key=lambda c: -c["mtime"])
-        songs, _, _ = song_pool(load_config()) if load_config().get("mp3_dir") else ([], [], None)
-        songs.sort(key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
+        if PERF is not None:
+            PERF.stages.append(((_t1 - PERF_T0) * 1000, (time.perf_counter() - _t1) * 1000, "load_clips: per-clip rows (kills lookup, compute_kills, getmtime)", threading.current_thread().name))
+        with pstage("load_clips: song_pool (song match)"):
+            songs, _, _ = song_pool(load_config()) if load_config().get("mp3_dir") else ([], [], None)
+            songs.sort(key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
+        _put = time.perf_counter()
 
         def fill():
+            if PERF is not None:
+                PERF.stages.append(((_put - PERF_T0) * 1000, (time.perf_counter() - _put) * 1000, "load_clips: hand-off wait (q.put -> UI poll runs fill)", "MainThread"))
+                PERF.stages.append(((_t0 - PERF_T0) * 1000, (time.perf_counter() - _t0) * 1000, "load_clips: TOTAL until fill starts", "MainThread"))
+            _f0 = time.perf_counter()
             self.scan_active = False                                # scan finished: the lists are filled exactly once, now
             self.clips, self.songs = rows, songs
             self.byp = {c["path"]: c for c in rows}
@@ -6949,6 +6986,8 @@ class App:
             self.folder_names = ["All folders"] + sorted({c["folder"] for c in rows})
             self.apply_filter()
             self.refresh_songs()
+            if PERF is not None:
+                PERF.stage("load_clips: fill() on UI thread (apply_filter + refresh_songs)", _f0)
         self.q.put(("call", fill))
 
     def apply_filter(self):
@@ -7249,10 +7288,14 @@ class App:
 
     def load_matches(self):
         cfg = load_config()
-        audio = scan_audio(cfg)
-        csvp, rows, col = read_playlist(cfg)
-        matched, unmatched = match_playlist(rows, audio, cfg) if rows and audio else ([], rows)
-        write_song_matches(audio, matched)
+        with pstage("load_matches: scan_audio"):
+            audio = scan_audio(cfg)
+        with pstage("load_matches: read_playlist"):
+            csvp, rows, col = read_playlist(cfg)
+        with pstage("load_matches: match_playlist"):
+            matched, unmatched = match_playlist(rows, audio, cfg) if rows and audio else ([], rows)
+        with pstage("load_matches: write_song_matches"):
+            write_song_matches(audio, matched)
         by = {a["path"]: (r, sc) for r, a, sc in matched}
         items = []
         for a in sorted(audio, key=lambda a: a["path"].lower()):
@@ -7263,9 +7306,12 @@ class App:
         weak = sum(1 for i in items if i[5] != "ok")
 
         def fill():
+            _f0 = time.perf_counter()
             self.match_rows, self.match_audio, self.match_items = rows, audio, items
             self.fill_matches()
             self.m_info.set(f"{len(audio)} MP3 files, {len(rows)} playlist tracks, {len(matched)} matched, {weak} to check, {len(unmatched)} playlist tracks without a file")
+            if PERF is not None:
+                PERF.stage("load_matches: fill() on UI thread", _f0)
         self.q.put(("call", fill))
 
     def fill_matches(self):
@@ -9578,7 +9624,11 @@ class PerfLog:
                 pass
             return " ".join(out_)
         add("dpi_awareness", dpi)
-        return "ENV  " + "   ".join(bits)
+        line = "ENV  " + "   ".join(bits)
+        if "=? (" in line and getattr(self, "_hdr", None):      # window already destroyed (atexit write after on_close): keep the live one
+            return self._hdr
+        self._hdr = line
+        return line
 
     def stage_table(self):
         L = ["STAGE TABLE (ms; start = ms since process start; thread shown; indent = nested inside the stage above)"]

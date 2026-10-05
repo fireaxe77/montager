@@ -5,6 +5,15 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V6.2 - 2026-10-05
+- Measurement build (detection, planner, effects and render pipeline untouched; no behaviour change without the switches below). `python montage.py perflog` now also records:
+  - a stack sampler (daemon thread, main thread sampled every 10 ms); for every main-loop gap above 50 ms the most frequent stack (top 6 Python frames) is kept and the summary lists the top 10 by total blocked time. If the main thread was inside Tk's C code the entry is labelled "Tk C-level" with the last Python frame;
+  - an `ENV` header line: OS / Windows build, Python, Tk patchlevel, sv_ttk version, window size, screen size, `tk scaling`, DPI awareness (process, window and system DPI on Windows) and the theme in use;
+  - a STAGE TABLE with the duration of every startup stage (Tk(), apply_theme and its parts, splash, widget build per tab, prerealize, App.startup with every package import, each phase of the clip scan thread, song match, hand-off to the UI thread, first fill, show) plus marks (splash painted, first fill done, window shown) and whether the OCR engine was created before the window was shown;
+  - THEME SWITCHES: per switch the stages (theme source / theme_use / ttk style configure / registry recolour / the update_idletasks that follows), the time to the first idle callback and first Expose after it, and the main-loop gaps in the 2 s after it.
+- `MONTAGE_SIMPLE_THEME=1` (A/B test only): the app uses the built-in ttk `clam` theme with the same base / accent palette (the existing fallback theme, styles applied with Style configure / map, no sv_ttk image elements). Without the variable nothing changes.
+- OCR engine: it is already created lazily (first real OCR call, only when clips need scanning); not changed.
+
 ## V6.1 - 2026-10-05
 - GUI only (detection, planner, effects and render pipeline untouched). Splash: a small centred "Montager - loading" window with a progress bar is painted first; the main window stays withdrawn. Everything that used to happen after the window appeared now happens behind the splash: divider positions (apply_layout, computed from the window geometry without a late retry), App.startup, the first clip / song cache load and the first fill of the clip, song and Auto status lists. The main window is shown once, after the first fill (safety: after 12 s it is shown with "Loading..." and fills when ready). The main progress bar never changes before the window is shown; scan progress keeps the 4-per-second throttle afterwards.
 - Tab switching: App.refresh_songs no longer refills the list or resets the selection (the 50 ms follow-up) when the data is unchanged. Tab switches themselves only show the existing frame (unchanged).
