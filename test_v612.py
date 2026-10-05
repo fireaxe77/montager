@@ -373,7 +373,110 @@ def t_open():
     root.destroy()
 
 
-SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow, "open": t_open}
+# ---------------------------------------------------------------- 5: Sun Valley fixes that do not change the look
+from tkinter import ttk
+
+SEQ = [("lime", "grey"), ("yellow", "black"), ("orange", "grey"), ("red", "black"), ("pink", "grey"), ("purple", "black"),
+       ("lime", "black"), ("yellow", "grey"), ("orange", "black"), ("red", "grey"), ("pink", "black"), ("purple", "grey")]
+
+
+def t_theme():
+    print("[5] Sun Valley: one <<ThemeChanged>> handler, each variant sourced once, classic widgets use the Sun Valley background")
+    M.messagebox.askyesno = lambda *a, **k: False
+    M.save_json(M.CONFIG_PATH, dict(M.load_config(), mp3_dir="", accent="lime", base="grey"))
+    built = []
+    real = M.lime_theme_dir
+    M.lime_theme_dir = lambda *a, **k: (built.append(a), real(*a, **k))[1]
+    try:
+        app = M.App(0)
+    finally:
+        pass
+    root = app.root
+    root.geometry("1400x900+0+0")
+    root.update()
+    st = ttk.Style(root)
+    bad_cls, bad_pix, n = [], [], 0
+    for rnd in range(2):
+        for acc, base in SEQ:
+            app.retheme(acc, base)
+            for tab in app.tabs:
+                app.nb.select(app.tabs[tab])
+                root.update()
+                time.sleep(0.15)
+                root.update()
+            sv_bg = str(st.lookup("TFrame", "background")).lower()
+            pal = M.make_palette(acc, base)
+            if sv_bg != pal["bg"].lower():
+                bad_cls.append(f"{acc}/{base}: Sun Valley TFrame background {sv_bg} != app palette {pal['bg']}")
+            for w in app._tk_widgets():
+                role = app.role_of(w)
+                if role in ("window", "label"):
+                    n += 1
+                    if str(w.cget("bg")).lower() != sv_bg:
+                        bad_cls.append(f"{acc}/{base}: {w.winfo_class()} {w} bg={w.cget('bg')} want {sv_bg}")
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab(xdisplay=os.environ.get("DISPLAY"))
+                want = tuple(int(sv_bg[i:i + 2], 16) for i in (1, 3, 5))
+                todo = [root]
+                while todo:
+                    w = todo.pop()
+                    try:
+                        todo.extend(w.winfo_children())
+                        if w.winfo_class() in ("TLabel", "TFrame") and w.winfo_viewable() and w.winfo_width() > 12 and w.winfo_height() > 8:
+                            x, y = w.winfo_rootx() + 1, w.winfo_rooty() + 1
+                            if 0 <= x < img.width and 0 <= y < img.height and root.winfo_containing(x, y) is w and str(w.cget("style")) in ("", "TLabel", "TFrame"):
+                                n += 1
+                                px = img.getpixel((x, y))[:3]
+                                if max(abs(a - b) for a, b in zip(px, want)) > 3:
+                                    for _ in range(5):
+                                        root.update()
+                                        time.sleep(0.2)
+                                    px2 = ImageGrab.grab(xdisplay=os.environ.get("DISPLAY")).getpixel((x, y))[:3]
+                                    if max(abs(a - b) for a, b in zip(px2, want)) <= 3:
+                                        bad_pix.append(f"(late redraw only: {px} -> {px2}) {w}")
+                                        continue
+                                    bad_pix.append(f"{acc}/{base}: {w.winfo_class()} {w} pixel {px} want {want} [text={str(w.cget('text'))[:25]!r} style={str(w.cget('style'))!r} lookup={st.lookup('TLabel', 'background')} geometry={w.winfo_rootx()},{w.winfo_rooty()} {w.winfo_width()}x{w.winfo_height()} tab={app._visible_tab() if hasattr(app, '_visible_tab') else app.nb.tab(app.nb.select(), 'text')}]")
+                    except tk.TclError:
+                        continue
+            except ImportError:
+                pass
+    check(not bad_cls, f"classic tk widgets carry the Sun Valley background in all 12 combinations ({n} checks)" + (": " + "; ".join(bad_cls[:3]) if bad_cls else ""))
+    check(not bad_pix, "screen pixels of ttk labels / frames equal the classic widgets' background (no black boxes)" + (": " + "; ".join(sorted({b.split(":")[0] + " x" + str(sum(1 for c in bad_pix if c.split(":")[0] == b.split(":")[0])) for b in bad_pix})) + " e.g. " + bad_pix[0] if bad_pix else ""))
+    nb = str(root.tk.call("bind", "Tk", "<<ThemeChanged>>")).count("configure_colors")
+    check(nb == 1, f"exactly one <<ThemeChanged>> -> configure_colors handler after 24 switches ({nb})")
+    check(len(built) <= 12 and len({tuple(b) for b in built}) == len(built), f"each Sun Valley variant is built / sourced at most once ({len(built)} builds for {len(SEQ)} variants x 2 rounds)")
+    root.destroy()
+    M.lime_theme_dir = real
+
+
+def t_length():
+    print("[length] fixed length 80-150 s")
+    for v, want in ((30, 80), (79, 80), (80, 80), (100, 100), (150, 150), (151, 150), (999, 150), ("optimal", "optimal")):
+        M.save_json(M.CONFIG_PATH, dict(M.load_config(), length_s=v))
+        got = M.load_config()["length_s"]
+        check(got == want, f"saved length_s {v!r} loads as {got!r} (want {want!r})")
+    M.messagebox.askyesno = lambda *a, **k: False
+    M.save_json(M.CONFIG_PATH, dict(M.load_config(), length_s=60, mp3_dir=""))
+    app = M.App(0)
+    scales = []
+    todo = [app.root]
+    while todo:
+        w = todo.pop()
+        todo.extend(w.winfo_children())
+        if w.winfo_class() == "TScale":
+            scales.append((float(w.cget("from")), float(w.cget("to"))))
+    check(len(scales) >= 2 and all(s == (80.0, 150.0) for s in scales), f"Manual and Settings sliders range {scales}")
+    check(app.m_len is app.set_len and app.m_len.get() >= 80, f"the two sliders share one variable, value {app.m_len.get()}")
+    app.m_opt.set(False)
+    app.m_len.set(500)
+    check(app.collect_settings(dict(app.cfg))["length_s"] == 150, "collect_settings clamps a too large value to 150")
+    app.m_len.set(10)
+    check(app.collect_settings(dict(app.cfg))["length_s"] == 80, "collect_settings clamps a too small value to 80")
+    app.root.destroy()
+
+
+SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow, "open": t_open, "theme": t_theme, "length": t_length}
 
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if not a.startswith("--")] or list(SECTIONS)
