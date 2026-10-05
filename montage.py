@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.42"
+APP_VERSION = "V5.42B"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -818,9 +818,10 @@ def _side_col(bx):
     return max(set(cs), key=cs.count) if cs else ""
 
 
-def ocr_rows(boxes, blobs):
+def ocr_rows(boxes, blobs, game=None):
     """Group OCR boxes into killfeed rows (by y-centre), find each row's weapon icon (white blob between the texts, else the
-    largest horizontal gap) and split into killer side / victim side."""
+    largest horizontal gap) and split into killer side / victim side. CS2 (V5.42B): the weapon is the largest LONG icon -
+    a square modifier icon next to it (through-smoke, wallbang, no-scope, blind, headshot) is never taken for the weapon."""
     import numpy as np
     good = [b for b in boxes if len(_alnum(b[4])) >= 2 and b[5] >= 0.5]
     if not good:
@@ -852,7 +853,10 @@ def ocr_rows(boxes, blobs):
         between = [g for g in free if bx[0][0] < g[0] + g[2] / 2 < bx[-1][2]]
         icon, split = None, None
         if between or free:
-            icon = max(between or free, key=lambda g: g[2] * g[3])
+            pick = between or free
+            if game == "cs2" and any(g[2] >= 1.5 * g[3] for g in pick):
+                pick = [g for g in pick if g[2] >= 1.5 * g[3]]
+            icon = max(pick, key=lambda g: g[2] * g[3])
             split = "icon"
             cut = icon[0] + icon[2] / 2
         elif len(bx) >= 2:
@@ -876,6 +880,7 @@ def ocr_rows(boxes, blobs):
                     "split": split, "hs": bool(hs), "boxes": bx, "appear": min(_box_appear(b) for b in bx),
                     "appear_max": max(_box_appear(b) for b in bx), "kcol": _side_col(kil), "vcol": _side_col(vic)})
     for d in res:
+        d["game"] = game
         d["ktext"] = " ".join(b[4] for b in d["killer"])
         d["vtext"] = " ".join(b[4] for b in d["victim"])
         d["ks"], kpos = name_match(d["ktext"]) if d["killer"] else (0.0, 0)
@@ -885,19 +890,24 @@ def ocr_rows(boxes, blobs):
     return res
 
 
-def classify_row(r, cfg=None, lg=0.0):
+def classify_row(r, cfg=None, lg=0.0, game=None):
     """THE rule set, used identically by the crop view, Dry plan, Render, sync report and Self-test.
-    Returns [(verdict, reason), ...]: verdict in kill / death / reject / none (one row can be both kill and death)."""
+    Returns [(verdict, reason), ...]: verdict in kill / death / reject / none (one row can be both kill and death).
+    V5.42B: the knife and revive / resurrect rules are VALORANT ONLY (its icons and team colours); in CS2 a row is a kill,
+    a death, a utility kill (small square icon only) or an assist."""
     out_ = []
     thr = float((cfg or {}).get("name_match", NAME_MIN))
+    val = (game or r.get("game")) != "cs2"
     if r.get("split") is None and max(r.get("ks", 0), r.get("vs", 0)) >= thr:
         return [("none", "FIREAXE seen but no weapon icon / gap to split the row")]
-    if r.get("vcol") == "g" and max(r.get("ks", 0), r.get("vs", 0)) >= thr and r.get("kcol") != "r":
+    if val and r.get("vcol") == "g" and max(r.get("ks", 0), r.get("vs", 0)) >= thr and r.get("kcol") != "r":
         # V5.42 colour first: a GREEN (teammate) victim side with no red killer = Clove self-revive / Sage resurrect (of me or a
         # teammate). Never a kill, never a death. (My real death: red killer side, me on the green victim side.)
         return [("revive", f"revive: green victim side ('{r['ktext'] or '-'}' -> '{r.get('vtext') or '-'}') - teammate revive / "
                            "resurrect, not a kill, not a death")]
-    if r.get("ks", 0) >= thr and (r.get("vs", 0) >= thr or (not r.get("vtext") and not r["gun"])):
+    if not val and r.get("ks", 0) >= thr and r.get("vs", 0) >= thr:
+        return [("none", f"CS2: FIREAXE on both sides ('{r['ktext']}' -> '{r.get('vtext') or '-'}') - not a kill")]
+    if val and r.get("ks", 0) >= thr and (r.get("vs", 0) >= thr or (not r.get("vtext") and not r["gun"])):
         # Clove self-revive: FIREAXE with an ability icon and no victim, or FIREAXE on both sides. Never a kill, never a death.
         return [("revive", f"revive: FIREAXE self-revive row ('{r['ktext']}' -> '{r.get('vtext') or '-'}') - not a kill")]
     if r.get("vs", 0) >= thr:
@@ -906,7 +916,7 @@ def classify_row(r, cfg=None, lg=0.0):
         w = "weapon icon" if r["split"] == "icon" else "gap"
         if not r["gun"]:
             out_.append(("reject", f"utility: small/square {w} (grenade, molotov, ability)"))
-        elif weapon_class(r) == "knife":
+        elif weapon_class(r, game) == "knife":
             out_.append(("reject", f"knife: long thin blade icon - knife kills are not used"))
         elif r.get("before"):
             out_.append(("reject", f"assist: '{r['before']}' comes before FIREAXE on the killer side"))
@@ -1084,7 +1094,7 @@ def scan_clip(path, rec, det, cfg, scale=None):
     t0 = time.time()
     ocr, n = scan_frames(frame_stream(path, rec, det, cfg, FPS))
     e = {"v": CACHE_V, "ocr": ocr, "frames": n, "size": [det.dw, det.dh], "region": det.d["region"],
-         "v_off": rec.get("v_off", 0.0), "ocr_calls": len(ocr), "secs": round(time.time() - t0, 1)}
+         "v_off": rec.get("v_off", 0.0), "ocr_calls": len(ocr), "secs": round(time.time() - t0, 1), "game": rec.get("game")}
     a = analyse_entry(e, cfg)
     e["best_name"], e["best_vic"] = round(a["best_k"], 3), round(a["best_v"], 3)
     return e
@@ -1133,12 +1143,15 @@ def _row_match_v4(t, r, prev_f):
     return sc
 
 
-def weapon_class(r):
+def weapon_class(r, game=None):
     """gun / knife / util from the weapon icon. util = small or square icon (grenades, molotov, abilities); knife = thin, sparse
-    and low icon (a blade). Conservative: anything unclear stays 'gun'."""
+    and low icon (a blade) - Valorant only (V5.42B: CS2's AWP / Scout / rifle icons are long and thin too). Conservative:
+    anything unclear stays 'gun'."""
     ic = r.get("icon")
     if not r.get("gun"):
         return "util"
+    if (game or r.get("game")) == "cs2":
+        return "gun"
     if r.get("split") == "icon" and ic and len(ic) >= 5 and ic[4] < 0.30 and ic[3] <= 0.75 * r.get("th", 20) and ic[2] >= 2.0 * ic[3]:
         return "knife"
     if r.get("split") == "icon" and ic and ic[2] >= 5.0 * ic[3] and ic[3] <= 1.0 * r.get("th", 20):
@@ -1217,17 +1230,18 @@ def resurrect_rows(tracks, dead_others):
     return res
 
 
-def analyse_entry(entry, cfg):
+def analyse_entry(entry, cfg, game=None):
     """Raw OCR frames -> rows -> verdicts -> content-tracked rows (identity = killer text + victim text + weapon) -> kills /
     deaths / rejected rows with reasons. The ONE implementation behind Dry plan, Render, the sync report, Self-test and the
     killfeed crop view."""
     off = entry.get("v_off", 0.0)
+    game = game or entry.get("game")
     bk = bv = 0.0
     tracks, mine, seen_rows, dead_others = [], [], 0, {}
     last_ocr = entry["ocr"][-1][0] if entry.get("ocr") else 0
     prev_f = -1
     for f, since, boxes, blobs in entry.get("ocr", []):
-        rs = ocr_rows(boxes, blobs)
+        rs = ocr_rows(boxes, blobs, game)
         seen_rows = max(seen_rows, len(rs))
         thr = float((cfg or {}).get("name_match", NAME_MIN))
         cand = []
@@ -1258,11 +1272,11 @@ def analyse_entry(entry, cfg):
                 tracks.append({"first": first, "seen": f, "last": f, "y": r["y"], "hits": 1, "k": r["ktext"].lower(), "v": r["vtext"].lower(),
                                "gun": r["gun"], "split": r["split"], "iw": r["icon"][2] if r["icon"] else 0, "hs": r["hs"],
                                "ks": r["ks"] / 100, "vs": r["vs"] / 100, "votes": [v], "ktext": r["ktext"], "vtext": r["vtext"], "frames": {f},
-                               "weapon": weapon_class(r), "box": [min(b[0] for b in r["boxes"]), min(b[1] for b in r["boxes"]),
+                               "weapon": weapon_class(r, game), "box": [min(b[0] for b in r["boxes"]), min(b[1] for b in r["boxes"]),
                                                                   max(b[2] for b in r["boxes"]), max(b[3] for b in r["boxes"])]})
         prev_f = f
     tracks = merge_variants(tracks)
-    res_why = resurrect_rows(tracks, dead_others)
+    res_why = resurrect_rows(tracks, dead_others) if game != "cs2" else {}      # V5.42B: Valorant only
     kills, deaths, revives, rej, vis = [], [], [], [], []
     for t in tracks:
         tt = round(t["first"] / FPS + off, 3)
@@ -1390,8 +1404,8 @@ def _analyse_entry_v4(entry, cfg):
             "ocr_calls": len(entry.get("ocr", []))}
 
 
-def compute_kills(entry, cfg):
-    a = analyse_entry(entry, cfg)
+def compute_kills(entry, cfg, game=None):
+    a = analyse_entry(entry, cfg, game)
     return a["kills"], a["deaths"]
 
 
@@ -1588,7 +1602,7 @@ def test_frame(game, img, cfg=None):
     """OCR one 1920x1080 normalised frame's killfeed: rows found + verdict per row (Calibrate / Self-test / crop view)."""
     det = Detector(game)
     boxes, blobs = ocr_frame(det.crop_norm(img).copy())
-    rows = ocr_rows(boxes, blobs)
+    rows = ocr_rows(boxes, blobs, game)
     return rows, boxes, blobs
 
 
@@ -1686,7 +1700,7 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
                 errs += 1
                 out(f"[{done}/{len(jobs)}] {g:8} ERROR {name}: {err}")
             else:
-                a = analyse_entry(res, cfg)
+                a = analyse_entry(res, cfg, g)
                 out(f"[{done}/{len(jobs)}] {g:8} {len(a['kills'])} kills {' '.join(ts(k['t']) for k in a['kills']) or '-'}"
                     f" | rows found {a['rows_max']} max/frame, {a['ocr_calls']} OCR calls | best name killer-side {a['best_k']:.2f},"
                     f" victim-side {a['best_v']:.2f} | rect {content_rect(r, cfg)} crop {'yes' if r.get('bars') else 'no'} | {name} ({res['secs']}s)")
@@ -1725,7 +1739,7 @@ def game_pool(cfg, game, paths=None):
         if not e or e.get("error"):
             continue
         stats["scanned"] += 1
-        a = analyse_entry(e, cfg)
+        a = analyse_entry(e, cfg, game)
         for j in a["rej"]:
             allrej.append((Path(r["path"]).name, j))
         if a["kills"]:
@@ -1780,7 +1794,7 @@ def grab_kill_crop(rec, det, cfg, k, scale=None):
         return None, []
     fr = np.frombuffer(r.stdout[:n], np.uint8).reshape(det.dh, det.dw, 3).copy()
     boxes, blobs = ocr_frame(fr)
-    rows = ocr_rows(boxes, blobs)
+    rows = ocr_rows(boxes, blobs, rec.get("game"))
     draw_rows(fr, rows)
     import cv2
     cv2.putText(fr, f"{Path(rec['path']).name[-28:]} t={ts(k['t'])}" + (" HS" if k.get("hs") else ""),
@@ -1800,7 +1814,7 @@ def cmd_verify(args):
     for r in scan_clips(cfg):
         e = cache.get(kills_key(r, args.game, det)) if r.get("game") == args.game and not r.get("error") else None
         if e and not e.get("error"):
-            ks, _ = compute_kills(e, cfg)
+            ks, _ = compute_kills(e, cfg, args.game)
             if ks:
                 items.append((r, e, ks))
     if not items:
@@ -1899,7 +1913,8 @@ def detection_regression(cfg=None, dirs=None, verbose=True):
         if not e.get("ocr"):
             continue
         name = Path(j.get("key", fp.name).split("|")[0]).name
-        a4, a5 = _analyse_entry_v4(e, cfg), analyse_entry(e, cfg)
+        g_ = (j.get("key", "").split("|") + ["", ""])[1] or None
+        a4, a5 = _analyse_entry_v4(e, cfg), analyse_entry(e, cfg, g_)
         from rapidfuzz.distance import Levenshtein
         must = [k for k in a4["kills"] if k.get("hits", 0) >= 2 and k["ks"] >= 0.86]
         vic = lambda row: _alnum(row.rsplit("[", 1)[-1].rstrip("]").lower())
@@ -1964,7 +1979,7 @@ def selftest_detection(cfg, per_game=20):
         sample = items[::max(1, len(items) // per_game)][:per_game]
         zero, kh, vh, reasons, nk = 0, [0] * 11, [0] * 11, {}, 0
         for r, e in items:
-            a = analyse_entry(e, cfg)
+            a = analyse_entry(e, cfg, g)
             zero += 0 if a["kills"] else 1
             nk += len(a["kills"])
             kh[min(10, int(a["best_k"] * 10))] += 1
@@ -1979,7 +1994,7 @@ def selftest_detection(cfg, per_game=20):
         out(f"  best victim-side FIREAXE match per clip (bin:clips): {bins or '-'}")
         out("  rows rejected by reason: " + (", ".join(f"{k}: {v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])) or "none"))
         for r, e in sample:
-            a = analyse_entry(e, cfg)
+            a = analyse_entry(e, cfg, g)
             out(f"  {len(a['kills'])} kills, {len(a['deaths'])} deaths | rows found {a['rows_max']} max/frame, {a['ocr_calls']} OCR calls"
                 f" | killer {a['best_k']:.2f} victim {a['best_v']:.2f} | {Path(r['path']).name}")
             for m in a["mine"]:
@@ -5381,7 +5396,7 @@ class App:
             e = kc.get(kills_key(r, g, det)) if det else None
             ks = None
             if e and not e.get("error"):
-                ks = [k["t"] for k in compute_kills(e, cfg)[0]]
+                ks = [k["t"] for k in compute_kills(e, cfg, g)[0]]
             try:
                 mt = os.path.getmtime(r["path"])
             except OSError:
@@ -5808,7 +5823,7 @@ class App:
         if not e:
             out("not scanned yet: press Rescan this clip")
             return
-        a = analyse_entry(e, cfg)
+        a = analyse_entry(e, cfg, g)
         ks, ds = a["kills"], a["deaths"]
         out(f"{Path(p).name}: {len(ks)} kills (before the gunshot check): " + ", ".join(ts(k['t']) + ("*HS" if k.get("hs") else "") for k in ks) +
             f"; my deaths at {', '.join(ts(d) for d in ds) or '-'}; rows found {a['rows_max']} max/frame, {a['ocr_calls']} OCR calls;"
@@ -6217,7 +6232,7 @@ def measure_render(outfile, plan, cfg, refine=True):
         fa, fb = int(math.ceil(t["out_start"] * FPS)), int(math.ceil((t["out_start"] + t["dur"]) * FPS))
         sub = [[f - fa, sn - fa, [b[:6] + [v if isinstance(v, str) else v - fa for v in b[6:]] for b in bx], bl]
                for f, sn, bx, bl in entry["ocr"] if fa <= f < fb]
-        e = {"frames": fb - fa, "v_off": fa / FPS + entry.get("v_off", 0.0)}
+        e = {"frames": fb - fa, "v_off": fa / FPS + entry.get("v_off", 0.0), "game": entry.get("game")}
         if sub:
             kills_all += analyse_entry(dict(e, ocr=sub), cfg)["kills"]
         sub = [x for x in sub if not any(a <= x[0] / FPS <= b for a, b in fxw[ti])]
@@ -6635,6 +6650,53 @@ def fixture_rows_test(verbose=True):
     return fails
 
 
+def synth_cs2_row(killer, victim, icons, kcol=(90, 200, 235), vcol=(230, 180, 110), w=1100, h=200, y=100):
+    """Generated CS2 killfeed crop: coloured names (default T-yellow killer, CT-blue victim), my red row frame, white icons
+    [(w, h, kind)] left to right: 'awp' (long thin rifle), 'smoke' (cloud), anything else a solid block."""
+    import cv2
+    import numpy as np
+    img = np.full((h, w, 3), (70, 78, 86), np.uint8)
+    f, sc, th = cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
+    lw, rw = cv2.getTextSize(killer, f, sc, th)[0][0], cv2.getTextSize(victim, f, sc, th)[0][0]
+    x0 = w - 24 - (lw + 20 + sum(i[0] for i in icons) + 8 * (len(icons) - 1) + 20 + rw)
+    cv2.rectangle(img, (x0 - 10, y - 28), (w - 12, y + 10), (28, 28, 30), -1)
+    cv2.rectangle(img, (x0 - 10, y - 28), (w - 12, y + 10), (40, 40, 200), 2)
+    cv2.putText(img, killer, (x0, y), f, sc, kcol, th, cv2.LINE_AA)
+    ix = x0 + lw + 20
+    for iw, ih, kind in icons:
+        top = y - 9 - ih // 2
+        if kind == "awp":
+            cv2.rectangle(img, (ix, top + ih // 2 - 2), (ix + iw, top + ih // 2 + 1), (255, 255, 255), -1)
+            cv2.rectangle(img, (ix + iw // 2, top), (ix + iw - 10, top + ih), (255, 255, 255), -1)
+        elif kind == "smoke":
+            r = ih // 3
+            for cx, cy in ((ix + r, top + ih - r), (ix + iw // 2, top + r), (ix + iw - r, top + ih - r)):
+                cv2.circle(img, (cx, cy), r, (255, 255, 255), -1)
+        else:
+            cv2.rectangle(img, (ix, top), (ix + iw, top + ih), (255, 255, 255), -1)
+        ix += iw + 8
+    cv2.putText(img, victim, (ix + 12, y), f, sc, vcol, th, cv2.LINE_AA)
+    return img
+
+
+def cs2_rows_test(verbose=True):
+    """V5.42B: CS2 rows with long weapon icons (AWP) and modifier icons (through-smoke, no-scope, headshot) next to CT-blue /
+    T-yellow names are MY GUN KILLS in CS2 - never knife, utility or revive (those rules are Valorant's)."""
+    fails = []
+    cases = {"AWP, CT victim": [(150, 22, "awp")], "rifle + through-smoke": [(96, 26, "rect"), (30, 26, "smoke")],
+             "pistol + big smoke icon": [(40, 26, "rect"), (40, 34, "smoke")],
+             "AWP no-scope + smoke + HS": [(150, 22, "awp"), (24, 24, "rect"), (30, 26, "smoke"), (24, 24, "rect")]}
+    for nm, icons in cases.items():
+        rows = ocr_rows(*ocr_frame(synth_cs2_row("fireaxe", "ctguy", icons)), "cs2")
+        vs = [(v, why) for r in rows for v, why in classify_row(r)]
+        wc = [weapon_class(r) for r in rows]
+        if verbose:
+            out(f"  CS2 {nm}: " + "; ".join(f"{v.upper()} ({why})" for v, why in vs) + f" | weapon {wc}")
+        if [v for v, _ in vs] != ["kill"] or wc != ["gun"]:
+            fails.append(f"CS2 {nm}: expected one gun KILL, got {vs} weapon {wc}")
+    return fails
+
+
 def planner_selftest(verbose=True):
     """V5.1 planner on a generated song (intro/verse/build/drop/breakdown/drop/outro) with synthetic events: cut-list rules,
     best multikill on the biggest drop, first kills on beats, tails 0.2-0.5 s, strong slow-mo ending with fades from the final
@@ -6950,6 +7012,14 @@ def cmd_smoketest(args):
     except Exception:
         fails.append("fixture test crashed")
         out("  FAIL fixtures: " + traceback.format_exc())
+    out("== CS2 killfeed rows (AWP, through-smoke, modifier icons, CT / T name colours) ==")
+    try:
+        f = cs2_rows_test()
+        fails += f
+        out("  OK: every CS2 row is a gun kill (no knife / utility / revive in CS2)" if not f else "\n".join("  FAIL " + x for x in f))
+    except Exception:
+        fails.append("CS2 row test crashed")
+        out("  FAIL CS2 rows: " + traceback.format_exc())
     out("== Song-map planner (generated song, synthetic events, 4 seeds) ==")
     try:
         f = planner_selftest()
