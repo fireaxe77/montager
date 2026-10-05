@@ -2959,6 +2959,36 @@ def _victim_offset(ka, kb, rf=None):
     return None if best is None else best[1]
 
 
+def _same_kills(ia, ib, rf, cache):
+    """V5.42B: do two clips show the SAME kills, whatever their file times say (a copy, a re-export, a trimmed duplicate)?
+    Same victims at matching times: 2+ shared victims at one consistent offset (+-0.35 s), or one shared victim whose kill
+    frame is the same footage in both files. Returns the timeline offset (t_in_a - t_in_b) or None."""
+    from rapidfuzz import fuzz
+    v = lambda k: _alnum((k.get("victim") or "").lower())
+    pairs = [(x, y) for x in ia["kills"] for y in ib["kills"] if len(v(x)) >= 3 and len(v(y)) >= 3 and fuzz.ratio(v(x), v(y)) >= 80]
+    if not pairs:
+        return None
+    best = None
+    for x0, y0 in pairs:
+        o = x0["t"] - y0["t"]
+        grp = [(x, y) for x, y in pairs if abs(x["t"] - y["t"] - o) <= 0.35]
+        n = min(len({id(x) for x, _ in grp}), len({id(y) for _, y in grp}))
+        if best is None or n > best[0]:
+            best = (n, x0, y0)
+    n, x, y = best
+    o = rf(x) - rf(y)
+    if n >= 2:
+        return o
+    key = f"dup|{file_key(ia['rec']['path'])}|{file_key(ib['rec']['path'])}|{x['t']:.3f}|{y['t']:.3f}"
+    if key not in cache:
+        try:
+            cache[key] = verify_stitch(({"path": ia["rec"]["path"], "shift": 0.0}, {"path": ib["rec"]["path"], "shift": o}),
+                                       rf(x))[0]
+        except Exception:
+            cache[key] = False
+    return o if cache[key] else None
+
+
 FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
 
 
@@ -3005,13 +3035,20 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
         used.add(i)
         for j in range(i + 1, len(items)):
             b = items[j]
-            if j in used or b["ctime"] - a["ctime"] > 60 + a["rec"].get("dur", 0):
+            if j in used:
                 continue
+            near = b["ctime"] - a["ctime"] <= 60 + a["rec"].get("dur", 0)
             off = None
             for (m, mo) in g:
-                o = _victim_offset(m["kills"], b["kills"], rf)
+                o = _victim_offset(m["kills"], b["kills"], rf) if near else None
                 if o is not None and abs(b["ctime"] - m["ctime"]) <= 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
                     off = mo + o
+                    break
+                o = _same_kills(m, b, rf, refine)          # V5.42B: same kills = same event, whatever the file times say
+                if o is not None:
+                    off = mo + o
+                    notes.append(f"same kills in two files: {Path(m['rec']['path']).name} = {Path(b['rec']['path']).name} "
+                                 "(one event, never placed twice)")
                     break
             if off is not None:
                 g.append((b, off))
