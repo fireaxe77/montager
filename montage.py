@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.41"
+APP_VERSION = "V5.42"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -761,7 +761,39 @@ def ocr_frame(bgr):
             outb += [[xa, b[1], xb, b[3], t, round(c, 3)] for xa, xb, t, c in halves]
         else:
             outb.append(b)
+    for b in outb:                                         # V5.42: background colour of the box (Valorant team colour)
+        b.append(side_colour(bgr, b))
     return outb, blobs
+
+
+def side_colour(bgr, b):
+    """'r' (enemy red), 'g' (teammate green / teal) or '' (unknown / dark) behind a killfeed name box, text pixels excluded."""
+    import numpy as np
+    x0, y0, x1, y1 = (max(0, int(v)) for v in b[:4])
+    roi = bgr[y0:y1 + 1, x0:x1 + 1]
+    if roi.size == 0:
+        return ""
+    px = roi[~bright_mask(roi)].astype(int)
+    px = px[px.sum(1) >= 150]
+    if len(px) < 0.15 * roi.shape[0] * roi.shape[1]:          # pale highlight (my own row): text-like pixels, minus pure white
+        px = roi.reshape(-1, 3).astype(int)
+        px = px[(px.sum(1) >= 150) & (px.min(1) < 235)]
+        if len(px) < 0.15 * roi.shape[0] * roi.shape[1]:
+            return ""
+    bl, g, r = (float(np.median(px[:, i])) for i in range(3))
+    if r > g + 40 and r > bl + 30:
+        return "r"
+    if g > r + 15:
+        return "g"
+    return ""
+
+
+def _box_appear(b):
+    return next((v for v in b[6:] if not isinstance(v, str)), 0)
+
+
+def _box_col(b):
+    return next((v for v in b[6:] if isinstance(v, str)), "")
 
 
 def _alnum(s):
@@ -779,6 +811,11 @@ def name_match(text):
         return float(fuzz.ratio(t, MY_NAME)), 0
     al = fuzz.partial_ratio_alignment(MY_NAME, t)
     return float(al.score), int(al.dest_start)
+
+
+def _side_col(bx):
+    cs = [_box_col(b) for b in bx if _box_col(b)]
+    return max(set(cs), key=cs.count) if cs else ""
 
 
 def ocr_rows(boxes, blobs):
@@ -827,8 +864,8 @@ def ocr_rows(boxes, blobs):
                 icon = [int(bx[gi][2] + 0.15 * rh), int(r["cy"] - 0.6 * rh), int(max(1, gw - 0.3 * rh)), int(1.2 * rh)]
         if split is None:
             res.append({"y": int(r["cy"]), "y0": y0, "y1": y1, "th": rh, "killer": [], "victim": [], "icon": None, "gun": False,
-                        "split": None, "hs": False, "boxes": bx, "appear": min(b[6] if len(b) > 6 else 0 for b in bx),
-                        "appear_max": max(b[6] if len(b) > 6 else 0 for b in bx)})
+                        "split": None, "hs": False, "boxes": bx, "appear": min(_box_appear(b) for b in bx),
+                        "appear_max": max(_box_appear(b) for b in bx), "kcol": "", "vcol": ""})
             continue
         kil = [b for b in bx if (b[0] + b[2]) / 2 < cut]
         vic = [b for b in bx if (b[0] + b[2]) / 2 >= cut]
@@ -836,8 +873,8 @@ def ocr_rows(boxes, blobs):
         hs = split == "icon" and any(g is not icon and 0 <= g[0] - (icon[0] + icon[2]) <= 1.5 * rh and 0.6 <= g[2] / max(1, g[3]) <= 1.6
                                      and (not vic or g[0] + g[2] <= vic[0][0] + 2) for g in free)
         res.append({"y": int(r["cy"]), "y0": y0, "y1": y1, "th": rh, "killer": kil, "victim": vic, "icon": icon, "gun": bool(gun),
-                    "split": split, "hs": bool(hs), "boxes": bx, "appear": min(b[6] if len(b) > 6 else 0 for b in bx),
-                    "appear_max": max(b[6] if len(b) > 6 else 0 for b in bx)})
+                    "split": split, "hs": bool(hs), "boxes": bx, "appear": min(_box_appear(b) for b in bx),
+                    "appear_max": max(_box_appear(b) for b in bx), "kcol": _side_col(kil), "vcol": _side_col(vic)})
     for d in res:
         d["ktext"] = " ".join(b[4] for b in d["killer"])
         d["vtext"] = " ".join(b[4] for b in d["victim"])
@@ -855,6 +892,11 @@ def classify_row(r, cfg=None, lg=0.0):
     thr = float((cfg or {}).get("name_match", NAME_MIN))
     if r.get("split") is None and max(r.get("ks", 0), r.get("vs", 0)) >= thr:
         return [("none", "FIREAXE seen but no weapon icon / gap to split the row")]
+    if r.get("vcol") == "g" and max(r.get("ks", 0), r.get("vs", 0)) >= thr and r.get("kcol") != "r":
+        # V5.42 colour first: a GREEN (teammate) victim side with no red killer = Clove self-revive / Sage resurrect (of me or a
+        # teammate). Never a kill, never a death. (My real death: red killer side, me on the green victim side.)
+        return [("revive", f"revive: green victim side ('{r['ktext'] or '-'}' -> '{r.get('vtext') or '-'}') - teammate revive / "
+                           "resurrect, not a kill, not a death")]
     if r.get("ks", 0) >= thr and (r.get("vs", 0) >= thr or (not r.get("vtext") and not r["gun"])):
         # Clove self-revive: FIREAXE with an ability icon and no victim, or FIREAXE on both sides. Never a kill, never a death.
         return [("revive", f"revive: FIREAXE self-revive row ('{r['ktext']}' -> '{r.get('vtext') or '-'}') - not a kill")]
@@ -864,6 +906,8 @@ def classify_row(r, cfg=None, lg=0.0):
         w = "weapon icon" if r["split"] == "icon" else "gap"
         if not r["gun"]:
             out_.append(("reject", f"utility: small/square {w} (grenade, molotov, ability)"))
+        elif weapon_class(r) == "knife":
+            out_.append(("reject", f"knife: long thin blade icon - knife kills are not used"))
         elif r.get("before"):
             out_.append(("reject", f"assist: '{r['before']}' comes before FIREAXE on the killer side"))
         else:
@@ -1097,6 +1141,8 @@ def weapon_class(r):
         return "util"
     if r.get("split") == "icon" and ic and len(ic) >= 5 and ic[4] < 0.30 and ic[3] <= 0.75 * r.get("th", 20) and ic[2] >= 2.0 * ic[3]:
         return "knife"
+    if r.get("split") == "icon" and ic and ic[2] >= 5.0 * ic[3] and ic[3] <= 1.0 * r.get("th", 20):
+        return "knife"                                     # V5.42: Valorant blade, long and thin (guns are under 5:1)
     return "gun"
 
 
@@ -6169,7 +6215,7 @@ def measure_render(outfile, plan, cfg, refine=True):
     kills_clean = []                                       # second pass without the effect frames (a zoomed row can be misread)
     for ti, t in enumerate(plan["takes"]):                 # a montage cut ends every killfeed row: one analysis per take
         fa, fb = int(math.ceil(t["out_start"] * FPS)), int(math.ceil((t["out_start"] + t["dur"]) * FPS))
-        sub = [[f - fa, sn - fa, [b[:6] + [b[6] - fa] if len(b) > 6 else b for b in bx], bl]
+        sub = [[f - fa, sn - fa, [b[:6] + [v if isinstance(v, str) else v - fa for v in b[6:]] for b in bx], bl]
                for f, sn, bx, bl in entry["ocr"] if fa <= f < fb]
         e = {"frames": fb - fa, "v_off": fa / FPS + entry.get("v_off", 0.0)}
         if sub:
@@ -6556,6 +6602,39 @@ def fake_events(n=26, seed=3):
     return evs
 
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def fixture_rows_test(verbose=True):
+    """V5.42 real Valorant killfeed rows (fixtures/): knife kill = excluded, Clove self-revive and Sage resurrect (green victim
+    side) = revive, never a kill or death; through the scan path a real kill AFTER a resurrect row is kept."""
+    import cv2
+    import numpy as np
+    fails = []
+    want = {"valorant_knife_kill.png": "knife", "valorant_clove_self_revive.png": "revive", "valorant_sage_resurrect.png": "revive"}
+    for nm, w in want.items():
+        im = cv2.imread(str(FIXTURES / nm))
+        if im is None:
+            fails.append(f"fixture {nm} missing")
+            continue
+        big = cv2.resize(im, None, fx=2.4, fy=2.4, interpolation=cv2.INTER_CUBIC)          # killfeed crops are scanned upscaled
+        canvas = np.full((360, 1100, 3), (70, 78, 86), np.uint8)
+        canvas[40:40 + big.shape[0], 1100 - 20 - big.shape[1]:1100 - 20] = big
+        kill = synth_row_frame("fireaxe", "enemy", w=1100, h=360, y=220)
+        frames = [np.full_like(canvas, (70, 78, 86))] * 12 + [canvas] * 24 + [np.where(kill != (70, 78, 86), kill, canvas)] * 30
+        ocr, n = scan_frames(iter(frames))
+        a = analyse_entry({"ocr": ocr, "frames": n, "v_off": 0.0}, {})
+        ks = [k for k in a["kills"] if k.get("weapon", "gun") != "knife"]
+        if verbose:
+            out(f"  {nm}: kills {[k['t'] for k in ks]}, knife kills {[k['t'] for k in a['kills'] if k.get('weapon') == 'knife']}, "
+                f"deaths {a['deaths']}, revives {a['revives']}")
+        ok = len(ks) == 1 and ks[0]["t"] > 1.0 and not a["deaths"] and (len(a["revives"]) == 1 if w == "revive" else not a["revives"])
+        if not ok:
+            fails.append(f"fixture {nm}: expected {w} row ignored + the later real kill kept, got kills {[k['t'] for k in a['kills']]} "
+                         f"deaths {a['deaths']} revives {a['revives']}")
+    return fails
+
+
 def planner_selftest(verbose=True):
     """V5.1 planner on a generated song (intro/verse/build/drop/breakdown/drop/outro) with synthetic events: cut-list rules,
     best multikill on the biggest drop, first kills on beats, tails 0.2-0.5 s, strong slow-mo ending with fades from the final
@@ -6863,6 +6942,14 @@ def cmd_smoketest(args):
     except Exception as ex:
         fails.append(f"OCR: {ex}")
         out("  FAIL OCR: " + traceback.format_exc())
+    out("== REAL KILLFEED FIXTURES (knife kill, Clove self-revive, Sage resurrect + a real kill after each) ==")
+    try:
+        f = fixture_rows_test()
+        fails += f
+        out("  OK: knife excluded, both revives ignored, the kill after each row kept" if not f else "\n".join("  FAIL " + x for x in f))
+    except Exception:
+        fails.append("fixture test crashed")
+        out("  FAIL fixtures: " + traceback.format_exc())
     out("== Song-map planner (generated song, synthetic events, 4 seeds) ==")
     try:
         f = planner_selftest()
