@@ -7182,14 +7182,16 @@ class App:
         self.e_rand.pack(side="left")
         self.m_incl_used = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="Include used clips", variable=self.m_incl_used).pack(side="left", padx=(12, 3))
-        fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used"), height=20, selectmode="none")
+        fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used", "open"), height=20, selectmode="none")
         fr.pack(fill="both", expand=True)
-        for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 100, "Used")):
-            self.ctree.column(c, width=w, minwidth=56, stretch=(c == "#0"))
+        for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 100, "Used"),
+                        ("open", 74, "")):
+            self.ctree.column(c, width=w, minwidth=56 if c != "open" else 64, stretch=(c == "#0"), anchor="center" if c == "open" else "w")
             self.ctree.heading(c, text=t)
         self.make_sortable(self.ctree, self.apply_filter, {"#0": "Clip", "date": "Date", "len": "Length", "kills": "Kills",
                                                            "used": "Used"})
         self.ctree.bind("<Button-1>", self.on_tree_click)
+        self.ctree.bind("<Double-1>", self.on_tree_double)
         s2 = ttk.LabelFrame(mid, text="Step 2: choose the song (newest added first)", padding=4)
         mid.add(s1, minsize=int(180 * UI_SCALE[0]), stretch="always", padx=2, pady=2)
         mid.add(s2, minsize=int(84 * UI_SCALE[0]), stretch="never", padx=2, pady=2)
@@ -7278,10 +7280,35 @@ class App:
         ttk.Button(bb, text="Apply", style="Accent.TButton", command=ok).pack(side="left")
         self.reveal(win)
 
+    OPEN_COL = "#5"                                        # the "▶ Open" column (last)
+
+    def open_clip_player(self, path):
+        """Opens a clip in the default video player without waiting (Windows: os.startfile, Linux: xdg-open)."""
+        try:
+            if not os.path.exists(path):
+                self.status_flash("Clip not found: " + Path(path).name)
+            elif os.name == "nt":
+                os.startfile(path)
+            else:
+                subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception as ex:
+            self.status_flash(f"Could not open the clip: {ex}")
+
+    def on_tree_double(self, e):
+        if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
+            return None
+        iid = self.ctree.identify_row(e.y)
+        if iid:
+            self.open_clip_player(iid)
+        return "break"
+
     def on_tree_click(self, e):
         if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
             return None                                    # header click = sort
         iid = self.ctree.identify_row(e.y)
+        if iid and self.ctree.identify_column(e.x) == self.OPEN_COL:
+            self.open_clip_player(iid)                     # the Open cell never ticks or unticks the row
+            return "break"
         if iid:
             if (e.state & 0x1) and self.last_click and self.ctree.exists(self.last_click):
                 vis = list(self.ctree.get_children())
@@ -7408,7 +7435,7 @@ class App:
                 continue
             rows.append((c["path"], self.row_text(c["path"]),
                          (time.strftime("%Y-%m-%d", time.localtime(c["mtime"])), f"{int(c['dur'] // 60)}:{int(c['dur'] % 60):02d}",
-                          "not scanned" if c["kills"] is None else str(c["kills"]), c.get("used", ""))))
+                          "not scanned" if c["kills"] is None else str(c["kills"]), c.get("used", ""), "\u25b6 Open")))
         self.fill_chunked(self.ctree, self.sorted_rows(self.ctree, rows))
         self.update_status()
 

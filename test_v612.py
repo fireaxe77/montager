@@ -468,7 +468,82 @@ def t_theme():
         root.destroy()
 
 
-SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow, "theme": t_theme}
+def t_contrast():
+    print("[4] Fast theme: SV colour table + contrast of all 12 combinations")
+    got = M.sample_sv_colours()
+    if got is None:
+        print("  (sv_ttk / cv2 not available: table check skipped)")
+    else:
+        diff = {k: (M.SV_DARK[k], got[k]) for k in M.SV_DARK if M.SV_DARK[k] != got[k]}
+        check(not diff, "SV_DARK equals the colours read from the installed sv_ttk files" + (f": {diff}" if diff else ""))
+    bad = []
+    for acc in M.ACCENT_DEF:
+        for base in ("grey", "black"):
+            p, c = M.make_palette(acc, base), M.sv_colours(acc, base)
+            for name, a, b, lim in (("text/bg", p["fg"], p["bg"], 7), ("dim/bg", p["dim"], p["bg"], 4.5), ("accent text on accent", p["acc_fg"], p["acc"], 4.5),
+                                    ("selection text", p["sel_fg"], p["sel"], 4.5), ("accent/bg", p["acc"], p["bg"], 3), ("text on button", p["fg"], c["btn_rest"], 7),
+                                    ("text on field", p["fg"], c["tb_rest"], 7), ("text on tab", p["dim"], c["tab_rest"], 4.5),
+                                    ("disabled text/bg", c["disfg"], p["bg"], 2)):
+                r = M.contrast(a, b)
+                if r < lim:
+                    bad.append(f"{acc}/{base} {name} {r:.1f} < {lim}")
+    check(not bad, "all 12 combinations keep readable contrast" + (": " + "; ".join(bad[:6]) if bad else ""))
+
+
+def t_open():
+    print("[open column] Manual clip list: '\u25b6 Open' cell and double-click")
+    d = Path(tempfile.mkdtemp(prefix="mt_open_"))
+    M.messagebox.askyesno = lambda *a, **k: False
+    M.save_json(M.CONFIG_PATH, dict(M.load_config(), mp3_dir=""))
+    app = M.App(0)
+    root = app.root
+    root.geometry("1300x900+0+0")
+    app.nb.select(app.tabs["Manual"])
+    root.update()
+    clip = d / "clip1.mp4"
+    clip.write_bytes(b"\0" * 10)
+    app.byp = {str(clip): {"path": str(clip), "name": "clip1.mp4", "kills": 2, "used": ""}}
+    app.ctree.delete(*app.ctree.get_children())
+    app.ctree.insert("", "end", iid=str(clip), text="clip1.mp4", values=("2026-01-01", "0:10", "2", "", "\u25b6 Open"))
+    root.update()
+    opened = []
+    app.open_clip_player = lambda p: opened.append(p)
+    tree = app.ctree
+    check(tree.item(str(clip), "values")[-1] == "\u25b6 Open", "every row shows '\u25b6 Open' in the last column")
+    x0, y0, w, h = tree.bbox(str(clip), app.OPEN_COL)
+    tree.event_generate("<Button-1>", x=x0 + w // 2, y=y0 + h // 2)
+    root.update()
+    check(opened == [str(clip)] and str(clip) not in app.ticked, f"click on the Open cell opens the clip and does not tick the row ({opened})")
+    tree.event_generate("<Button-1>", x=x0 + w // 2, y=y0 + h // 2)
+    root.update()
+    check(str(clip) not in app.ticked and len(opened) == 2, "a second click on the Open cell still does not tick it")
+    xc, yc, wc, hc = tree.bbox(str(clip), "#0")
+    tree.event_generate("<Button-1>", x=xc + 20, y=yc + hc // 2)
+    root.update()
+    check(str(clip) in app.ticked and len(opened) == 2, "a click on the clip name still ticks the row")
+    app.ticked.clear()
+    opened.clear()
+    ev = type("E", (), {"x": xc + 20, "y": yc + hc // 2})()
+    check(tree.bind("<Double-1>"), "<Double-1> is bound on the clip list")
+    app.on_tree_double(ev)
+    root.update()
+    check(opened == [str(clip)], "double-click on a row opens the clip")
+    # the real opener must not block: stub xdg-open
+    app2_launch = M.App.open_clip_player
+    import subprocess as sp
+    calls = []
+    real = sp.Popen
+    sp.Popen = lambda *a, **k: calls.append((a, k))
+    try:
+        t0 = time.time()
+        app2_launch(app, str(clip))
+        check(calls and calls[0][0][0][0] == "xdg-open" and time.time() - t0 < 0.5, "open_clip_player starts xdg-open without waiting")
+    finally:
+        sp.Popen = real
+    root.destroy()
+
+
+SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow, "theme": t_theme, "contrast": t_contrast, "open": t_open}
 
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if not a.startswith("--")] or list(SECTIONS)
