@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.1.3"
+APP_VERSION = "V6.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -662,45 +662,131 @@ def _rank_key(r):
     return r.get("uri") or f"{r['artist']} - {r['title']}"
 
 
+SONG_DUPS = set()                      # V6.5: files that exactly match a track another (larger) file already has (Flag column: DUPLICATE)
+_FN_BAD = re.compile(r'[\\/:*?"<>|]')    # characters Windows cannot keep in a file name: dropped on both sides before comparing
+_SPLIT_ARTISTS = re.compile(r", | & ")
+
+
+def norm_song(s):
+    """Both sides of the song match are normalised the same way: NFKC, casefold, one kind of quote and dash, no characters a file name
+    cannot hold, single spaces, trimmed. Every other character (Cyrillic, Japanese, ...) is kept."""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", str(s or "")).casefold()
+    s = re.sub("[\u2018\u2019\u201a\u201b\u2032\u00b4`]", "'", s)
+    s = re.sub("[\u201c\u201d\u201e\u201f\u2033]", '"', s)
+    s = re.sub("[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]", "-", s)
+    s = _FN_BAD.sub("", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _artists_of(s):
+    return {x for x in (norm_song(a) for a in _SPLIT_ARTISTS.split(str(s or ""))) if x}
+
+
+def parse_song_file(a):
+    """(title, artists) of an MP3: the file name split on its LAST ' - ' (before = title, after = artist list split on ', ' and ' & ');
+    when the name cannot be parsed the title / artist tags are used. (None, set()) when neither works."""
+    stem = Path(a["path"]).stem
+    if " - " in stem:
+        t, ar = stem.rsplit(" - ", 1)
+        if norm_song(t) and _artists_of(ar):
+            return norm_song(t), _artists_of(ar)
+    if norm_song(a.get("title", "")) and _artists_of(a.get("artist", "")):
+        return norm_song(a["title"]), _artists_of(a["artist"])
+    return None, set()
+
+
+def _title_core(t):
+    """A normalised title without bracketed parts and without a dash suffix: '(feat. X)', '- Radio Edit', '- Remix', '(Sped Up)'."""
+    t = re.sub(r"\(.*?\)|\[.*?\]|\{.*?\}", " ", t)
+    t = t.split(" - ")[0]
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _file_size(a):
+    try:
+        return int(_akey(a).rsplit("|", 2)[1])
+    except (IndexError, ValueError):
+        try:
+            return os.path.getsize(a["path"])
+        except OSError:
+            return 0
+
+
 def match_playlist(rows, audio, cfg):
-    """ONE-TO-ONE best global assignment of MP3 files to CSV rows. Each file (ID3 title if present, else the filename) is compared
-    with 'Track', 'Artist - Track' and 'Track - Artist' using rapidfuzz WRatio; duration within 3 s adds a little."""
-    import numpy as np
-    from rapidfuzz import fuzz, process
-    from scipy.optimize import linear_sum_assignment
+    """V6.5: a file matches a playlist track only when BOTH the title and an artist agree (nothing fuzzy, no leftover assignments).
+    ok (100): normalised title identical AND at least one normalised artist identical. CHECK (80): an artist matches and the title is the
+    same once bracketed / dash suffixes are removed. Everything else: no match. One file per track: of several files that match a track
+    exactly the larger one is kept and the others are listed in SONG_DUPS (flag DUPLICATE). Manual matches (song_overrides) come first."""
+    SONG_DUPS.clear()
     if not rows or not audio:
         return [], list(rows)
-    names = []
-    for a in audio:
-        stem = re.sub(r"^\s*\d{1,3}[\s._-]+", "", Path(a["path"]).stem)
-        names.append(clean(a.get("title", "")) or clean(stem) or stem.lower())
-    t1 = [clean(r["title"]) or r["title"].lower() for r in rows]
-    t2 = [clean(f"{r['artist']} - {r['title']}") for r in rows]
-    t3 = [clean(f"{r['title']} - {r['artist']}") for r in rows]
-    M = np.zeros((len(audio), len(rows)))
-    for i, nm in enumerate(names):
-        M[i] = np.maximum.reduce([process.cdist([nm], t, scorer=fuzz.WRatio)[0] for t in (t1, t2, t3)])
-        da = audio[i].get("dur") or 0
-        if da:
-            for j, r in enumerate(rows):
-                if r.get("dur") and abs(da - r["dur"]) <= 3:
-                    M[i, j] += 2.0
-    rk = lambda r: r.get("uri") or f"{r['artist']} - {r['title']}"
+    rk = _rank_key
+    taken_r, taken_a, matched = set(), set(), []
     idx = {a["path"]: i for i, a in enumerate(audio)}
-    for path, key in cfg.get("song_overrides", {}).items():              # manual overrides from the Songs view
+    for path, key in cfg.get("song_overrides", {}).items():              # manual matches from "Change match" are kept
         i = idx.get(path)
-        j = next((k for k, r in enumerate(rows) if rk(r) == key), None)
-        if i is not None and j is not None:
-            M[i, :], M[:, j] = -1, -1
-            M[i, j] = 1000
-    ri, ci = linear_sum_assignment(-M)
-    matched, got = [], set()
-    for i, j in zip(ri, ci):
-        sc = M[i, j]
-        if sc >= cfg.get("match_floor", 60):
-            matched.append((rows[j], audio[i], int(min(sc, 100) if sc < 1000 else 100)))
-            got.add(j)
-    return matched, [r for j, r in enumerate(rows) if j not in got]
+        j = next((k for k, r in enumerate(rows) if rk(r) == key and k not in taken_r), None)
+        if i is not None and j is not None and i not in taken_a:
+            taken_a.add(i)
+            taken_r.add(j)
+            matched.append((i, j, 100))
+    by_title = {}
+    for j, r in enumerate(rows):
+        if j in taken_r:
+            continue
+        by_title.setdefault(norm_song(r["title"]), []).append((j, _artists_of(r["artist"])))
+    parsed = [parse_song_file(a) if i not in taken_a else (None, set()) for i, a in enumerate(audio)]
+    sizes = [_file_size(a) for a in audio]
+    exact = {}                                                           # track -> [file indexes]
+    for i, (t, ars) in enumerate(parsed):
+        if t is None:
+            continue
+        for j, rars in by_title.get(t, ()):
+            if ars & rars:
+                exact.setdefault(j, []).append(i)
+    exact_files = set()
+    for j in sorted(exact):
+        files = sorted(exact[j], key=lambda i: (-sizes[i], audio[i]["path"].lower()))
+        free = [i for i in files if i not in taken_a]
+        if not free:
+            continue
+        keep = free[0]
+        taken_a.add(keep)
+        taken_r.add(j)
+        matched.append((keep, j, 100))
+        for i in files:
+            if i != keep:
+                if i not in exact_files:
+                    SONG_DUPS.add(audio[i]["path"])
+            exact_files.add(i)
+    # a file that matched exactly (or is another file's duplicate) never becomes somebody's CHECK candidate
+    cores = {}
+    for j, r in enumerate(rows):
+        if j in taken_r:
+            continue
+        cores.setdefault(_title_core(norm_song(r["title"])), []).append((j, _artists_of(r["artist"]), norm_song(r["title"])))
+    cand = []
+    for i, (t, ars) in enumerate(parsed):
+        if t is None or i in taken_a or i in exact_files:
+            continue
+        for j, rars, rt in cores.get(_title_core(t), ()):
+            if ars & rars and _title_core(t):
+                cand.append((abs(len(rt) - len(t)), -sizes[i], audio[i]["path"].lower(), i, j))
+    for _, _, _, i, j in sorted(cand):
+        if i not in taken_a and j not in taken_r:
+            taken_a.add(i)
+            taken_r.add(j)
+            matched.append((i, j, 80))
+    matched.sort()
+    return [(rows[j], audio[i], sc) for i, j, sc in matched], [r for j, r in enumerate(rows) if j not in taken_r]
+
+
+def match_flag(path, r, sc):
+    """The Flag column of the song match: ok | CHECK (under 85) | DUPLICATE | NO MATCH."""
+    if not r:
+        return "DUPLICATE" if path in SONG_DUPS else "NO MATCH"
+    return "CHECK (under 85)" if sc < 85 else "ok"
 
 
 def write_song_matches(audio, matched):
@@ -711,8 +797,7 @@ def write_song_matches(audio, matched):
         w.writerow(["file", "matched track", "artist", "score", "flag"])
         for a in sorted(audio, key=lambda a: a["path"].lower()):
             r, sc = by.get(a["path"], (None, 0))
-            w.writerow([a["path"], r["title"] if r else "", r["artist"] if r else "", sc,
-                        "NO MATCH" if not r else "CHECK (under 85)" if sc < 85 else "ok"])
+            w.writerow([a["path"], r["title"] if r else "", r["artist"] if r else "", sc, match_flag(a["path"], r, sc)])
 
 
 # ------------------------------------------------------------- kill detection
@@ -2996,6 +3081,7 @@ def parse_added(s):
 
 
 MATCH_CACHE = DATA / "match_cache.json"
+MATCH_CACHE_VER = 2                  # V6.5: bump = every automatic match is recomputed once (manual matches live in the config)
 SONG_STATE = ["none"]                 # V6.1.2: state of the last song_pool call: hit | incremental | full | stale (cached_only) | none (cached_only, no cache)
 
 
@@ -3033,7 +3119,11 @@ def match_cached(cfg, csvp, rows, audio, cached_only=False):
     for r in rows:
         by_r.setdefault(_rank_key(r), []).append(r)
     kept, used_r = [], set()
+    if isinstance(cache, dict) and cache.get("v") != MATCH_CACHE_VER:
+        cache = {}                                                 # V6.5: an older matcher's results are never reused
     if isinstance(cache, dict) and cache.get("ov") == ov:
+        SONG_DUPS.clear()
+        SONG_DUPS.update(a_["path"] for a_ in (by_a.get(k_) for k_ in cache.get("dups", [])) if a_)
         for e in cache.get("pairs", []):
             a, cand = by_a.get(e.get("a")), by_r.get(e.get("r"))
             r = next((x for x in (cand or []) if id(x) not in used_r), None)
@@ -3048,17 +3138,14 @@ def match_cached(cfg, csvp, rows, audio, cached_only=False):
         return kept, unmatched_of(kept), "hit"
     if cached_only:
         return kept, unmatched_of(kept), ("stale" if kept else "none")
-    done_a = {id(a) for _, a, _ in kept}
-    rem_a = [a for a in audio if id(a) not in done_a]
-    rem_r = unmatched_of(kept)
-    m2, _ = match_playlist(rem_r, rem_a, cfg) if rem_r and rem_a else ([], rem_r)
-    matched = kept + m2
+    matched, _ = match_playlist(rows, audio, cfg)                  # V6.5: exact rule, cheap: everything is recomputed when the key changed
     try:
-        save_json(MATCH_CACHE, {"v": 1, "csv": csv_sig, "folder": folder, "ov": ov,
+        save_json(MATCH_CACHE, {"v": MATCH_CACHE_VER, "csv": csv_sig, "folder": folder, "ov": ov,
+                                "dups": [_akey(a) for a in audio if a["path"] in SONG_DUPS],
                                 "pairs": [{"a": _akey(a), "r": _rank_key(r), "s": sc} for r, a, sc in matched]})
     except Exception as ex:
         out(f"songs: match cache not saved ({ex})")
-    return matched, unmatched_of(matched), ("incremental" if kept else "full")
+    return matched, unmatched_of(matched), "full"
 
 
 def song_pool(cfg, cached_only=False):
@@ -7467,7 +7554,7 @@ class App:
         for a in sorted(audio, key=lambda a: a["path"].lower()):
             r, sc = by.get(a["path"], (None, 0))
             items.append((a["path"], Path(a["path"]).name, r["title"] if r else "", r["artist"] if r else "", sc,
-                          "NO MATCH" if not r else "CHECK (under 85)" if sc < 85 else "ok",
+                          match_flag(a["path"], r, sc),
                           f"{r['tempo']:.0f}" if r and r.get("tempo") else ""))
         weak = sum(1 for i in items if i[5] != "ok")
         songs = None
