@@ -260,7 +260,109 @@ def t_match():
         check(same >= 0.98, f"full 2000x2000: {same * 100:.1f} % of the pairs identical to the old algorithm ({len(set(so) ^ set(sn))} differ of {len(so)}; old took {time.time() - t0:.1f}s)")
 
 
-SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match}
+def make_library(n, seed=5, name="lib"):
+    """A CSV + mp3 files (old mtimes) in a temp folder; returns (dir, cfg, rows, paths)."""
+    import csv as _csv
+    d = Path(tempfile.mkdtemp(prefix=f"mt_{name}_"))
+    rows, audio = gen_data(n, n, seed)
+    old = time.time() - 3600
+    with open(d / "playlist.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = _csv.writer(f)
+        w.writerow(["Track URI", "Track Name", "Artist Name(s)", "Added At", "Duration (ms)", "Tempo"])
+        for r in rows:
+            w.writerow([r["uri"], r["title"], r["artist"], "2026-09-01T10:00:00Z", int(r["dur"] * 1000), 120])
+    paths = []
+    for a in audio:
+        stem = Path(a["path"]).stem
+        p = d / (re.sub(r'[\\/:*?"<>|]', "", stem) + ".mp3")
+        p.write_bytes(b"\0" * 3000)
+        os.utime(p, (old, old))
+        paths.append(p)
+    cfg = dict(M.load_config(), mp3_dir=str(d), playlist_dir=str(d), output_root=str(d / "_out"))
+    return d, cfg, rows, paths
+
+
+def t_cache():
+    print("[2c] match cache: hit / stale / incremental")
+    d, cfg, rows, paths = make_library(300)
+    M.AUDIO_CACHE, M.MATCH_CACHE = d / "audio_cache.json", d / "match_cache.json"
+    M.AUDIO_STABLE_WAIT_S = 0.05
+    calls = []
+    real = M.match_playlist
+
+    def spy(r, a, c):
+        calls.append((len(r), len(a)))
+        return real(r, a, c)
+    M.match_playlist = spy
+    try:
+        s0, _, _ = M.song_pool(cfg, cached_only=True)
+        check(s0 == [] and M.SONG_STATE[0] == "none" and not calls, "no cache: cached_only returns an empty list, state none, matcher not run")
+        t0 = time.time()
+        s1, _, _ = M.song_pool(cfg)
+        t1 = time.time() - t0
+        check(M.SONG_STATE[0] == "full" and len(calls) == 1 and len(s1) > 200, f"first run: full match ({calls[-1]}), {len(s1)} songs, {t1:.2f}s")
+        calls.clear()
+        t0 = time.time()
+        s2, _, _ = M.song_pool(cfg)
+        check(M.SONG_STATE[0] == "hit" and not calls, f"second run: cache hit, matcher not run ({time.time() - t0:.2f}s)")
+        check(sorted((x["path"], x["title"]) for x in s1) == sorted((x["path"], x["title"]) for x in s2), "cache hit returns the same songs")
+        # new files appear
+        extra = []
+        for k in range(3):
+            p = d / f"Brand New Artist - Fresh Song {k} Zork.mp3"
+            p.write_bytes(b"\0" * 3000)
+            os.utime(p, (time.time() - 3000, time.time() - 3000))
+            extra.append(p)
+        s3, _, _ = M.song_pool(cfg, cached_only=True)
+        check(M.SONG_STATE[0] == "stale" and not calls and len(s3) == len(s1), "files added: cached_only shows the cached matches (stale), no matching")
+        s4, _, _ = M.song_pool(cfg)
+        check(M.SONG_STATE[0] == "incremental" and len(calls) == 1 and calls[0][1] < 100 and calls[0][0] < 100,
+              f"files added: only new / unmatched files are matched (rows x files = {calls[-1] if calls else None} instead of {len(rows)} x {len(paths) + 3})")
+        old_map = {x["path"]: x["title"] for x in s1}
+        check(all(old_map[p_] == t_ for p_, t_ in ((x["path"], x["title"]) for x in s4) if p_ in old_map), "incremental run keeps the earlier matches")
+        calls.clear()
+        M.song_pool(cfg)
+        check(M.SONG_STATE[0] == "hit", "after the incremental run the cache is a hit again")
+    finally:
+        M.match_playlist = real
+
+
+def t_firstshow():
+    print("[2d] first show does not wait for the matcher")
+    d, cfg, rows, paths = make_library(120, name="fs")
+    M.AUDIO_CACHE, M.MATCH_CACHE = d / "audio_cache.json", d / "match_cache.json"
+    M.AUDIO_STABLE_WAIT_S = 0.05
+    M.save_json(M.CONFIG_PATH, cfg)
+    real = M.match_playlist
+
+    def slow(r, a, c):
+        time.sleep(4)
+        return real(r, a, c)
+    M.match_playlist = slow
+    M.messagebox.askyesno = lambda *a, **k: False
+    try:
+        t0 = time.time()
+        app = M.App(0)
+        t_show = time.time() - t0
+        check(app._shown and t_show < 3.5, f"main window shown after {t_show:.2f}s although the matcher takes 4 s")
+        check(app.busy, "the matcher is still running when the window is shown")
+        info0 = app.m_info.get()
+        check("Matching songs" in info0, f"status line says '{info0}'")
+        n0 = len(app.stree.get_children())
+        deadline = time.time() + 30
+        while (app.busy or app.pending) and time.time() < deadline:
+            app.root.update()
+            time.sleep(0.02)
+        for _ in range(10):
+            app.root.update()
+        n1 = len(app.stree.get_children())
+        check(n1 > n0 and "matched" in app.m_info.get(), f"Songs list filled once the match finished ({n0} -> {n1} rows): {app.m_info.get()[:70]}")
+        app.root.destroy()
+    finally:
+        M.match_playlist = real
+
+
+SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow}
 
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if not a.startswith("--")] or list(SECTIONS)
