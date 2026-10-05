@@ -56,7 +56,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V6.0"
+APP_VERSION = "V6.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -8015,7 +8015,7 @@ def render_check(outfile, plan, cfg, verbose=True):
 
 
 def cmd_rendercheck(args):
-    """rendercheck <montage.mp4>: uses the .plan.json saved in logs\ next to it (older montages: next to the video)."""
+    """rendercheck <montage.mp4>: uses the .plan.json saved in logs/ next to it (older montages: next to the video)."""
     f = Path(args.file)
     pj = next((q for q in (f.parent / "logs" / (f.stem + ".plan.json"), f.with_suffix(".plan.json")) if q.exists()), None)
     if not pj:
@@ -8863,11 +8863,11 @@ def settings_persist_test():
         app.root.destroy()                                         # no Save click, no on_close: only the save-on-change counts
         LOG_SINK[0] = PROGRESS[0] = None
         r = subprocess.run([sys.executable, str(HERE / "montage.py"), "cfgdump"], cwd=str(other), capture_output=True, text=True, timeout=120,
-                           env=dict(os.environ, MONTAGER_DATA=str(tmpd / "data")))
+                           encoding="utf-8", errors="replace", env=dict(os.environ, MONTAGER_DATA=str(tmpd / "data"), PYTHONIOENCODING="utf-8"))
         try:
             d = json.loads(r.stdout.strip().splitlines()[-1])
         except Exception:
-            return fails + [f"cfgdump from another folder failed: {(r.stdout + r.stderr)[-300:]}"]
+            return fails + [f"cfgdump from another folder failed: {((r.stdout or '') + (r.stderr or ''))[-300:]}"]
         if not d.get("exists") or Path(d["config_path"]) != CONFIG_PATH:
             fails.append(f"config file not found from another working folder: {d.get('config_path')} exists={d.get('exists')}")
         for k, v in want.items():
@@ -8876,8 +8876,11 @@ def settings_persist_test():
         if (d["cfg"].get("game_audio_track") or {}).get("cs2") != "2" or "theme" in d["cfg"]:
             fails.append(f"game_audio_track / theme not as expected: {d['cfg'].get('game_audio_track')} {d['cfg'].get('theme')}")
         r0 = subprocess.run([sys.executable, str(HERE / "montage.py"), "cfgdump"], cwd=str(other), capture_output=True, text=True, timeout=120,
-                            env={k: v for k, v in os.environ.items() if k != "MONTAGER_DATA"})
-        p0 = json.loads(r0.stdout.strip().splitlines()[-1])["config_path"]
+                            encoding="utf-8", errors="replace", env=dict({k: v for k, v in os.environ.items() if k != "MONTAGER_DATA"}, PYTHONIOENCODING="utf-8"))
+        try:
+            p0 = json.loads((r0.stdout or "").strip().splitlines()[-1])["config_path"]
+        except Exception:
+            return fails + [f"cfgdump (default data folder) failed: {((r0.stdout or '') + (r0.stderr or ''))[-300:]}"]
         if Path(p0) != HERE / "montage_data" / "config.json":
             fails.append(f"the default config path depends on the working folder: {p0}")
         app2 = App(0, startup=False)                               # the "reopened" app
@@ -8918,9 +8921,9 @@ def audio_track_test():
                             "-f", "lavfi", "-i", "sine=frequency=300:sample_rate=48000:duration=8",
                             "-f", "lavfi", "-i", "anoisesrc=d=8:c=white:r=48000:a=0.4,volume='if(lt(mod(t,1),0.07),1,0)':eval=frame",
                             "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "mpeg4", "-c:a", "aac", str(clip)],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         if not clip.exists():
-            return fails + ["could not build the two-track test clip: " + r.stderr[-200:]]
+            return fails + ["could not build the two-track test clip: " + (r.stderr or "")[-200:]]
         rec = {"path": str(clip), "audio": True}
         for setting, want in (("auto", 1), ("1", 0), ("2", 1), ("3", 1)):
             au = clip_audio(rec, setting)

@@ -5,6 +5,9 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V6.1 - 2026-10-05
+- Smoketest (Windows): settings_persist_test and the other smoketest child processes now read UTF-8 (`encoding="utf-8", errors="replace"`, `PYTHONIOENCODING=utf-8`) and the failure message no longer crashes on missing output; the rendercheck docstring no longer raises a SyntaxWarning.
+
 ## V5.6 - 2026-10-05
 - GUI only, no more widgets or lists appearing one after another. The main window stays withdrawn while every tab is built and laid out once, then it is shown in one step (no alpha trick). Popups (changelog, date range, playlist track picker) are created withdrawn, laid out, centred over the main window and then shown.
 - Lists (clips, songs, tables) are filled in one pass while the list is unmapped and shown once; no row-by-row growth. While clips are being scanned the lists are not refilled at all: the status line shows "Scanning 51 / 210" and the lists are refilled once when the scan ends.

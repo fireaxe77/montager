@@ -1,0 +1,89 @@
+PERFLOG V6.0  (times in ms since module import; POST-SHOW = after the first main-window <Map> at 124 ms)
+
+SUMMARY
+Top 10 slowest events:
+      39.8 ms  @      84  layout     App.prerealize   POST-SHOW
+      37.4 ms  @      84  update     update_idletasks() from prerealize:6037 
+       7.9 ms  @    7124  after      App.on_close (scheduled 7000)   POST-SHOW
+       7.5 ms  @     545  after      App.poll (scheduled 80)   POST-SHOW
+       2.3 ms  @     524  after      App.startup (scheduled 400)   POST-SHOW
+       2.3 ms  @     524  after      App.startup   POST-SHOW
+       1.5 ms  @      50  theme      apply_theme 
+       0.9 ms  @     122  update     update() from prerealize:6040 
+       0.3 ms  @     123  update     update() from prerealize:6040 
+       0.3 ms  @     224  after      App.apply_layout.<locals>.<lambda> (scheduled 100)   POST-SHOW
+Total POST-SHOW work: 58 ms (top-level events only, nested calls not double counted)
+POST-SHOW theme/style events: 0   list fills: 2   after/after_idle: 7   widget creates: 0   configures: 3   layout calls: 2   update calls: 2
+POST-SHOW widget creates/configures within 500 ms of a tab switch: 2
+Longest main-loop blockage: 0 ms (0 gaps > 50 ms)
+Events recorded: 68
+
+CHRONOLOGICAL
+     49.6  pre  theme          1.5 ms apply_theme 
+     50.4  pre  style          0.0 ms   Style.theme_use(clam) 
+     50.7  pre  style          0.0 ms   Style.configure(.) 
+     50.7  pre  style          0.0 ms   Style.configure(Treeview) 
+     50.7  pre  style          0.0 ms   Style.map(Treeview) 
+     50.8  pre  style          0.0 ms   Style.configure(Treeview.Heading) 
+     50.8  pre  style          0.0 ms   Style.configure(TLabelframe) 
+     50.8  pre  style          0.0 ms   Style.configure(TLabelframe.Label) 
+     50.8  pre  style          0.0 ms   Style.configure(TNotebook) 
+     50.8  pre  style          0.0 ms   Style.configure(TNotebook.Tab) 
+     50.8  pre  style          0.0 ms   Style.map(TNotebook.Tab) 
+     50.8  pre  style          0.0 ms   Style.configure(TButton) 
+     50.9  pre  style          0.0 ms   Style.map(TButton) 
+     50.9  pre  style          0.0 ms   Style.configure(TEntry) 
+     50.9  pre  style          0.0 ms   Style.map(TEntry) 
+     50.9  pre  style          0.0 ms   Style.configure(TSpinbox) 
+     51.0  pre  style          0.0 ms   Style.map(TSpinbox) 
+     51.0  pre  style          0.0 ms   Style.configure(TCombobox) 
+     51.0  pre  style          0.0 ms   Style.map(TCombobox) 
+     51.0  pre  style          0.0 ms   Style.configure(TCheckbutton) 
+     51.0  pre  style          0.0 ms   Style.map(TCheckbutton) 
+     51.0  pre  style          0.0 ms   Style.configure(TRadiobutton) 
+     51.0  pre  style          0.0 ms   Style.map(TRadiobutton) 
+     51.0  pre  style          0.0 ms   Style.configure(TProgressbar) 
+     51.0  pre  style          0.0 ms   Style.configure(Vertical.TScrollbar) 
+     51.1  pre  style          0.0 ms   Style.configure(Horizontal.TScale) 
+     51.1  pre  style          0.0 ms   Style.configure(Big.TButton) 
+     51.1  pre  style          0.0 ms   Style.configure(Big.Accent.TButton) 
+     51.1  pre  style          0.0 ms   Style.map(Big.Accent.TButton) 
+     51.1  pre  style          0.0 ms   Style.configure(Accent.TButton) 
+     51.1  pre  style          0.0 ms   Style.map(Accent.TButton) 
+     51.1  pre  style          0.0 ms   Style.configure(Section.TLabel) 
+     51.1  pre  style          0.0 ms   Style.configure(Dim.TLabel) 
+     84.2  pre  mark                  main window built (widgets created) 
+     84.3  POST [switch] layout        39.8 ms App.prerealize 
+     84.3  pre  update        37.4 ms   update_idletasks() from prerealize:6037 
+    121.7  pre  update         0.9 ms   update() from prerealize:6040 
+    121.8  pre  tab                   TAB SWITCH to Auto (widget creates / configures in the next 500 ms are tagged [switch]) 
+    122.6  pre  update         0.3 ms   update() from prerealize:6040 
+    122.7  pre  tab                   TAB SWITCH to Manual (widget creates / configures in the next 500 ms are tagged [switch]) 
+    122.9  pre  update         0.2 ms   update() from prerealize:6040 
+    123.0  pre  tab                   TAB SWITCH to Songs (widget creates / configures in the next 500 ms are tagged [switch]) 
+    123.1  pre  update         0.2 ms   update() from prerealize:6040 
+    123.2  pre  tab                   TAB SWITCH to Troubleshoot (widget creates / configures in the next 500 ms are tagged [switch]) 
+    123.4  pre  update         0.2 ms   update() from prerealize:6040 
+    123.4  pre  tab                   TAB SWITCH to Settings (widget creates / configures in the next 500 ms are tagged [switch]) 
+    123.6  pre  layout         0.1 ms   App.apply_layout 
+    123.6  pre  update         0.1 ms     update_idletasks() from apply_layout:6136 
+    123.7  pre  update         0.1 ms   update() from prerealize:6045 
+    123.8  pre  tab                   TAB SWITCH to Auto (widget creates / configures in the next 500 ms are tagged [switch]) 
+    123.9  pre  show                  deiconify 
+    124.0  pre  mark                  FIRST <Map> of the main window 
+    126.9  POST [switch] mark                  first <Expose> 
+    205.8  POST [switch] after          0.1 ms App.build_settings.<locals>.relayout (scheduled 100) 
+    205.9  POST [switch] configure               Canvas .!panedwindow.!notebook.!frame5.!frame2.!canvas scrollregion
+    223.9  POST [switch] after          0.3 ms App.apply_layout.<locals>.<lambda> (scheduled 100) 
+    223.9  POST [switch] layout         0.2 ms   App.apply_layout 
+    223.9  POST [switch] update         0.2 ms     update_idletasks() from apply_layout:6136 
+    524.3  POST [switch] after          2.3 ms App.startup (scheduled 400) 
+    524.3  POST [switch] after          2.3 ms   App.startup 
+    545.2  POST [switch] after          7.5 ms App.poll (scheduled 80) 
+    550.1  POST [switch] list           0.2 ms   list fill .!panedwindow.!notebook.!frame2.!panedwindow.!labelframe.!frame3.!treeview 0 rows, container unmapped
+    550.4  POST [switch] list           0.1 ms   list fill .!panedwindow.!notebook.!frame2.!panedwindow.!labelframe2.!frame2.!treeview 1 rows, container unmapped
+    551.4  POST [switch] configure               TProgressbar .!frame.!frame.!progressbar value
+    600.7  POST [switch] after          0.0 ms App.refresh_songs.<locals>.<lambda> (scheduled 50) 
+    633.8  POST configure               TProgressbar .!frame.!frame.!progressbar value
+   7124.3  POST after          7.9 ms App.on_close (scheduled 7000) 
+   7125.9  POST update         0.2 ms   update_idletasks() from layout_state:6125 
