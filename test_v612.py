@@ -476,7 +476,110 @@ def t_length():
     app.root.destroy()
 
 
-SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow, "open": t_open, "theme": t_theme, "length": t_length}
+# ---------------------------------------------------------------- 7: every window the app can open, normal mode and perflog mode
+def _make_wav(path, secs=6, rate=22050):
+    import math
+    import struct
+    import wave
+    with wave.open(str(path), "w") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 220 * i / rate) * (1 if (i // (rate // 2)) % 2 else 0.4)))
+                               for i in range(rate * secs)))
+
+
+def run_popups(mode):
+    import subprocess as sp
+    import numpy as np
+    print(f"  -- {mode} mode")
+    d = Path(tempfile.mkdtemp(prefix="mt_popups_"))
+    errors = []
+    M.messagebox.askyesno = lambda *a, **k: False
+    M.messagebox.showinfo = lambda *a, **k: None
+    M.save_json(M.CONFIG_PATH, dict(M.load_config(), mp3_dir=str(d), playlist_dir=str(d), output_root=str(d / "_out")))
+    app = M.App(0)
+    root = app.root
+    root.geometry("1300x900+0+0")
+    root.update()
+    root.report_callback_exception = lambda *a: errors.append("callback: " + "".join(traceback.format_exception(*a))[-400:])
+
+    def pump(n=10, dt=0.05):
+        for _ in range(n):
+            root.update()
+            time.sleep(dt)
+
+    def toplevels():
+        return [w for w in root.winfo_children() if w.winfo_class() == "Toplevel"]
+
+    def attempt(name, fn, expect_window=True):
+        before = set(map(str, toplevels()))
+        try:
+            fn()
+            pump(4)
+            new = [w for w in toplevels() if str(w) not in before]
+            if expect_window and not new:
+                errors.append(f"{name}: no window opened")
+            for w in new:
+                w.update_idletasks()
+                w.destroy()
+            pump(2)
+            print(f"     {name}: opened {len(new)} window(s), closed")
+        except Exception:
+            errors.append(f"{name}: " + traceback.format_exc()[-500:])
+            for w in toplevels():
+                if str(w) not in before:
+                    try:
+                        w.destroy()
+                    except Exception:
+                        pass
+    # generated media
+    wav = d / "Song One.wav"
+    _make_wav(wav)
+    clip = d / "clip.mp4"
+    sp.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=640x360:rate=15:duration=2", "-pix_fmt", "yuv420p", str(clip)], check=True)
+    attempt("Calibrate killfeed region", lambda: M.CalibDialog(app))
+    attempt("Song map view", lambda: (M.SongMapView(app, str(wav), 120.0), pump(30)))
+    attempt("Changelog", app.show_changelog)
+    attempt("Date range", app.date_range_dialog)
+    # track picker (Songs > Matches > Change match)
+    rows = [{"title": "Track A", "artist": "Artist", "uri": "a", "dur": 0}, {"title": "Track B", "artist": "Artist", "uri": "b", "dur": 0}]
+    app.match_rows = rows
+    app.mtree.insert("", "end", iid=str(wav), text=wav.name, values=("", "", "", 0, "NO MATCH"))
+    app.mtree.selection_set(str(wav))
+    attempt("Track picker (change match)", app.change_match)
+    # Troubleshoot > Clips: killfeed crop window and before/after bar preview
+    app.ttree.insert("", "end", iid=str(clip), text=clip.name)
+    app.ttree.selection_set(str(clip))
+    real = {k: getattr(M, k) for k in ("load_dets", "analyse_clip", "load_kills_cache", "analyse_entry", "grab_kill_crop")}
+    fake_det = type("D", (), {"d": {"stamp": "x"}})()
+    fake_cache = type("K", (), {"get": lambda self, k, d=None: {"ocr": [(0, 0, [1])]}})()
+    M.load_dets = lambda g=None: {g: fake_det}
+    M.analyse_clip = lambda p, cache, rescan, bar: (None, {"path": p, "dur": 2.0})
+    M.load_kills_cache = lambda: fake_cache
+    M.analyse_entry = lambda e, cfg, g: {"kills": [{"t": 1.0}], "deaths": [], "rows_max": 1, "ocr_calls": 1, "best_k": 1.0, "best_v": 0.0, "mine": [], "rej": []}
+    M.grab_kill_crop = lambda rec, det, cfg, pick: (np.zeros((120, 400, 3), np.uint8), [])
+    try:
+        attempt("Killfeed crop (Kill timestamps)", app.show_kills)
+    finally:
+        for k, v in real.items():
+            setattr(M, k, v)
+    attempt("Before / after bars preview", app.bar_preview)
+    check(not errors, f"{mode}: every popup opens and closes without an exception" + (": " + " | ".join(e.replace(chr(10), " ")[-220:] for e in errors[:3]) if errors else ""))
+    app.root.destroy()
+
+
+def t_popups():
+    print("[7] popups: every window the app can open")
+    import traceback as tb
+    globals()["traceback"] = tb
+    run_popups("normal")
+    M.PERF = M.PerfLog()
+    M.PERF.install()
+    run_popups("perflog")
+
+
+SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow, "open": t_open, "theme": t_theme, "length": t_length, "popups": t_popups}
 
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if not a.startswith("--")] or list(SECTIONS)
