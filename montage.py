@@ -5414,7 +5414,7 @@ class CalibDialog:
     """OPTIONAL: pick a clip (or screenshot), drag one box around the whole killfeed area. OCR then shows the rows it reads."""
     def __init__(self, app):
         self.app, self.cfg = app, load_config()
-        self.win = tk.Toplevel(app.root)
+        self.win = app.reg(tk.Toplevel(app.root), "window")
         self.win.title("Killfeed region (optional - defaults to top-right)")
         self.win.configure(bg=app.pal["bg"])
         top = ttk.Frame(self.win)
@@ -5434,7 +5434,7 @@ class CalibDialog:
         self.msg = tk.StringVar(value="Open a clip (scrub to a moment with killfeed rows) or a screenshot, then drag a box around the "
                                       "WHOLE killfeed area. Yellow = current region.")
         ttk.Label(self.win, textvariable=self.msg, font=("Segoe UI", F(10), "bold"), wraplength=1260).pack(anchor="w", padx=6)
-        self.cv = tk.Canvas(self.win, width=1280, height=720, bg="#222", highlightthickness=1, highlightbackground="#888")
+        self.cv = app.reg(tk.Canvas(self.win, width=1280, height=720, bg="#222", highlightthickness=1, highlightbackground="#888"), "fixed")
         self.cv.pack(padx=6, pady=6)
         self.cv.bind("<ButtonPress-1>", self.press)
         self.cv.bind("<B1-Motion>", self.drag)
@@ -5804,7 +5804,7 @@ class SongMapView:
     """Songs tab > Song map: waveform, energy curve, beat + downbeat ticks, coloured sections, drops and accents."""
     def __init__(self, app, path, csv_bpm=None):
         self.app, self.path, self.an, self.zoom = app, path, None, 1
-        self.win = tk.Toplevel(app.root)
+        self.win = app.reg(tk.Toplevel(app.root), "window")
         self.win.title(f"Song map - {Path(path).name}")
         self.win.configure(bg=app.pal["bg"])
         top = ttk.Frame(self.win)
@@ -5818,8 +5818,8 @@ class SongMapView:
         ttk.Label(top, text="Zoom").pack(side="right", padx=4)
         fr = ttk.Frame(self.win)
         fr.pack(fill="both", expand=True, padx=6, pady=4)
-        self.cv = tk.Canvas(fr, width=1300, height=int(360 * UI_SCALE[0]), bg="#ececec",
-                            highlightthickness=1, highlightbackground=app.pal["border"])
+        self.cv = app.reg(tk.Canvas(fr, width=1300, height=int(360 * UI_SCALE[0]), bg="#ececec",
+                                    highlightthickness=1, highlightbackground=app.pal["border"]), "fixed")
         sb = ttk.Scrollbar(fr, orient="horizontal", command=self.cv.xview)
         self.cv.configure(xscrollcommand=sb.set)
         self.cv.pack(fill="both", expand=True)
@@ -5827,7 +5827,7 @@ class SongMapView:
         leg = ttk.Frame(self.win)
         leg.pack(fill="x", padx=6, pady=2)
         for k in ("intro", "verse", "build", "drop", "breakdown", "outro"):
-            tk.Label(leg, text=f"  {k}  ", bg=SECTION_COLORS[k], fg="#111").pack(side="left", padx=2)
+            app.reg(tk.Label(leg, text=f"  {k}  ", bg=SECTION_COLORS[k], fg="#111"), "fixed").pack(side="left", padx=2)
         ttk.Label(leg, text="   red line = drop   | tall tick = downbeat   | dot = accent (filled = bass hit)   | line = energy").pack(side="left")
         self.cv.bind("<Configure>", lambda e: self.draw())
 
@@ -5964,6 +5964,8 @@ class App:
         self.cfg = load_config()
         self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0), self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"))
         sc = UI_SCALE[0]
+        self._shown = False                                        # V6.1: the main window is shown once, after the first fill
+        self._splash_make()
         lay = self.cfg.get("ui_layout") or {}
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         w0, h0 = int(1220 * sc), int(920 * sc)
@@ -5973,7 +5975,7 @@ class App:
         self.root.geometry(f"{max(920, min(w0, sw))}x{max(640, min(h0, sh - 60))}")      # V5.55: the size from the last run
         self.last_click = None
         # bottom area first so the panes can expand above it
-        bot = ttk.Frame(self.root, padding=(10, 4))
+        bot = self._bot = ttk.Frame(self.root, padding=(10, 4))
         bot.pack(side="bottom", fill="x")
         row = ttk.Frame(bot)
         row.pack(fill="x")
@@ -6000,6 +6002,7 @@ class App:
         self.log = tk.Text(lf, height=4, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"],
                            relief="flat", bd=0, highlightthickness=1, highlightbackground=self.pal["border"], padx=10, pady=8,
                            font=("Consolas", F(10)), selectbackground=self.pal["sel"], selectforeground=self.pal["sel_fg"])
+        self.reg(self.log, "text")
         lsb = ttk.Scrollbar(lf, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=lsb.set)
         self.log.pack(side="left", fill="both", expand=True)
@@ -6020,14 +6023,14 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         if PERF is not None:
             PERF.attach(self.root)
+        self._lay = lay
         self.prerealize(start_tab, lay)                           # V5.58: every tab is laid out once before the window is visible
         self.switch_ms = []                                       # V5.58: (tab, ms) of every tab switch until the layout is idle again
         self._sw_t0 = None
         self.nb.bind("<<NotebookTabChanged>>", self.on_tab_changed, add="+")
         self.root.bind("<Configure>", self.on_root_configure, add="+")
         self.root.after(100, self.poll)
-        if startup:
-            self.root.after(400, self.startup)
+        self.first_show(startup)                                  # V6.1: startup work + first fill behind the splash, then show once
 
     # ---- tab switching (V5.58): all tabs are built once in __init__ and only shown / hidden afterwards
     def prerealize(self, start_tab, lay):
@@ -6043,8 +6046,80 @@ class App:
             self.nb.select(start_tab)
             self.apply_layout(lay)
             self.root.update()
+        except tk.TclError:
+            pass
+
+    # ---- V6.1 splash + first show: everything that changes visible widgets happens while the main window is still withdrawn
+    def _splash_make(self):
+        sp = self._splash = tk.Toplevel(self.root)
+        sp.withdraw()
+        sp.overrideredirect(True)
+        sp.title(f"{APP_NAME} - loading")
+        self._splash_lbl = tk.Label(sp, text=f"{APP_NAME} - loading", padx=40, pady=16, font=("Segoe UI", F(12)))
+        self._splash_lbl.pack()
+        self._splash_bar = ttk.Progressbar(sp, maximum=1.0, length=int(320 * UI_SCALE[0]))
+        self._splash_bar.pack(padx=24, pady=(0, 18))
+        self._splash_frame = sp
+        self.reg(sp, "window")
+        self.reg(self._splash_lbl, "label")
+        sp.update_idletasks()
+        w, h = sp.winfo_reqwidth(), sp.winfo_reqheight()
+        sp.geometry(f"+{(sp.winfo_screenwidth() - w) // 2}+{(sp.winfo_screenheight() - h) // 3}")
+        sp.deiconify()
+        sp.update()                                               # painted now; the main window stays withdrawn
+
+    def splash_set(self, frac=None, text=None):
+        try:
+            if frac is not None and self._splash is not None:
+                self._splash_bar["value"] = max(self._splash_bar["value"], min(1.0, frac))
+            if text and self._splash is not None:
+                self._splash_lbl.config(text=text)
+        except tk.TclError:
+            pass
+
+    def first_show(self, startup):
+        """Startup work, first cache load and first fill of the clip and song lists run behind the splash; the main window is shown only
+        after that (or after 12 s, with a 'Loading...' status line, and fills when ready)."""
+        late = False
+        try:
+            if startup:
+                self.splash_set(0.05, f"{APP_NAME} - checking setup ...")
+                self._splash.update()
+                self._startup_t0 = time.monotonic()
+                self.startup()
+                self.splash_set(0.15, f"{APP_NAME} - loading clips and songs ...")
+                while not self.first_fill_done():
+                    if time.monotonic() - self._startup_t0 > 12:
+                        late = True
+                        break
+                    self.root.update()
+                    time.sleep(0.02)
+        except tk.TclError:
+            pass
         finally:
-            self.root.deiconify()                                 # V5.6: first and only time the window becomes visible
+            self.show_main(late)
+
+    def first_fill_done(self):
+        return (not self.busy and not self.pending and not getattr(self, "_auto_busy", False) and not self._fill_pending
+                and self.q.empty() and not self._resizing)
+
+    def show_main(self, late=False):
+        self.splash_set(1.0, f"{APP_NAME} - ready")
+        self._shown = True
+        try:
+            self.flush_log()
+            if late:
+                self.plabel.set("Loading...")
+            self.root.update_idletasks()
+            self.root.update()
+            self._first_cfg_n, self._first_cfg_id = 0, self.nb.bind("<Configure>", self._first_configure, add="+")
+            self.root.deiconify()                                 # first and only time the window becomes visible
+        finally:
+            try:
+                self._splash.destroy()
+            except tk.TclError:
+                pass
+            self._splash = None
 
     def reveal(self, win, over=None):
         """Popups are created withdrawn; lay them out, centre over the main window, then show once."""
@@ -6117,8 +6192,9 @@ class App:
     # ------------------------------------------------------------ plumbing
     def make_pane(self, parent, orient):
         """A drag divider between two areas (V5.55)."""
-        return tk.PanedWindow(parent, orient=orient, sashwidth=9, sashrelief="flat", sashpad=1, bd=0, bg=self.pal["border"],
-                              opaqueresize=False, showhandle=False)         # V5.56: drag a thin line, lay out once on release
+        pw = tk.PanedWindow(parent, orient=orient, sashwidth=9, sashrelief="flat", sashpad=1, bd=0, bg=self.pal["border"],
+                            opaqueresize=False, showhandle=False)
+        return self.reg(pw, "pane")         # V5.56: drag a thin line, lay out once on release
 
     def layout_state(self):
         """Window size + divider positions (as fractions of their pane, so they survive other window sizes)."""
@@ -6134,7 +6210,10 @@ class App:
     def apply_layout(self, lay, tries=0):
         """Divider positions from the last run (or a default: the log gets ~150 px, the song list ~30% of the Manual tab)."""
         self.root.update_idletasks()
-        if self.vpane.winfo_height() < 200 and tries < 30:         # the window is not laid out yet: try again shortly
+        est = not self._shown and self.vpane.winfo_height() < 200  # V6.1: withdrawn window: pane heights come from the geometry, no retry later
+        if est:
+            hv, hm = self._pane_heights_est()
+        elif self.vpane.winfo_height() < 200 and tries < 30:       # the window is not laid out yet: try again shortly
             self.root.after(100, lambda: self.apply_layout(lay, tries + 1))
             return
         if lay.get("v") != 2:                                      # V5.56: the clip list got more room - forget the older divider
@@ -6143,13 +6222,44 @@ class App:
             if pw is None:
                 continue
             try:
-                h = max(1, pw.winfo_height())
+                h = max(1, (hv if k == "main" else hm) if est else pw.winfo_height())
                 frac = lay.get(k)
                 y = int(h * frac) if isinstance(frac, (int, float)) and 0.1 < frac < 0.95 else \
                     (int(h * dflt) if dflt else h - int(100 * UI_SCALE[0]))
                 pw.sash_place(0, 0, y)
+                self._sash_want = getattr(self, "_sash_want", {})
+                self._sash_want[k] = y
             except Exception:
                 pass
+
+    def _first_configure(self, _e=None):
+        """The dividers are re-placed once, while the window gets its real size on the first map (before the first paint); then it unbinds."""
+        if _e is not None and _e.widget is not self.nb:
+            return
+        self._first_cfg_n += 1
+        want = getattr(self, "_sash_want", {}).get("main")
+        try:
+            ok = want is not None and abs(self.vpane.sash_coord(0)[1] - want) <= 2 and self.vpane.winfo_height() > 200
+        except tk.TclError:
+            ok = True
+        if ok or self._first_cfg_n > 10:                           # the dividers sit where the saved layout says: done
+            self.nb.unbind("<Configure>", self._first_cfg_id)
+            return
+        self.apply_layout(self._lay)
+
+    def _pane_heights_est(self):
+        """Heights the two dividers' panes will have once the window is shown, from the window geometry and the requested sizes."""
+        m = re.match(r"(\d+)x(\d+)", self.root.geometry())
+        H = int(m.group(2)) if m else 900
+        hv = max(1, H - self._bot.winfo_reqheight() - 12)          # vpane: window minus the footer and the 8 + 4 px padding
+        lay_y = self.cfg.get("ui_layout") or {}
+        fr = lay_y.get("main") if lay_y.get("v") == 2 else None
+        ny = int(hv * fr) if isinstance(fr, (int, float)) and 0.1 < fr < 0.95 else hv - int(100 * UI_SCALE[0])
+        strip = self.nb.winfo_reqheight() - max(f.winfo_reqheight() for f in self.tabs.values())
+        man = self.tabs["Manual"]
+        s3 = next((c for c in man.winfo_children() if c.winfo_class() == "TLabelframe" and c is not self.mpane), None)
+        hm = ny - strip - 20 - (s3.winfo_reqheight() + 8 if s3 is not None else 0)
+        return hv, max(1, hm)
 
     def save_layout(self, *_):
         try:
@@ -6294,7 +6404,7 @@ class App:
         self.busy = True
         self.scan_active = name == "clips"                         # V5.6: no list refills while clips are being scanned
         if self.scan_active:
-            self.plabel.set("Scanning ...")
+            self._prog_ui(None, "Scanning ...")
         CANCEL.clear()
         self.set_buttons(False)
 
@@ -6322,9 +6432,22 @@ class App:
     def flush_prog(self, force=False):
         now = time.monotonic()
         if self._prog_val is not None and (force or now - self._prog_at >= 0.25):
-            self.pbar["value"], txt = self._prog_val
-            self.plabel.set(txt)
+            f_, txt = self._prog_val
+            self._prog_ui(f_, txt)
             self._prog_val, self._prog_at = None, now
+
+    def _prog_ui(self, frac, text):
+        """Progress bar / label: before the main window is shown the splash carries it (the main bar never changes pre-show)."""
+        if self._shown:
+            if frac is not None:
+                self.pbar["value"] = frac
+            if text is not None:
+                self.plabel.set(text)
+        else:
+            if frac is not None:
+                self.splash_set(0.15 + 0.75 * max(0.0, min(1.0, float(frac))))
+            if text and text != "Idle":
+                self.splash_set(None, f"{APP_NAME} - {text}")
 
     def poll(self):
         try:
@@ -6342,8 +6465,7 @@ class App:
                     self.flush_log()
                     self._prog_val = None
                     self.busy = self.scan_active = False
-                    self.pbar["value"] = 0
-                    self.plabel.set("Idle")
+                    self._prog_ui(0, "Idle")
                     self.set_buttons(True)
                     bb_, self._busy_btn = self._busy_btn, None
                     if bb_:
@@ -6707,7 +6829,7 @@ class App:
 
     def date_range_dialog(self):
         """Small window for the custom date range (From / to, YYYY-MM-DD)."""
-        win = tk.Toplevel(self.root)
+        win = self.reg(tk.Toplevel(self.root), "window")
         win.withdraw()
         win.title("Date range")
         win.transient(self.root)
@@ -6891,8 +7013,11 @@ class App:
                 continue
             rows.append((s["path"], f"{s['title']}  -  {s['artist']}" if s["artist"] else s["title"],
                          (self.song_bpm(s), s["added"].strftime("%Y-%m-%d") if s["added"] else "")))
+        rows = self.sorted_rows(self.stree, rows)
+        if getattr(self, "_fill_sig", {}).get(self.stree) == rows and self._fill_token.get(self.stree) is not None:
+            return                                                  # V6.1: same data as the list shows: no refill, no selection reset
         keep = self.stree.selection()
-        self.fill_chunked(self.stree, self.sorted_rows(self.stree, rows))
+        self.fill_chunked(self.stree, rows)
         self.root.after(50, lambda: self.stree.selection_set(keep[0]) if keep and self.stree.exists(keep[0]) else self.stree.selection_set("auto") if self.stree.exists("auto") else None)
 
     def song_bpm(self, s):
@@ -7171,7 +7296,7 @@ class App:
             messagebox.showinfo("Songs", "Press Refresh, then select a file.")
             return
         path = sel[0]
-        w = tk.Toplevel(self.root)
+        w = self.reg(tk.Toplevel(self.root), "window")
         w.withdraw()
         w.title("Pick the playlist track for " + Path(path).name)
         w.geometry("640x520")
@@ -7301,7 +7426,7 @@ class App:
                 out(f"   crop at {ts(pick['t'])}: {len(rows)} rows")
                 for r in rows:
                     out("     " + row_desc(r))
-                w = tk.Toplevel(self.root)
+                w = self.reg(tk.Toplevel(self.root), "window")
                 w.title("Killfeed crop: green = KILL, red = DEATH, orange = rejected (assist/utility), grey = other rows")
                 ph, _ = to_photo(fr, 1100, 700)
                 self._imgs.append(ph)
@@ -7348,7 +7473,7 @@ class App:
         before = grab_gray_bgr(p, info["dur"] / 2, info["w"], info["h"])
         rec = analyse_clip(p, {}, True, cfg.get("bar"))[1]
         after, _ = grab_norm_frame(p, info["dur"] / 2, cfg)
-        w = tk.Toplevel(self.root)
+        w = self.reg(tk.Toplevel(self.root), "window")
         w.title(f"before (left) / after (right)  bars applied: {rec.get('bars')}")
         ph, _ = to_photo(np.hstack([cv2.resize(before, (640, 360)), cv2.resize(after, (640, 360))]), 1300, 400)
         self._imgs.append(ph)
@@ -7383,7 +7508,7 @@ class App:
         self.btn(fi, "Changelog", self.show_changelog, name="Changelog").pack(side="left")     # always visible, next to Save
         body = ttk.Frame(host)
         body.pack(side="top", fill="both", expand=True)
-        self.set_canvas = cv = tk.Canvas(body, bg=self.pal["bg"], highlightthickness=0, bd=0)
+        self.set_canvas = cv = self.reg(tk.Canvas(body, bg=self.pal["bg"], highlightthickness=0, bd=0), "window")
         vs = ttk.Scrollbar(body, orient="vertical", command=cv.yview)
         hs = ttk.Scrollbar(body, orient="horizontal", command=cv.xview)
         cv.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
@@ -7588,53 +7713,87 @@ class App:
                   "insertbackground": "fg", "selectbackground": "sel", "selectforeground": "sel_fg", "activebackground": "btn_act",
                   "activeforeground": "fg", "troughcolor": "head", "disabledforeground": "dim", "selectcolor": "field"}
 
+    # V6.1: one registry for the classic tk widgets. A widget registers at creation with a role; retheme() walks every classic widget
+    # (registered ones by their role, the rest - Tk's own combobox pop-downs, dialog frames - by their class) and applies the CURRENT palette.
+    ROLE_OPTS = {
+        "window": {"bg": "bg", "highlightbackground": "bg", "highlightcolor": "acc"},
+        "label": {"bg": "bg", "fg": "fg", "highlightbackground": "bg", "highlightcolor": "acc", "activebackground": "bg", "activeforeground": "fg"},
+        "text": {"bg": "field", "fg": "fg", "insertbackground": "fg", "highlightbackground": "border", "highlightcolor": "acc",
+                 "selectbackground": "sel", "selectforeground": "sel_fg"},
+        "entry": {"bg": "field", "fg": "fg", "insertbackground": "fg", "highlightbackground": "border", "highlightcolor": "acc",
+                  "selectbackground": "sel", "selectforeground": "sel_fg"},
+        "list": {"bg": "field", "fg": "fg", "highlightbackground": "border", "highlightcolor": "acc", "selectbackground": "acc",
+                 "selectforeground": "acc_fg"},
+        "pane": {"bg": "border", "highlightbackground": "border"},
+        "menu": {"bg": "field", "fg": "fg", "activebackground": "acc", "activeforeground": "acc_fg"},
+        "accent": {"bg": "acc", "fg": "acc_fg", "highlightbackground": "acc"},
+        "fixed": {},                                              # data / image backdrops with their own fixed colours
+    }
+    CLASS_ROLE = {"Tk": "window", "Toplevel": "window", "Frame": "window", "Canvas": "window", "Label": "label", "Text": "text",
+                  "Entry": "entry", "Spinbox": "entry", "Listbox": "list", "Panedwindow": "pane", "Menu": "menu"}
+
+    def reg(self, w, role):
+        """Register a classic tk widget with its colour role; returns the widget."""
+        if not hasattr(self, "_reg"):
+            self._reg = {}
+        self._reg[str(w)] = role
+        return w
+
+    def role_of(self, w):
+        return getattr(self, "_reg", {}).get(str(w)) or self.CLASS_ROLE.get(w.winfo_class())
+
     def _tk_widgets(self):
         """Every classic tk widget of the app (all windows, the pop-downs of the comboboxes included)."""
         out_, todo = [], [self.root]
+        sp = getattr(self, "_splash", None)
+        if sp is not None:
+            todo.append(sp)
         while todo:
             w = todo.pop()
-            todo.extend(w.winfo_children())
+            try:
+                todo.extend(w.winfo_children())
+            except tk.TclError:
+                continue
             if not w.winfo_class().startswith("T") or w.winfo_class() in ("Toplevel", "Tk", "Text"):
                 out_.append(w)
         return out_
 
+    def recolour(self):
+        """Apply the current palette to every classic tk widget by role."""
+        pal = self.pal
+        for w in self._tk_widgets():
+            role = self.role_of(w)
+            for opt, key in self.ROLE_OPTS.get(role, {}).items():
+                try:
+                    if str(w.cget(opt)).lower() != pal[key].lower():
+                        w.configure(**{opt: pal[key]})
+                except tk.TclError:
+                    pass                                          # the widget has no such option
+
     def retheme(self, accent=None, base=None):
         """Re-apply the Sun Valley theme (a unique theme per accent x base, sourced into the running window) and recolour every widget:
-        ttk styles (buttons, checkboxes, sliders, tabs, selection, progress, dropdowns, footer) come from the theme; the classic tk widgets
-        (log, canvases, dividers, pop-downs, changelog popout) that still carry a colour of the old palette get the matching new one."""
+        ttk styles come from the theme; every classic tk widget is recoloured by its registered role (see recolour)."""
         cfg = self.cfg
         accent = accent or cfg.get("accent", "lime")
         base = base or cfg.get("base", "grey")
-        old, snap = dict(self.pal), []
+        old, tagsnap = dict(self.pal), []
         for w in self._tk_widgets():
-            vals = {}
-            for opt in self.COLOR_OPTS:
-                try:
-                    vals[opt] = str(w.cget(opt)).lower()
-                except tk.TclError:
-                    pass
-            tags = {}
             if w.winfo_class() == "Text":
+                tags = {}
                 for t in w.tag_names():
                     for opt in ("foreground", "background", "selectbackground", "selectforeground"):
                         v = str(w.tag_cget(t, opt)).lower()
                         if v:
                             tags[(t, opt)] = v
-            snap.append((w, vals, tags))
+                tagsnap.append((w, tags))
         self.pal = apply_theme(self.root, UI_SCALE[0], accent, base)         # the scale in use (a changed scale applies after restart)
         PAL.clear()
         PAL.update(self.pal)
+        self.recolour()
         old_to_key = {}
         for k, v in old.items():
             old_to_key.setdefault(str(v).lower(), k)
-        for w, vals, tags in snap:
-            for opt, v in vals.items():
-                k = old_to_key.get(v)
-                if k is not None and self.pal[k].lower() != v:
-                    try:
-                        w.configure(**{opt: self.pal[k]})
-                    except tk.TclError:
-                        pass
+        for w, tags in tagsnap:
             for (t, opt), v in tags.items():
                 k = old_to_key.get(v)
                 if k is not None:
@@ -7664,7 +7823,7 @@ class App:
             old.deiconify()
             old.lift()
             return
-        win = self.cl_win = tk.Toplevel(self.root)
+        win = self.cl_win = self.reg(tk.Toplevel(self.root), "window")
         win.withdraw()
         win.title(f"{APP_NAME} changelog")
         win.configure(bg=self.pal["bg"])
@@ -7676,6 +7835,7 @@ class App:
         txt = tk.Text(fr, wrap="word", bg=self.pal["field"], fg=self.pal["fg"], insertbackground=self.pal["fg"], relief="flat", bd=0,
                       highlightthickness=1, highlightbackground=self.pal["border"], padx=16, pady=12, font=("Segoe UI", F(10)),
                       selectbackground=self.pal["sel"], selectforeground=self.pal["sel_fg"], spacing1=2, spacing3=2)
+        self.reg(txt, "text")
         sb = ttk.Scrollbar(fr, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
