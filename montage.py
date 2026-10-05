@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.4"
+APP_VERSION = "V5.41"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -1141,13 +1141,43 @@ def merge_variants(tracks):
     return out_
 
 
+def resurrect_rows(tracks, dead_others):
+    """V5.41 (Valorant): revive / resurrect rows with an ability icon that are not a kill and not a death (same rule as the
+    Clove self-revive). Someone revives ME: an ability-icon row with FIREAXE as the victim while I am already dead (my death row
+    >= 1.5 s earlier, no revive or kill of mine since) - nobody dies twice. I resurrect a TEAMMATE: FIREAXE + ability icon + a
+    victim who already died earlier in the clip - nobody is killed twice. Returns {id(track): reason}."""
+    from rapidfuzz import fuzz
+    res, dead_me = {}, None
+    for t in sorted(tracks, key=lambda t: t["first"]):
+        tally = {}
+        for v in t["votes"]:
+            for a, _ in v:
+                if a != "none":
+                    tally[a] = tally.get(a, 0) + 1
+        top = max(tally, key=tally.get) if tally else None
+        if not t["gun"] and top == "death" and dead_me is not None and t["first"] - dead_me >= 1.5 * FPS:
+            res[id(t)] = f"revive: '{t['ktext'] or '-'}' revived FIREAXE (ability icon while I was dead) - not a kill, not a death"
+            dead_me = None
+            continue
+        vn = _alnum(t["vtext"]).lower()
+        if not t["gun"] and top == "reject" and t["ks"] >= 0.8 and len(vn) >= 3 and \
+                any(f0 <= t["first"] - FPS and fuzz.ratio(vn, n) >= 80 for n, f0 in dead_others.items()):
+            res[id(t)] = f"revive: FIREAXE resurrected '{t['vtext']}' (ability icon, they died earlier) - not a kill"
+            continue
+        if top == "death":
+            dead_me = t["first"]
+        elif top in ("revive", "kill"):
+            dead_me = None
+    return res
+
+
 def analyse_entry(entry, cfg):
     """Raw OCR frames -> rows -> verdicts -> content-tracked rows (identity = killer text + victim text + weapon) -> kills /
     deaths / rejected rows with reasons. The ONE implementation behind Dry plan, Render, the sync report, Self-test and the
     killfeed crop view."""
     off = entry.get("v_off", 0.0)
     bk = bv = 0.0
-    tracks, mine, seen_rows = [], [], 0
+    tracks, mine, seen_rows, dead_others = [], [], 0, {}
     last_ocr = entry["ocr"][-1][0] if entry.get("ocr") else 0
     prev_f = -1
     for f, since, boxes, blobs in entry.get("ocr", []):
@@ -1159,6 +1189,8 @@ def analyse_entry(entry, cfg):
             bk, bv = max(bk, r["ks"] / 100), max(bv, r["vs"] / 100)
             v = classify_row(r, cfg)
             if all(x[0] == "none" for x in v) and max(r["ks"], r["vs"]) < thr:
+                if r.get("split") and len(_alnum(r["vtext"])) >= 3:      # someone else died: a later resurrect of them is no kill
+                    dead_others.setdefault(_alnum(r["vtext"]).lower(), f)
                 continue
             cand.append((r, v))
         pairs = sorted(((_row_match(t, r, prev_f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
@@ -1184,6 +1216,7 @@ def analyse_entry(entry, cfg):
                                                                   max(b[2] for b in r["boxes"]), max(b[3] for b in r["boxes"])]})
         prev_f = f
     tracks = merge_variants(tracks)
+    res_why = resurrect_rows(tracks, dead_others)
     kills, deaths, revives, rej, vis = [], [], [], [], []
     for t in tracks:
         tt = round(t["first"] / FPS + off, 3)
@@ -1192,6 +1225,8 @@ def analyse_entry(entry, cfg):
             for a, why in v:
                 if a != "none":
                     tally.setdefault(a, [0, why])[0] += 1
+        if id(t) in res_why:                                   # V5.41: any revive / resurrect row (Sage, Clove) is never a kill
+            tally = {"revive": [len(t["votes"]), res_why[id(t)]]}
         if not tally:
             continue
         verdicts = [a for a in ("kill", "reject", "death") if a in tally]
@@ -1238,7 +1273,7 @@ def _analyse_entry_v4(entry, cfg):
     killfeed crop view."""
     off = entry.get("v_off", 0.0)
     bk = bv = 0.0
-    tracks, mine, seen_rows = [], [], 0
+    tracks, mine, seen_rows, dead_others = [], [], 0, {}
     last_ocr = entry["ocr"][-1][0] if entry.get("ocr") else 0
     prev_f = -1
     for f, since, boxes, blobs in entry.get("ocr", []):
@@ -1250,6 +1285,8 @@ def _analyse_entry_v4(entry, cfg):
             bk, bv = max(bk, r["ks"] / 100), max(bv, r["vs"] / 100)
             v = classify_row(r, cfg)
             if all(x[0] == "none" for x in v) and max(r["ks"], r["vs"]) < thr:
+                if r.get("split") and len(_alnum(r["vtext"])) >= 3:      # someone else died: a later resurrect of them is no kill
+                    dead_others.setdefault(_alnum(r["vtext"]).lower(), f)
                 continue
             cand.append((r, v))
         pairs = sorted(((_row_match_v4(t, r, prev_f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
@@ -3145,6 +3182,62 @@ def _ticks(bt):
     return U
 
 
+GAP_ALLOW = (1.5, 2.0, 4.5)              # V5.41 multikill dead air (s): tight (builds / drops / hype) .. calm max
+STYLE_CALM = {"chill": 1.0, "cinematic": 0.75, "smooth": 0.6, "hype": 0.15, "aggressive": 0.0}
+
+
+def gap_allowance(an, rname, t_song):
+    """The empty time allowed between two kills of a multikill at song time t_song: builds and drops stay tight (1.5-2 s),
+    calm / moody sections of slow, chill songs breathe (up to 4.5 s). From the song map section + energy, the BPM and the
+    style recipe."""
+    import bisect
+    bt = an["beats"]
+    j = max(0, min(len(bt) - 1, bisect.bisect_right(bt, t_song) - 1))
+    sec = (an.get("section_of_beat") or [""] * len(bt))[min(j, len(an.get("section_of_beat") or bt) - 1)]
+    lv = an["level"][min(j, len(an["level"]) - 1)]
+    en = an["energy"][min(j, len(an["energy"]) - 1)]
+    slow_t = min(1.0, max(0.0, (130.0 - float(an.get("bpm") or 120)) / 50.0))
+    calm_s = STYLE_CALM.get(rname, 0.4)
+    if sec in ("build", "drop") or lv == 2:
+        return GAP_ALLOW[0] + (GAP_ALLOW[1] - GAP_ALLOW[0]) * max(slow_t, calm_s) * 0.5 * (1 + slow_t)
+    c = 0.35 * slow_t + 0.35 * calm_s + 0.3 * (1.0 - min(1.0, max(0.0, en)))
+    return GAP_ALLOW[1] + (GAP_ALLOW[2] - GAP_ALLOW[1]) * c
+
+
+def dead_air_cuts(ev, U, kb):
+    """V5.41: jump-cuts over over-long empty time inside a multikill (first kill on song time U[kb]). A gap longer than its
+    allowance (gap_allowance) is cut ON a beat 0.4 s+ after the kill, landing about 1 s before the next kill (on a beat when
+    that lands within 0.85-1.15 s); kills stay 1.0x and every kill is shown. Returns (cuts, output span), cuts =
+    [(output s from the first kill, source time the footage resumes at)]. No over-long gap: ([], the plain span)."""
+    times = ev["times"]
+    span = times[-1] - times[0]
+    allow = ev.get("_allow")
+    if allow is None or len(times) < 2 or max(b - a for a, b in zip(times, times[1:])) <= GAP_ALLOW[0]:
+        return [], span
+    import bisect
+    cuts, o = [], 0.0                                      # o = output time of kill i, from the first kill
+    T0, nt = float(U[kb]), len(U)
+    for a, b in zip(times, times[1:]):
+        g = b - a
+        if g <= allow(T0 + o):
+            o += g
+            continue
+        j0 = bisect.bisect_left(U, T0 + o + 0.4 - 1e-6)
+        ok = [j for j in range(j0, nt) if U[j] - (T0 + o) <= g - 1.0 - 0.25 and U[j] - (T0 + o) <= 2.5]
+        cj = next((j for j in ok if j % 2 == 0), ok[0] if ok else None)
+        if cj is None:
+            o += g
+            continue
+        dc = float(U[cj]) - T0
+        lead = 1.0
+        nxt = [float(U[j]) - float(U[cj]) for j in range(cj + 1, min(nt, cj + 6)) if 0.85 <= U[j] - U[cj] <= 1.15]
+        if nxt:
+            lead = min(nxt, key=lambda x: abs(x - 1.0))
+        cuts.append((dc, b - lead))
+        o = dc + lead
+    return cuts, (o if cuts else span)
+
+
 def geom(ev, U, c, kb, end, ramp, slow, ending=False):
     """One continuous take (ticks = beats + half-beats; kb = the beat tick where the first kill lands): run-up from tick c,
     1.0x from 1.0 s before the first kill through the last, speed-ups only before that, tail 0.2-0.5 s to the end tick
@@ -3154,6 +3247,7 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False):
         return None
     first, last = ev["times"][0], ev["times"][-1]
     span = last - first
+    cuts, span = dead_air_cuts(ev, U, kb)
     r = 1.0
     if ramp > 1.0 and lead_t >= 1.6:
         app = lead_t - 1.0
@@ -3168,7 +3262,7 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False):
         if post < 0.1:
             return None
         return {"ev": ev, "c": c, "kb": kb, "end": None, "lead_t": lead_t, "ramp": r, "slow": True, "ending": True,
-                "dur": lead_t + span + END_FADE[0]}
+                "dur": lead_t + span + END_FADE[0], **({"cuts": cuts, "ospan": span} if cuts else {})}
     if end is None or end <= kb:
         return None
     D = float(U[end] - U[c])
@@ -3183,7 +3277,8 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False):
         return None
     if end - c < 2 * MIN_TAKE_BEATS or D < MIN_TAKE_S:
         return None
-    return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "ramp": r, "slow": slow, "ending": False, "dur": D}
+    return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "ramp": r, "slow": slow, "ending": False, "dur": D,
+            **({"cuts": cuts, "ospan": span} if cuts else {})}
 
 
 def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, ending=False, c_only=None):
@@ -3211,7 +3306,7 @@ def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, endi
             if g:
                 return g
             continue
-        last_out = U[kk] + span
+        last_out = U[kk] + dead_air_cuts(ev, U, kk)[1]
         ends = [end] if end is not None else \
             sorted([j for j in range(kk + 1, min(nt + 1, kk + 40 + int(span / max(1e-3, float(U[1] - U[0]))) + 1))   # long fights too
                     if TAIL[0] - 0.12 <= U[j] - last_out <= TAIL[1] + 0.01],
@@ -3252,8 +3347,9 @@ def why_no_take(ev):
 def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
     """Event-driven, song-anchored layout (V4): the best multikill lands on the biggest drop's downbeat; build-up before it,
     the rest after it, a strong slow-mo ending last; takes on the song's beat grid, first kills on beats.
-    manual=True (ticked clips): every usable event is used; Optimal = all of them, limited only by the song; a fixed length
-    may trim (listed by name). Auto: Optimal / fixed length keeps the best events and leaves the lowest-ranked out.
+    manual=True (ticked clips): every usable event is used; Optimal = all of them within the shorter of 120 s and the music
+    available (the section starts earlier when that fits more), strongest first, the rest listed as not fitting; a fixed
+    length may trim (listed by name). Auto: Optimal / fixed length keeps the best events and leaves the lowest-ranked out.
     The montage never runs past the end of the song: the music covers every frame through the final fade."""
     import numpy as np
     rng = random.Random(seed)
@@ -3268,10 +3364,14 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         for e in evs:
             e["times"] = list(e.get("times_v4") or e["times"])
             e["first"], e["last"], e["span"] = e["times"][0], e["times"][-1], e["times"][-1] - e["times"][0]
+    for e in evs:                                          # V5.41: dead air allowed between kills follows the music
+        e["_allow"] = lambda t, _an=an, _r=rname: gap_allowance(_an, _r, t)
     song_end = float(an.get("dur") or (bt[-1] + bd)) - 0.1     # the montage's last frame stays inside the music
     optimal = target_s in (None, "", "optimal", 0)
-    if optimal:
-        target = None if manual else optimal_length([e for e in evs], bd, notes)
+    if optimal and manual:                                 # V5.41: the shorter of 120 s and the music there is
+        target = min(120.0, song_end - float(bt[0]))
+    elif optimal:
+        target = optimal_length([e for e in evs], bd, notes)
     else:
         target = max(30.0, min(120.0, float(target_s)))
     strong = [e for e in evs if not e.get("plain")]
@@ -3285,6 +3385,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     elif plain:
         notes.append(f"{len(plain)} plain single kills left out (enough better material)")
     cap_t = int(min(120.0, target * 1.1) / td) if target else 10 ** 9
+    if manual and optimal:                                 # ticked clips: only 120 s pre-trims, the song end decides the rest
+        cap_t = int(120.0 / td)
     nm = lambda e: Path(e["path"]).name
     phrase_ticks = {2 * int(b) for b in an.get("phrase4", [])} | {2 * int(x["start"]) for x in an.get("sections", [])}
     heads = {h.get("headline") for h in hist_c[-4:]}
@@ -3316,7 +3418,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         e = rest.pop()
         total -= nat(e)
         cut_len.append(e)
-    if cut_len:
+    if cut_len and not (manual and optimal):
         notes.append(f"{len(cut_len)} lowest-ranked events left out to keep the montage near {target:.0f} s: "
                      + ", ".join(nm(e) for e in cut_len))
     nb = len(bt) - 1
@@ -3415,7 +3517,6 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     def place_end(e, c):
         """The ending take from tick c: its 2-3 s fade ends on a song phrase / section boundary when a run-up allows it, else
         on a beat; never past the end of the song."""
-        span = e["times"][-1] - e["times"][0]
         lo, hi = rp.get("lead", (1, 2))
         cands = []
         for kk in range(c + 1, min(nt, c + 17)):
@@ -3424,7 +3525,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             g = geom(e, U, c, kk, None, 1.0, True, ending=True)
             if not g:
                 continue
-            last_out = U[kk] + span
+            last_out = U[kk] + g.get("ospan", e["times"][-1] - e["times"][0])
             ends = [j for j in range(kk, len(U)) if END_FADE[0] <= U[j] - last_out <= END_FADE[1] and U[j] <= song_end]
             if not ends:
                 continue
@@ -3447,9 +3548,9 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             c = t["end"]
         else:
             left_song.append(e)
-    if left:
+    if left and not (manual and optimal):
         notes.append(f"{len(left)} events left out to keep the montage near {target:.0f} s: " + ", ".join(nm(e) for e in left))
-    if left_song:
+    if left_song and not (manual and optimal):
         notes.append(f"SONG TOO SHORT: {len(left_song)} events did not fit before the song ends: " + ", ".join(nm(e) for e in left_song))
     end_take = None
     if ending is not None:
@@ -3459,6 +3560,25 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         else:
             notes.append("the planned ending clip could not be placed before the song ends; the last take ends the montage")
             left_song.append(ending)
+    if manual and optimal and (cut_len or left or left_song) and takes:
+        # V5.41 Optimal fits the song: clips that did not fit after the drop go in front (the section starts earlier), strongest
+        # first, while the montage stays within the 120 s / music-available target; the rest are listed as not fitting
+        E = float(U[end_take["fade_end"]]) if end_take else float(U[takes[-1]["end"]])
+        for e in sorted(cut_len + left + left_song, key=lambda e: -e["score"]):
+            c1, got = takes[0]["c"], None
+            cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - 48), -1) if E - U[cc] <= target + 1e-6]
+            for cc in sorted(cc_s, key=lambda cc: (cc % 2, -cc)):
+                got = place(e, U, down, rp, c=cc, end=c1)
+                if got:
+                    break
+            if got:
+                takes.insert(0, got)
+                for lst in (cut_len, left, left_song):
+                    if e in lst:
+                        lst.remove(e)
+        miss = cut_len + left + left_song
+        if miss:
+            notes.append(f"{len(miss)} ticked clips didn't fit in this song: " + ", ".join(nm(e) for e in miss))
     for t in list(takes):
         if not t.get("ending") and (t["end"] - t["c"] < 2 * MIN_TAKE_BEATS or U[t["end"]] - U[t["c"]] < MIN_TAKE_S):
             takes.remove(t)
@@ -3467,7 +3587,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     plan["fit"] = {"usable": len(usable), "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
-                   "left_out": [nm(e) for e in cut_len + left], "song_short": [nm(e) for e in left_song],
+                   "left_out": [] if manual and optimal else [nm(e) for e in cut_len + left],
+                   "song_short": [nm(e) for e in (cut_len + left + left_song if manual and optimal else left_song)],
                    "section_s": plan["song"]["section_s"], "manual": manual, "optimal": optimal}
     plan["notes"].insert(1, f"{'OPTIMAL' if optimal else 'FIXED'} LENGTH {D:.0f} s = {len(plan['takes'])} "
                          f"{'usable ' if manual else ''}takes{'' if optimal else f' (slider {target:.0f} s)'}, ends on "
@@ -3491,11 +3612,26 @@ def take_segments(tk, f_c, f_k, f_x):
         segs.append([round(a1 - nr / OUT_FPS * tk["ramp"], 6), round(a1, 6), tk["ramp"], nr])
     else:
         a1 = k0 - n_lead / OUT_FPS
-    n_kill = int(round((kl - k0) * OUT_FPS))
+    cuts = tk.get("cuts") or []
+    n_kill = int(round(tk.get("ospan", kl - k0) * OUT_FPS))
+
+    def run_1x(n):                                         # 1.0x footage for n frames from a1, jump-cut over dead air (V5.41)
+        pieces, at, done = [], a1, 0
+        for dc, res in cuts:
+            fb = (f_k + int(round(dc * OUT_FPS))) - (f_c + nr)
+            if done < fb < n:
+                pieces.append([round(at, 6), round(at + (fb - done) / OUT_FPS, 6), 1.0, fb - done])
+                at, done = res, fb
+        pieces.append([round(at, 6), round(at + (n - done) / OUT_FPS, 6), 1.0, n - done])
+        return pieces, at + (n - done) / OUT_FPS
     if tk["slow"]:
         n_to_last = (f_k - f_c - nr) + n_kill
-        kl2 = a1 + n_to_last / OUT_FPS
-        segs.append([round(a1, 6), round(kl2, 6), 1.0, n_to_last])
+        if cuts:
+            p1, kl2 = run_1x(n_to_last)
+            segs += p1
+        else:
+            kl2 = a1 + n_to_last / OUT_FPS
+            segs.append([round(a1, 6), round(kl2, 6), 1.0, n_to_last])
         rem = (f_x - f_c) - nr - n_to_last
         post = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
         src = rem / OUT_FPS * 0.5
@@ -3509,7 +3645,10 @@ def take_segments(tk, f_c, f_k, f_x):
             segs.append([hold, hold, 0.0, rem - ns])
     else:
         n1 = (f_x - f_c) - nr
-        segs.append([round(a1, 6), round(a1 + n1 / OUT_FPS, 6), 1.0, n1])
+        if cuts:
+            segs += run_1x(n1)[0]
+        else:
+            segs.append([round(a1, 6), round(a1 + n1 / OUT_FPS, 6), 1.0, n1])
     return [s for s in segs if s[3] > 0]
 
 
@@ -3564,19 +3703,23 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         kb = tk["kb"]
         f_c, f_k = fr(U[tk["c"]]), fr(U[kb])
         if tk.get("ending"):
-            last_k = f_k + int(round(ev["span"] * OUT_FPS))
+            osp = tk.get("ospan", ev["span"])
+            last_k = f_k + int(round(osp * OUT_FPS))
             # fade 2-3 s from the final kill, ending on a beat tick when one falls inside that window
-            room = float(an.get("dur") or 1e9) - 0.1 - (U[kb] + ev["span"])     # never past the end of the song
-            cand = [j for j in range(kb, len(U)) if END_FADE[0] <= U[j] - (U[kb] + ev["span"]) <= min(END_FADE[1], room)]
+            room = float(an.get("dur") or 1e9) - 0.1 - (U[kb] + osp)     # never past the end of the song
+            cand = [j for j in range(kb, len(U)) if END_FADE[0] <= U[j] - (U[kb] + osp) <= min(END_FADE[1], room)]
             if tk.get("fade_end") is not None:
                 cand = [tk["fade_end"]]
-            fade = (U[cand[0]] - (U[kb] + ev["span"])) if cand else min(2.5, room)
+            fade = (U[cand[0]] - (U[kb] + osp)) if cand else min(2.5, room)
             f_x = last_k + int(round(fade * OUT_FPS))
         else:
             f_x = fr(U[tk["end"]])
         if i + 1 < len(takes) and f_x != fr(U[takes[i + 1]["c"]]):
             f_x = fr(U[takes[i + 1]["c"]])
         segs = split_parts(take_segments(tk, f_c, f_k, f_x), ev)
+        if tk.get("cuts"):
+            notes.append(f"dead air: {Path(ev['path']).name} jump-cut over {len(tk['cuts'])} empty stretch"
+                         f"{'es' * (len(tk['cuts']) > 1)} between its kills ({ev['span']:.1f} s of fight shown in {tk['ospan']:.1f} s)")
         nf = f_x - f_c
         if sum(s[3] for s in segs) != nf:
             segs[-1][3] += nf - sum(s[3] for s in segs)
@@ -3624,7 +3767,8 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           "victims": ev.get("victims", []), "lags": [0.0] * ev["n"], "n": ev["n"], "score": round(ev["score"], 1),
                           "hs": ev["hs"], "ramp": round(tk["ramp"], 2), "slow": tk["slow"], "ending": bool(tk.get("ending")),
                           "snapped": 0, "stitched": ev.get("stitched", False), "stitch_note": ev.get("stitch_note", ""),
-                          "death_after": ev.get("death_after"), "lag": ev.get("lag", 0.1), "level": int(lv[min(kb // 2, len(lv) - 1)])})
+                          "death_after": ev.get("death_after"), "lag": ev.get("lag", 0.1), "level": int(lv[min(kb // 2, len(lv) - 1)]),
+                          **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {})})
     total_f = out_takes[-1]["f0"] + out_takes[-1]["nf"]
     total_s = total_f / OUT_FPS
     last = out_takes[-1]
@@ -5395,7 +5539,10 @@ class App:
         used = len({p["path"] for t in plan["takes"] for p in (t.get("srcs") or [t])})
         txt = (f"montage {plan['duration']:.0f} s from {used} of {n_clips} clips ({fit.get('usable', '?')} usable events, "
                f"song section {sg['section_s']:.0f} s), song: {sg['title'] or Path(sg['path']).stem}, style: {plan['recipe']}")
-        if fit.get("song_short"):
+        if fit.get("song_short") and fit.get("optimal"):
+            txt = (f"{len(fit['song_short'])} ticked clips didn't fit in this song: " + ", ".join(fit["song_short"][:4]) +
+                   (" ..." if len(fit["song_short"]) > 4 else "") + "  |  " + txt)
+        elif fit.get("song_short"):
             txt = (f"song too short: fits {fit['used']} of {fit['usable']} clips; pick a longer song or untick some  |  " + txt)
         if fit.get("left_out"):
             txt += f"; fixed length leaves out {len(fit['left_out'])}: " + ", ".join(fit["left_out"][:4]) + \
