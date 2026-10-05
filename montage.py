@@ -3050,13 +3050,80 @@ def parse_added(s):
         return None
 
 
-def song_pool(cfg):
+MATCH_CACHE = DATA / "match_cache.json"
+SONG_STATE = ["none"]                 # V6.1.2: state of the last song_pool call: hit | incremental | full | stale (cached_only) | none (cached_only, no cache)
+
+
+def _akey(a):
+    return a.get("key") or a["path"]
+
+
+def _folder_sig(audio):
+    newest = 0
+    for a in audio:
+        try:
+            newest = max(newest, int(_akey(a).rsplit("|", 1)[1]))
+        except (IndexError, ValueError):
+            pass
+    return [len(audio), newest]
+
+
+def match_cached(cfg, csvp, rows, audio, cached_only=False):
+    """V6.1.2: song match with an on-disk cache keyed by the CSV (name, size, mtime) and the songs folder (file count, newest mtime).
+    Same key: the saved matches are returned at once. Key changed: matches of unchanged files whose track is still in the CSV are
+    reused and only the new / changed / unmatched files are matched against the free tracks. cached_only: never matches, returns what the
+    cache holds for the files that exist now. Returns (matched, unmatched, state)."""
+    if not rows or not audio:
+        return [], list(rows), "none"
+    try:
+        st = csvp.stat()
+        csv_sig = [csvp.name, st.st_size, int(st.st_mtime)]
+    except (OSError, AttributeError):
+        csv_sig = [str(csvp), 0, 0]
+    ov = hashlib.md5(json.dumps([cfg.get("song_overrides", {}), cfg.get("match_floor", 60)], sort_keys=True).encode()).hexdigest()[:10]
+    folder = _folder_sig(audio)
+    cache = load_json(MATCH_CACHE, {})
+    by_a = {_akey(a): a for a in audio}
+    by_r = {}
+    for r in rows:
+        by_r.setdefault(_rank_key(r), []).append(r)
+    kept, used_r = [], set()
+    if isinstance(cache, dict) and cache.get("ov") == ov:
+        for e in cache.get("pairs", []):
+            a, cand = by_a.get(e.get("a")), by_r.get(e.get("r"))
+            r = next((x for x in (cand or []) if id(x) not in used_r), None)
+            if a is not None and r is not None:
+                used_r.add(id(r))
+                kept.append((r, a, int(e.get("s", 0))))
+    exact = isinstance(cache, dict) and cache.get("csv") == csv_sig and cache.get("folder") == folder and cache.get("ov") == ov
+    def unmatched_of(m):
+        got = {id(r) for r, _, _ in m}
+        return [r for r in rows if id(r) not in got]
+    if exact:
+        return kept, unmatched_of(kept), "hit"
+    if cached_only:
+        return kept, unmatched_of(kept), ("stale" if kept else "none")
+    done_a = {id(a) for _, a, _ in kept}
+    rem_a = [a for a in audio if id(a) not in done_a]
+    rem_r = unmatched_of(kept)
+    m2, _ = match_playlist(rem_r, rem_a, cfg) if rem_r and rem_a else ([], rem_r)
+    matched = kept + m2
+    try:
+        save_json(MATCH_CACHE, {"v": 1, "csv": csv_sig, "folder": folder, "ov": ov,
+                                "pairs": [{"a": _akey(a), "r": _rank_key(r), "s": sc} for r, a, sc in matched]})
+    except Exception as ex:
+        out(f"songs: match cache not saved ({ex})")
+    return matched, unmatched_of(matched), ("incremental" if kept else "full")
+
+
+def song_pool(cfg, cached_only=False):
     """Matched playlist songs that have a file (plus the unmatched list). Falls back to every audio file."""
     audio = scan_audio(cfg)
     csvp, rows, col = read_playlist(cfg)
     songs, unmatched = {}, []
+    SONG_STATE[0] = "none"
     if rows:
-        matched, unmatched = match_playlist(rows, audio, cfg)
+        matched, unmatched, SONG_STATE[0] = match_cached(cfg, csvp, rows, audio, cached_only)
         for r, a, sc in matched:
             added = parse_added(r["added"]) if r["added"] else None
             old = songs.get(a["path"])
@@ -3064,14 +3131,17 @@ def song_pool(cfg):
                 songs[a["path"]] = {"path": a["path"], "artist": r["artist"], "title": r["title"], "added": added,
                                     "csv_bpm": r.get("tempo") or None, "energy": r.get("energy"), "dance": r.get("dance"), "score": sc}
         try:
-            write_song_matches(audio, matched)
+            if not cached_only:
+                write_song_matches(audio, matched)
         except Exception as ex:
             out(f"could not write song_matches.csv: {ex}")
-    if rows:
+    if rows and not cached_only:
         wk = [r for r in rows if r["added"] and parse_added(r["added"]) and (datetime.datetime.now() - parse_added(r["added"])).days < cfg.get("week_days", 7)]
         have = {id(r) for r, a, sc in matched}
         out(f"songs: {len(rows)} CSV tracks, {len(matched)} matched to an MP3, {len(unmatched)} unmatched; "
             f"this week: {len(wk)} added, {sum(1 for r in wk if id(r) in have)} with MP3")
+    if not songs and cached_only and rows:
+        return [], unmatched, (csvp.name if csvp else None)          # first show: the matcher is still running (status line says so)
     if not songs:
         out("no playlist matches: using every audio file in the MP3 folder")
         for a in audio:
@@ -6235,7 +6305,7 @@ class App:
             pmark("main window shown")
 
     def first_fill_done(self):
-        return (not self.busy and not self.pending and not getattr(self, "_auto_busy", False) and not self._fill_pending
+        return (getattr(self, "_clips_filled", False) and not getattr(self, "_auto_busy", False) and not self._fill_pending
                 and self.q.empty() and not self._resizing)
 
     def show_main(self, late=False):
@@ -7085,8 +7155,8 @@ class App:
         rows.sort(key=lambda c: -c["mtime"])
         if PERF is not None:
             PERF.stages.append(((_t1 - PERF_T0) * 1000, (time.perf_counter() - _t1) * 1000, "load_clips: per-clip rows (kills lookup, compute_kills, getmtime)", threading.current_thread().name))
-        with pstage("load_clips: song_pool (song match)"):
-            songs, _, _ = song_pool(load_config()) if load_config().get("mp3_dir") else ([], [], None)
+        with pstage("load_clips: song_pool (cached matches only)"):
+            songs, _, _ = song_pool(load_config(), cached_only=True) if load_config().get("mp3_dir") else ([], [], None)
             songs.sort(key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
         _put = time.perf_counter()
 
@@ -7102,6 +7172,9 @@ class App:
             self.folder_names = ["All folders"] + sorted({c["folder"] for c in rows})
             self.apply_filter()
             self.refresh_songs()
+            self._clips_filled = True                               # V6.1.2: the first show waits for this, not for the song matcher
+            if SONG_STATE[0] in ("none", "stale") and load_config().get("mp3_dir") and not getattr(self, "_matched_once", False):
+                self.m_info.set("Matching songs...")
             if PERF is not None:
                 PERF.stage("load_clips: fill() on UI thread (apply_filter + refresh_songs)", _f0)
         self.q.put(("call", fill))
@@ -7408,8 +7481,8 @@ class App:
             audio = scan_audio(cfg)
         with pstage("load_matches: read_playlist"):
             csvp, rows, col = read_playlist(cfg)
-        with pstage("load_matches: match_playlist"):
-            matched, unmatched = match_playlist(rows, audio, cfg) if rows and audio else ([], rows)
+        with pstage("load_matches: match_playlist (cached / incremental)"):
+            matched, unmatched, _st = match_cached(cfg, csvp, rows, audio) if rows and audio else ([], rows, "none")
         with pstage("load_matches: write_song_matches"):
             write_song_matches(audio, matched)
         by = {a["path"]: (r, sc) for r, a, sc in matched}
@@ -7420,9 +7493,17 @@ class App:
                           "NO MATCH" if not r else "CHECK (under 85)" if sc < 85 else "ok",
                           f"{r['tempo']:.0f}" if r and r.get("tempo") else ""))
         weak = sum(1 for i in items if i[5] != "ok")
+        songs = None
+        if rows and cfg.get("mp3_dir"):
+            with pstage("load_matches: song_pool (cache hit)"):
+                songs = sorted(song_pool(cfg)[0], key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
 
         def fill():
             _f0 = time.perf_counter()
+            self._matched_once = True
+            if songs is not None and [(x["path"], x["title"], x["artist"]) for x in songs] != [(x["path"], x["title"], x["artist"]) for x in self.songs]:
+                self.songs = songs                                  # V6.1.2: the new match result is applied once, in one batch
+                self.refresh_songs()
             self.match_rows, self.match_audio, self.match_items = rows, audio, items
             self.fill_matches()
             self.m_info.set(f"{len(audio)} MP3 files, {len(rows)} playlist tracks, {len(matched)} matched, {weak} to check, {len(unmatched)} playlist tracks without a file")
