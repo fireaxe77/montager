@@ -6481,32 +6481,76 @@ class App:
         self.refresh_auto()
 
     def refresh_auto(self):
+        """V6.1: the Auto status texts are collected in a worker thread (cache reads, detector, folder listings) and only the finished
+        strings are applied on the UI thread. Not repeated when nothing it reads has changed."""
+        if getattr(self, "_auto_busy", False):
+            self._auto_again = True
+            return
+        self._auto_busy = True
+
+        def work():
+            res = None
+            try:
+                res = self._auto_collect()
+            except Exception:
+                out("Status refresh failed: " + traceback.format_exc()[-300:])
+            self.q.put(("call", lambda: self._auto_apply(res)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _auto_apply(self, res):
+        self._auto_busy = False
+        if res:
+            self._auto_sig = res[0]
+            for g, txt in res[1].items():
+                if self.auto_status[g].get() != txt:
+                    self.auto_status[g].set(txt)
+        if getattr(self, "_auto_again", False):
+            self._auto_again = False
+            self.refresh_auto()
+
+    def _auto_signature(self, cfg):
+        sig = [week_tag(datetime.datetime.now()), repr({g: (v or {}).get("song") for g, v in LAST_PLAN.items()})]
         try:
-            cfg = load_config()
-            recs = [v for v in load_json(CLIPS_CACHE, {}).values() if isinstance(v, dict) and v.get("path")]
-            kc = load_kills_cache()
-            for g in GAMES:
-                det = load_dets(g).get(g)
-                mine = [r for r in recs if tag_game(r["path"], cfg)[0] == g and not r.get("error") and r.get("dur", 0) <= cfg["max_dur_s"] and os.path.exists(r["path"])]
-                done = 0
-                if det:
-                    for r in mine:
-                        r.setdefault("game", g)
-                        if kills_key(r, g, det) in kc:
-                            done += 1
-                ex = weekly_existing(cfg, g)
-                d = Path(cfg["output_root"]) / GAME_DIR[g]
-                allv = [p for p, _ in montage_videos(d, g)]
-                lp = LAST_PLAN.get(g)
-                song = f"{lp['song']['artist']} - {lp['song']['title']} ({lp['song']['bpm']} BPM)" if lp else "chosen when the montage is made (newest week first)"
-                self.auto_status[g].set(
-                    f"Killfeed region: {('calibrated' if det.calibrated else 'default top-right (optional: Troubleshoot > Calibrate killfeed region)') if det else 'OCR unavailable - Troubleshoot > Selfcheck'}\n"
-                    f"Clips scanned: {done} / {len(mine)}\n"
-                    f"Song: {song}\n"
-                    f"This week ({week_tag(datetime.datetime.now())}): {ex[-1].name if ex else 'no montage yet'}    "
-                    f"Last montage: {allv[-1].name if allv else '-'}")
-        except Exception:
-            out("Status refresh failed: " + traceback.format_exc()[-300:])
+            with os.scandir(DATA) as it:
+                sig += [(e.name, e.stat().st_mtime_ns) for e in it]
+        except OSError:
+            pass
+        for g in GAMES:
+            try:
+                sig.append(os.stat(Path(cfg["output_root"]) / GAME_DIR[g]).st_mtime_ns)
+            except OSError:
+                sig.append(None)
+        return repr(sig)
+
+    def _auto_collect(self):
+        cfg = load_config()
+        sig = self._auto_signature(cfg)
+        if sig == getattr(self, "_auto_sig", None):
+            return None                                            # nothing changed since the last collect
+        recs = [v for v in load_json(CLIPS_CACHE, {}).values() if isinstance(v, dict) and v.get("path")]
+        kc = load_kills_cache()
+        texts = {}
+        for g in GAMES:
+            det = load_dets(g).get(g)
+            mine = [r for r in recs if tag_game(r["path"], cfg)[0] == g and not r.get("error") and r.get("dur", 0) <= cfg["max_dur_s"] and os.path.exists(r["path"])]
+            done = 0
+            if det:
+                for r in mine:
+                    r.setdefault("game", g)
+                    if kills_key(r, g, det) in kc:
+                        done += 1
+            ex = weekly_existing(cfg, g)
+            d = Path(cfg["output_root"]) / GAME_DIR[g]
+            allv = [p for p, _ in montage_videos(d, g)]
+            lp = LAST_PLAN.get(g)
+            song = f"{lp['song']['artist']} - {lp['song']['title']} ({lp['song']['bpm']} BPM)" if lp else "chosen when the montage is made (newest week first)"
+            texts[g] = (
+                f"Killfeed region: {('calibrated' if det.calibrated else 'default top-right (optional: Troubleshoot > Calibrate killfeed region)') if det else 'OCR unavailable - Troubleshoot > Selfcheck'}\n"
+                f"Clips scanned: {done} / {len(mine)}\n"
+                f"Song: {song}\n"
+                f"This week ({week_tag(datetime.datetime.now())}): {ex[-1].name if ex else 'no montage yet'}    "
+                f"Last montage: {allv[-1].name if allv else '-'}")
+        return sig, texts
 
     # ------------------------------------------------------------ Manual tab
     def build_manual(self):
