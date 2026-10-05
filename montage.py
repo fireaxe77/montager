@@ -54,7 +54,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-APP_VERSION = "V5.2"
+APP_VERSION = "V5.3"
 HERE = Path(__file__).resolve().parent
 DATA = HERE / "montage_data"
 CONFIG_PATH = DATA / "config.json"
@@ -850,6 +850,9 @@ def classify_row(r, cfg=None, lg=0.0):
     thr = float((cfg or {}).get("name_match", NAME_MIN))
     if r.get("split") is None and max(r.get("ks", 0), r.get("vs", 0)) >= thr:
         return [("none", "FIREAXE seen but no weapon icon / gap to split the row")]
+    if r.get("ks", 0) >= thr and (r.get("vs", 0) >= thr or (not r.get("vtext") and not r["gun"])):
+        # Clove self-revive: FIREAXE with an ability icon and no victim, or FIREAXE on both sides. Never a kill, never a death.
+        return [("revive", f"revive: FIREAXE self-revive row ('{r['ktext']}' -> '{r.get('vtext') or '-'}') - not a kill")]
     if r.get("vs", 0) >= thr:
         out_.append(("death", f"death: FIREAXE on the victim side ('{r['vtext']}' {r['vs']:.0f})"))
     if r.get("ks", 0) >= thr:
@@ -1176,7 +1179,7 @@ def analyse_entry(entry, cfg):
                                                                   max(b[2] for b in r["boxes"]), max(b[3] for b in r["boxes"])]})
         prev_f = f
     tracks = merge_variants(tracks)
-    kills, deaths, rej, vis = [], [], [], []
+    kills, deaths, revives, rej, vis = [], [], [], [], []
     for t in tracks:
         tt = round(t["first"] / FPS + off, 3)
         tally = {}
@@ -1189,6 +1192,8 @@ def analyse_entry(entry, cfg):
         verdicts = [a for a in ("kill", "reject", "death") if a in tally]
         if "kill" in tally and "reject" in tally:              # OCR noise: majority wins between kill and reject
             verdicts.remove("reject" if tally["kill"][0] >= tally["reject"][0] else "kill")
+        if "revive" in tally:                                  # a self-revive row misread now and then stays a revive
+            verdicts = [a for a in verdicts if tally[a][0] > tally["revive"][0]] or ["revive"]
         row = f"[{t['ktext'] or '-'}] {'gun' if t['gun'] else 'util'} [{t['vtext'] or '-'}]"
         for a in verdicts:
             why = tally[a][1]
@@ -1210,13 +1215,16 @@ def analyse_entry(entry, cfg):
             elif a == "death":
                 deaths.append(tt)
                 rej.append({"t": tt, "reason": f"{why} - not a kill", "ks": t["vs"]})
+            elif a == "revive":
+                revives.append(tt)
+                rej.append({"t": tt, "reason": why, "ks": t["ks"]})
             else:
                 vis.append((tt, round(t["last"] / FPS + off + 0.3, 3)))
                 rej.append({"t": tt, "reason": why, "ks": t["ks"]})
     kills.sort(key=lambda k: k["t"])
-    return {"kills": kills, "deaths": sorted(deaths), "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis, "best_k": bk, "best_v": bv,
-            "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(tracks), "rows_max": seen_rows,
-            "ocr_calls": len(entry.get("ocr", []))}
+    return {"kills": kills, "deaths": sorted(deaths), "revives": sorted(revives), "rej": sorted(rej, key=lambda r: r["t"]),
+            "vis": vis, "best_k": bk, "best_v": bv, "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(tracks),
+            "rows_max": seen_rows, "ocr_calls": len(entry.get("ocr", []))}
 
 
 def _analyse_entry_v4(entry, cfg):
@@ -1362,7 +1370,8 @@ def verified_kills(pool_items, cfg):
                 k = dict(k, shot=True, lag=round(k["t"] - shot, 3), shot_t=round(shot, 3))
             if k.get("weak_hl"):
                 it["rej"].append({"t": k["t"], "reason": "no highlight colour (kept - highlight is only a bonus)", "ks": k["ks"], "soft": True})
-            if any(d < k["t"] <= d + lock for d in it.get("deaths", [])):
+            if any(d < k["t"] <= d + lock and not any(d < rv <= k["t"] for rv in it.get("revives", []))
+                   for d in it.get("deaths", [])):                     # a (Clove) revive ends the lock
                 st["death_lock"] += 1
                 it["rej"].append({"t": k["t"], "reason": f"within {lock:.0f}s after my death", "ks": k["ks"]})
                 continue
@@ -1632,7 +1641,7 @@ def game_pool(cfg, game, paths=None):
         for j in a["rej"]:
             allrej.append((Path(r["path"]).name, j))
         if a["kills"]:
-            pool.append({"rec": r, "kills": a["kills"], "deaths": a["deaths"], "vis": a["vis"], "rej": []})
+            pool.append({"rec": r, "kills": a["kills"], "deaths": a["deaths"], "revives": a["revives"], "vis": a["vis"], "rej": []})
     stats["with_kills"] = len(pool)
     stats["audio"] = verified_kills(pool, cfg) if pool else {"raw": 0, "no_shot": 0, "death_lock": 0, "kept": 0}
     for it in pool:
@@ -1726,11 +1735,13 @@ def cmd_verify(args):
 
 
 def synth_row_frame(left="fireaxe", right="enemy", w=720, h=360, y=120, icon_w=80, extra=()):
-    """Generated killfeed crop: '<left> [white weapon icon] <right>' on a dark row (used by Self-test and smoketest)."""
+    """Generated killfeed crop: '<left> [white weapon icon] <right>' on a dark row (used by Self-test and smoketest).
+    An extra row (y, (left, right, icon_w)) gets its own icon width (22 = square ability icon)."""
     import cv2
     import numpy as np
     img = np.full((h, w, 3), (70, 78, 86), np.uint8)
-    for yy, (l2, r2) in [(y, (left, right))] + list(extra):
+    for yy, (l2, r2, *iw_) in [(y, (left, right, icon_w))] + list(extra):
+        icon_w = iw_[0] if iw_ else 80
         f, sc, th = cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2
         lw = cv2.getTextSize(l2, f, sc, th)[0][0]
         rw = cv2.getTextSize(r2, f, sc, th)[0][0]
@@ -2817,13 +2828,20 @@ def _victim_offset(ka, kb, rf=None):
     return None if best is None else best[1]
 
 
+FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
+
+
+def fight_gap(cfg, game):
+    return max(float(cfg["gap_s"][game]), FIGHT_SPLIT_S.get(game, 0.0))
+
+
 def build_events(pool, game, cfg, rng, flick_budget=40):
     """Clip pool -> montage events. Knife / utility kills are excluded. Clips recorded within ~60 s of each other that share a
     victim are ONE event (union of kills): the clip covering most kills is used, or - if none shows them all - the clips are
     stitched back to back at the overlap. One event per clip, so no clip and no kill is ever used twice. Kill times are made
     frame-exact (first frame the row is visible)."""
     det = load_dets(game).get(game)
-    gap = cfg["gap_s"][game]
+    gap = fight_gap(cfg, game)
     notes = []
     items = []
     for it in pool:
@@ -2883,9 +2901,10 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
                          + f" ({len(allk)} distinct kills)")
         # events by kill spacing on the group timeline
         allk.sort(key=lambda k: k["tt"])
+        revs = sorted(rv + off for it, off in g for rv in it.get("revives", []))
         clusters, cur = [], [allk[0]]
-        for k in allk[1:]:
-            if k["tt"] - cur[-1]["tt"] <= gap:
+        for k in allk[1:]:                                 # one fight = one event: split only on a long gap with no revive in it
+            if k["tt"] - cur[-1]["tt"] <= gap or any(cur[-1]["tt"] < rv < k["tt"] for rv in revs):
                 cur.append(k)
             else:
                 clusters.append(cur)
@@ -3177,7 +3196,8 @@ def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, endi
             continue
         last_out = U[kk] + span
         ends = [end] if end is not None else \
-            sorted([j for j in range(kk + 1, min(nt + 1, kk + 40)) if TAIL[0] - 0.12 <= U[j] - last_out <= TAIL[1] + 0.01],
+            sorted([j for j in range(kk + 1, min(nt + 1, kk + 40 + int(span / max(1e-3, float(U[1] - U[0]))) + 1))   # long fights too
+                    if TAIL[0] - 0.12 <= U[j] - last_out <= TAIL[1] + 0.01],
                    key=lambda j: (j % 2, abs(U[j] - last_out - 0.32)))
         for j in ends:
             g = geom(ev, U, cc, kk, j, ramp, slow)
@@ -5217,7 +5237,7 @@ class App:
 
     def update_status(self):
         cfg = self.cfg
-        gap = cfg["gap_s"][self.m_game.get()]
+        gap = fight_gap(cfg, self.m_game.get())
         tk_ = [self.byp[p] for p in self.ticked if p in getattr(self, "byp", {})]
         kills = sum(c["kills"] or 0 for c in tk_)
         uns = sum(1 for c in tk_ if c["kills"] is None)
@@ -5665,14 +5685,17 @@ SHOT_LAG = 0.12                         # generated clips: the killfeed row appe
 
 def synth_clip(path, kills, dur=7.0, fps=60, row_s=4.0, t0_frames=0, deaths=()):
     """Generated 1920x1080 clip: moving background, a gunshot SHOT_LAG before each killfeed row '<left> [gun] <right>', which
-    appears at an exact FRAME. deaths = frames where an 'enemy [gun] fireaxe' row appears."""
+    appears at an exact FRAME. deaths = frames where an 'enemy [gun] fireaxe' row appears. A kill tuple may carry a 4th value,
+    the icon width (22 = square ability icon, no gunshot)."""
     import numpy as np
     W, H = 1920, 1080
     n = int(dur * fps)
     sr = 48000
     a = (np.random.default_rng(1).standard_normal(int(dur * sr)) * 0.01).astype(np.float32)
     rng_ = np.random.default_rng(2)
-    for kf, l, r in kills:
+    for kf, l, r, *iw in kills:
+        if iw and iw[0] < 40:
+            continue
         i0 = int((kf / fps - SHOT_LAG) * sr)
         if 0 <= i0 < len(a) - 4000:
             a[i0:i0 + 4000] += (rng_.standard_normal(4000) * 0.6 * np.exp(-np.arange(4000) / 600)).astype(np.float32)
@@ -5696,12 +5719,12 @@ def synth_clip(path, kills, dur=7.0, fps=60, row_s=4.0, t0_frames=0, deaths=()):
         code = f + t0_frames                               # game-frame barcode (16 bits, bottom-left): continuity checks
         for bit in range(16):
             img[1040:1064, 20 + bit * 28:44 + bit * 28] = 255 if (code >> bit) & 1 else 0
-        vis = [(kf, l, r) for kf, l, r in kills if kf <= f < kf + row_s * fps]
+        vis = [k for k in kills if k[0] <= f < k[0] + row_s * fps]
         if vis:
             key = tuple(vis)
             if key not in rows:
-                rows[key] = synth_row_frame(*vis[0][1:], w=int(0.42 * W), h=int(0.37 * H), y=60,
-                                            extra=[(60 + 48 * (i + 1), (l, r)) for i, (_, l, r) in enumerate(vis[1:])])
+                rows[key] = synth_row_frame(vis[0][1], vis[0][2], icon_w=(vis[0][3] if len(vis[0]) > 3 else 80), w=int(0.42 * W), h=int(0.37 * H), y=60,
+                                            extra=[(60 + 48 * (i + 1), tuple(k[1:])) for i, k in enumerate(vis[1:])])
             fr = rows[key]
             region = img[y0:y0 + fr.shape[0], x0:x0 + fr.shape[1]]
             m = fr.astype(int).sum(2) != (70 + 78 + 86)
@@ -6128,6 +6151,53 @@ def sync_e2e_test(workdir=None, keep=False, verbose=True):
             shutil.rmtree(wd, ignore_errors=True)
 
 
+def revive_fight_test(workdir=None, verbose=True):
+    """CLOVE REVIVE TEST: one generated Valorant clip with kill, death, self-revive row (FIREAXE + ability icon, no victim),
+    kill, kill. The revive must not be a kill, it must end the death lock and bridge the 10.5 s gap: ONE 3k event, ONE take."""
+    import tempfile
+    wd = Path(workdir or tempfile.mkdtemp(prefix="montage_revive_"))
+    old = use_data_dir(wd / "montage_data")
+    fails = []
+    try:
+        clips = wd / "clips" / "VALORANT"
+        clips.mkdir(parents=True, exist_ok=True)
+        mp3 = wd / "mp3"
+        mp3.mkdir(exist_ok=True)
+        clip = clips / "VALORANT 2026.01.05 - 20.15.00.00.DVR.mp4"
+        # kill 1.5 s, death 5.0 s, revive 10.0 s, kill 12.0 s (inside the 8 s death lock), kill 13.5 s
+        synth_clip(clip, [(90, "fireaxe", "alpha"), (600, "fireaxe", "", 22), (720, "fireaxe", "bravo"), (810, "fireaxe", "charlie")],
+                   dur=16.0, deaths=(300,))
+        song = mp3 / "Test Artist - Click Song.mp3"
+        synth_song(song, 120.0, layout=(("verse", 32),), click=True)
+        with open(wd / "playlist.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["Track URI", "Track Name", "Artist Name(s)", "Added At", "Duration (ms)", "Danceability", "Energy", "Tempo"])
+            w.writerow(["u:1", "Click Song", "Test Artist", datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), "65000", "0.7", "0.8", "120.000"])
+        cfg = dict(DEFAULT_CONFIG, clip_dirs={"valorant": [str(clips)], "cs2": []}, mp3_dir=str(mp3), playlist_dir=str(wd),
+                   output_root=str(wd / "out"), bar_checked=True, bar=None, sync_report=False, length_s=60)
+        save_json(CONFIG_PATH, cfg)
+        plan, _ = make_plan(cfg, "valorant", seed=7, lock=1.0)
+        pool, _ = game_pool(cfg, "valorant")
+        it = pool[0] if pool else {"kills": [], "deaths": [], "revives": []}
+        if verbose:
+            out(f"  clip: kills {[k['t'] for k in it['kills']]}, deaths {it['deaths']}, revives {it['revives']}")
+        if len(it.get("revives", [])) != 1:
+            fails.append(f"revive: expected 1 revive row, got {it.get('revives')}")
+        if len(it["kills"]) != 3:
+            fails.append(f"revive: expected 3 kills (no kill from the revive row, none lost to the death lock), got {len(it['kills'])}")
+        takes = [t for t in plan["takes"] if Path(t["path"]).name == clip.name]
+        if verbose:
+            out("  takes from the clip: " + ", ".join(f"{t['n']}k @ {t['out_start']:.2f}s" for t in takes))
+        if len(takes) != 1 or takes[0]["n"] != 3:
+            fails.append(f"revive: expected ONE 3k take from the clip, got {[t['n'] for t in takes]}")
+        return fails
+    finally:
+        restore_data_dir(old)
+        LAST_PLAN.pop("valorant", None)
+        if workdir is None:
+            shutil.rmtree(wd, ignore_errors=True)
+
+
 def audio_tone_test(plan, workdir, verbose=True):
     """AUDIO TONE CHECK: the montage's song replaced by a steady 440 Hz tone, rendered with every effect and the game audio
     (gunshots on the kills). Outside the fade-in / fade-out the tone's level must stay within 1 dB: no ducking, no limiter pumping,
@@ -6495,6 +6565,15 @@ def cmd_smoketest(args):
     except Exception:
         fails.append("planner test crashed")
         out("  FAIL planner: " + traceback.format_exc())
+    out("== CLOVE REVIVE (generated clip: kill, death, revive row, kill, kill -> one 3k take) ==")
+    try:
+        f = revive_fight_test()
+        fails += f
+        out("  OK: revive row is not a kill, it ends the death lock, one 3k event and one take from the clip" if not f
+            else "\n".join("  FAIL " + x for x in f))
+    except Exception:
+        fails.append("revive test crashed")
+        out("  FAIL revive test: " + traceback.format_exc())
     if not getattr(args, "no_render", False):
         out("== END-TO-END SYNC TEST (click-track song + clips with kill rows at known frames -> real render -> measured) ==")
         import tempfile
