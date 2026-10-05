@@ -109,6 +109,7 @@ DEFAULT_CONFIG = {
     "clip_dirs": {"valorant": [r"E:\Movies\VALORANT\Clips", r"E:\Movies\LEGACY\Valorant"],
                   "cs2": [r"E:\Movies\2026\Counter-strike 2", r"E:\Movies\2026\cs clips",
                           r"E:\Movies\Movies 2025\Counter-strike 2", r"E:\Movies\LEGACY\Counter-strike 2"]},
+    "player_names": {"valorant": ["fireaxe"], "cs2": ["fireaxe", "火斧"]},      # V6.0: Settings > Player names (; separated)
     "game_audio_track": {"valorant": "auto", "cs2": "auto"},     # V5.56: which audio track of a clip is the game sound: auto | 1 | 2 | 3
     "ui_scale": 1.0,                # GUI font / row height scale
     "audio_mode": "auto",           # V5.57: auto = V5.56 track pick | legacy = the exact V5.55 audio path
@@ -196,6 +197,9 @@ def load_config():
         cfg["game_audio_track"] = dict(DEFAULT_CONFIG["game_audio_track"])
     if cfg.get("audio_mode") not in ("auto", "legacy"):            # V5.57
         cfg["audio_mode"] = "auto"
+    if not isinstance(cfg.get("player_names"), dict):
+        cfg["player_names"] = {g: list(v) for g, v in DEFAULT_PLAYER_NAMES.items()}
+    set_player_names(cfg)                                          # V6.0
     if cfg.get("accent") not in ACCENTS:
         cfg["accent"] = "lime"
     if cfg.get("base") not in BASES:
@@ -666,6 +670,49 @@ ALGO = f"v{CACHE_V}"
 MY_NAME = "fireaxe"
 MY_NAME_CS2 = "火斧"               # V5.42B: CS2 renders my name 'fireaxe火斧'; OCR garbles 'fireaxe' but reads these two reliably
 NAME_MIN = 80                   # rapidfuzz partial_ratio needed for FIREAXE
+# V6.0: Settings > Player names. Latin names match fuzzily (as 'fireaxe' always did); a name with non-ASCII letters (CJK) is found as exact
+# text and makes the row mine when the Latin read is garbled (as '火斧' in CS2 always did). Defaults = exactly what V5.x hardcoded.
+DEFAULT_PLAYER_NAMES = {"valorant": [MY_NAME], "cs2": [MY_NAME, MY_NAME_CS2]}
+_NAMES = {g: list(v) for g, v in DEFAULT_PLAYER_NAMES.items()}
+
+
+def norm_names(lst, game):
+    """Clean list (lower case, no blanks / duplicates). An empty list = the defaults."""
+    if isinstance(lst, str):
+        lst = lst.split(";")
+    out_ = []
+    for n in lst or []:
+        n = str(n).strip().lower()
+        if n and n not in out_:
+            out_.append(n)
+    return out_ or list(DEFAULT_PLAYER_NAMES.get(game, [MY_NAME]))
+
+
+def set_player_names(cfg):
+    pn = cfg.get("player_names") if isinstance(cfg.get("player_names"), dict) else {}
+    for g in DEFAULT_PLAYER_NAMES:
+        _NAMES[g] = norm_names(pn.get(g), g)
+
+
+def names_split(game=None):
+    """(Latin names, non-ASCII names) for one game; game None = every game's names together."""
+    ns = [n for g in ([game] if game in _NAMES else list(_NAMES)) for n in _NAMES[g]]
+    ns = list(dict.fromkeys(ns))
+    return [n for n in ns if n.isascii()], [n for n in ns if not n.isascii()]
+
+
+def names_for_cache(game):
+    return sorted(_NAMES.get(game, [MY_NAME]))
+
+
+def entry_names(entry, game):
+    """Names a cached kill entry was scanned with; entries with no record count as scanned with the DEFAULT names."""
+    n = entry.get("names") if isinstance(entry, dict) else None
+    return sorted(norm_names(n, game)) if n else sorted(DEFAULT_PLAYER_NAMES.get(game, [MY_NAME]))
+
+
+def names_stale(entry, game):
+    return entry_names(entry, game) != names_for_cache(game)
 DEFAULT_REGION = {"valorant": [0.58, 0.05, 1.0, 0.42], "cs2": [0.58, 0.03, 1.0, 0.40]}   # fractions of the content rect
 
 
@@ -822,17 +869,26 @@ def _alnum(s):
     return re.sub(r"[\W_]+", "", s or "")
 
 
-def name_match(text):
-    """(score 0-100, start index in text) of the best FIREAXE match. rapidfuzz partial_ratio, case-insensitive; a text shorter
-    than 5 letters must match as a whole (so 'fire' or 'axe' alone never counts)."""
+def _name_match1(t, name):
     from rapidfuzz import fuzz
-    t = (text or "").lower()
     if len(_alnum(t)) < 5:
-        return float(fuzz.ratio(_alnum(t), MY_NAME)), 0
-    if len(t) <= len(MY_NAME):
-        return float(fuzz.ratio(t, MY_NAME)), 0
-    al = fuzz.partial_ratio_alignment(MY_NAME, t)
+        return float(fuzz.ratio(_alnum(t), name)), 0
+    if len(t) <= len(name):
+        return float(fuzz.ratio(t, name)), 0
+    al = fuzz.partial_ratio_alignment(name, t)
     return float(al.score), int(al.dest_start)
+
+
+def name_match(text, game=None, with_name=False):
+    """(score 0-100, start index in text) of the best FIREAXE match (V6.0: best of the game's Latin player names). rapidfuzz
+    partial_ratio, case-insensitive; a text shorter than 5 letters must match as a whole (so 'fire' or 'axe' alone never counts)."""
+    t = (text or "").lower()
+    best = None
+    for nm_ in names_split(game)[0] or [MY_NAME]:
+        r = _name_match1(t, nm_) + (nm_,)
+        if best is None or r[0] > best[0]:
+            best = r
+    return best if with_name else best[:2]
 
 
 def _side_col(bx):
@@ -905,12 +961,12 @@ def ocr_rows(boxes, blobs, game=None):
         d["game"] = game
         d["ktext"] = " ".join(b[4] for b in d["killer"])
         d["vtext"] = " ".join(b[4] for b in d["victim"])
-        d["ks"], kpos = name_match(d["ktext"]) if d["killer"] else (0.0, 0)
-        d["vs"], _ = name_match(d["vtext"]) if d["victim"] else (0.0, 0)
-        if game == "cs2":                                  # V5.42B: '火斧' is my name too (garbled 'fireaxe' before it is part of it)
+        d["ks"], kpos = name_match(d["ktext"], game) if d["killer"] else (0.0, 0)
+        d["vs"], _ = name_match(d["vtext"], game) if d["victim"] else (0.0, 0)
+        if names_split(game)[1]:                           # V5.42B: '火斧' is my name too (garbled 'fireaxe' before it is part of it)
             for side in ("k", "v"):
                 txt = d[side + "text"]
-                i = txt.find(MY_NAME_CS2)
+                i = min([x for x in (txt.find(c_) for c_ in names_split(game)[1]) if x >= 0], default=-1)
                 if i < 0 or d[side + "s"] >= 100:
                     continue
                 if d[side + "s"] < NAME_MIN:
@@ -1134,6 +1190,48 @@ def _relink_or_explain(jobs, dets, cache, cfg):
     return todo
 
 
+def cached_names(store, key, game):
+    """Names a cached entry was scanned with, read from the first bytes of its file (the OCR payload is not loaded). No record =
+    the default names (V6.0: old caches stay valid)."""
+    try:
+        with open(store._p(key), "rb") as f:
+            head = f.read(4000).decode("utf-8", "ignore")
+        head = head.split('"ocr":')[0]
+        m = re.search(r'"names": (\[[^\]]*\])', head)
+        return sorted(norm_names(json.loads(m.group(1)), game)) if m else sorted(DEFAULT_PLAYER_NAMES.get(game, [MY_NAME]))
+    except Exception:
+        return sorted(DEFAULT_PLAYER_NAMES.get(game, [MY_NAME]))
+
+
+def stale_name_clips(cfg=None):
+    """V6.0: clips whose cached scan used other player names than Settings has now (needs no OCR, never rescans by itself).
+    Returns [(path, game)]."""
+    set_player_names(cfg or load_config())
+    dets = load_dets()
+    store = load_kills_cache()
+    res = []
+    for r in scan_clips(cfg or load_config()):
+        g = r.get("game")
+        if r.get("error") or not r.get("w") or g not in dets:
+            continue
+        key = kills_key(r, g, dets[g])
+        if key in store and cached_names(store, key, g) != names_for_cache(g):
+            res.append((r["path"], g))
+    return res
+
+
+def rescan_stale_names(cfg=None):
+    """Rescan only the name-stale clips (run in the background; cancel = CANCEL; the clips already done stay done, so a later
+    call resumes with the rest)."""
+    cfg = cfg or load_config()
+    stale = stale_name_clips(cfg)
+    out(f"player names changed: {len(stale)} clip(s) were scanned with other names")
+    if not stale:
+        return 0
+    # the old entry stays until its rescan finishes (run_scan's put replaces the file): cancelled = still stale = resumable
+    return run_scan(cfg, None, [p for p, _ in stale], 0, True)
+
+
 def _band_changed(m, last):
     """Cheap pixel diff of the bright-text mask vs the last OCR'd frame, per horizontal band (~a killfeed row)."""
     d = m != last
@@ -1190,7 +1288,7 @@ def scan_clip(path, rec, det, cfg, scale=None):
     later logic or threshold change needs no rescan."""
     t0 = time.time()
     ocr, n = scan_frames(frame_stream(path, rec, det, cfg, FPS))
-    e = {"v": CACHE_V, "ocr": ocr, "frames": n, "size": [det.dw, det.dh], "region": det.d["region"],
+    e = {"v": CACHE_V, "names": names_for_cache(rec.get("game")), "ocr": ocr, "frames": n, "size": [det.dw, det.dh], "region": det.d["region"],
          "v_off": rec.get("v_off", 0.0), "ocr_calls": len(ocr), "secs": round(time.time() - t0, 1), "game": rec.get("game")}
     a = analyse_entry(e, cfg)
     e["best_name"], e["best_vic"] = round(a["best_k"], 3), round(a["best_v"], 3)
@@ -1331,10 +1429,11 @@ def resurrect_rows(tracks, dead_others):
 def _killer_leftover(ktext):
     """V5.43: the killer side with MY name taken out - what is 'stuck' to it (another name read into my row)."""
     t = (ktext or "").lower()
-    sc, st = name_match(t)
+    sc, st, nm_ = name_match(t, None, True)
     if sc >= NAME_MIN:
-        t = t[:st] + t[st + len(MY_NAME):]
-    t = t.replace(MY_NAME_CS2, "")
+        t = t[:st] + t[st + len(nm_):]
+    for c_ in names_split(None)[1]:
+        t = t.replace(c_, "")
     return _alnum(t)
 
 
@@ -6042,6 +6141,8 @@ class App:
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
+        if self.set_names:
+            cfg["player_names"] = {g: norm_names(v.get(), g) for g, v in self.set_names.items()}
         cfg["audio_mode"] = next((k for k, lab in AUDIO_MODES.items() if lab == self.set_audio.get()), "auto")
         cfg["accent"] = next((k for k, lab in ACCENT_NAMES.items() if lab == self.set_accent.get()), "lime")
         cfg["base"] = "black" if self.set_base.get().lower() == "black" else "grey"
@@ -7210,7 +7311,7 @@ class App:
         cv.bind("<Configure>", later)
         f.bind("<Configure>", later)
         self.set_relayout = relayout
-        self.sv, self.sl, self.sn, self.set_track = {}, {}, {}, {}
+        self.sv, self.sl, self.sn, self.set_track, self.set_names = {}, {}, {}, {}, {}
         r = [0]
         LW = int(300 * sc)
         PX, PY = 12, 6
@@ -7275,6 +7376,17 @@ class App:
             h = holder()
             ttk.Combobox(h, textvariable=v, values=["auto", "1", "2", "3"], width=8, state="readonly").pack(side="left", padx=(0, PX))
             hint(h, "Auto = most gunshots; 1, 2 or 3 = fixed (ignored in Legacy audio mode)")
+            r[0] += 1
+        section("Player names")
+        for g in GAMES:
+            label(f"Player names: {GAME_DIR[g]}")
+            v = tk.StringVar(value="; ".join(norm_names((self.cfg.get("player_names") or {}).get(g), g)))
+            self.set_names[g] = v
+            h = holder()
+            e_ = ttk.Entry(h, textvariable=v, width=28)
+            e_.pack(side="left", padx=(0, PX))
+            e_.bind("<FocusOut>", self.names_changed)
+            hint(h, "names / aliases separated by ';' (letters = fuzzy match, e.g. CJK = exact text)")
             r[0] += 1
         section("Montage")
         self.set_opt, self.set_len, self.set_style, self.set_q = self.m_opt, self.m_len, self.m_style, self.m_q    # shared with the Manual tab
@@ -7344,9 +7456,27 @@ class App:
         self.set_last = f.grid_slaves(row=r[0] + 1, column=0)[0]
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
-        for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), self.set_opt, self.set_len,
+        for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
                   self.set_style, self.set_q, self.set_place, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
+
+    def names_changed(self, *_):
+        """V6.0: after editing player names, say how many cached clips were scanned with other names and ASK before rescanning."""
+        cfg = self.collect_settings(dict(self.cfg))
+        sig = json.dumps(cfg.get("player_names"), sort_keys=True)
+        if sig == getattr(self, "_names_sig", json.dumps(self.cfg.get("player_names"), sort_keys=True)):
+            return
+        self._names_sig = sig
+        self.flush_settings()
+        try:
+            n = len(stale_name_clips(load_config()))
+        except Exception as ex:
+            out(f"player names: could not check cached clips ({ex})")
+            return
+        if n and messagebox.askyesno("Player names", f"{n} clip(s) were scanned with other player names and are marked stale.\n\n"
+                                     "Rescan them now? It runs in the background, can be cancelled and resumes later. "
+                                     "Nothing is rescanned unless you say yes."):
+            self.run_task("rescan", lambda: rescan_stale_names(load_config()))
 
     def save_settings(self):
         self.flush_settings()

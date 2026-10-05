@@ -40,8 +40,49 @@ def audio_clip_test():
     return fails
 
 
+def names_test():
+    fails = []
+    tmpd = Path(tempfile.mkdtemp(prefix="v60n_"))
+    old = m.use_data_dir(tmpd / "data")
+    blobs = [[290, 24, 110, 22, 0.6]]
+    boxes = lambda k, v: [[60, 20, 260, 50, k, 0.9, 12, ""], [420, 20, 540, 50, v, 0.9, 12, ""]]
+
+    def verdicts(k, v, game):
+        rows = m.ocr_rows(boxes(k, v), blobs, game)
+        return [vv for r in rows for vv, _ in m.classify_row(r)]
+    try:
+        m.set_player_names({})
+        base = {g: [verdicts("fireaxe", "enemy", g), verdicts("enemy", "fireaxe", g), verdicts("enemy + fireaxe", "victim", g)]
+                for g in ("valorant", "cs2")}
+        if base["cs2"] != [["kill"], ["death"], ["reject"]] or base["valorant"] != base["cs2"]:
+            fails.append(f"default names behave differently: {base}")
+        m.set_player_names({"player_names": {"valorant": ["fireaxe", "zzalias"], "cs2": ["fireaxe", "火斧", "zzalias"]}})
+        for g in ("valorant", "cs2"):
+            got = [verdicts("zzalias", "enemy", g), verdicts("enemy", "zzalias", g), verdicts("enemy + zzalias", "victim", g)]
+            if got != base[g]:
+                fails.append(f"{g}: alias differs from default name: {got} vs {base[g]}")
+        # cache: an old entry (no names record) is valid, not stale; a new scan records names; changed names => stale
+        m.set_player_names({})
+        st = m.load_kills_cache()
+        st.put("/c/a.mov|1|2|cs2|ocrabcdef12v9nb", {"v": 9, "ocr": [[0, 0, [], []]]})
+        st.put("/c/b.mov|1|2|cs2|ocrabcdef12v9nb", {"v": 9, "names": m.names_for_cache("cs2"), "ocr": [[0, 0, [], []]]})
+        ka, kb = "/c/a.mov|1|2|cs2|ocrabcdef12v9nb", "/c/b.mov|1|2|cs2|ocrabcdef12v9nb"
+        if m.cached_names(st, ka, "cs2") != m.names_for_cache("cs2") or m.cached_names(st, kb, "cs2") != m.names_for_cache("cs2"):
+            fails.append("default-name cache entries must not be stale")
+        if m.names_stale(st.get(ka), "cs2") or m.names_stale(st.get(kb), "cs2"):
+            fails.append("names_stale true for default names")
+        m.set_player_names({"player_names": {"cs2": ["fireaxe", "火斧", "zzalias"]}})
+        if not (m.cached_names(st, ka, "cs2") != m.names_for_cache("cs2") and m.cached_names(st, kb, "cs2") != m.names_for_cache("cs2")):
+            fails.append("changed names must mark both entries stale")
+        if m.names_for_cache("valorant") != ["fireaxe"] or m.cached_names(st, ka, "valorant") != ["fireaxe"]:
+            fails.append("valorant names unexpectedly changed")
+    finally:
+        m.set_player_names({})
+    return fails
+
+
 def main():
-    fails = audio_clip_test()
+    fails = audio_clip_test() + names_test()
     for n, lo, hi in ((60, 80, 150), (2, 0, 80)):
         plan, notes = auto_len(n)
         d = plan["duration"]
