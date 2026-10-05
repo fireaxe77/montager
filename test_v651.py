@@ -225,7 +225,9 @@ def t_gui():
     x, y, w, h = tree.bbox(str(clips[3]), app.USED_COL)
     tree.event_generate("<Button-1>", x=x + w // 2, y=y + h // 2)
     root.update()
-    check(app.ticked == {str(clips[3])} and len(M.used_dates()) == 3 and not any("unflagged" in l for l in logs), "clicking an empty Used cell does nothing (no tick change)")
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    check(app.ticked == {str(clips[3])} and len(M.used_dates()) == 4 and M.used_dates().get(M._pkey(str(clips[3]))) == today and not any("unflagged" in l for l in logs),
+          "clicking an empty Used cell flags the clip with today's date (V6.5.2), no tick change")
     # click a used date: only that clip is unflagged, ticks unchanged
     x, y, w, h = tree.bbox(str(clips[1]), app.USED_COL)
     tree.event_generate("<Button-1>", x=x + w // 2, y=y + h // 2)
