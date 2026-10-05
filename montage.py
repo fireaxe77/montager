@@ -3455,7 +3455,7 @@ def _game_gain(cfg, song_lufs, clip_lufs):
 
 
 def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock):
-    """Frame-exact take list + V4 effects (zoom pulses on kills, flash on the headline, ramps, slow-mo) + gentle transitions."""
+    """Frame-exact take list + V4 effects (centred zoom punches on kills, ramps, slow-mo) + hard cuts (V5.2: no flashes)."""
     import numpy as np
     S0 = float(U[takes[0]["c"]])
     fr = lambda t: int(round((t - S0) * OUT_FPS))
@@ -3488,18 +3488,14 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         strong = (kb // 2) in down or en[min(kb // 2, len(en) - 1)] >= 0.6
         frq = lambda x: round(x * OUT_FPS) / OUT_FPS
         pulses = []
-        if role in ("headline", "ending") or (strong and rng.random() < rp["zoom_p"]):
+        if role == "headline" or (strong and rng.random() < rp["zoom_p"]):                   # V4 zoom punch frequency
             pulses.append(frq(ko[0]))
         for k2 in ko[1:]:
             j = int(np.argmin(np.abs(bt - (U[tk["c"]] + k2))))
             if abs(bt[j] - (U[tk["c"]] + k2)) < 0.06 and (j in down or en[min(j, len(en) - 1)] >= 0.6) and len(pulses) < 3 \
                     and rng.random() < rp["zoom_p"] * 0.6:
                 pulses.append(frq(k2))
-        trans = "hard"
-        if i > 0:
-            w = rp.get("trans", {"hard": 1.0})
-            if role in ("headline", "drop", "build", "ending") or rng.random() < 0.35:
-                trans = rng.choices(list(w), weights=list(w.values()))[0]
+        trans = "hard"                                     # V5.2: no flash / zoom cuts - every take starts on a hard cut
         slow_at = None
         o = 0
         for sg in segs:
@@ -3521,7 +3517,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           "segs": segs, "f0": f_c, "nf": nf, "out_start": round(f_c / OUT_FPS, 4), "dur": round(nf / OUT_FPS, 4),
                           "role": role, "section": sec[min(kb // 2, len(sec) - 1)] if sec else "",
                           "pulses": [round(p, 4) for p in pulses], "amp": round(rp["zoom_amp"], 3),
-                          "flash": frq(ko[0]) if role == "headline" and rp["flash"] else None, "trans": trans, "slow_at": slow_at,
+                          "flash": None, "trans": trans, "slow_at": slow_at,
                           "beat0": b0, "beat_end": b0 + nf / OUT_FPS / (2 * (U[1] - U[0])), "beat_kill": (kb - takes[0]["c"]) / 2,
                           "song_beat": tk["c"] // 2, "kill_down": kb % 2 == 0 and (kb // 2) in down, "locked": True,
                           "kills": [round(x, 6) for x in ev["times"]], "rows": [round(x, 6) for x in ev.get("rows", ev["times"])],
@@ -3668,9 +3664,9 @@ def _sum_expr(terms):
 
 
 def build_filter(plan, cfg, preview, fx=FX_ALL):
-    """ONE filter graph (V4 engine). Effects sit on each take's own output timeline: zoom pulses on kills (V4 curve, rendered sharp
-    by 2x scale+crop and overlaid only inside the pulse), V4's white flash on the headline kill, ramps before kills, V4 slow-mo
-    (frame blending only inside slow-mo segments), optional flash / zoom cut at a take start. Music: never ducked, stretched or
+    """ONE filter graph (V4 engine). Effects sit on each take's own output timeline: centred V4 zoom punches on kills (overlaid
+    only inside the punch), ramps before kills, V4 slow-mo (frame blending only inside slow-mo segments). V5.2: no flashes, no
+    zoom / flash cuts - takes join on hard cuts. Music: never ducked, stretched or
     automated - sample-exact start, 0.3 s fade-in, fade-out from the final kill. Game audio: V4 balance + kill boost."""
     inputs, chains, k = [], [], 0
     takes = plan["takes"]
@@ -3729,16 +3725,12 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
         chains.append("".join(tv) + (f"concat=n={len(tv)}:v=1:a=0" if len(tv) > 1 else "null") + f"[{base}c]")
         chains.append("".join(ta) + (f"concat=n={len(ta)}:v=0:a=1" if len(ta) > 1 else "anull") + f"[{base}a]")
         # effects on the take's own timeline; frames outside an effect window stay untouched
-        tr = t.get("trans", "hard") if ti > 0 and "transition" in fx else "hard"
         zt, wins = [], []
         tt = "(in/60)"                                                                     # take-timeline seconds inside perspective
         if "zoom" in fx:
-            for p in t.get("pulses", []):                                                  # smooth punch: float zoom, eased in AND out
-                zt.append(f"between({tt},{p:.4f},{p + 0.45:.4f})*{t['amp']:.3f}*0.5*(1-cos(2*PI*({tt}-{p:.4f})/0.45))")
+            for p in t.get("pulses", []):                                                  # V4 punch: centred, peak on the kill, 0.45 s decay
+                zt.append(f"between({tt},{p:.4f},{p + 0.45:.4f})*{t['amp']:.3f}*exp(-9*({tt}-{p:.4f}))")
                 wins.append((p, p + 0.45))
-        if tr == "zoom":
-            zt.append(f"between({tt},0,0.25)*0.06*0.5*(1+cos(PI*{tt}/0.25))")
-            wins.append((0.0, 0.26))
         lab = f"[{base}c]"
         if zt:
             en_ = "+".join(f"between(t,{a_:.4f},{b_:.4f})" for a_, b_ in wins)
@@ -3749,13 +3741,7 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             chains.append(f"[{base}m]format=yuv420p[{base}m2]")
             chains.append(f"[{base}m2][{base}e]overlay=0:0:eof_action=pass:enable='{en_}'[{base}o]")
             lab = f"[{base}o]"
-        post = []
-        if "flash" in fx and t.get("flash") is not None:                               # V4 flash on the headline kill
-            f0 = t["flash"]
-            post.append(f"drawbox=x=0:y=0:w=iw:h=ih:color=white@0.8:t=fill:enable='between(t,{f0:.3f},{f0 + 0.12:.3f})'")
-        if tr == "flash":
-            post.append("drawbox=x=0:y=0:w=iw:h=ih:color=white@0.6:t=fill:enable='lt(t,0.07)'")
-        chains.append(lab + (",".join(post) + "," if post else "") + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
+        chains.append(lab + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
         vl.append(f"[{base}v][{base}a]")
     D = plan["duration"]
     fo = float(plan["song"].get("fade_out_start", max(0.0, D - 2.0)))
