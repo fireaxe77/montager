@@ -362,7 +362,113 @@ def t_firstshow():
         M.match_playlist = real
 
 
-SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow}
+# ---------------------------------------------------------------- 6: one palette, no leftover colours (every engine)
+from tkinter import ttk
+
+SEQ = [("lime", "grey"), ("yellow", "black"), ("orange", "grey"), ("red", "black"), ("pink", "grey"), ("purple", "black"),
+       ("lime", "black"), ("yellow", "grey"), ("orange", "black"), ("red", "grey"), ("pink", "black"), ("purple", "grey")]
+CLS_EXPECT = {"window": {"bg": "bg", "highlightbackground": "bg"}, "label": {"bg": "bg", "fg": "fg", "highlightbackground": "bg"},
+              "text": {"bg": "field", "fg": "fg", "highlightbackground": "border"}, "entry": {"bg": "field", "fg": "fg", "highlightbackground": "border"},
+              "pane": {"bg": "border"}}
+CLS_ROLE = {"Tk": "window", "Toplevel": "window", "Frame": "window", "Canvas": "window", "Label": "label", "Text": "text",
+            "Entry": "entry", "Spinbox": "entry", "Listbox": "text", "Panedwindow": "pane"}
+# ttk style option -> palette key that EVERY engine must deliver (looked up through ttk.Style.lookup)
+TTK_EXPECT = {"TFrame": {"background": "bg"}, "TLabel": {"background": "bg", "foreground": "fg"},
+              "TCheckbutton": {"background": "bg", "foreground": "fg"}, "TRadiobutton": {"background": "bg", "foreground": "fg"},
+              "TLabelframe": {"background": "bg"}, "TLabelframe.Label": {"background": "bg"}, "TNotebook": {"background": "bg"},
+              "Dim.TLabel": {"foreground": "dim"}, "Section.TLabel": {"foreground": "acc"},
+              "TEntry": {"foreground": "fg"}, "TCombobox": {"foreground": "fg"}, "Treeview": {"foreground": "fg"}}
+
+
+def stale_counts(app, pal, engine, pixels=True):
+    """(classic stale, ttk stale, pixel stale, widgets checked) for the CURRENT combination."""
+    classic, ttkbad, pix, n = [], [], [], 0
+    reg = getattr(app, "_reg", {})
+    for w in app._tk_widgets():
+        role = reg.get(str(w)) or CLS_ROLE.get(w.winfo_class())
+        if role is None or role in ("fixed", "list", "menu"):
+            continue
+        for opt, key in CLS_EXPECT.get(role, {}).items():
+            try:
+                v = str(w.cget(opt)).lower()
+            except tk.TclError:
+                continue
+            n += 1
+            if v != pal[key].lower():
+                classic.append(f"{w.winfo_class()} {w} {opt}={v} want {pal[key]}")
+    st = ttk.Style(app.root)
+    for style, opts in TTK_EXPECT.items():
+        for opt, key in opts.items():
+            n += 1
+            v = str(st.lookup(style, opt)).lower()
+            if v != pal[key].lower():
+                ttkbad.append(f"{style} {opt}={v} want {pal[key]}")
+    if pixels:
+        try:
+            from PIL import ImageGrab
+            app.root.update()
+            img = ImageGrab.grab(xdisplay=os.environ.get("DISPLAY"))
+            want = tuple(int(pal["bg"][i:i + 2], 16) for i in (1, 3, 5))
+            seen = 0
+            for w in app._all_widgets() if hasattr(app, "_all_widgets") else []:
+                pass
+            todo = [app.root]
+            while todo:
+                w = todo.pop()
+                try:
+                    todo.extend(w.winfo_children())
+                    cls = w.winfo_class()
+                    if cls in ("TLabel", "TFrame") and w.winfo_ismapped() and w.winfo_viewable() and w.winfo_width() > 12 and w.winfo_height() > 8:
+                        x, y = w.winfo_rootx() + 1, w.winfo_rooty() + 1
+                        if not (0 <= x < img.width and 0 <= y < img.height) or app.root.winfo_containing(x, y) is not w:
+                            continue                                 # clipped (scrolled page) or covered by a child: not a sample of this widget
+                        px = img.getpixel((x, y))[:3]
+                        seen += 1
+                        n += 1
+                        if str(w.cget("style")) in ("", "TLabel", "TFrame", "Dim.TLabel", "Section.TLabel") and max(abs(a - b) for a, b in zip(px, want)) > 3:
+                            pix.append(f"{cls} {w} pixel {px} want {want}")
+                except tk.TclError:
+                    continue
+            if seen == 0:
+                pix.append("no mapped TLabel / TFrame found to sample")
+        except ImportError:
+            pass
+    return classic, ttkbad, pix, n
+
+
+def t_theme():
+    print("[6] one palette: 12 combinations in ONE window, every engine")
+    d = Path(tempfile.mkdtemp(prefix="mt_theme_"))
+    M.messagebox.askyesno = lambda *a, **k: False
+    engines = [e for e in ("fast", "lite", "full") if e in getattr(M, "THEME_ENGINES", {"fast": 1})] or ["fast"]
+    for eng in engines:
+        cfg = dict(M.load_config(), theme_engine=eng, mp3_dir="", accent="lime", base="grey")
+        M.save_json(M.CONFIG_PATH, cfg)
+        app = M.App(0)
+        root = app.root
+        root.geometry("1400x900+0+0")
+        root.update()
+        tot = [0, 0, 0, 0]
+        first = []
+        for acc, base in SEQ:
+            t0 = time.perf_counter()
+            app.retheme(acc, base)
+            ms = (time.perf_counter() - t0) * 1000
+            pal = M.make_palette(acc, base)
+            for tab in app.tabs:                                  # other tabs are refreshed the first time they are shown
+                app.nb.select(app.tabs[tab])
+                root.update()
+            c, t_, p_, n = stale_counts(app, pal, eng)
+            tot = [tot[0] + len(c), tot[1] + len(t_), tot[2] + len(p_), tot[3] + n]
+            if (c or t_ or p_) and len(first) < 4:
+                first += (c + t_ + p_)[:2]
+            print(f"      {eng:5} {acc:6} {base:5} retheme {ms:6.0f} ms  stale classic={len(c)} ttk={len(t_)} pixel={len(p_)} of {n}")
+        check(tot[0] == 0 and tot[1] == 0 and tot[2] == 0, f"engine {eng}: stale classic {tot[0]}, ttk styles {tot[1]}, pixels {tot[2]} (of {tot[3]} checks)"
+              + (": " + "; ".join(first[:3]) if first else ""))
+        root.destroy()
+
+
+SECTIONS = {"workers": t_workers, "audio": t_audio, "match": t_match, "cache": t_cache, "firstshow": t_firstshow, "theme": t_theme}
 
 if __name__ == "__main__":
     want = [a for a in sys.argv[1:] if not a.startswith("--")] or list(SECTIONS)

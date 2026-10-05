@@ -51,7 +51,9 @@ def main():
     for acc, base in SEQ:
         app.cfg["accent"], app.cfg["base"] = acc, base
         app.retheme(acc, base)
-        app.root.update()
+        for f_ in app.tabs.values():                              # V6.1.2: tabs other than the visible one are recoloured when first shown
+            app.nb.select(f_)
+            app.root.update()
         bad, n = stale(app, M.make_palette(acc, base))
         total += len(bad)
         widgets = n

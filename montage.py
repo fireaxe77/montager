@@ -90,6 +90,7 @@ DEFAULT_CONFIG = {
     "window_max_s": 90,
     "game_audio_level": 0.6,        # game audio under the music (linear; V4 was 0.5), +4 dB around kills; quiet clips lifted <= 8 dB
     "cfg_version": 5,
+    "theme_engine": "fast",         # V6.1.2: fast (clam, no images) | lite (Sun Valley, small controls only) | full (Sun Valley)
     "include_valorant": ["VALORANT"],   # only folders whose name matches are used (any depth under clip_root)
     "include_cs": ["CS", "COUNTER STRIKE"],
     "max_mb": 60,
@@ -5774,9 +5775,9 @@ def random_pick(cands, an=None, style="auto", rng=None):
 ACCENT_DEF = {"lime": ("#a3e635", "#4c7a14", "#2c3d0c", 42), "yellow": ("#facc15", "#8a6d0a", "#4a3a05", 24),
               "orange": ("#fb923c", "#9a4f12", "#4f2808", 14), "red": ("#f87171", "#a62b2b", "#561515", 0),
               "pink": ("#f472b6", "#a3306f", "#521838", 164), "purple": ("#a78bfa", "#5b3fb0", "#2e2060", 129)}
-BASE_DEF = {"grey": dict(bg="#343434", fg="#f2f2f2", field="#454545", head="#3d3d3d", dim="#b4b4b4", border="#5c5c5c", btn="#454545",
+BASE_DEF = {"grey": dict(bg="#343434", fg="#fafafa", field="#454545", head="#3d3d3d", dim="#b4b4b4", border="#5c5c5c", btn="#454545",
                          btn_act="#505050"),
-            "black": dict(bg="#0b0b0b", fg="#f2f2f2", field="#1b1b1b", head="#141414", dim="#a8a8a8", border="#3a3a3a", btn="#1b1b1b",
+            "black": dict(bg="#0b0b0b", fg="#fafafa", field="#1b1b1b", head="#141414", dim="#a8a8a8", border="#3a3a3a", btn="#1b1b1b",
                           btn_act="#2a2a2a")}
 
 
@@ -5792,9 +5793,16 @@ def contrast(a, b):
     return (la + 0.05) / (lb + 0.05)
 
 
+def _mix(a, b, t):
+    """#rrggbb a blended towards b by t (0..1)."""
+    ca, cb = [int(a[i:i + 2], 16) for i in (1, 3, 5)], [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(round(x + (y - x) * t)) for x, y in zip(ca, cb))
+
+
 def make_palette(accent="lime", base="grey"):
     acc, dark, _, _ = ACCENT_DEF.get(accent, ACCENT_DEF["lime"])
     pal = dict(BASE_DEF.get(base, BASE_DEF["grey"]))
+    pal["alt"] = _mix(pal["bg"], pal["fg"], 0.045)
     pal.update(acc=acc, sel=dark, sel_fg="#ffffff", check=acc, acc_fg="#10200a" if contrast(acc, "#10200a") >= contrast(acc, "#ffffff") else "#ffffff")
     return pal
 
@@ -5812,13 +5820,13 @@ def F(size):
 
 SIMPLE_THEME = os.environ.get("MONTAGE_SIMPLE_THEME") == "1"      # V6.2: A/B test switch: built-in clam theme instead of Sun Valley
 SV_THEME = [False]                                    # True when the Sun Valley ttk theme (sv-ttk) is active
-THEME_VER = "t3"
+THEME_VER = "t4"
 
 
 def _neutral(v, base):
     """Sun Valley dark neutral grey level -> the grey (lifted) or black base."""
-    if base == "black":
-        return max(0, min(255, int(round((v - 28) * 250 / 222)))) if v > 28 else 0
+    if base == "black":                                            # V6.1.2: bg 28 -> 11 (= palette bg #0b0b0b), so ttk and classic widgets match
+        return max(0, min(255, int(round(11 + (v - 28) * 239 / 222)))) if v > 28 else max(0, int(round(11 - (28 - v) * 0.4)))
     return max(0, min(255, int(round(52 + (v - 28) * (250 - 52) / (250 - 28))) if v > 28 else 52 - (28 - v) // 2))
 
 
@@ -5833,18 +5841,34 @@ def _tint_hex(m, accent="lime", base="grey"):
     return {"57c8ff": f'"{acc}"', "2f60d8": f'"{dark}"', "25536a": f'"{darkest}"'}.get(h.lower(), m.group(0))
 
 
-def lime_theme_dir(accent="lime", base="grey"):
+LITE_FLAT = ("Treeview.field", "Notebook.border", "Card.field", "Labelframe.border", "Horizontal.Scrollbar.trough", "Vertical.Scrollbar.trough",
+             "Horizontal.Progressbar.trough", "Horizontal.Progressbar.pbar", "Vertical.Progressbar.trough", "Vertical.Progressbar.pbar",
+             "Separator.separator")
+# V6.1.2: Sun Valley Lite keeps the image elements of the SMALL controls (Button / Toolbutton / Accent / Toggle buttons, Menubutton,
+# OptionMenu, Notebook.tab, Checkbutton / Radiobutton / Switch indicators, Entry / Combobox / Spinbox fields, their arrows, Scale slider and
+# troughs, Scrollbar thumbs and arrows, Treeview heading cells and expanders, Sizegrip) and replaces the elements that cover a LARGE or
+# variable area with the flat clam elements (LITE_FLAT), coloured through Style configure with the Sun Valley colours.
+LITE_KEPT = ("Button.button", "Toolbutton.button", "AccentButton.button", "ToggleButton.button", "Menubutton.button", "OptionMenu.button",
+             "Notebook.tab", "Checkbutton.indicator", "Radiobutton.indicator", "Switch.indicator", "Entry.field", "Combobox.field",
+             "Spinbox.field", "Combobox.arrow", "Spinbox.uparrow/downarrow", "Scale.slider", "Horizontal/Vertical.Scale.trough",
+             "Scrollbar.thumb", "Scrollbar arrows", "Treeheading.cell", "Treeitem.indicator", "Sizegrip.sizegrip")
+
+
+def lime_theme_dir(accent="lime", base="grey", lite=False):
     """A copy of the sv-ttk package whose dark theme has the chosen base (grey | black) and accent colour (checkboxes, sliders, tabs,
     Accent buttons): the sprite sheet is recoloured once per combination (cached in montage_data\\theme_cache) and the colour
-    constants of dark.tcl are replaced."""
+    constants of dark.tcl are replaced. V6.1.2: lite=True also strips the image elements of LITE_FLAT (clam draws them instead); the
+    <<ThemeChanged>> bindings of sv.tcl (configure_colors -> tk_setPalette over every widget, added again on EVERY sourcing) are removed:
+    apply_theme configures the same ttk colours itself, once per switch."""
     import sv_ttk
     import cv2
     import numpy as np
     src = Path(sv_ttk.__file__).parent
-    dst = DATA / "theme_cache" / f"sv_{THEME_VER}_{accent}_{base}"
+    kind = "svl" if lite else "sv"
+    dst = DATA / "theme_cache" / f"{kind}_{THEME_VER}_{accent}_{base}"
     if (dst / "ok").exists():
         return dst
-    tmp = DATA / "theme_cache" / f"tmp_{os.getpid()}_{accent}_{base}"
+    tmp = DATA / "theme_cache" / f"tmp_{os.getpid()}_{kind}_{accent}_{base}"
     shutil.rmtree(tmp, ignore_errors=True)
     shutil.copytree(src, tmp, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.py", "py.typed"))
     im = cv2.imread(str(tmp / "theme" / "spritesheet_dark.png"), cv2.IMREAD_UNCHANGED)
@@ -5853,7 +5877,7 @@ def lime_theme_dir(accent="lime", base="grey"):
     grey = (mx - mn) < 12
     v0 = bgr[:, :, 0]
     if base == "black":
-        lifted = np.where(v0 > 28, (v0 - 28) * 250 / 222, 0)
+        lifted = np.where(v0 > 28, 11 + (v0 - 28) * 239 / 222, np.maximum(0, 11 - (28 - v0) * 0.4))
     else:
         lifted = np.where(v0 > 28, 52 + (v0 - 28) * (250 - 52) / (250 - 28), 52 - (28 - v0) / 2)
     out_ = bgr.copy()
@@ -5867,14 +5891,20 @@ def lime_theme_dir(accent="lime", base="grey"):
     cv2.imwrite(str(tmp / "theme" / "spritesheet_dark.png"), np.concatenate([np.clip(out_, 0, 255).astype(np.uint8), alpha], axis=2))
     sub = lambda m: _tint_hex(m, accent, base)
     tag = f"{accent}_{base}"
+    tname = f"mtl-{tag}" if lite else f"mt-{tag}"
     for f_ in (tmp / "theme" / "dark.tcl", tmp / "sv.tcl"):
         txt_ = re.sub(r'"#([0-9a-fA-F]{6})"', sub, f_.read_text(encoding="utf-8"))
         # V5.58: a unique theme + namespace name per combination, fonts created once only: the running window can source another
         # combination (live theme switching) without "theme already exists" / "font already exists" errors
-        txt_ = txt_.replace("sun-valley-dark", f"mt-{tag}").replace("sv_dark", f"sv_{tag}")
+        txt_ = txt_.replace("sun-valley-dark", tname).replace("sv_dark", f"sv{'l' if lite else ''}_{tag}")
         if f_.name == "sv.tcl":
             txt_ = re.sub(r"^source \[file join \[file dirname \[info script\]\] theme light\.tcl\]\s*$", "", txt_, flags=re.M)
             txt_ = re.sub(r"^font create (.*)$", r"catch {font create \1}", txt_, flags=re.M)
+            txt_ = re.sub(r"^bind .*$", "", txt_, flags=re.M)               # no <<ThemeChanged>> handlers (see the docstring)
+        elif lite:
+            for el in LITE_FLAT:
+                txt_ = re.sub(r"^[ \t]*ttk::style element create " + re.escape(el) + r" image .*\n", "", txt_, flags=re.M)
+            txt_ = txt_.replace("Notebook.border -children", "Notebook.client -children").replace("Card.field {", "Labelframe.border {")
         f_.write_text(txt_, encoding="utf-8")
     (tmp / "ok").write_text(THEME_VER)
     shutil.rmtree(dst, ignore_errors=True)
@@ -5882,110 +5912,277 @@ def lime_theme_dir(accent="lime", base="grey"):
     return dst
 
 
-def apply_theme(root, scale=None, accent="lime", base="grey"):
-    """V5.57: Sun Valley dark (pip: sv-ttk, offline) recoloured to a base (grey | black) and an accent colour; the plain clam
-    fallback uses the same palette. Returns the palette (log, canvases, tags)."""
+# ---- V6.1.2 theme engines
+THEME_ENGINES = {"fast": "Fast (default)", "lite": "Sun Valley Lite", "full": "Sun Valley (full, slower)"}
+
+# Colours sampled from the sprite sheet / dark.tcl of the installed sv-ttk (Sun Valley dark, sv_ttk 2.x): centre or edge pixel of the named
+# sprite. sample_sv_colours() re-reads them from the installed files (test_v612 checks that this table still matches).
+SV_DARK = {"bg": "#1c1c1c", "fg": "#fafafa", "disfg": "#595959", "btn_dis_fg": "#7a7a7a", "entry_dis_fg": "#757575",
+           "card_border": "#2f2f2f", "btn_rest": "#2a2a2a", "btn_border": "#313131", "btn_hover": "#2f2f2f", "btn_press": "#232323",
+           "btn_press_border": "#2c2c2c", "btn_dis": "#2f2f2f", "btn_dis_border": "#2c2c2c", "tb_rest": "#292929", "tb_border": "#2f2f2f",
+           "tb_hover": "#2f2f2f", "tb_focus": "#1c1c1c", "tb_dis": "#262626", "tab_rest": "#2f2f2f", "tab_sel": "#1c1c1c", "tab_hover": "#292929",
+           "head_rest": "#2a2a2a", "head_hover": "#2f2f2f", "head_press": "#232323", "trough": "#292929", "thumb": "#9e9e9e",
+           "prog_trough": "#989898", "slider_trough": "#979797", "check_border": "#989898", "sep": "#2f2f2f", "selrow": "#292929",
+           "accbtn_dis": "#404040"}
+_SV_SAMPLES = {"card_border": ("card", 0, 25), "btn_rest": ("button-rest", 10, 10), "btn_border": ("button-rest", 0, 10),
+               "btn_hover": ("button-hover", 10, 10), "btn_press": ("button-pressed", 10, 10), "btn_press_border": ("button-pressed", 0, 10),
+               "btn_dis": ("button-dis", 10, 10), "btn_dis_border": ("button-dis", 0, 10), "tb_rest": ("textbox-rest", 10, 10),
+               "tb_border": ("textbox-rest", 0, 10), "tb_hover": ("textbox-hover", 10, 10), "tb_focus": ("textbox-focus", 10, 10),
+               "tb_dis": ("textbox-dis", 10, 10), "tab_rest": ("tab-rest", 16, 16), "tab_sel": ("tab-selected", 16, 16),
+               "tab_hover": ("tab-hover", 16, 16), "head_rest": ("heading-rest", 11, 11), "head_hover": ("heading-hover", 11, 11),
+               "head_press": ("heading-pressed", 11, 11), "trough": ("scrollbar-trough-vert", 6, 10), "thumb": ("scrollbar-thumb-vert", 6, 10),
+               "prog_trough": ("progressbar-trough-hor", 10, 2), "slider_trough": ("slider-trough-hor", 11, 11),
+               "check_border": ("check-unsel-rest", 0, 10), "sep": ("sep", 5, 5), "accbtn_dis": ("button-accent-dis", 10, 10)}
+
+
+def sample_sv_colours():
+    """The SV_DARK table, read from the installed sv_ttk files (sprites_dark.tcl + spritesheet_dark.png + dark.tcl); None when unavailable."""
+    try:
+        import sv_ttk
+        import cv2
+        d = Path(sv_ttk.__file__).parent / "theme"
+        info = {n: tuple(map(int, v)) for n, *v in (m for m in re.findall(r"(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)", (d / "sprites_dark.tcl").read_text()))}
+        im = cv2.imread(str(d / "spritesheet_dark.png"), cv2.IMREAD_UNCHANGED)
+        out_ = dict(SV_DARK)
+        for k, (name, dx, dy) in _SV_SAMPLES.items():
+            x, y, _, _ = info[name]
+            b, g, r = (int(v) for v in im[y + dy, x + dx][:3])
+            out_[k] = "#%02x%02x%02x" % (r, g, b)
+        tcl = (d / "dark.tcl").read_text()
+        cm = dict(re.findall(r'-(\w+)\s+"(#[0-9a-fA-F]{6})"', tcl.split("proc load_images")[0]))
+        out_.update(bg=cm["bg"].lower(), fg=cm["fg"].lower(), disfg=cm["disfg"].lower())
+        return out_
+    except Exception:
+        return None
+
+
+_SVC_CACHE = {}
+
+
+def sv_colours(accent="lime", base="grey"):
+    """The Sun Valley dark colours for a base (neutrals re-levelled exactly like the recoloured sprites) and an accent."""
+    key = (accent, base)
+    if key not in _SVC_CACHE:
+        def m(h):
+            v = int(h[1:3], 16)
+            g = _neutral(v, base)
+            return "#%02x%02x%02x" % (g, g, g)
+        c = {k: m(v) for k, v in SV_DARK.items()}
+        acc, dark, darkest, _ = ACCENT_DEF.get(accent, ACCENT_DEF["lime"])
+        c.update(acc=acc, acc_hover=_scale_hex(acc, 0.945), acc_press=_scale_hex(acc, 0.89), acc_border=_mix(acc, "#ffffff", 0.12), sel=dark)
+        _SVC_CACHE[key] = c
+    return _SVC_CACHE[key]
+
+
+def _scale_hex(h, f):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(int(h[i:i + 2], 16) * f)))) for i in (1, 3, 5))
+
+
+def theme_engine(cfg=None):
+    """fast | lite | full. MONTAGE_SIMPLE_THEME=1 forces fast."""
+    if SIMPLE_THEME:
+        return "fast"
+    v = (cfg if cfg is not None else load_config()).get("theme_engine", "fast")
+    return v if v in THEME_ENGINES else "fast"
+
+
+def _ui_family(root):
+    import tkinter.font as tkfont
+    try:
+        fam = set(tkfont.families(root))
+    except tk.TclError:
+        fam = set()
+    sfx = "" if os.name == "nt" else " static"
+    return {"body": next((f for f in (f"Segoe UI Variable{sfx} Text", "Segoe UI Variable Text") if f in fam), "Segoe UI"),
+            "caption": next((f for f in (f"Segoe UI Variable{sfx} Small", "Segoe UI Variable Small") if f in fam), "Segoe UI"),
+            "strong": next((f for f in (f"Segoe UI Variable{sfx} Text Semibold", "Segoe UI Variable Text Semibold") if f in fam), "Segoe UI")}
+
+
+def _ensure_sv_fonts(root):
+    """The Sun Valley named fonts exist in every engine (Fast does not source sv.tcl); created once, sized by apply_theme."""
+    import tkinter.font as tkfont
+    fm = _ui_family(root)
+    have = set(tkfont.names(root))
+    for nm, fam, bold in (("SunValleyCaptionFont", fm["caption"], 0), ("SunValleyBodyFont", fm["body"], 0), ("SunValleyBodyStrongFont", fm["strong"], 1)):
+        if nm not in have:
+            tkfont.Font(root=root, name=nm, family=fam, size=-12 if "Caption" in nm else -14, weight="bold" if bold and fm["strong"] == "Segoe UI" else "normal")
+    return fm
+
+
+def _app_styles(root, st, pal, engine):
+    """Every ttk style the app uses, configured from the CURRENT palette each time (all engines): defaults, the custom styles
+    (Big.TButton, Big.Accent.TButton, Accent.TButton, Section.TLabel, Dim.TLabel), Treeview, notebook tab, labelframe label."""
+    bold = ("SunValleyBodyFont", F(10), "bold")
+    st.configure("Treeview", rowheight=int(26 * UI_SCALE[0]), foreground=pal["fg"], font="SunValleyBodyFont")
+    st.configure("Treeview.Heading", font=("SunValleyBodyFont", F(10), "bold"))
+    st.configure("TLabelframe.Label", font=bold, background=pal["bg"], foreground=pal["fg"] if engine == "fast" else pal["acc"])
+    st.configure("TNotebook.Tab", padding=(16, 5), font=bold)
+    st.configure("Big.TButton", font=("SunValleyBodyFont", F(11), "bold"), padding=(14, 6))
+    st.configure("Big.Accent.TButton", font=("SunValleyBodyFont", F(11), "bold"), padding=(14, 6))
+    st.configure("Section.TLabel", font=("SunValleyBodyFont", F(11), "bold"), foreground=pal["acc"], background=pal["bg"])
+    st.configure("Dim.TLabel", foreground=pal["dim"], background=pal["bg"])
+
+
+def _style_sv_defaults(st, pal, c):
+    """What sv.tcl's configure_colors did on <<ThemeChanged>> (ttk part), from the palette, once per switch."""
+    st.configure(".", background=pal["bg"], foreground=pal["fg"], troughcolor=pal["bg"], focuscolor=pal["sel"], selectbackground=pal["sel"],
+                 selectforeground=pal["sel_fg"], insertwidth=1, insertcolor=pal["fg"], fieldbackground=pal["bg"], font="SunValleyBodyFont",
+                 borderwidth=0, relief="flat")
+    st.map(".", foreground=[("disabled", c["disfg"])])
+    st.configure("Treeview", background=pal["bg"], fieldbackground=pal["bg"])
+
+
+def _style_lite_flat(st, pal, c):
+    """The flat clam elements that replace the big image elements of Sun Valley (same colours)."""
+    bg, brd = pal["bg"], c["card_border"]
+    st.configure("Treeview", background=bg, fieldbackground=bg, bordercolor=brd, lightcolor=bg, darkcolor=bg, borderwidth=1, relief="solid")
+    st.map("Treeview", background=[("selected", c["selrow"])], foreground=[("selected", pal["fg"])])         # Sun Valley's own subtle selection
+    st.configure("TNotebook", background=bg, bordercolor=brd, lightcolor=bg, darkcolor=bg, borderwidth=1, tabmargins=(0, 0, 0, 0))
+    st.configure("TLabelframe", background=bg, bordercolor=brd, lightcolor=bg, darkcolor=bg, borderwidth=1, relief="solid")
+    for o in ("Vertical", "Horizontal"):
+        st.configure(f"{o}.TScrollbar", troughcolor=c["trough"], bordercolor=c["trough"], lightcolor=c["trough"], darkcolor=c["trough"],
+                     background=c["thumb"], borderwidth=0)
+        st.configure(f"{o}.TProgressbar", troughcolor=c["btn_rest"], bordercolor=c["btn_rest"], lightcolor=pal["acc"], darkcolor=pal["acc"],
+                     background=pal["acc"], borderwidth=0)
+    st.configure("TSeparator", background=c["sep"])
+    st.configure("Card.TFrame", background=bg, bordercolor=brd, lightcolor=bg, darkcolor=bg, borderwidth=1, relief="solid")
+
+
+def _style_fast(st, pal, c):
+    """Fast engine: the Sun Valley dark look with the built-in clam theme and Style configure / map / layout only (no image elements).
+    Colours and metrics come from c = sv_colours() (read from the sv_ttk theme files) and the palette."""
+    bg, fg, acc = pal["bg"], pal["fg"], pal["acc"]
+    brd = c["card_border"]
+    st.configure(".", background=bg, foreground=fg, bordercolor=brd, darkcolor=bg, lightcolor=bg, troughcolor=c["trough"], focuscolor=bg,
+                 selectbackground=pal["sel"], selectforeground=pal["sel_fg"], selectcolor=acc, insertcolor=fg, insertwidth=1,
+                 fieldbackground=c["tb_rest"], font="SunValleyBodyFont", borderwidth=1, relief="flat")
+    st.map(".", foreground=[("disabled", c["disfg"])])
+    st.configure("TFrame", background=bg)
+    st.configure("TLabel", background=bg, foreground=fg)
+    st.configure("TLabelframe", background=bg, bordercolor=brd, lightcolor=bg, darkcolor=bg, borderwidth=1, relief="solid", padding=8)
+    st.configure("TLabelframe.Label", background=bg, foreground=fg)
+    st.configure("TSeparator", background=c["sep"])
+    st.configure("Card.TFrame", background=bg, bordercolor=brd, lightcolor=bg, darkcolor=bg, borderwidth=1, relief="solid")
+    # buttons: flat, 1 px subtle border, accent on the primary ones
+    for w in ("TButton", "TMenubutton", "Toolbutton"):
+        st.configure(w, padding=(8, 2, 8, 3), anchor="center", background=c["btn_rest"], foreground=fg, bordercolor=c["btn_border"],
+                     lightcolor=c["btn_rest"], darkcolor=c["btn_rest"], borderwidth=1, relief="flat", focuscolor=c["btn_rest"], focusthickness=1)
+        st.map(w, background=[("disabled", c["btn_dis"]), ("pressed", c["btn_press"]), ("active", c["btn_hover"])],
+               lightcolor=[("disabled", c["btn_dis"]), ("pressed", c["btn_press"]), ("active", c["btn_hover"])],
+               darkcolor=[("disabled", c["btn_dis"]), ("pressed", c["btn_press"]), ("active", c["btn_hover"])],
+               foreground=[("disabled", c["btn_dis_fg"]), ("pressed", "#d0d0d0")],
+               bordercolor=[("disabled", c["btn_dis_border"]), ("pressed", c["btn_press_border"]), ("focus", acc), ("active", c["btn_border"])],
+               relief=[("pressed", "flat")])
+    st.configure("Accent.TButton", background=acc, foreground=pal["acc_fg"], bordercolor=c["acc_border"], lightcolor=acc, darkcolor=acc, focuscolor=acc)
+    st.map("Accent.TButton", background=[("disabled", c["accbtn_dis"]), ("pressed", c["acc_press"]), ("active", c["acc_hover"])],
+           lightcolor=[("disabled", c["accbtn_dis"]), ("pressed", c["acc_press"]), ("active", c["acc_hover"])],
+           darkcolor=[("disabled", c["accbtn_dis"]), ("pressed", c["acc_press"]), ("active", c["acc_hover"])],
+           foreground=[("disabled", c["btn_dis_fg"]), ("pressed", pal["acc_fg"])],
+           bordercolor=[("disabled", c["btn_dis_border"]), ("pressed", c["acc_press"]), ("active", c["acc_border"])])
+    # entry fields: flat, accent focus border
+    for w in ("TEntry", "TSpinbox", "TCombobox"):
+        st.configure(w, padding=(6, 1, 4, 2), fieldbackground=c["tb_rest"], foreground=fg, bordercolor=c["tb_border"], lightcolor=c["tb_rest"],
+                     darkcolor=c["tb_rest"], insertcolor=fg, arrowcolor=fg, background=c["btn_rest"], arrowsize=14, borderwidth=1)
+        st.map(w, bordercolor=[("disabled", c["btn_dis_border"]), ("focus", acc), ("hover", c["btn_border"])],
+               lightcolor=[("focus", acc)], darkcolor=[("focus", acc)],
+               fieldbackground=[("disabled", c["tb_dis"]), ("readonly", c["btn_rest"]), ("focus", c["tb_focus"]), ("hover", c["tb_hover"])],
+               foreground=[("disabled", c["entry_dis_fg"])], arrowcolor=[("disabled", c["entry_dis_fg"])],
+               background=[("active", c["btn_hover"]), ("pressed", c["btn_press"])],
+               selectbackground=[("readonly", c["btn_rest"])], selectforeground=[("readonly", fg)])
+    for w in ("TCheckbutton", "TRadiobutton"):
+        st.configure(w, padding=4, background=bg, foreground=fg, indicatorbackground=bg, indicatorforeground=pal["acc_fg"], indicatorcolor=bg,
+                     bordercolor=c["check_border"], upperbordercolor=c["check_border"], lowerbordercolor=c["check_border"], focuscolor=bg)
+        st.map(w, indicatorcolor=[("disabled", c["btn_dis"]), ("selected", acc), ("pressed", c["acc_press"])],
+               indicatorforeground=[("disabled", c["btn_dis_fg"])],
+               upperbordercolor=[("selected", acc), ("active", fg)], lowerbordercolor=[("selected", acc), ("active", fg)],
+               bordercolor=[("selected", acc), ("active", fg)], background=[("active", bg)], foreground=[("disabled", c["disfg"])])
+    # notebook: the selected tab carries a 1 px accent line
+    st.configure("TNotebook", background=bg, bordercolor=brd, lightcolor=bg, darkcolor=bg, borderwidth=1, tabmargins=(2, 4, 2, 0))
+    st.configure("TNotebook.Tab", background=c["tab_rest"], foreground=pal["dim"], bordercolor=brd, lightcolor=c["tab_rest"],
+                 darkcolor=c["tab_rest"], borderwidth=1, padding=(16, 5))
+    st.map("TNotebook.Tab", background=[("selected", c["tab_sel"]), ("active", c["tab_hover"])],
+           lightcolor=[("selected", acc), ("active", c["tab_hover"])], darkcolor=[("selected", c["tab_sel"]), ("active", c["tab_hover"])],
+           foreground=[("selected", fg), ("active", fg)], expand=[("selected", (0, 2, 0, 0))])
+    # treeview
+    st.configure("Treeview", background=bg, fieldbackground=bg, foreground=fg, bordercolor=brd, lightcolor=bg, darkcolor=bg, borderwidth=1,
+                 relief="solid")
+    st.map("Treeview", background=[("selected", pal["sel"])], foreground=[("selected", pal["sel_fg"])])
+    st.configure("Treeview.Heading", background=c["head_rest"], foreground=fg, bordercolor=bg, lightcolor=c["head_rest"], darkcolor=c["head_rest"],
+                 relief="flat", padding=(8, 5), borderwidth=1)
+    st.map("Treeview.Heading", background=[("pressed", c["head_press"]), ("active", c["head_hover"])],
+           lightcolor=[("pressed", c["head_press"]), ("active", c["head_hover"])], darkcolor=[("pressed", c["head_press"]), ("active", c["head_hover"])])
+    # thin scrollbars (no arrow buttons)
+    for o, side, sticky in (("Vertical", "ns", "ns"), ("Horizontal", "ew", "ew")):
+        st.layout(f"{o}.TScrollbar", [(f"{o}.Scrollbar.trough", {"sticky": sticky, "children": [(f"{o}.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        st.configure(f"{o}.TScrollbar", background=c["thumb"], troughcolor=c["trough"], bordercolor=c["trough"], lightcolor=c["thumb"],
+                     darkcolor=c["thumb"], arrowsize=10, gripcount=0, borderwidth=0, relief="flat")
+        st.map(f"{o}.TScrollbar", background=[("active", pal["fg"]), ("pressed", pal["fg"])], lightcolor=[("active", pal["fg"]), ("pressed", pal["fg"])],
+               darkcolor=[("active", pal["fg"]), ("pressed", pal["fg"])])
+    # progressbar / scale in the accent
+    for o in ("Horizontal", "Vertical"):
+        st.configure(f"{o}.TProgressbar", background=acc, troughcolor=c["btn_rest"], bordercolor=c["btn_rest"], lightcolor=acc, darkcolor=acc,
+                     thickness=6, borderwidth=0)
+        st.configure(f"{o}.TScale", background=acc, troughcolor=c["btn_press"], bordercolor=c["btn_press"], lightcolor=acc, darkcolor=acc,
+                     sliderlength=18, borderwidth=0)
+        st.map(f"{o}.TScale", background=[("active", c["acc_hover"]), ("pressed", c["acc_press"]), ("disabled", c["accbtn_dis"])])
+    st.configure("Sash", sashthickness=4, gripcount=0, bordercolor=brd, lightcolor=brd, darkcolor=brd)
+    st.configure("TSizegrip", background=bg)
+
+
+def apply_theme(root, scale=None, accent="lime", base="grey", engine=None):
+    """V6.1.2: one palette for three engines. fast = built-in clam + Style configure/map/layout (Sun Valley look, no images);
+    lite = Sun Valley with image elements for small controls only; full = the complete Sun Valley theme. Every ttk style the app uses is
+    configured from the palette on every call, whatever the engine. Returns the palette (log, canvases, tags)."""
     if scale:
         UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
     pal = make_palette(accent, base)
-    if SIMPLE_THEME:                                               # V6.2 A/B: ttk "clam" + the same palette, no sv_ttk image elements
-        SV_THEME[0] = False
-        with pstage("apply_theme: clam theme_use + style configure/map"):
-            return _apply_theme_clam(root, scale, pal)
-    try:
-        import tkinter.font as tkfont
-        tname = f"mt-{accent}_{base}"
-        if tname not in ttk.Style(root).theme_names():             # V5.58: every combination is sourced once per window, then reused
-            with pstage("apply_theme: build/read theme dir + source sv.tcl"):
-                root.tk.call("source", str(lime_theme_dir(accent, base) / "sv.tcl"))
-        root._sv_ttk_loaded = True                                 # sv_ttk itself must not load its blue copy
-        with pstage("apply_theme: ttk theme_use"):
-            ttk.Style(root).theme_use(tname)
-        SV_THEME[0] = True
-        with pstage("apply_theme: named fonts configure"):
-            for nm, sz, bold in (("TkDefaultFont", 10, 0), ("TkTextFont", 10, 0), ("TkMenuFont", 10, 0), ("TkHeadingFont", 10, 1),
-                                 ("SunValleyBodyFont", 10, 0), ("SunValleyBodyStrongFont", 10, 1), ("SunValleyCaptionFont", 9, 0)):
-                try:
-                    tkfont.nametofont(nm, root).configure(size=F(sz))
-                except Exception:
-                    pass
-        st = ttk.Style(root)
-        with pstage("apply_theme: ttk style configure (10 calls)"):
-            st.configure("Treeview", rowheight=int(26 * UI_SCALE[0]))
-            st.configure("Treeview.Heading", font=("Segoe UI", F(10), "bold"))
-            st.configure("TLabelframe.Label", font=("Segoe UI", F(10), "bold"), foreground=pal["acc"])
-            st.configure("TNotebook.Tab", padding=(16, 5), font=("Segoe UI", F(10), "bold"))
-            st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
-            st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
-            st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
-            st.configure("Dim.TLabel", foreground=pal["dim"])
-        root.configure(bg=pal["bg"])
-        root.option_add("*TCombobox*Listbox.background", pal["field"])
-        root.option_add("*TCombobox*Listbox.foreground", pal["fg"])
-        root.option_add("*TCombobox*Listbox.selectBackground", pal["acc"])
-        root.option_add("*TCombobox*Listbox.selectForeground", pal["acc_fg"])
-        return pal
-    except Exception as ex:
-        SV_THEME[0] = False
-        LOGONLY(f"Sun Valley theme not available ({ex}) - plain dark theme")
-        return _apply_theme_clam(root, scale, pal)
-
-
-def _apply_theme_clam(root, scale=None, pal=None):
-    """Plain dark theme with the same palette (used when sv-ttk is not installed)."""
-    pal = dict(pal or PAL)
-    if scale:
-        UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
+    engine = engine or theme_engine()
+    import tkinter.font as tkfont
     st = ttk.Style(root)
-    st.theme_use("clam")
+    c = sv_colours(accent, base)
+    if engine in ("lite", "full"):
+        try:
+            tname = f"{'mtl' if engine == 'lite' else 'mt'}-{accent}_{base}"
+            if tname not in st.theme_names():                      # every variant is sourced once per window, then reused by name
+                with pstage(f"apply_theme: build/read {engine} theme dir + source sv.tcl"):
+                    root.tk.call("source", str(lime_theme_dir(accent, base, engine == "lite") / "sv.tcl"))
+            root._sv_ttk_loaded = True                             # sv_ttk itself must not load its blue copy
+            _ensure_sv_fonts(root)
+            with pstage("apply_theme: ttk theme_use"):
+                if st.theme_use() != tname:
+                    st.theme_use(tname)
+            SV_THEME[0] = True
+        except Exception as ex:
+            LOGONLY(f"Sun Valley theme not available ({ex}) - Fast theme")
+            engine = "fast"
+    if engine == "fast":
+        _ensure_sv_fonts(root)
+        SV_THEME[0] = False
+        with pstage("apply_theme: ttk theme_use"):
+            if st.theme_use() != "clam":
+                st.theme_use("clam")
+    with pstage("apply_theme: named fonts configure"):
+        for nm, sz in (("TkDefaultFont", 10), ("TkTextFont", 10), ("TkMenuFont", 10), ("TkHeadingFont", 10),
+                       ("SunValleyBodyFont", 10), ("SunValleyBodyStrongFont", 10), ("SunValleyCaptionFont", 9)):
+            try:
+                tkfont.nametofont(nm, root).configure(size=F(sz))
+            except Exception:
+                pass
+    with pstage("apply_theme: ttk style configure/map (all from the palette)"):
+        if engine == "fast":
+            _style_fast(st, pal, c)
+        else:
+            _style_sv_defaults(st, pal, c)
+            if engine == "lite":
+                _style_lite_flat(st, pal, c)
+        _app_styles(root, st, pal, engine)
     root.configure(bg=pal["bg"])
-    root.option_add("*Font", ("Segoe UI", F(10)))
-    root.option_add("*TCombobox*Listbox.background", pal["field"])
-    root.option_add("*TCombobox*Listbox.foreground", pal["fg"])
-    root.option_add("*TCombobox*Listbox.selectBackground", pal["acc"])
-    root.option_add("*TCombobox*Listbox.selectForeground", pal["acc_fg"])
-    st.configure(".", background=pal["bg"], foreground=pal["fg"], fieldbackground=pal["field"], font=("Segoe UI", F(10)),
-                 bordercolor=pal["border"], lightcolor=pal["bg"], darkcolor=pal["bg"], troughcolor=pal["head"],
-                 selectbackground=pal["sel"], selectforeground=pal["sel_fg"], insertcolor=pal["fg"], focuscolor=pal["acc"])
-    st.configure("Treeview", background=pal["field"], fieldbackground=pal["field"], foreground=pal["fg"], rowheight=int(24 * UI_SCALE[0]),
-                 bordercolor=pal["border"], borderwidth=1)
-    st.map("Treeview", background=[("selected", pal["sel"])], foreground=[("selected", pal["sel_fg"])])
-    st.configure("Treeview.Heading", background=pal["head"], foreground=pal["fg"], font=("Segoe UI", F(10), "bold"), padding=5,
-                 bordercolor=pal["border"], relief="raised")
-    st.configure("TLabelframe", background=pal["bg"], bordercolor=pal["border"], padding=8, relief="solid", borderwidth=1)
-    st.configure("TLabelframe.Label", background=pal["bg"], foreground=pal["fg"], font=("Segoe UI", F(10), "bold"))
-    st.configure("TNotebook", background=pal["bg"], borderwidth=1, bordercolor=pal["border"])
-    st.configure("TNotebook.Tab", background=pal["head"], foreground=pal["fg"], padding=(16, 7), font=("Segoe UI", F(10), "bold"),
-                 bordercolor=pal["border"])
-    st.map("TNotebook.Tab", background=[("selected", pal["acc"])], foreground=[("selected", pal["acc_fg"])])
-    st.configure("TButton", padding=(10, 5), background=pal["btn"], foreground=pal["fg"], bordercolor=pal["border"],
-                 lightcolor=pal["btn"], darkcolor=pal["btn"], borderwidth=1, relief="raised")
-    st.map("TButton", background=[("disabled", pal["bg"]), ("pressed", pal["sel"]), ("active", pal["btn_act"])],
-           foreground=[("disabled", pal["dim"])], bordercolor=[("focus", pal["acc"]), ("active", pal["acc"])])
-    for w in ("TEntry", "TSpinbox", "TCombobox"):
-        st.configure(w, padding=4, fieldbackground=pal["field"], foreground=pal["fg"], bordercolor=pal["border"],
-                     lightcolor=pal["field"], darkcolor=pal["field"], arrowcolor=pal["fg"], background=pal["btn"], insertcolor=pal["fg"])
-        st.map(w, bordercolor=[("focus", pal["acc"])], lightcolor=[("focus", pal["acc"])],
-               fieldbackground=[("readonly", pal["field"]), ("disabled", pal["bg"])], foreground=[("readonly", pal["fg"]), ("disabled", pal["dim"])])
-    for w in ("TCheckbutton", "TRadiobutton"):
-        st.configure(w, background=pal["bg"], foreground=pal["fg"], indicatorbackground=pal["field"], indicatorforeground=pal["check"],
-                     indicatorcolor=pal["field"], bordercolor=pal["border"], upperbordercolor=pal["border"], lowerbordercolor=pal["border"])
-        st.map(w, indicatorcolor=[("selected", pal["check"]), ("pressed", pal["sel"])], background=[("active", pal["btn_act"])],
-               indicatorbackground=[("selected", pal["check"])])
-    st.configure("TProgressbar", background=pal["acc"], troughcolor=pal["head"], bordercolor=pal["border"])
-    st.configure("Vertical.TScrollbar", background=pal["btn"], troughcolor=pal["head"], arrowcolor=pal["fg"], bordercolor=pal["border"])
-    st.configure("Horizontal.TScale", background=pal["acc"], troughcolor=pal["head"], bordercolor=pal["border"])
-    st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
-    st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6), background=pal["acc"], foreground=pal["acc_fg"],
-                 lightcolor=pal["acc"], darkcolor=pal["acc"], bordercolor=pal["acc"])
-    st.map("Big.Accent.TButton", background=[("disabled", pal["head"]), ("active", pal["sel"]), ("pressed", pal["sel"])],
-           foreground=[("disabled", pal["dim"]), ("active", pal["sel_fg"])])
-    st.configure("Accent.TButton", background=pal["acc"], foreground=pal["acc_fg"], lightcolor=pal["acc"], darkcolor=pal["acc"],
-                 bordercolor=pal["acc"])
-    st.map("Accent.TButton", background=[("disabled", pal["head"]), ("active", pal["sel"]), ("pressed", pal["sel"])],
-           foreground=[("disabled", pal["dim"]), ("active", pal["sel_fg"])])
-    st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
-    st.configure("Dim.TLabel", foreground=pal["dim"])
+    for pat, val in (("*TCombobox*Listbox.background", pal["field"]), ("*TCombobox*Listbox.foreground", pal["fg"]),
+                     ("*TCombobox*Listbox.selectBackground", pal["sel"]), ("*TCombobox*Listbox.selectForeground", pal["sel_fg"]),
+                     ("*background", pal["bg"]), ("*foreground", pal["fg"]), ("*highlightColor", pal["acc"]), ("*selectBackground", pal["sel"]),
+                     ("*selectForeground", pal["sel_fg"]), ("*activeBackground", pal["btn_act"]), ("*activeForeground", pal["fg"])):
+        root.option_add(pat, val, 80)
+    root._mt_engine = engine
     return pal
 
 
@@ -6158,7 +6355,8 @@ class App:
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
         with pstage("apply_theme (App.__init__)"):
-            self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0), self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"))
+            self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0), self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"),
+                                   theme_engine(self.cfg))
         sc = UI_SCALE[0]
         self._shown = False                                        # V6.1: the main window is shown once, after the first fill
         with pstage("splash build + paint"):
@@ -6343,6 +6541,7 @@ class App:
         win.deiconify()
 
     def on_tab_changed(self, _e=None):
+        self.tab_recolour_if_stale()
         self._sw_t0 = time.perf_counter()
         self.root.after_idle(self._tab_idle)
 
@@ -6414,6 +6613,9 @@ class App:
 
     def apply_layout(self, lay, tries=0):
         """Divider positions from the last run (or a default: the log gets ~150 px, the song list ~30% of the Manual tab)."""
+        sig = (self.root.winfo_width(), self.root.winfo_height(), json.dumps(lay, sort_keys=True, default=str))
+        if self._shown and sig == getattr(self, "_lay_sig", None):
+            return                                                 # V6.1.2: nothing changed since the last placement
         self.root.update_idletasks()
         est = not self._shown and self.vpane.winfo_height() < 200  # V6.1: withdrawn window: pane heights come from the geometry, no retry later
         if est:
@@ -6431,11 +6633,14 @@ class App:
                 frac = lay.get(k)
                 y = int(h * frac) if isinstance(frac, (int, float)) and 0.1 < frac < 0.95 else \
                     (int(h * dflt) if dflt else h - int(100 * UI_SCALE[0]))
-                pw.sash_place(0, 0, y)
+                if est or abs(pw.sash_coord(0)[1] - y) > 1:        # V6.1.2: a divider that already sits there is not touched
+                    pw.sash_place(0, 0, y)
                 self._sash_want = getattr(self, "_sash_want", {})
                 self._sash_want[k] = y
             except Exception:
                 pass
+        if self._shown and not est:
+            self._lay_sig = sig
 
     def _first_configure(self, _e=None):
         """The dividers are re-placed once, while the window gets its real size on the first map (before the first paint); then it unbinds."""
@@ -6447,7 +6652,7 @@ class App:
             ok = want is not None and abs(self.vpane.sash_coord(0)[1] - want) <= 2 and self.vpane.winfo_height() > 200
         except tk.TclError:
             ok = True
-        if ok or self._first_cfg_n > 10:                           # the dividers sit where the saved layout says: done
+        if ok or self._first_cfg_n > 1:                            # V6.1.2: at most ONE re-placement after the window is shown
             self.nb.unbind("<Configure>", self._first_cfg_id)
             return
         self.apply_layout(self._lay)
@@ -6515,6 +6720,7 @@ class App:
         cfg["audio_mode"] = next((k for k, lab in AUDIO_MODES.items() if lab == self.set_audio.get()), "auto")
         cfg["accent"] = next((k for k, lab in ACCENT_NAMES.items() if lab == self.set_accent.get()), "lime")
         cfg["base"] = "black" if self.set_base.get().lower() == "black" else "grey"
+        cfg["theme_engine"] = next((k for k, lab in THEME_ENGINES.items() if lab == self.set_engine.get()), "fast")
         return cfg
 
     def autosave(self, *_):
@@ -6746,8 +6952,9 @@ class App:
             getattr(tree, f"{mgr}_forget" if mgr != "grid" else "grid_remove")()
         try:
             tree.delete(*tree.get_children())
-            for iid, text, vals in rows:
-                tree.insert("", "end", iid=iid, text=text, values=vals)
+            tree.tag_configure("alt", background=self.pal["alt"] if getattr(self.root, "_mt_engine", "fast") == "fast" else self.pal["bg"])
+            for n_, (iid, text, vals) in enumerate(rows):
+                tree.insert("", "end", iid=iid, text=text, values=vals, tags=("alt",) if n_ & 1 else ())
         finally:
             if info:
                 if mgr == "pack":
@@ -7913,6 +8120,14 @@ class App:
         cb_ = ttk.Combobox(h, textvariable=self.set_base, values=["Grey", "Black"], width=14, state="readonly")
         cb_.pack(side="left", padx=(0, PX))
         r[0] += 1
+        label("Theme engine")
+        h = holder()
+        self.set_engine = tk.StringVar(value=THEME_ENGINES[theme_engine(self.cfg)])
+        cb_ = ttk.Combobox(h, textvariable=self.set_engine, values=list(THEME_ENGINES.values()), width=24, state="readonly")
+        cb_.pack(side="left", padx=(0, PX))
+        ttk.Label(h, text="Fast = Sun Valley look without images; Lite / full use the Sun Valley images (applies at once; restart if a page looks off)",
+                  style="Dim.TLabel", wraplength=520).pack(side="left")
+        r[0] += 1
         label("UI scale (font + row height)")
         h = holder()
         v = tk.StringVar(value=str(self.cfg.get("ui_scale", 1.0)))
@@ -7933,8 +8148,9 @@ class App:
         self.set_last = f.grid_slaves(row=r[0] + 1, column=0)[0]
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
+        self.set_engine.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base, self.set_engine]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
@@ -7996,26 +8212,31 @@ class App:
     def role_of(self, w):
         return getattr(self, "_reg", {}).get(str(w)) or self.CLASS_ROLE.get(w.winfo_class())
 
-    def _tk_widgets(self):
-        """Every classic tk widget of the app (all windows, the pop-downs of the comboboxes included)."""
-        out_, todo = [], [self.root]
+    def _tk_widgets(self, scope=None):
+        """Every classic tk widget of the app (all windows, the pop-downs of the comboboxes included). V6.1.2: scope = a tab name returns
+        only the widgets inside that tab's page; scope = "global" everything outside the five pages; None = all."""
+        out_, todo = [], [(self.root, None)]
         sp = getattr(self, "_splash", None)
         if sp is not None:
-            todo.append(sp)
+            todo.append((sp, None))
+        pages = {str(f): n for n, f in getattr(self, "tabs", {}).items()}
         while todo:
-            w = todo.pop()
+            w, tab = todo.pop()
             try:
-                todo.extend(w.winfo_children())
+                kids = w.winfo_children()
             except tk.TclError:
                 continue
+            tab = pages.get(str(w), tab)
+            todo.extend((k, tab) for k in kids)
             if not w.winfo_class().startswith("T") or w.winfo_class() in ("Toplevel", "Tk", "Text"):
-                out_.append(w)
+                if scope is None or (scope == "global" and tab is None) or scope == tab:
+                    out_.append(w)
         return out_
 
-    def recolour(self):
-        """Apply the current palette to every classic tk widget by role."""
+    def recolour(self, scope=None):
+        """Apply the current palette to every classic tk widget by role (scope: see _tk_widgets)."""
         pal = self.pal
-        for w in self._tk_widgets():
+        for w in self._tk_widgets(scope):
             role = self.role_of(w)
             for opt, key in self.ROLE_OPTS.get(role, {}).items():
                 try:
@@ -8024,12 +8245,14 @@ class App:
                 except tk.TclError:
                     pass                                          # the widget has no such option
 
-    def retheme(self, accent=None, base=None):
-        """Re-apply the Sun Valley theme (a unique theme per accent x base, sourced into the running window) and recolour every widget:
-        ttk styles come from the theme; every classic tk widget is recoloured by its registered role (see recolour)."""
+    def retheme(self, accent=None, base=None, engine=None):
+        """Re-apply the theme (engine fast | lite | full; every variant is sourced once and reused by name) and recolour the classic tk
+        widgets of the VISIBLE tab and of everything outside the tab pages at once; the other tabs are recoloured the first time they are
+        shown (on_tab_changed). One update_idletasks at the end; no widget is created or rebuilt."""
         cfg = self.cfg
         accent = accent or cfg.get("accent", "lime")
         base = base or cfg.get("base", "grey")
+        engine = engine or theme_engine(cfg)
         old, tagsnap = dict(self.pal), []
         with pstage("retheme: snapshot Text tag colours"):
             for w in self._tk_widgets():
@@ -8042,11 +8265,15 @@ class App:
                                 tags[(t, opt)] = v
                     tagsnap.append((w, tags))
         with pstage("retheme: apply_theme (total)"):
-            self.pal = apply_theme(self.root, UI_SCALE[0], accent, base)     # the scale in use (a changed scale applies after restart)
+            self.pal = apply_theme(self.root, UI_SCALE[0], accent, base, engine)     # the scale in use (a changed scale applies after restart)
         PAL.clear()
         PAL.update(self.pal)
-        with pstage("retheme: registry recolour (classic tk widgets)"):
-            self.recolour()
+        self._theme_ver = getattr(self, "_theme_ver", 0) + 1
+        vis = self._visible_tab()
+        self._tab_ver = {vis: self._theme_ver}
+        with pstage("retheme: registry recolour (visible tab + outside the pages)"):
+            self.recolour("global")
+            self.recolour(vis)
         old_to_key = {}
         for k, v in old.items():
             old_to_key.setdefault(str(v).lower(), k)
@@ -8058,18 +8285,43 @@ class App:
                         w.tag_configure(t, **{opt: self.pal[k]})
                     except tk.TclError:
                         pass
+        self.alt_rows_recolour()
         with pstage("retheme: update_idletasks that follows"):
             self.root.update_idletasks()
+
+    def _visible_tab(self):
+        try:
+            return self.nb.tab(self.nb.select(), "text")
+        except tk.TclError:
+            return None
+
+    def tab_recolour_if_stale(self):
+        """The first time a tab is shown after a theme switch its classic widgets get the current palette."""
+        tab, ver = self._visible_tab(), getattr(self, "_theme_ver", 0)
+        tv = self.__dict__.setdefault("_tab_ver", {})
+        if tab is not None and tv.get(tab, 0) != ver:
+            tv[tab] = ver
+            self.recolour(tab)
+
+    def alt_rows_recolour(self):
+        """Subtle alternating row colour of the lists (Fast engine only; other engines draw plain rows)."""
+        col = self.pal["alt"] if getattr(self.root, "_mt_engine", "fast") == "fast" else self.pal["bg"]
+        for tree in list(getattr(self, "_fill_sig", {})):
+            try:
+                tree.tag_configure("alt", background=col)
+            except tk.TclError:
+                pass
 
     def on_theme_pick(self, *_):
         """Accent colour / base picked in Settings: switch the running window at once."""
         acc = next((k for k, lab in ACCENT_NAMES.items() if lab == self.set_accent.get()), "lime")
         base = "black" if self.set_base.get().lower() == "black" else "grey"
-        if (acc, base) == (self.cfg.get("accent", "lime"), self.cfg.get("base", "grey")):
+        eng = next((k for k, lab in THEME_ENGINES.items() if lab == self.set_engine.get()), "fast")
+        if (acc, base, eng) == (self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"), self.cfg.get("theme_engine", "fast")):
             return
-        self.cfg["accent"], self.cfg["base"] = acc, base
+        self.cfg["accent"], self.cfg["base"], self.cfg["theme_engine"] = acc, base, eng
         try:
-            self.retheme(acc, base)
+            self.retheme(acc, base, theme_engine(self.cfg))
         except Exception as ex:
             out(f"Theme not applied: {ex}")
         self.autosave()
@@ -9162,7 +9414,7 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
         # V5.55: theme, dividers (move + remembered), used column / filter, Random pick
         try:
             import sv_ttk                                          # noqa: F401
-            if not SV_THEME[0] or "mt-" not in ttk.Style(root).theme_use():
+            if theme_engine() != "fast" and (not SV_THEME[0] or "mt" not in ttk.Style(root).theme_use()):
                 fails.append(f"Sun Valley theme did not load (theme {ttk.Style(root).theme_use()})")
         except ImportError:
             out("  (sv-ttk not installed - the plain fallback theme is in use; pip install sv-ttk)")
@@ -9799,6 +10051,7 @@ class PerfLog:
         add("tk_scaling", lambda: r.tk.call("tk", "scaling"))
         add("ui_scale", lambda: UI_SCALE[0])
         add("theme", lambda: ("SIMPLE clam (MONTAGE_SIMPLE_THEME=1)" if SIMPLE_THEME else "Sun Valley") + f" [{ttk.Style(r).theme_use()}]")
+        add("theme_engine", lambda: f"{getattr(r, '_mt_engine', '?')} (config {load_config().get('theme_engine', 'fast')}{', forced by MONTAGE_SIMPLE_THEME=1' if SIMPLE_THEME else ''})")
         def dpi():
             if os.name != "nt":
                 return "n/a (not Windows)"
