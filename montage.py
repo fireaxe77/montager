@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.3"
+APP_VERSION = "V6.9.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4678,6 +4678,67 @@ def analyse_song(path, csv_bpm=None):
     return an
 
 
+SONGMAP_DEFAULT = "v1"                   # V6.9.5: the default song map; switching the default to SONGMAPV2 is this one line ("v2")
+SONGMAP_CHOICES = {"v1": "Songmap V1", "v2": "Songmap V2"}
+SONGMAP_V2_HOOK = [None]                 # tests only: called at the start of a V2 analysis (inject an error / a delay)
+
+
+def songmap_version(cfg=None):
+    v = str((cfg if cfg is not None else load_config()).get("songmap_version") or SONGMAP_DEFAULT).lower()
+    return "v2" if v in ("v2", "songmap v2") else "v1"
+
+
+def get_songmap(path, csv_bpm=None, version=None):
+    """THE routing point for song map requests (V6.9.5): V1 = analyse_song() exactly as before; V2 = the isolated songmap_v2 package with its
+    own cache file. Any V2 problem (error, timeout, missing module) logs 'songmap v2 fallback: <song> (<reason>)' and returns the V1 map
+    flagged songmap_version = 'v1-fallback', so a montage never fails because of V2."""
+    v = version or songmap_version()
+    if v != "v2":
+        return analyse_song(path, csv_bpm)
+    name = Path(path).name
+    try:
+        import songmap_v2
+        cpath = DATA / songmap_v2.CACHE_NAME
+        key = songmap_v2.cache_key(path, csv_bpm)
+        cache = load_json(cpath, {})
+        hit = cache.get(key)
+        if hit and not hit.get("fallback_marker"):
+            return hit
+        if hit:
+            raise RuntimeError(hit["fallback_marker"] + " (cached: not retried until the V2 algorithm version changes)")
+        box = {}
+        deadline = time.monotonic() + songmap_v2.ANALYSIS_CAP_S
+
+        def work():
+            try:
+                box["m"] = songmap_v2.build_songmap_v2(path, csv_bpm, deadline=deadline, hook=SONGMAP_V2_HOOK[0])
+            except BaseException as ex:      # noqa: BLE001 - nothing may escape the worker
+                box["err"] = f"{type(ex).__name__}: {ex}"
+        t0 = time.time()
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        th.join(songmap_v2.ANALYSIS_CAP_S)
+        if th.is_alive() or "m" not in box:
+            reason = "timeout (analysis cap %.0f s)" % songmap_v2.ANALYSIS_CAP_S if th.is_alive() or "cap reached" in box.get("err", "") else box.get("err", "no result")
+            if reason.startswith("timeout"):
+                c2 = load_json(cpath, {})
+                c2[key] = {"fallback_marker": reason}
+                save_json(cpath, c2)
+            raise RuntimeError(reason)
+        m = box["m"]
+        c2 = load_json(cpath, {})
+        c2[key] = m
+        save_json(cpath, c2)
+        out(f"songmap v2: {name} {time.time() - t0:.1f} s, bpm={m['bpm']}, grid_conf={m['v2']['grid_confidence']}, "
+            f"{len(m['v2']['events'])} events, {len(m['drops'])} drops")
+        return m
+    except Exception as ex:
+        out(f"songmap v2 fallback: {name} ({ex})")
+        m = dict(analyse_song(path, csv_bpm))
+        m.update(songmap_version="v1-fallback", songmap_fallback_reason=str(ex))
+        return m
+
+
 def analyse_song_v4(path, csv_bpm=None):
     """V4's song analysis (kept for synccompare / the 'v4' placement). Beat grid, downbeats, per-beat energy, section levels, drop. Cached per file. The CSV 'Tempo' is the PRIMARY BPM: librosa only
     refines the beat grid, and is snapped to the CSV tempo when it lands at about 2x or 0.5x (or within 4% on a steady grid)."""
@@ -4931,7 +4992,7 @@ def pick_song(cfg, game, songs, now=None, forced=None):
                 "total": round(rec + sum(fit.values()) - pen, 1), "days": None if d == 999 else d}
     if forced:
         s = next((x for x in songs if x["path"] == forced), None) or {"path": forced, "artist": "", "title": Path(forced).stem, "added": None}
-        an = analyse_song(forced, (next((x for x in songs if x['path'] == forced), {}) or {}).get('csv_bpm'))
+        an = get_songmap(forced, (next((x for x in songs if x['path'] == forced), {}) or {}).get('csv_bpm'))
         return s, an, score(s, an), []
     week = sorted([s for s in songs if s["added"] and (now - s["added"]).days < wd], key=lambda s: s["added"], reverse=True)
     rest = sorted([s for s in songs if s not in week], key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
@@ -4942,7 +5003,7 @@ def pick_song(cfg, game, songs, now=None, forced=None):
                 raise RuntimeError("cancelled")
             progress(i / 15, f"analysing song {i + 1}")
             try:
-                an = analyse_song(s["path"], s.get("csv_bpm"))
+                an = get_songmap(s["path"], s.get("csv_bpm"))
             except Exception as ex:
                 out(f"  skip {Path(s['path']).name}: {ex}")
                 continue
@@ -7252,7 +7313,7 @@ def weekly_song_fit(song, an, sinfo, runners):
         return song, an, sinfo, runners
     for s_, sc_ in runners:
         try:
-            a2 = analyse_song(s_["path"], s_.get("csv_bpm"))
+            a2 = get_songmap(s_["path"], s_.get("csv_bpm"))
         except Exception:
             continue
         if sec(a2) >= WEEKLY_MIN_S:
@@ -8529,7 +8590,7 @@ class SongMapView:
 
         def work():
             try:
-                an = analyse_song(path, csv_bpm)
+                an = get_songmap(path, csv_bpm)
                 self.app.q.put(("call", lambda: self.show(an)))
             except Exception as ex:
                 msg = f"song map failed: {ex}"
@@ -8538,6 +8599,7 @@ class SongMapView:
 
     def show(self, an):
         self.an = an
+        self.win.title(f"Song map ({SONGMAP_CHOICES.get(str(an.get('songmap_version', 'v1'))[:2], 'Songmap V1')}) - {Path(self.path).name}" if getattr(self, "path", None) else self.win.title())
         drops = ", ".join(f"{ts(d['t'])} ({d['strength']:.2f})" for d in an.get("drops", [])) or "none"
         self.info.set(f"BPM {an['bpm']} ({an.get('bpm_src')}, librosa {an.get('bpm_librosa')}, agree {an.get('librosa_agree_ms')} ms)   "
                       f"beats {len(an['beats'])}   rhythm {an.get('rhythm')}   loudness {an.get('lufs')} LUFS   drops: {drops}   "
@@ -9011,6 +9073,7 @@ class App:
                 pass                                               # half-typed number: keep the old value
         cfg["length_s"] = "optimal" if self.set_opt.get() else max(LEN_MIN_S, min(LEN_MAX_S, int(self.set_len.get())))
         cfg["style"], cfg["placement"] = self.set_style.get(), self.set_place.get()
+        cfg["songmap_version"] = next((k for k, lab in SONGMAP_CHOICES.items() if lab == self.set_songmap.get()), SONGMAP_DEFAULT)
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
@@ -10119,7 +10182,7 @@ class App:
                 an = None
                 if song:
                     try:
-                        an = analyse_song(song["path"], song.get("csv_bpm"))
+                        an = get_songmap(song["path"], song.get("csv_bpm"))
                     except Exception as ex:
                         out(f"Random pick: song map unavailable ({ex}), sizing for a plain 120 BPM song")
                 paths, fit = random_pick(cands, an, style)
@@ -10645,6 +10708,10 @@ class App:
         label("Kill placement (see synccompare)")
         ttk.Combobox(holder(), textvariable=self.set_place, values=["v5", "v4"], width=10, state="readonly").pack(side="left")
         r[0] += 1
+        self.set_songmap = tk.StringVar(value=SONGMAP_CHOICES[songmap_version(self.cfg)])
+        label("Songmap version")
+        ttk.Combobox(holder(), textvariable=self.set_songmap, values=list(SONGMAP_CHOICES.values()), width=12, state="readonly").pack(side="left")
+        r[0] += 1
         am = self.cfg.get("audio_mode", "auto")
         self.set_audio = tk.StringVar(value=AUDIO_MODES.get(am, AUDIO_MODES["auto"]))
         label("Audio mode")
@@ -10694,7 +10761,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
@@ -11253,7 +11320,7 @@ def measure_render(outfile, plan, cfg, refine=True):
         return res
     seen, seen_clean = timed(kills_all), timed(kills_clean)
     off = music_offset(outfile, plan["song"]["path"], plan["song"]["start_t"]) or 0.0
-    an = analyse_song(plan["song"]["path"], plan["song"].get("bpm") if plan.get("placement") != "v4" else None)
+    an = get_songmap(plan["song"]["path"], plan["song"].get("bpm") if plan.get("placement") != "v4" else None)
     beats = np.array(an["beats"]) - plan["song"]["start_t"] + off
     strong = local_onsets(plan["song"]["path"]) - plan["song"]["start_t"] + off   # strong hits for THEIR part of the song
     rows = []
@@ -12924,6 +12991,12 @@ def main():
     fc.add_argument("--limit", type=int, default=0)
     fc.add_argument("--all", action="store_true")
     fc.set_defaults(fn=cmd_fpscheck)
+    sm = sp.add_parser("songmapcompare", help="V6.9.5: find the songs where SONGMAP V1 and V2 disagree most and write listening material (compare_out/)")
+    sm.add_argument("target", nargs="?", help="a song file or a list.txt (default: choose songs automatically)")
+    sm.add_argument("--auto", type=int, nargs="?", const=10, default=None, help="pick the N most suspicious songs (default 10)")
+    sm.add_argument("--songs-dir", help="analyse this folder instead of the playlist / songs folder")
+    sm.add_argument("--out", help="output folder (default compare_out next to montage.py)")
+    sm.set_defaults(fn=lambda a: __import__("songmap_compare").main(a))
     pc = sp.add_parser("pairscan", help="V6.9: candidate neighbour clip pairs among all cached CS2 clips (read-only, writes pairscan_cs2.txt)")
     pc.add_argument("game", choices=["cs2"])
     pc.add_argument("--limit", type=int, default=30)
