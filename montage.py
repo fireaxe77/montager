@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.5"
+APP_VERSION = "V6.9.5.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4688,6 +4688,10 @@ def songmap_version(cfg=None):
     return "v2" if v in ("v2", "songmap v2") else "v1"
 
 
+class _V2Fail(Exception):
+    """A V2 failure whose message already names the exception type (worker errors, timeouts)."""
+
+
 def get_songmap(path, csv_bpm=None, version=None):
     """THE routing point for song map requests (V6.9.5): V1 = analyse_song() exactly as before; V2 = the isolated songmap_v2 package with its
     own cache file. Any V2 problem (error, timeout, missing module) logs 'songmap v2 fallback: <song> (<reason>)' and returns the V1 map
@@ -4705,7 +4709,7 @@ def get_songmap(path, csv_bpm=None, version=None):
         if hit and not hit.get("fallback_marker"):
             return hit
         if hit:
-            raise RuntimeError(hit["fallback_marker"] + " (cached: not retried until the V2 algorithm version changes)")
+            raise _V2Fail(hit["fallback_marker"] + " (cached: not retried until the V2 algorithm version changes)")
         box = {}
         deadline = time.monotonic() + songmap_v2.ANALYSIS_CAP_S
 
@@ -4724,7 +4728,7 @@ def get_songmap(path, csv_bpm=None, version=None):
                 c2 = load_json(cpath, {})
                 c2[key] = {"fallback_marker": reason}
                 save_json(cpath, c2)
-            raise RuntimeError(reason)
+            raise _V2Fail(reason)
         m = box["m"]
         c2 = load_json(cpath, {})
         c2[key] = m
@@ -4733,9 +4737,10 @@ def get_songmap(path, csv_bpm=None, version=None):
             f"{len(m['v2']['events'])} events, {len(m['drops'])} drops")
         return m
     except Exception as ex:
-        out(f"songmap v2 fallback: {name} ({ex})")
+        why = str(ex) if isinstance(ex, _V2Fail) else f"{type(ex).__name__}: {ex}"
+        out(f"songmap v2 fallback: {name} ({why})")
         m = dict(analyse_song(path, csv_bpm))
-        m.update(songmap_version="v1-fallback", songmap_fallback_reason=str(ex))
+        m.update(songmap_version="v1-fallback", songmap_fallback_reason=why)
         return m
 
 
@@ -12995,6 +13000,8 @@ def main():
     sm.add_argument("target", nargs="?", help="a song file or a list.txt (default: choose songs automatically)")
     sm.add_argument("--auto", type=int, nargs="?", const=10, default=None, help="pick the N most suspicious songs (default 10)")
     sm.add_argument("--songs-dir", help="analyse this folder instead of the playlist / songs folder")
+    sm.add_argument("--seed", type=int, help="seed of the random sample of the songs folder (printed on every run, reusable)")
+    sm.add_argument("--song", action="append", help="analyse the songs whose file name contains this text (repeatable)")
     sm.add_argument("--out", help="output folder (default compare_out next to montage.py)")
     sm.set_defaults(fn=lambda a: __import__("songmap_compare").main(a))
     pc = sp.add_parser("pairscan", help="V6.9: candidate neighbour clip pairs among all cached CS2 clips (read-only, writes pairscan_cs2.txt)")

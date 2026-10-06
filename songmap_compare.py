@@ -6,6 +6,7 @@ Read-only: it builds both maps in memory (never through the cache), never writes
 to compare_out/ (git-ignored)."""
 import importlib
 import json
+import os
 import math
 import re
 import sys
@@ -30,13 +31,21 @@ def _montage():
 
 # ------------------------------------------------------------------------------------------------------------- analysis
 def analyse_pair(M, path, csv_bpm=None):
-    """(V1 map, V2 map, y, sr) built in memory only. Raises if either fails."""
+    """(V1 map or None, V2 map or None, y, sr, errors). V1 is always attempted first; a V2 failure never hides the V1 result."""
     import songmap_v2
     from songmap_v2 import timebase
-    v1 = M.build_song_map(str(path), csv_bpm)
-    v2 = songmap_v2.build_songmap_v2(str(path), csv_bpm, deadline=time.monotonic() + max(120.0, songmap_v2.ANALYSIS_CAP_S * 2))
+    errors = {}
+    v1 = v2 = None
+    try:
+        v1 = M.build_song_map(str(path), csv_bpm)
+    except Exception as ex:
+        errors["v1"] = f"{type(ex).__name__}: {ex}"
+    try:
+        v2 = songmap_v2.build_songmap_v2(str(path), csv_bpm, deadline=time.monotonic() + max(120.0, songmap_v2.ANALYSIS_CAP_S * 2))
+    except Exception as ex:
+        errors["v2"] = f"{type(ex).__name__}: {ex}"
     y, sr = timebase.decode(str(path))
-    return v1, v2, y, sr
+    return v1, v2, y, sr, errors
 
 
 def kick_times(v2):
@@ -116,14 +125,20 @@ def compare(v1, v2, name):
     sanity = lambda ts, m, sh: sum(1 for t in ts if (lambda L: L < sections.DROP_MIN_S)(next((b - a for a, b in drop_sections(m) if a - 0.5 <= t <= b), 0.0))) + (1 if sh > cap else 0)
     san1, san2 = sanity(t1, v1, s1), sanity(t2, v2, s2)
     p1, p2 = o1["p95_ms"], o2["p95_ms"]
-    if p1 is not None and p2 is not None and p2 <= 0.8 * p1 and san2 <= san1:
+    NOISE_MS = 2.0                                           # offsets closer than this (or within 20 %) are measurement noise
+    if unmatched1 or unmatched2:
+        verdict = "needs listening"                          # the drop times differ by more than 2 bars: a number cannot judge that
+    elif p1 is None or p2 is None or abs(p1 - p2) <= max(NOISE_MS, 0.2 * max(p1, p2)):
+        verdict = "tie"
+    elif p2 < p1 and san2 <= san1:
         verdict = "V2 better"
-    elif p1 is not None and p2 is not None and p1 <= 0.8 * p2 and san1 <= san2:
+    elif p1 < p2 and san1 <= san2:
         verdict = "V1 better"
     else:
-        verdict = "unclear"
-    why = (f"kick-to-grid p95 V1 {p1} ms vs V2 {p2} ms, drops V1 {len(t1)} / V2 {len(t2)}, drop share V1 {s1:.0%} / V2 {s2:.0%}, "
-           f"drop sanity problems V1 {san1} / V2 {san2}")
+        verdict = "tie"
+    why = (f"kick-to-grid offset V1 median {o1['median_ms']} / p95 {p1} ms, V2 median {o2['median_ms']} / p95 {p2} ms; "
+           f"drops V1 {[round(t, 1) for t in t1]} ({len(t1)}), V2 {[round(t, 1) for t in t2]} ({len(t2)}); V1 drops V2 rejected {[round(t, 1) for t in short_rejected]}; "
+           f"drop share V1 {s1:.0%} / V2 {s2:.0%}; drop sanity problems V1 {san1} / V2 {san2}")
     return {"song": name, "bpm": v2["bpm"], "beats": len(v2["beats"]), "grid_confidence": v2["v2"]["grid_confidence"],
             "downbeat_confidence": v2["v2"]["downbeat_confidence"], "drops_v1": [round(t, 2) for t in t1], "drops_v2": [round(t, 2) for t in t2],
             "rejected_v1_drops": [round(t, 2) for t in short_rejected], "unmatched_v1": [round(t, 2) for t in unmatched1],
@@ -243,28 +258,63 @@ def first_drop(m):
 
 
 # ------------------------------------------------------------------------------------------------------------- selection
-def collect_songs(M, args, notes):
-    """Candidate pool: songs from past montages (used songs) first, then the songs folder; read-only; capped at POOL_CAP."""
+def norm_title(M, path):
+    """Normalised 'artist - title' (tags when readable, else the file name) used to treat two copies of one song as one candidate."""
+    stem = Path(path).stem
+    try:
+        a, t, _ = M.read_tags(str(path))
+    except Exception:
+        a = t = ""
+    base = f"{a} {t}" if (a and t) else stem
+    return re.sub(r"[^\w]+", " ", base.lower()).strip()
+
+
+def collect_songs(M, args, notes, say=print):
+    """Pool: (1) songs used in past montages and songs added to the folder in the last 7 days, then (2) a seeded RANDOM sample of the rest of
+    the songs folder; deduplicated by normalised title + artist (the other copies are listed under `also`); capped at POOL_CAP."""
+    import random
     cfg = M.load_config()
     exts = {e for e in M.AUDIO_EXT}
-    pool, seen = [], set()
+    seed = getattr(args, "seed", None)
+    if seed is None:
+        seed = random.randrange(1, 10 ** 6)
+    args.seed_used = seed
+    folder = args.songs_dir or cfg.get("mp3_dir")
+    files = []
+    if folder and Path(folder).is_dir():
+        files = sorted(str(p) for p in M.walk_files([str(folder)], exts, 0, cfg))
+    else:
+        notes.append(f"Songs folder not found ({folder!r}); use --songs-dir.")
+    pool, by_key = [], {}
 
     def add(p, why):
         p = str(p)
-        k = M._pkey(p)
-        if k not in seen and Path(p).is_file() and Path(p).suffix.lower() in exts:
-            seen.add(k)
-            pool.append({"path": p, "why": why})
-    if args.target:
+        if not (Path(p).is_file() and Path(p).suffix.lower() in exts):
+            return False
+        key = norm_title(M, p)
+        if key in by_key:
+            if p not in by_key[key]["paths"]:
+                by_key[key]["paths"].append(p)
+            return False
+        e = {"path": p, "why": why, "paths": [p], "key": key}
+        by_key[key] = e
+        pool.append(e)
+        return True
+    if getattr(args, "target", None):
         t = Path(args.target)
-        if t.suffix.lower() == ".txt":
-            for line in t.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    add(line.strip().strip('"'), "list")
-        else:
-            add(t, "given")
-        return pool
-    folder = args.songs_dir or cfg.get("mp3_dir")
+        for line in (t.read_text(encoding="utf-8").splitlines() if t.suffix.lower() == ".txt" else [str(t)]):
+            if line.strip():
+                add(line.strip().strip('"'), "given")
+        return pool, seed
+    frags = [f.lower() for f in (getattr(args, "song", None) or [])]
+    if frags:
+        for p in files:
+            if any(f in Path(p).name.lower() for f in frags):
+                add(p, "--song")
+        for f in frags:
+            if not any(f in Path(e["path"]).name.lower() for e in pool):
+                notes.append(f"--song '{f}': no song with that name fragment found in {folder!r}.")
+        return pool, seed
     used = M.load_json(M.USED_SONGS, {}) if not args.songs_dir else {}
     hist = []
     for game_hist in used.values() if isinstance(used, dict) else []:
@@ -274,15 +324,26 @@ def collect_songs(M, args, notes):
     for d, p in sorted(hist, reverse=True):
         add(p, "used in a montage " + d)
     if not hist:
-        notes.append("No used-song records available (montage_data/used_songs.json is empty or missing): candidates come from the songs folder only.")
-    if folder and Path(folder).is_dir():
-        for p in sorted(M.walk_files([str(folder)], exts, 0, cfg)):
-            if len(pool) >= POOL_CAP:
-                break
-            add(p, "songs folder")
-    else:
-        notes.append(f"Songs folder not found ({folder!r}); use --songs-dir.")
-    return pool[:POOL_CAP]
+        notes.append("No used-song records available (montage_data/used_songs.json is empty or missing).")
+    week = time.time() - 7 * 86400
+    for p in files:
+        try:
+            if os.path.getmtime(p) >= week:
+                add(p, "added in the last 7 days")
+        except OSError:
+            pass
+    nt = {p: norm_title(M, p) for p in files}
+    rest = [p for p in files if nt[p] not in by_key]
+    random.Random(seed).shuffle(rest)
+    for p in rest:
+        if len(pool) >= POOL_CAP:
+            break
+        add(p, f"random sample (seed {seed})")
+    for p in files:                                           # other copies of a candidate (same title + artist): listed, never analysed twice
+        e = by_key.get(nt[p])
+        if e is not None and p not in e["paths"]:
+            e["paths"].append(p)
+    return pool[:POOL_CAP], seed
 
 
 def safe(s):
@@ -290,61 +351,66 @@ def safe(s):
 
 
 # ------------------------------------------------------------------------------------------------------------- main
-def run(M, pool, n_keep, out_dir, say=print):
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    t_start = time.time()
-    results, maps = [], {}
-    for i, c in enumerate(pool, 1):
-        if time.time() - t_start > TIME_BUDGET_S:
-            say(f"  time budget reached after {i - 1} songs")
-            break
-        say(f"[{i}/{len(pool)}] analysing {Path(c['path']).name} ...")
+def write_song_files(out_dir, r, v1, v2, y, sr, have_plt, say):
+    """PNGs (optional matplotlib) + 2 x 3 listening clips + full click WAVs for one song. Returns the file dict; never raises for PNGs."""
+    base = safe(Path(r["path"]).stem)
+    files = {}
+    if have_plt:
         try:
-            v1, v2, y, sr = analyse_pair(M, c["path"])
-            res = compare(v1, v2, Path(c["path"]).name)
-            res.update(path=c["path"], why_candidate=c["why"])
-            results.append(res)
-            maps[c["path"]] = (v1, v2, y, sr)
-            say(f"      score {res['disagreement_score']}  {res['verdict']}")
+            plot_pair(out_dir / f"{base}_compare.png", r["song"], v1, v2, y, sr, None, f"{r['song']}   V1 vs V2   score {r['disagreement_score']}")
+            files["png"] = f"{base}_compare.png"
         except Exception as ex:
-            say(f"      skipped ({type(ex).__name__}: {ex})")
-    results.sort(key=lambda r: -r["disagreement_score"])
-    top = results[:n_keep]
-    for r in top:
-        v1, v2, y, sr = maps[r["path"]]
-        base = safe(Path(r["path"]).stem)
-        files = {}
-        plot_pair(out_dir / f"{base}_compare.png", r["song"], v1, v2, y, sr, None, f"{r['song']}   V1 vs V2   score {r['disagreement_score']}")
-        files["png"] = f"{base}_compare.png"
-        fd = first_drop(v2) if first_drop(v2) is not None else first_drop(v1)
-        per = float(np.median(np.diff(v2["beats"])))
-        zc = fd if fd is not None else float(v2["dur"]) / 2
-        plot_pair(out_dir / f"{base}_zoom.png", r["song"], v1, v2, y, sr, (max(0.0, zc - 2 * 4 * per), zc + 6 * 4 * per),
-                  f"{r['song']}   8 bars around the first drop ({zc:.1f} s)")
-        files["zoom"] = f"{base}_zoom.png"
-        k = kick_times(v2)
-        sus = suspicious_time(r, v1, v2, k)
-        for tag, center in (("firstdrop", zc), ("suspect", sus)):
-            a, b = clip_bounds(center, float(v2["dur"]))
-            seg = y[int(a * sr):int(b * sr)]
-            write_wav(out_dir / f"{base}_{tag}_original.wav", seg, sr)
-            for ver, m in (("v1", v1), ("v2", v2)):
-                ck = clicks(m, sr, 0, len(y))[int(a * sr):int(b * sr)]
-                write_wav(out_dir / f"{base}_{tag}_{ver}_clicks.wav", np.clip(seg * 0.7 + ck, -1, 1), sr)
-            files[tag] = {"center_s": round(center, 2), "from_s": round(a, 2), "to_s": round(b, 2),
-                          "files": [f"{base}_{tag}_original.wav", f"{base}_{tag}_v1_clicks.wav", f"{base}_{tag}_v2_clicks.wav"]}
+            say(f"      PNG skipped for this song ({type(ex).__name__}: {ex})")
+    fd = first_drop(v2) if first_drop(v2) is not None else first_drop(v1)
+    per = float(np.median(np.diff(v2["beats"])))
+    zc = fd if fd is not None else float(v2["dur"]) / 2
+    if have_plt:
+        try:
+            plot_pair(out_dir / f"{base}_zoom.png", r["song"], v1, v2, y, sr, (max(0.0, zc - 2 * 4 * per), zc + 6 * 4 * per),
+                      f"{r['song']}   8 bars around the first drop ({zc:.1f} s)")
+            files["zoom"] = f"{base}_zoom.png"
+        except Exception as ex:
+            say(f"      zoom PNG skipped ({type(ex).__name__}: {ex})")
+    k = kick_times(v2)
+    sus = suspicious_time(r, v1, v2, k)
+    for tag, center in (("firstdrop", zc), ("suspect", sus)):
+        a, b = clip_bounds(center, float(v2["dur"]))
+        seg = y[int(a * sr):int(b * sr)]
+        write_wav(out_dir / f"{base}_{tag}_original.wav", seg, sr)
         for ver, m in (("v1", v1), ("v2", v2)):
-            write_wav(out_dir / f"{base}_full_{ver}_clicks.wav", clicks(m, sr, 0, len(y)), sr)
-            files[f"full_{ver}"] = f"{base}_full_{ver}_clicks.wav"
-        r["files"] = files
-    return results, top
+            ck = clicks(m, sr, 0, len(y))[int(a * sr):int(b * sr)]
+            write_wav(out_dir / f"{base}_{tag}_{ver}_clicks.wav", np.clip(seg * 0.7 + ck, -1, 1), sr)
+        files[tag] = {"center_s": round(center, 2), "from_s": round(a, 2), "to_s": round(b, 2),
+                      "files": [f"{base}_{tag}_original.wav", f"{base}_{tag}_v1_clicks.wav", f"{base}_{tag}_v2_clicks.wav"]}
+    for ver, m in (("v1", v1), ("v2", v2)):
+        write_wav(out_dir / f"{base}_full_{ver}_clicks.wav", clicks(m, sr, 0, len(y)), sr)
+        files[f"full_{ver}"] = f"{base}_full_{ver}_clicks.wav"
+    return files
 
 
-def write_reports(out_dir, results, top, notes):
+def remove_files(out_dir, files):
+    names = []
+    for v in files.values():
+        names += v["files"] if isinstance(v, dict) else [v]
+    for n in names:
+        try:
+            (Path(out_dir) / n).unlink()
+        except OSError:
+            pass
+
+
+def write_reports(out_dir, state, notes):
+    """Regenerated after EVERY song: report.json (all entries so far) and report.md (the current ranking)."""
     out_dir = Path(out_dir)
-    (out_dir / "report.json").write_text(json.dumps({"notes": notes, "songs": top, "analysed": len(results)}, indent=1), encoding="utf-8")
-    L = ["# SONGMAP V1 vs V2 - listening report", "", f"{len(results)} songs analysed, the {len(top)} most suspicious are listed (highest disagreement first).", ""]
+    top = state["top"]
+    summary = {"analysed": len(state["results"]), "skipped": len(state["errors"]), "written": len(top), "seed": state.get("seed"),
+               "pool": state.get("pool_size"), "png": state.get("png", False)}
+    (out_dir / "report.json").write_text(json.dumps({"summary": summary, "notes": notes, "songs": top, "errors": state["errors"],
+                                                     "all_scores": [{"song": r["song"], "score": r["disagreement_score"], "verdict": r["verdict"]} for r in state["results"]]},
+                                                    indent=1), encoding="utf-8")
+    L = ["# SONGMAP V1 vs V2 - listening report", "",
+         f"{summary['analysed']} songs analysed, {summary['skipped']} with problems, the {len(top)} with the largest disagreement are written below "
+         f"(random sample seed {summary['seed']}; repeat with --seed {summary['seed']}).", ""]
     for n in notes:
         L.append(f"> {n}")
     L += ["", "## Listen to these first", ""]
@@ -354,17 +420,92 @@ def write_reports(out_dir, results, top, notes):
         L.append(f"   - around the first drop ({f['firstdrop']['center_s']} s): `{f['firstdrop']['files'][0]}`, `{f['firstdrop']['files'][1]}`, `{f['firstdrop']['files'][2]}`")
         L.append(f"   - most suspicious region ({f['suspect']['center_s']} s): `{f['suspect']['files'][0]}`, `{f['suspect']['files'][1]}`, `{f['suspect']['files'][2]}`")
     L += ["", "Listen to the original, then the V1 clicks, then the V2 clicks: the clicks should sit exactly on the kicks / the beat. "
-          "Pitches: soft high tick = beat, 1760 Hz = downbeat, 3200 Hz = accent, low 330 Hz = bass hit, three-tone chord = drop.", ""]
+          "Pitches: soft high tick = beat, 1760 Hz = downbeat, 3200 Hz = accent, low 330 Hz = bass hit, three-tone chord = drop. "
+          "The verdict word is only a hint (tie = numbers within noise, needs listening = drop times differ by more than 2 bars); trust your ears and the numbers.", ""]
     for r in top:
         o1, o2 = r["kick_offset_v1"], r["kick_offset_v2"]
-        L += [f"## {r['song']}", "", f"- verdict: **{r['verdict']}** - {r['verdict_why']}",
+        L += [f"## {r['song']}", "", f"- verdict: **{r['verdict']}**",
+              f"- numbers: {r['verdict_why']}",
               f"- disagreement score {r['disagreement_score']}; BPM {r['bpm']} (V1 {r['bpm_v1']}); {r['beats']} beats; grid confidence {r['grid_confidence']}, downbeat confidence {r['downbeat_confidence']}",
-              f"- drops V1: {r['drops_v1']}  |  V2: {r['drops_v2']}  |  V1 drops V2 rejected: {r['rejected_v1_drops']}",
               f"- kick-to-grid offset: V1 median {o1['median_ms']} ms, p95 {o1['p95_ms']} ms  |  V2 median {o2['median_ms']} ms, p95 {o2['p95_ms']} ms",
-              f"- events on grid: V1 {r['events_on_grid_v1']}  |  V2 {r['events_on_grid_v2']}; share of song labelled drop: V1 {r['drop_share_v1']:.0%} / V2 {r['drop_share_v2']:.0%}",
-              f"- plots: `{r['files']['png']}`, `{r['files']['zoom']}`; full click tracks: `{r['files']['full_v1']}`, `{r['files']['full_v2']}`", ""]
+              f"- events on grid: V1 {r['events_on_grid_v1']}  |  V2 {r['events_on_grid_v2']}"]
+        if len(r.get("paths", [])) > 1:
+            L.append("- also found as (same title + artist): " + "; ".join(f"`{p}`" for p in r["paths"][1:]))
+        f = r["files"]
+        pngs = [f"`{f[k]}`" for k in ("png", "zoom") if k in f]
+        L += [f"- plots: {', '.join(pngs) if pngs else '(PNG maps skipped: pip install matplotlib)'}; full click tracks: `{f['full_v1']}`, `{f['full_v2']}`", ""]
+    if state["errors"]:
+        L += ["## Songs with problems", ""]
+        for e in state["errors"]:
+            L.append(f"- **{e['song']}**: {e['error']}" + (f"  (V1 result: BPM {e['v1']['bpm']}, drops {e['v1']['drops']})" if e.get("v1") else ""))
+        L.append("")
+    others = [r for r in state["results"] if r not in top]
+    if others:
+        L += ["## Other analysed songs (not written)", ""] + [f"- {r['song']}: score {r['disagreement_score']}, {r['verdict']}" for r in sorted(others, key=lambda r: -r["disagreement_score"])] + [""]
     (out_dir / "report.md").write_text("\n".join(L), encoding="utf-8")
     return "\n".join(L)
+
+
+def run(M, pool, n_keep, out_dir, say=print, notes=None, seed=None, after_song=None):
+    """Analyse the pool song by song. After EACH song: its report entry is added, the ranking regenerated and (if it is in the running top N)
+    its listening clips written; a crash later loses nothing, and one failing song is recorded and skipped."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    notes = notes if notes is not None else []
+    try:
+        import matplotlib  # noqa: F401
+        have_plt = True
+    except Exception:
+        have_plt = False
+        say("PNG maps skipped: run pip install matplotlib to enable them")
+        notes.append("PNG maps skipped: run pip install matplotlib to enable them (clips and report are complete).")
+    state = {"results": [], "errors": [], "top": [], "seed": seed, "pool_size": len(pool), "png": have_plt}
+    t_start = time.time()
+    for i, c in enumerate(pool, 1):
+        if time.time() - t_start > TIME_BUDGET_S:
+            say(f"  time budget reached after {i - 1} songs")
+            notes.append(f"Time budget reached: {len(pool) - i + 1} candidates were not analysed.")
+            break
+        name = Path(c["path"]).name
+        say(f"[{i}/{len(pool)}] analysing {name} ...")
+        try:
+            v1, v2, y, sr, errs = analyse_pair(M, c["path"])
+        except Exception as ex:
+            errs, v1, v2, y, sr = {"decode": f"{type(ex).__name__}: {ex}"}, None, None, None, None
+        if v1 is None or v2 is None:
+            e = {"song": name, "path": c["path"], "error": "; ".join(f"{k}: {v}" for k, v in errs.items())}
+            if v1 is not None:
+                e["v1"] = {"bpm": v1["bpm"], "drops": [round(d["t"], 1) for d in v1["drops"]]}
+            state["errors"].append(e)
+            say(f"      skipped ({e['error']})")
+        else:
+            try:
+                res = compare(v1, v2, name)
+                res.update(path=c["path"], paths=c.get("paths", [c["path"]]), why_candidate=c["why"])
+                state["results"].append(res)
+                say(f"      score {res['disagreement_score']}  {res['verdict']}")
+                ranked = sorted(state["results"], key=lambda r: -r["disagreement_score"])
+                if res in ranked[:n_keep]:
+                    try:
+                        res["files"] = write_song_files(out_dir, res, v1, v2, y, sr, have_plt, say)
+                    except Exception as ex:
+                        state["errors"].append({"song": name, "path": c["path"], "error": f"output step failed: {type(ex).__name__}: {ex}"})
+                        state["results"].remove(res)
+                        say(f"      output failed ({type(ex).__name__}: {ex})")
+                        res = None
+                    if res is not None and len(ranked) > n_keep:
+                        ev = ranked[n_keep]
+                        if "files" in ev:
+                            remove_files(out_dir, ev.pop("files"))
+            except Exception as ex:
+                state["errors"].append({"song": name, "path": c["path"], "error": f"{type(ex).__name__}: {ex}"})
+                say(f"      skipped ({type(ex).__name__}: {ex})")
+        state["top"] = [r for r in sorted(state["results"], key=lambda r: -r["disagreement_score"])[:n_keep] if "files" in r]
+        write_reports(out_dir, state, notes)
+        if after_song:
+            after_song(i, state)
+        del v1, v2, y
+    return state
 
 
 def main(args, say=print):
@@ -372,15 +513,18 @@ def main(args, say=print):
     notes = []
     out_dir = Path(args.out) if getattr(args, "out", None) else Path(M.HERE) / "compare_out"
     n = args.auto if getattr(args, "auto", None) is not None else 10
-    pool = collect_songs(M, args, notes)
+    pool, seed = collect_songs(M, args, notes, say)
     if not pool:
         say("songmapcompare: no songs found. " + " ".join(notes))
         return 1
-    if getattr(args, "target", None):
+    if getattr(args, "target", None) or getattr(args, "song", None):
         n = len(pool)
-    say(f"songmapcompare: {len(pool)} candidate song(s); keeping the {n} with the largest V1/V2 disagreement")
-    results, top = run(M, pool, n, out_dir, say)
-    text = write_reports(out_dir, results, top, notes)
+    say(f"songmapcompare: {len(pool)} candidate song(s); random sample seed {seed} (repeat with --seed {seed}); keeping the {n} with the largest V1/V2 disagreement")
+    state = run(M, pool, n, out_dir, say, notes, seed)
+    text = write_reports(out_dir, state, notes)
     say("\n" + text)
-    say(f"\nwritten to {out_dir} (report.md, report.json, PNGs, WAVs). Nothing else was changed.")
+    say(f"\nsummary: {len(state['results'])} analysed, {len(state['errors'])} skipped, {len(state['top'])} written to {out_dir} "
+        f"(report.md, report.json, listening clips{', PNGs' if state['png'] else ''}). Nothing else was changed.")
+    for e in state["errors"]:
+        say(f"   skipped: {e['song']}: {e['error']}")
     return 0
