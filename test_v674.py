@@ -113,8 +113,8 @@ def part_cache(old):
             check(all(M.kills_key(r, "valorant", M.Detector("valorant")) == old.kills_key(r, "valorant", od) for r, _ in jobs), f"{label}: key identical to 031cb64's")
         # control: an entry written under another killfeed region IS marked (the check is not blind)
         (M.DATA / "detect_valorant.json").write_text(json.dumps({"region": [0.5, 0.1, 1.0, 0.5], "ocr": True}), encoding="utf-8")
-        todo = M._relink_or_explain(jobs, {"valorant": M.Detector("valorant")}, store, {})
-        check(len(todo) == len(jobs), f"control: entries of another region are marked for rescan ({len(todo)}/{len(jobs)})")
+        todo = M._relink_or_explain(jobs, {"valorant": M.Detector("valorant")}, store, {}, region_ok=True)      # V6.7.6: Valorant needs the confirmation
+        check(len(todo) == len(jobs), f"control: entries of another region are marked for rescan once confirmed ({len(todo)}/{len(jobs)})")
     finally:
         M.restore_data_dir(keep)
 

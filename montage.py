@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.7.4"
+APP_VERSION = "V6.7.6"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -1288,14 +1288,31 @@ def _cache_index():
     return idx
 
 
-def _relink_or_explain(jobs, dets, cache, cfg):
+REGION_HELD = []                       # V6.7.6: [(path, [stored region hashes], current hash)] Valorant clips held back from a "calibration changed" rescan
+REGION_PROMPT = [None]                 # V6.7.6: hook(held, current_hash) the GUI sets: asks the user; nothing here ever rescans Valorant by itself
+REGION_CHANGED = "calibration changed (killfeed region)"
+
+
+def region_hold_text(held, cur):
+    """V6.7.6: the prompt / log text for held-back Valorant clips: how many, and the region hashes involved."""
+    per = {}
+    for _, stamps, _c in held:
+        for h in stamps:
+            per[h] = per.get(h, 0) + 1
+    return (f"{len(held)} Valorant clip(s) have kill entries scanned with another killfeed region. Current region hash: {cur}. "
+            f"Hashes stored for these clips: " + ", ".join(f"{h} ({n} clips)" for h, n in sorted(per.items())) +
+            ". The old entries are kept either way (python montage.py regioncheck valorant / regionrestore valorant --use <hash> "
+            "can make them valid again).")
+
+
+def _relink_or_explain(jobs, dets, cache, cfg, region_ok=False):
     """V5.5: a kill cache survives updates. For every clip with no entry under today's key: a cached entry of the same file
     (name, size, time) with the same calibration + bars (the clip folder moved) is re-linked, not rescanned; the rest are
     rescanned and the log says WHY (calibration changed / black-bar crop changed / cache format changed / clip file changed /
     new clip). Returns the jobs that really need a scan."""
     idx = _cache_index()
     paths = {e[2].lower() for v in idx.values() for e in v}
-    todo, why, linked = [], {}, 0
+    todo, why, linked, held = [], {}, 0, []
     for r, g in jobs:
         try:
             fk = file_key(r["path"])
@@ -1323,10 +1340,22 @@ def _relink_or_explain(jobs, dets, cache, cfg):
             reason = f"cache format changed (v{same[0][4]} -> v{algo})"
         else:
             reason = "black-bar crop changed"
+        if g == "valorant" and reason == REGION_CHANGED and not region_ok:
+            held.append((path, sorted({e[3] for e in same}), st))         # V6.7.6: never automatic for Valorant; the old entries stay on disk
+            continue
         why.setdefault(reason, []).append(Path(path).name)
         todo.append((r, g))
     if linked:
         out(f"kill cache: {linked} clip(s) re-linked (same file, new folder / path) - not rescanned")
+    REGION_HELD[:] = held
+    if held:
+        txt = region_hold_text(held, held[0][2])
+        out("NOT rescanning (needs your confirmation): " + txt)
+        if REGION_PROMPT[0]:
+            try:
+                REGION_PROMPT[0](list(held), held[0][2])
+            except Exception as ex:
+                out(f"region prompt failed: {ex}")
     if why:
         out("rescanning: " + "; ".join(f"{k} ({len(v)})" for k, v in why.items()))
         for k, v in why.items():
@@ -2190,6 +2219,228 @@ def cmd_calibrate_bars(args):
 
 
 # ------------------------------------------------------------ calibration
+def region_stamp(region):
+    """The region hash stored in every kill-cache key ('ocr' + md5 of the rounded region); same formula as Detector."""
+    return "ocr" + hashlib.md5(repr([round(float(v), 4) for v in region]).encode()).hexdigest()[:8]
+
+
+def backup_region_file(game):
+    """V6.7.6: a dated copy of detect_<game>.json (an empty record when there is none = default region) before every save / reset."""
+    p = DATA / f"detect_{game}.json"
+    DATA.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    dst, n = DATA / f"detect_{game}_backup_{stamp}.json", 1
+    while dst.exists():
+        n += 1
+        dst = DATA / f"detect_{game}_backup_{stamp}_{n}.json"
+    if p.exists():
+        shutil.copy2(p, dst)
+    else:
+        save_json(dst, {})
+    return dst
+
+
+VAL_BACKUP = DATA / "valorant_cache_backup.json"
+_VAL_BACKUP_LOCK = threading.Lock()
+
+
+def backup_valorant_entry(store, key):
+    """V6.7.6: before a cached Valorant entry is overwritten, its old content goes into valorant_cache_backup.json. The first copy per
+    clip is kept; an existing backup is never overwritten."""
+    if not store._p(key).exists():
+        return False
+    e = store.get(key)
+    if e is None:
+        return False
+    clip = "|".join(key.split("|")[:3])
+    with _VAL_BACKUP_LOCK:
+        b = load_json(VAL_BACKUP, {}) or {}
+        if clip in b:
+            return False
+        b[clip] = {"saved": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "key": key, "e": e}
+        save_json(VAL_BACKUP, b)
+    return True
+
+
+def _read_region(path):
+    """The region of a detect_*.json style file: [x0,y0,x1,y1], None = default region (no 'region'), False = unreadable."""
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    reg = d.get("region") if isinstance(d, dict) else None
+    if reg is None:
+        return None
+    try:
+        reg = [float(v) for v in reg]
+        return reg if len(reg) == 4 and 0 <= reg[0] < reg[2] <= 1 and 0 <= reg[1] < reg[3] <= 1 else False
+    except Exception:
+        return False
+
+
+def region_backups(game):
+    return sorted(DATA.glob(f"detect_{game}_backup_*.json"), key=lambda b: (b.stat().st_mtime_ns, b.name))
+
+
+def region_groups(game):
+    """{region hash: {"files", "clips", "times", "region"}} of the cached entries of a game (current cache format); region = the region the
+    entry itself stored (None for entries written before entries kept it). Second value: entries of another cache format (unusable)."""
+    groups, other = {}, 0
+    for (name, size, mt, g), lst in _cache_index().items():
+        if g != game:
+            continue
+        for p, _d, _path, stamp, algo, _bars in lst:
+            if algo != ALGO[1:]:
+                other += 1
+                continue
+            gr = groups.setdefault(stamp, {"files": [], "clips": set(), "times": [], "region": None})
+            gr["files"].append(p)
+            gr["clips"].add((name, size, mt))
+            try:
+                gr["times"].append(os.path.getmtime(p))
+            except OSError:
+                pass
+    for gr in groups.values():
+        for p in gr["files"][:8]:                             # the payload is only read for a few files per hash
+            try:
+                reg = json.loads(Path(p).read_text(encoding="utf-8")).get("e", {}).get("region")
+            except Exception:
+                continue
+            if reg and len(reg) == 4:
+                gr["region"] = [float(v) for v in reg]
+                break
+    return groups, other
+
+
+def _fmt_t(t):
+    return datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+
+
+def region_report(game):
+    """V6.7.6: everything regioncheck / regionrestore show, as data."""
+    det = Detector(game)
+    dflt = DEFAULT_REGION[game]
+    groups, other = region_groups(game)
+    return {"game": game, "current": det.d["region"], "current_hash": det.d["stamp"], "calibrated": det.calibrated,
+            "default": list(dflt), "default_hash": region_stamp(dflt),
+            "backups": [(b, _read_region(b)) for b in region_backups(game)], "groups": groups, "other_format": other}
+
+
+def _group_line(h, gr, rep):
+    t = gr["times"]
+    tag = " <- CURRENT region" if h == rep["current_hash"] else ""
+    tag += " (= default region)" if h == rep["default_hash"] else ""
+    return (f"  {h}  {len(gr['files']):5d} entries  {len(gr['clips']):5d} clips  scanned {_fmt_t(min(t)) if t else '?'} .. {_fmt_t(max(t)) if t else '?'}  "
+            f"region {gr['region'] if gr['region'] else 'not stored in these entries'}{tag}{'' if h == rep['current_hash'] else '  STALE (kept, ignored)'}")
+
+
+def cmd_regioncheck(args):
+    """V6.7.6: python montage.py regioncheck <game>"""
+    rep = region_report(args.game)
+    out(f"== {args.game}: killfeed region ({DATA / ('detect_' + args.game + '.json')}) ==")
+    out(f"current region  {rep['current']}  hash {rep['current_hash']}  ({'calibrated' if rep['calibrated'] else 'default'})")
+    out(f"default region  {rep['default']}  hash {rep['default_hash']}")
+    out(f"dated backups of the region file: {len(rep['backups'])}")
+    for b, reg in rep["backups"]:
+        out(f"  {b.name}  {_fmt_t(b.stat().st_mtime)}  region {reg if reg else 'default (none stored)' if reg is None else 'unreadable'}"
+            + (f"  hash {region_stamp(reg if reg else DEFAULT_REGION[args.game])}" if reg is not False else ""))
+    g = rep["groups"]
+    out(f"region hashes in cached {args.game} entries ({sum(len(x['files']) for x in g.values())} entries, {len(g)} hash(es)"
+        f"{', ' + str(rep['other_format']) + ' entries of an older cache format' if rep['other_format'] else ''}):")
+    for h in sorted(g, key=lambda h: (h != rep["current_hash"], -len(g[h]["files"]))):
+        out(_group_line(h, g[h], rep))
+    if g and rep["current_hash"] not in g:
+        out("  (no cached entry has the current region's hash)")
+    elif g:
+        out(f"  current hash {rep['current_hash']} matches {len(g[rep['current_hash']]['files'])} entries")
+
+
+def _resolve_region(game, use):
+    """(region|None for default, hash, source text) or (False, None, why). Never guesses: only what the user named."""
+    rep = region_report(game)
+    dflt_h = rep["default_hash"]
+    if use == "default":
+        return None, dflt_h, "the default region"
+    for pre in ("backup:", "file:"):
+        if use.startswith(pre):
+            f = Path(use[len(pre):])
+            if not f.is_absolute() and pre == "backup:" and (DATA / f).exists():
+                f = DATA / f
+            if not f.exists():
+                return False, None, f"{f} does not exist"
+            reg = _read_region(f)
+            if reg is False:
+                return False, None, f"{f} holds no readable region"
+            return reg, region_stamp(reg if reg else DEFAULT_REGION[game]), f"{pre}{f.name}"
+    h = use if use.startswith("ocr") else "ocr" + use
+    if not re.fullmatch(r"ocr[0-9a-f]{8}", h):
+        return False, None, f"'{use}' is not a hash, 'default', 'backup:<file>' or 'file:<path>'"
+    if h == dflt_h:
+        return None, h, "the default region"
+    if h == rep["current_hash"]:
+        return list(rep["current"]), h, "the current region"
+    gr = rep["groups"].get(h)
+    if gr and gr["region"]:
+        return gr["region"], h, f"the region stored in the cached entries of {h}"
+    for b, reg in rep["backups"]:
+        if reg and region_stamp(reg) == h:
+            return reg, h, f"backup {b.name}"
+    return False, None, f"no region values are available for hash {h} (its entries do not store the region and no backup matches); nothing changed"
+
+
+def _valid_counts(game, stamp):
+    """(entries valid under this hash, clips of the game's cache that would need a rescan)."""
+    groups, _ = region_groups(game)
+    clips = set()
+    for gr in groups.values():
+        clips |= gr["clips"]
+    mine = groups.get(stamp, {"files": [], "clips": set()})
+    return len(mine["files"]), len(clips - mine["clips"])
+
+
+def cmd_regionrestore(args):
+    """V6.7.6: python montage.py regionrestore <game> [--use <hash|default|backup:<file>|file:<path>>]. Without --use: options only."""
+    game = args.game
+    rep = region_report(game)
+    if not args.use:
+        out(f"== {game}: region options (nothing is chosen for you, nothing was changed) ==")
+        out(f"  --use default         {rep['default']}  hash {rep['default_hash']}  ({_valid_counts(game, rep['default_hash'])[0]} cached entries valid)")
+        out(f"  (current)             {rep['current']}  hash {rep['current_hash']}  ({_valid_counts(game, rep['current_hash'])[0]} cached entries valid)")
+        for b, reg in rep["backups"]:
+            if reg is not False:
+                h = region_stamp(reg if reg else DEFAULT_REGION[game])
+                out(f"  --use backup:{b.name}   {reg if reg else 'default'}  hash {h}  saved {_fmt_t(b.stat().st_mtime)}  ({_valid_counts(game, h)[0]} cached entries valid)")
+        for h, gr in sorted(rep["groups"].items(), key=lambda kv: -len(kv[1]["files"])):
+            out(f"  --use {h}" + _group_line(h, gr, rep).strip()[len(h):])
+            if not gr["region"]:
+                out("      (these entries do not store their region: usable only if a backup or --use file:<path> provides the values)")
+        out(f"run again with --use <option> to set one. A dated backup of the current region file is saved first.")
+        return
+    reg, h, src = _resolve_region(game, args.use)
+    if reg is False:
+        out(f"regionrestore: {src}")
+        return
+    bk = None
+    keep = (DATA / f"detect_{game}.json").read_bytes() if (DATA / f"detect_{game}.json").exists() else None
+    if reg is None:
+        reset_region(game)
+    else:
+        save_region(game, reg)
+    bk = region_backups(game)[-1].name
+    new = Detector(game)
+    if new.d["stamp"] != h:                                   # the values did not reproduce the hash: put everything back
+        p = DATA / f"detect_{game}.json"
+        if keep is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.write_bytes(keep)
+        out(f"regionrestore: the region from {src} gives hash {new.d['stamp']}, not {h}; the previous region was put back (backup {bk})")
+        return
+    valid, rescan = _valid_counts(game, h)
+    out(f"{game} region set to {src}: {new.d['region']} hash {h} (backup of the previous region file: {bk})")
+    out(f"cached entries valid under this region: {valid}; clips that would need a rescan: {rescan} (their old entries stay on disk)")
+
+
 def save_region(game, region_frac):
     """Optional calibration = only the killfeed REGION (fractions of the content rect). Other keys of an older file are kept."""
     x0, y0, x1, y1 = (min(1.0, max(0.0, float(v))) for v in region_frac)
@@ -2197,6 +2448,7 @@ def save_region(game, region_frac):
         raise ValueError("killfeed box too small")
     p = DATA / f"detect_{game}.json"
     d = load_json(p, {}) or {}
+    backup_region_file(game)
     d["region"] = [round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4)]
     d["ocr"] = True
     save_json(p, d)
@@ -2206,6 +2458,7 @@ def save_region(game, region_frac):
 def reset_region(game):
     p = DATA / f"detect_{game}.json"
     d = load_json(p, {}) or {}
+    backup_region_file(game)
     d.pop("region", None)
     save_json(p, d)
 
@@ -2266,7 +2519,7 @@ def auto_scan_set(cfg, game):
     return [p for _, p in new] + [p for _, p in old[:int(cfg.get("auto_old_per_run", 150))]]
 
 
-def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
+def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False):
     """Scans only what is needed (paths) - or every uncached tagged clip if paths is None. Returns clips scanned."""
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg not found - open Troubleshoot > Selfcheck")
@@ -2285,7 +2538,7 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
     if jobs and rescan:
         out("rescanning: forced rescan (requested)")
     elif jobs:
-        jobs = _relink_or_explain(jobs, dets, cache, cfg)
+        jobs = _relink_or_explain(jobs, dets, cache, cfg, region_ok)
     if limit:
         jobs = jobs[:limit]
     out(f"cached {len(recs) - len(jobs)}, scanning {len(jobs)}  (of {len(recs)} clips in scope)")
@@ -2301,6 +2554,8 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
             res = scan_clip(r["path"], r, dets[g], cfg)
             if CANCEL.is_set():
                 return r, g, None, "cancelled"             # half-scanned clips are never cached
+            if g == "valorant":
+                backup_valorant_entry(cache, kills_key(r, g, dets[g]))      # V6.7.6: an entry about to be overwritten is copied first
             cache.put(kills_key(r, g, dets[g]), res)           # saved the moment this clip finishes
             return r, g, res, None
         except Exception as ex:
@@ -2327,7 +2582,7 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False):
 
 
 def cmd_scan(args):
-    run_scan(load_config(), [args.game] if args.game else None, None, args.limit, args.rescan)
+    run_scan(load_config(), [args.game] if args.game else None, None, args.limit, args.rescan, getattr(args, "confirm_region_rescan", False))
 
 
 def game_pool(cfg, game, paths=None):
@@ -5877,13 +6132,16 @@ class CalibDialog:
         self.game = tk.StringVar(value="valorant")
         cb = ttk.Combobox(top, textvariable=self.game, values=list(GAMES), width=10, state="readonly")
         cb.pack(side="left")
-        cb.bind("<<ComboboxSelected>>", lambda e: self.show_region())
+        cb.bind("<<ComboboxSelected>>", lambda e: (self.show_game(), self.show_region()))
         ttk.Button(top, text="Open clip...", command=self.open_clip).pack(side="left", padx=4)
         ttk.Button(top, text="Open screenshot...", command=self.open_shot).pack(side="left")
         ttk.Button(top, text="Test OCR on this frame", command=self.test).pack(side="left", padx=8)
-        ttk.Button(top, text="Use default region", command=self.use_default).pack(side="left")
+        ttk.Button(top, text="Reset to default", command=self.use_default).pack(side="left")
         self.save = ttk.Button(top, text="Save region", command=self.do_save, state="disabled")
         self.save.pack(side="right")
+        self.big = tk.StringVar()                                    # V6.7.6: the game this box will be saved for, in large text
+        ttk.Label(self.win, textvariable=self.big, font=("Segoe UI", F(22), "bold")).pack(anchor="w", padx=6)
+        self.show_game()
         self.scale = ttk.Scale(self.win, from_=0, to=1, command=lambda v: None)
         self.scale.bind("<ButtonRelease-1>", lambda e: self.load_frame())
         self.msg = tk.StringVar(value="Open a clip (scrub to a moment with killfeed rows) or a screenshot, then drag a box around the "
@@ -5896,11 +6154,18 @@ class CalibDialog:
         self.cv.bind("<ButtonRelease-1>", self.release)
         self.base, self.path, self.dur, self.region, self.rect_id, self.p0, self.view = None, None, 0, None, None, None, None
 
+    def show_game(self):
+        self.big.set(f"Killfeed region for: {self.game.get().upper()}")
+
     def open_clip(self):
         p = filedialog.askopenfilename(initialdir=self.cfg["clip_root"], filetypes=[("video", "*.mov *.mp4 *.mkv")])
         if not p:
             return
         try:
+            g = tag_game(p, self.cfg)[0]                             # V6.7.6: a clip of the other game switches the selection (shown large)
+            if g in GAMES and g != self.game.get():
+                self.game.set(g)
+                self.show_game()
             self.path = p
             self.dur = probe_video(p)["dur"]
             self.scale.config(to=max(1.0, self.dur))
@@ -5976,6 +6241,8 @@ class CalibDialog:
         self.msg.set(f"{len(rows)} rows read, {sum(1 for r in rows if any(v == 'kill' for v, _ in classify_row(r)))} FIREAXE kill row(s) - details in the log.")
 
     def use_default(self):
+        if not messagebox.askyesno("Killfeed region", f"Reset the {self.game.get().upper()} killfeed region to the default?"):
+            return
         reset_region(self.game.get())
         out(f"{self.game.get()}: default killfeed region {DEFAULT_REGION[self.game.get()]}")
         self.show_region()
@@ -5985,6 +6252,8 @@ class CalibDialog:
         try:
             if not self.region:
                 return
+            if not messagebox.askyesno("Killfeed region", f"Save this box as the {self.game.get().upper()} killfeed region?"):
+                return                                               # V6.7.6: nothing is saved without a Yes
             res = do_calibrate(self.game.get(), self.base, self.region)
             self.show_region()
             messagebox.showinfo("Killfeed region", f"{self.game.get()} region saved. OCR read {res['rows']} rows, "
@@ -6536,6 +6805,7 @@ class App:
         self.root.minsize(920, 640)
         self._resizing, self._rs_after, self._last_size, self._save_after, self._loading = False, None, None, None, False
         self.q, self.busy, self.buttons, self._imgs, self.pending = queue.Queue(), False, [], [], []
+        REGION_PROMPT[0] = self.region_prompt                        # V6.7.6: a Valorant "calibration changed" rescan asks first
         self.named = {}                   # button registry (smoketest checks every required button)
         self._busy_btn, self._result = None, None
         self.sorts, self.sort_refill, self.sort_labels = {}, {}, {}
@@ -8248,15 +8518,43 @@ class App:
                 self._imgs.append(ph)
                 ttk.Label(w, image=ph).pack()
 
+    def region_prompt(self, held, cur):
+        """V6.7.6: called from a scan worker when Valorant clips are held back ('calibration changed'): asks on the UI thread, once per
+        distinct set; only a Yes rescans them. The old entries are kept either way."""
+        sig = (cur, tuple(sorted(p for p, _s, _c in held)))
+        if sig == getattr(self, "_region_asked", None):
+            return
+        self._region_asked = sig
+
+        def ask():
+            if not messagebox.askyesno("Valorant killfeed region", region_hold_text(held, cur) +
+                                       f"\n\nRescan these {len(held)} clips now? (No = nothing is rescanned; nothing is deleted.)"):
+                out("Valorant rescan declined: the entries stay as they are")
+                return
+
+            def job():
+                run_scan(load_config(), ["valorant"], [p for p, _s, _c in held], 0, False, True)
+                self.q.put(("call", lambda: self.run_task("clips", self.load_clips)))
+            self.run_task("rescan region", job)
+        self.q.put(("call", ask))
+
     def rescan_clip(self):
         p = self.sel_clip()
         if not p:
             return
 
+        g = self.t_game.get()
+
         def job():
             cache = load_kills_cache()
             fk = file_key(p) + "|"
-            cache.drop_file("|".join(fk.split("|")[:3]))
+            det = load_dets(g).get(g)
+            if g == "valorant" and det:                        # V6.7.6: only the entry under the current region is replaced (after a backup);
+                key = kills_key(analyse_clip(p, load_json(CLIPS_CACHE, {}), False, load_config().get("bar"))[1] | {"game": g}, g, det)
+                backup_valorant_entry(cache, key)              # entries under other region hashes are kept
+                cache._p(key).unlink(missing_ok=True)
+            else:
+                cache.drop_file("|".join(fk.split("|")[:3]))
             run_scan(load_config(), None, [p])
         self.run_task("rescan", job)
 
@@ -8714,7 +9012,7 @@ def grab_gray_bgr(path, t, w, h):
     return np.frombuffer(r.stdout[:w * h * 3], np.uint8).reshape(h, w, 3).copy()
 
 
-DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "USED_SONGS",
+DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "VAL_BACKUP", "USED_SONGS",
                 "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE")
 
 
@@ -10604,7 +10902,15 @@ def main():
     sc.add_argument("--game", choices=GAMES)
     sc.add_argument("--limit", type=int, default=0)
     sc.add_argument("--rescan", action="store_true")
+    sc.add_argument("--confirm-region-rescan", action="store_true", help="V6.7.6: also rescan Valorant clips whose entries were scanned with another killfeed region")
     sc.set_defaults(fn=cmd_scan)
+    rg = sp.add_parser("regioncheck", help="V6.7.6: killfeed region of a game, its hash, backups, and the region hashes stored in the cache")
+    rg.add_argument("game", choices=GAMES)
+    rg.set_defaults(fn=cmd_regioncheck)
+    rr = sp.add_parser("regionrestore", help="V6.7.6: list / set the killfeed region (never chosen automatically)")
+    rr.add_argument("game", choices=GAMES)
+    rr.add_argument("--use", help="<hash> | default | backup:<file> | file:<path>")
+    rr.set_defaults(fn=cmd_regionrestore)
     v = sp.add_parser("verify")
     v.add_argument("game", choices=GAMES)
     v.set_defaults(fn=cmd_verify)
