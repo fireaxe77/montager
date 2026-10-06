@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.8.2"
+APP_VERSION = "V6.9"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -7000,6 +7000,275 @@ def weekly_song_fit(song, an, sinfo, runners):
     return song, an, sinfo, runners
 
 
+# ======================================================================= V6.9: CS2 neighbour-clip pairing
+# A fight recorded as a multikill can be split over 2-3 consecutive clips. After the selection and before the planner, the neighbours
+# (by recording time) of a selected CS2 clip that shows a kill at its edge are added to the candidate pool as "pair partners". The
+# planner's existing continuation / duplicate merge and frame-match stitch verification decide whether they are joined; a partner is
+# never planned alone. Nothing here reads or decodes a clip: only file names, the cached clip records and the cached kill entries.
+PAIR_EDGE_S = 3.0                       # a kill this close to either end of the clip makes it a candidate for a larger fight
+PAIR_SINGLE_EDGE_S = 4.0                # a 1k clip: its single kill this close to either end
+PAIR_MAX_GAP_S = 12.0                   # build_events() tests continuations inline (not reusable on a pair outside the selection)
+PAIR_MAX_HOPS, PAIR_MAX_EXTRA = 2, 3    # per direction / per selected clip
+PAIR_CAP_S = 2.0                        # hard cap for the whole step
+PAIR_TEST_HOOK = [None]                 # tests only: called at the start of the step (inject an error / a delay)
+
+
+def pair_clip_start(path):
+    """Recording start from the file name ('Counter-strike 2 2025.02.08 - 19.48.57.15.DVR.mp4', 'Replay 2026-06-08 23-36-22.mov'; the
+    '_1' / '_1_1' variants share the base time), or None. Never guessed: no mtime fallback."""
+    m = _FN_TIME.search(Path(str(path)).name)
+    if not m:
+        return None
+    try:
+        return datetime.datetime(*[int(x) for x in m.groups()]).timestamp()
+    except ValueError:
+        return None
+
+
+def pair_time_index(recs):
+    """Sorted [(start, pkey, end, rec)] of the CS2 clips with a parsable name and a cached duration, plus the clips skipped."""
+    idx, skipped = [], []
+    for r in recs:
+        if r.get("game", "cs2") != "cs2" or r.get("error") or not r.get("w"):
+            continue
+        t0 = pair_clip_start(r["path"])
+        dur = r.get("dur")
+        if t0 is None or not dur:
+            skipped.append(r["path"])
+            continue
+        idx.append((t0, _pkey(r["path"]), t0 + float(dur), r))
+    idx.sort(key=lambda x: (x[0], x[1]))
+    return idx, skipped
+
+
+def pair_player_kills(rec, store, det, cfg):
+    """None = no cached kill entry (never scanned); else the cached kill times of the player (no decoding, no scan)."""
+    e = store.get(kills_key(rec, "cs2", det))
+    if not e or e.get("error"):
+        return None
+    return [float(k["t"]) for k in analyse_clip_entry(rec, e, cfg, "cs2")["kills"]]
+
+
+def pair_is_candidate(ts, dur):
+    if not ts:
+        return False
+    if any(t <= PAIR_EDGE_S or t >= dur - PAIR_EDGE_S for t in ts):
+        return True
+    return len(ts) == 1 and (ts[0] <= PAIR_SINGLE_EDGE_S or ts[0] >= dur - PAIR_SINGLE_EDGE_S)
+
+
+def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=None):
+    """Neighbour lookup for the selected CS2 clips. Returns {"partners": [(partner rec, selected clip path, gap s)], "checked": N,
+    "lookups": L, "skip": {...}, "lines": [log lines]}. recs = cached clip records, selected = set of path keys."""
+    kills_fn = kills_fn or (lambda r: pair_player_kills(r, store, det, cfg))
+    idx, bad = pair_time_index(recs)
+    pos = {k: i for i, (_, k, _, _) in enumerate(idx)}
+    res = {"partners": [], "checked": 0, "lookups": 0, "lines": [], "skip": {"not scanned": 0, "used": 0, "no kills": 0, "no match": 0}}
+    sk, lines = res["skip"], res["lines"]
+    added = set()
+    for key in sorted(selected):
+        if deadline and time.monotonic() > deadline:
+            raise TimeoutError("time cap reached")
+        if key not in pos:
+            if any(_pkey(r["path"]) == key and r.get("game", "cs2") == "cs2" for r in recs):
+                sk["no match"] += 1                           # unparsable name / no duration: skipped, never guessed
+            continue
+        i0 = pos[key]
+        t0, _, t1, rec = idx[i0]
+        res["checked"] += 1
+        ts = kills_fn(rec)
+        if ts is None:
+            sk["not scanned"] += 1
+            continue
+        if not pair_is_candidate(ts, t1 - t0):
+            continue
+        res["lookups"] += 1
+        state = {-1: i0, 1: i0}                               # the far end of the chain in each direction
+        alive = {-1: True, 1: True}
+        n_extra = 0
+        for _hop in range(PAIR_MAX_HOPS):
+            for d in (-1, 1):
+                if not alive[d] or n_extra >= PAIR_MAX_EXTRA:
+                    continue
+                cur = idx[state[d]]
+                j = state[d] + d
+                if not 0 <= j < len(idx):                         # no clip on that side at all
+                    alive[d] = False
+                    continue
+                nb = idx[j]
+                gap = (nb[0] - cur[2]) if d > 0 else (cur[0] - nb[2])
+                nm = Path(nb[3]["path"]).name
+                if gap > PAIR_MAX_GAP_S or nb[1] in selected or nb[1] in added:
+                    alive[d] = False
+                    sk["no match"] += 1
+                    continue
+                nk = kills_fn(nb[3])
+                if nk is None:
+                    alive[d] = False
+                    sk["not scanned"] += 1
+                    lines.append(f"neighbour not scanned: {nm}")
+                    continue
+                if nb[1] in used:
+                    alive[d] = False
+                    sk["used"] += 1
+                    lines.append(f"neighbour already used: {nm}")
+                    continue
+                if not nk:
+                    alive[d] = False
+                    sk["no kills"] += 1
+                    lines.append(f"neighbour has no kills of the player: {nm}")
+                    continue
+                added.add(nb[1])
+                n_extra += 1
+                state[d] = j
+                res["partners"].append((nb[3], rec["path"], gap))
+                lines.append(f"pair partner of {Path(rec['path']).name}: {nm} (gap {gap:.1f} s)")
+    return res
+
+
+def pair_summary(res):
+    s = res["skip"]
+    return (f"pairing: checked {res['checked']} clips, {len(res['partners'])} partner(s) added, {sum(s.values())} skipped "
+            f"({s['not scanned']} not scanned / {s['used']} used / {s['no kills']} no kills / {s['no match']} no match; "
+            f"neighbour window: gap <= {PAIR_MAX_GAP_S:.0f} s - the planner's continuation test is inline in build_events and not "
+            "reusable outside the selection)")
+
+
+def pairing_run(cfg, recs, selected_paths, quiet=False):
+    """The whole neighbour step, guarded: any error / unparsable name / missing cache / more than PAIR_CAP_S = one 'pairing skipped:
+    <reason>' line and None (the original selection stays). Runs in a helper thread so a hang cannot hold the plan up."""
+    sel = {_pkey(p) for p in selected_paths}
+    if not sel:
+        return None
+    box = {}
+
+    def work():
+        try:
+            if PAIR_TEST_HOOK[0]:
+                PAIR_TEST_HOOK[0]()
+            det = Detector("cs2")
+            store = load_kills_cache()
+            box["res"] = pair_find(cfg, recs, sel, store, det, used_dates(), deadline=time.monotonic() + PAIR_CAP_S)
+        except BaseException as ex:                          # noqa: BLE001 - nothing may escape the step
+            box["err"] = f"{type(ex).__name__}: {ex}"
+    log = LOGONLY if quiet else out
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(PAIR_CAP_S)
+    if th.is_alive():
+        log(f"pairing skipped: timeout (more than {PAIR_CAP_S:.0f} s)")
+        return None
+    if "err" in box or "res" not in box:
+        log(f"pairing skipped: {box.get('err', 'no result')}")
+        return None
+    res = box["res"]
+    log(pair_summary(res))
+    for l_ in res["lines"]:
+        log(l_)
+    return res
+
+
+def pairing_result_line(res, plan):
+    """After the planner: how many partners were stitched into a take, how many were rejected / left out."""
+    if not res or not res["partners"]:
+        return None
+    in_takes = {_pkey(x["path"]) for t in plan["takes"] for x in t.get("srcs", [])} | {_pkey(t["path"]) for t in plan["takes"]}
+    ok = [p for p, _, _ in res["partners"] if _pkey(p["path"]) in in_takes]
+    return f"pairing result: {len(ok)} pair(s) stitched, {len(res['partners']) - len(ok)} rejected"
+
+
+def pair_event_clips(e):
+    return {_pkey(p) for p in _ev_paths(e)} | {_pkey(x["path"]) for x in e.get("parts", []) if x.get("path")}
+
+
+def pairing_replace_events(res, pool, picked, game, cfg, seed):
+    """Weekly / Auto pick: each picked event whose clip has partners is re-built from its clips + partners with the SAME build_events();
+    the merged / stitched event replaces the single one in its slot (the pick's length and count are not recomputed). If the planner's
+    stitch is rejected build_events() falls back to the single clip: the pick stays as it was."""
+    by_clip = {}
+    for p, of, _ in res["partners"]:
+        by_clip.setdefault(_pkey(of), []).append(_pkey(p["path"]))
+    from rapidfuzz import fuzz
+    out_ev = list(picked)
+    for i, e in enumerate(picked):
+        mine = pair_event_clips(e)
+        ps = {p for c in mine for p in by_clip.get(c, [])}
+        if not ps:
+            continue
+        sub = [it for it in pool if _pkey(it["rec"]["path"]) in mine | ps]
+        if not any(_pkey(it["rec"]["path"]) in ps for it in sub):
+            continue
+        evs2, _ = build_events(sub, game, cfg, random.Random(seed))
+        # accepted: an event that uses a partner clip, was not a fallback after a rejected stitch, shows MORE kills than the single
+        # event and still contains all of its kills (so it is that fight, not a separate event of the partner clip)
+        have = lambda x: [_alnum((v or "").lower()) for v in x["victims"]]
+        merged = [x for x in evs2 if {_pkey(q["path"]) for q in x.get("parts", [])} & ps
+                  and "stitch rejected" not in x.get("stitch_note", "") and x["n"] > e["n"]
+                  and all(any(fuzz.ratio(v, u) >= 80 for u in have(x)) for v in have(e) if v)]
+        if merged:
+            out_ev[i] = max(merged, key=lambda x: x["n"])
+    return out_ev
+
+
+def cmd_pairscan(args):
+    """V6.9: python montage.py pairscan cs2 [--limit N]. Read-only: candidate pairs among ALL cached CS2 clips from the time index and the
+    cached kill entries (no scan, no decoding, no cache or flag written; only pairscan_cs2.txt next to montage.py)."""
+    cfg = load_config()
+    det = Detector("cs2")
+    store = load_kills_cache()
+    clips = load_json(CLIPS_CACHE, {})
+    recs = []
+    for p in sorted(set(walk_files(clip_roots(cfg), VIDEO_EXT, MIN_VIDEO, cfg))):
+        try:
+            if tag_game(p, cfg)[0] != "cs2":
+                continue
+            rec = clips.get(file_key(p))
+        except OSError:
+            continue
+        if rec and not rec.get("error"):
+            recs.append(dict(rec, path=p, game="cs2"))
+    lines, n_rows = pairscan_rows(cfg, recs, store, det, used_dates(), int(getattr(args, "limit", 0) or 30))
+    text = "\n".join(lines)
+    (HERE / "pairscan_cs2.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"({n_rows} neighbouring pairs; written to {HERE / 'pairscan_cs2.txt'}; nothing else was changed)")
+
+
+def pairscan_rows(cfg, recs, store, det, used, limit=30):
+    idx, bad = pair_time_index(recs)
+    kc = {}
+
+    def kills(r):
+        if r["path"] not in kc:
+            kc[r["path"]] = pair_player_kills(r, store, det, cfg)
+        return kc[r["path"]]
+    rows = []
+    for a, b in zip(idx, idx[1:]):
+        gap = b[0] - a[2]
+        if gap > PAIR_MAX_GAP_S:
+            continue
+        ka, kb = kills(a[3]), kills(b[3])
+        why = []
+        if ka is None or kb is None:
+            why.append("not scanned: " + ", ".join(Path(r["path"]).name for r, k in ((a[3], ka), (b[3], kb)) if k is None))
+        else:
+            if not ka or not kb:
+                why.append("no kills of the player in " + ("both" if not ka and not kb else "the first" if not ka else "the second"))
+            if not (pair_is_candidate(ka, a[2] - a[0]) or pair_is_candidate(kb, b[2] - b[0])):
+                why.append("no kill within the edge window of either clip")
+        used_b = [Path(r["path"]).name for _, k, _, r in (a, b) if k in used]
+        if used_b:
+            why.append("already used: " + ", ".join(used_b))
+        rows.append((len(ka or []) + len(kb or []), a, b, gap, ka, kb, why))
+    rows.sort(key=lambda r: (-r[0], r[1][0]))
+    lines = [f"pairscan cs2: {len(idx)} clips in the time index ({len(bad)} with an unparsable name skipped), "
+             f"{len(rows)} neighbouring pairs (gap <= {PAIR_MAX_GAP_S:.0f} s); top {min(limit, len(rows))} by combined kills"]
+    for tot, a, b, gap, ka, kb, why in rows[:limit]:
+        lines.append(f"{Path(a[3]['path']).name}  +  {Path(b[3]['path']).name}  gap {gap:.1f} s  kills {len(ka) if ka is not None else '?'} + "
+                     f"{len(kb) if kb is not None else '?'}  -> " + ("qualifies" if not why else "no: " + "; ".join(why)))
+    return lines, len(rows)
+
+
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True):
     """scan=False: plan from what is already scanned (the Manual status-line estimate runs exactly this, quietly)."""
     cfg = autodetect_dirs(cfg)
@@ -7015,7 +7284,13 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         out(f"auto: {len(paths)} uncached clips to scan this run (last {cfg['auto_recent_days']} days + up to {cfg['auto_old_per_run']} older)")
     if paths and scan:
         run_scan(cfg, [game], paths)
-    pool, st = game_pool(cfg, game, set(paths) if manual else None)
+    pair = None
+    pool_paths = set(paths) if manual else None
+    if game == "cs2" and manual and paths:                 # V6.9: neighbour clips of the ticked clips join the candidate pool
+        pair = pairing_run(cfg, tagged, paths, quiet=not scan)
+        if pair and pair["partners"]:
+            pool_paths |= {p_["path"] for p_, _, _ in pair["partners"]}
+    pool, st = game_pool(cfg, game, pool_paths)
     au = st["audio"]
     out(f"{game}: {st['tagged']} clips in included folders, {st['scanned']} scanned, {st['with_kills']} with detected kills; "
         f"{au['raw']} kills found, {au['no_shot']} without a heard gunshot (kept, audio is only a bonus), {au['death_lock']} dropped after my death, {au['kept']} usable")
@@ -7024,7 +7299,15 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
                            f"({au['raw']} found, {au['death_lock']} dropped after my death; rejected rows are listed above with their reasons). "
                            "Run Troubleshoot > Self-test detection to see the scores, or scan more clips.")
     seed = int(seed) if seed else random.randrange(1, 10 ** 6)
-    events, notes = build_events(pool, game, cfg, random.Random(seed))
+    if pair and pair["partners"]:                          # V6.9: the ticked clips are planned exactly as before; a partner only joins one of
+        sel_ = {_pkey(p_) for p_ in paths}                 # their events when the planner's own merge + stitch accepts it (never its own take)
+        events, notes = build_events([it for it in pool if _pkey(it["rec"]["path"]) in sel_], game, cfg, random.Random(seed))
+        try:
+            events = pairing_replace_events(pair, pool, events, game, cfg, seed)
+        except Exception as ex:
+            out(f"pairing skipped: {type(ex).__name__}: {ex}")
+    else:
+        events, notes = build_events(pool, game, cfg, random.Random(seed))
     if not events:
         raise RuntimeError("no usable kill events (utility kills are excluded)")
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
@@ -7033,6 +7316,14 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         notes += wk_notes
         for n_ in wk_notes:
             out(n_)
+        if game == "cs2":                                  # V6.9: neighbour clips of the picked CS2 clips (same slot, same count)
+            sel_ = set().union(*[pair_event_clips(e) for e in events]) if events else set()
+            pair = pairing_run(cfg, tagged, sel_, quiet=not scan)
+            if pair and pair["partners"]:
+                try:
+                    events = pairing_replace_events(pair, pool, events, game, cfg, seed)
+                except Exception as ex:
+                    out(f"pairing skipped: {type(ex).__name__}: {ex}")
     songs, unmatched, csvname = song_pool(cfg)
     song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path)
     if not manual and not song_path:
@@ -7071,6 +7362,10 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     plan["notes"] = list(plan["notes"]) + fixes
     for f_ in fixes:
         out(f_)
+    if pair:
+        pr_ = pairing_result_line(pair, plan)
+        if pr_:
+            (out if scan else LOGONLY)(pr_)
     if plan["duration"] > plan["song"]["section_s"] + 1e-3:              # never render past the end of the music
         raise RuntimeError(f"plan is {plan['duration']:.1f} s but the song only has {plan['song']['section_s']:.1f} s from "
                            f"{ts(plan['song']['start_t'])} - not rendered")
@@ -12361,6 +12656,10 @@ def main():
     rw.add_argument("--all", action="store_true", help="one table of every cached CS2 clip, sorted by the largest difference (rowdebug_cs2.txt)")
     rw.add_argument("--rebuild", action="store_true", help="rebuild the sidecar(s) first")
     rw.set_defaults(fn=cmd_rowdebug)
+    pc = sp.add_parser("pairscan", help="V6.9: candidate neighbour clip pairs among all cached CS2 clips (read-only, writes pairscan_cs2.txt)")
+    pc.add_argument("game", choices=["cs2"])
+    pc.add_argument("--limit", type=int, default=30)
+    pc.set_defaults(fn=cmd_pairscan)
     rh = sp.add_parser("rescanhash", help="V6.8.1: rescan only the clips that have an entry under <hash> and none under the current region")
     rh.add_argument("game", choices=GAMES)
     rh.add_argument("hash")
