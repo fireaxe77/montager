@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9"
+APP_VERSION = "V6.9.3"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6724,6 +6724,253 @@ def probe_duration(path):
         return 0.0
 
 
+# ======================================================================= V6.9.3: low-fps interpolation at render time
+# A clip recorded at about 30 fps sticks out in a 60 fps montage. Pre-step of the render input preparation only: for the clips that are in
+# the final plan (never any other clip) the real frame rate is read with ffprobe; a clip below 75% of the montage fps gets ONLY the source
+# ranges its takes use (+0.5 s margin each side) interpolated to a temporary file, and that file replaces the clip as the take's input
+# (same timeline: the take's shift moves by the range start). Everything else is untouched: a 60 fps plan produces the byte-identical
+# render command. Any problem uses the original clip; the render never fails because of interpolation. Hidden switch: config.json
+# "interpolate_low_fps" (default true).
+INTERP_FRAC = 0.75                      # candidate: effective fps below this share of the montage fps
+INTERP_MARGIN_S = 0.5
+INTERP_TIMEOUT_X = 4.0                  # a segment taking longer than this x its duration is abandoned
+INTERP_MIN_TIMEOUT_S = 5.0              # (floor for very short segments)
+INTERP_MIN_MEAN_SSIM, INTERP_MIN_FRAME_SSIM = 0.90, 0.75
+INTERP_MCI = "minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:scd=fdiff:mb_size=8:search_param=8"      # conservative: smallest block / search, no vsbmc
+INTERP_BLEND = "framerate=fps=60"                                                          # blend only (scene changes are duplicated)
+INTERP_STATE = {"mci_slow": False}
+
+
+def _ratio(s):
+    try:
+        n, _, d = str(s).partition("/")
+        return float(n) / float(d) if d and float(d) else (float(n) if not d else 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def probe_fps(path):
+    """{avg, r, nb, dur, eff, vfr} of the first video stream (ffprobe only). eff = frames / duration when known, else avg_frame_rate."""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration", "-of", "json", str(path)], timeout=60)
+    j = json.loads(r.stdout or b"{}")
+    s = (j.get("streams") or [{}])[0]
+    avg, rr = _ratio(s.get("avg_frame_rate")), _ratio(s.get("r_frame_rate"))
+    try:
+        nb = int(s.get("nb_frames"))
+    except (TypeError, ValueError):
+        nb = 0
+    try:
+        dur = float(s.get("duration") or (j.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    eff = nb / dur if nb > 1 and dur > 0 else (avg or rr)
+    return {"avg": avg, "r": rr, "nb": nb, "dur": dur, "eff": eff, "vfr": bool(avg and rr and abs(avg - rr) > 0.5)}
+
+
+def _run_timed(cmd, timeout):
+    """(returncode, stderr text, stdout text); returncode None = timeout. Registered in PROCS so Cancel kills it."""
+    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    PROCS.append(pr)
+    try:
+        so, se = pr.communicate(timeout=timeout)
+        return pr.returncode, se.decode(errors="replace"), so.decode(errors="replace")
+    except subprocess.TimeoutExpired:
+        pr.kill()
+        pr.communicate()
+        return None, "timeout", ""
+    finally:
+        if pr in PROCS:
+            PROCS.remove(pr)
+
+
+def interp_segment_cmd(src, s0, d, outp, method):
+    filt = INTERP_MCI if method == "mci" else INTERP_BLEND
+    return ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(src), "-map", "0:v:0", "-map", "0:a?",
+            "-vf", f"tpad=stop_mode=clone:stop_duration={INTERP_MARGIN_S:.2f},{filt},trim=end={d:.4f}", "-vsync", "0",
+            "-c:v", "libx264", "-crf", "10", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", str(outp)]
+
+
+def _ssim_values(a_chain, b_chain, a_in, b_in):
+    cmd = ["ffmpeg", "-hide_banner", "-v", "error"] + a_in + b_in + ["-lavfi", f"[0:v]{a_chain}[a];[1:v]{b_chain}[b];[a][b]ssim,"
+           "metadata=mode=print:key=lavfi.ssim.All:file=-", "-vsync", "0", "-f", "null", "-"]
+    rc, err, so = _run_timed(cmd, 120)
+    vals = [float(x) for x in re.findall(r"lavfi\.ssim\.All=([\d.]+)", so)]
+    return rc, err, vals
+
+
+def interp_validate(src, seg, s0, d, src_fps):
+    """None when the interpolated segment is sound, else the reason (see the V6.9.3 rules)."""
+    seg = Path(seg)
+    if not seg.exists() or seg.stat().st_size < 1000:
+        return "temp file missing"
+    dur = probe_duration(seg)
+    if abs(dur - d) > 1.0 / OUT_FPS + 0.002:
+        return f"duration {dur:.3f} s instead of {d:.3f} s"
+    r = run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames,start_time",
+             "-of", "json", str(seg)], timeout=120)
+    try:
+        st = json.loads(r.stdout or b"{}")["streams"][0]
+        n, t0 = int(st["nb_read_frames"]), float(st.get("start_time") or 0)
+    except Exception:
+        return "frame count unreadable"
+    want = int(round((d - t0) * OUT_FPS))
+    if abs(n - want) > (0 if t0 < 0.001 else 1):
+        return f"{n} frames instead of {want}"
+    ain, bin_ = ["-ss", "0", "-i", str(seg)], ["-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(src)]
+    small = "scale=480:-2:flags=bilinear,format=yuv420p"
+    rc, err, v60 = _ssim_values(f"{small}", f"{small},fps={OUT_FPS}:round=near", ain, bin_)          # every frame vs its nearest source frame
+    err = "\n".join(l for l in err.splitlines() if "non monotonically" not in l).strip()      # (a muxer remark of the null output, not a decode problem)
+    if rc != 0 or err:
+        return "decode error: " + err[:80]
+    if not v60:
+        return "SSIM not measurable"
+    if min(v60) < INTERP_MIN_FRAME_SSIM:
+        return f"a frame differs too much from its nearest source frame (SSIM {min(v60):.2f})"
+    rc, err, vo = _ssim_values(f"{small},fps={src_fps:.4f}:round=near", small, ain, bin_)             # at the source frame times
+    if rc != 0 or not vo:
+        return "SSIM at the source times not measurable"
+    if sum(vo) / len(vo) < INTERP_MIN_MEAN_SSIM:
+        return f"mean SSIM {sum(vo) / len(vo):.2f} against the source frames"
+    return None
+
+
+def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
+    """Returns (plan to build the filter from, number of temp files). The same plan object when nothing is interpolated."""
+    if not cfg.get("interpolate_low_fps", True):
+        out("fps: interpolation disabled (interpolate_low_fps = false), no clips probed")
+        return plan
+    paths = []
+    for t in plan["takes"]:
+        for s in (t.get("srcs") or [{"path": t["path"]}]):
+            if s["path"] not in paths:
+                paths.append(s["path"])
+    info, fails = {}, 0
+    for p_ in paths:
+        try:
+            info[p_] = probe_fps(p_)
+        except Exception:
+            fails += 1
+    cand = {p_ for p_, i in info.items() if 0 < i["eff"] < INTERP_FRAC * OUT_FPS}
+    if not cand:
+        out(f"fps: {len(paths)} clips probed, 0 low-fps" + (f" ({fails} unreadable)" if fails else ""))
+        return plan
+    done, fell = 0, 0
+    names = ", ".join(f"{Path(p_).name} {info[p_]['eff']:.0f} fps" for p_ in paths if p_ in cand)
+    new_takes, idx = [], 0
+    INTERP_STATE["mci_slow"] = False
+    for t in plan["takes"]:
+        srcs = [dict(s) for s in (t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"], "audio": t["audio"],
+                                                      "a_stream": 0, "gain_db": -6.0}])]
+        rng = {}
+        for sg in t["segs"]:
+            a, b, sp, n = sg[:4]
+            si = sg[4] if len(sg) > 4 and sg[4] < len(srcs) else 0
+            if srcs[si]["path"] not in cand:
+                continue
+            sa = a - srcs[si]["shift"]
+            need = max((b - a) if sp > 0 else 1.0 / OUT_FPS, n / OUT_FPS) + 0.3          # also what the no-slow-mo retry would read
+            lo, hi = rng.get(si, (sa, sa + need))
+            rng[si] = (min(lo, sa), max(hi, sa + need))
+        changed = False
+        for si, (lo, hi) in rng.items():
+            if CANCEL.is_set():
+                raise RuntimeError("cancelled")
+            i = info[srcs[si]["path"]]
+            s0 = max(0.0, lo - INTERP_MARGIN_S)
+            e = hi + INTERP_MARGIN_S
+            if i["dur"] > 0:
+                e = min(e, i["dur"])
+            d = e - s0
+            nm = Path(srcs[si]["path"]).name
+            if d < 0.2:
+                continue
+            seg = Path(tmpdir) / f"seg{idx}.mov"
+            idx += 1
+            why = None
+            t_start = time.time()
+            method = "blend" if INTERP_STATE["mci_slow"] else "mci"
+            for method in ((method,) if method == "blend" else ("mci", "blend")):
+                Path(tmpdir).mkdir(parents=True, exist_ok=True)
+                t_start = time.time()
+                rc, err, _ = _run_timed(interp_segment_cmd(srcs[si]["path"], s0, d, seg, method), max(INTERP_MIN_TIMEOUT_S, INTERP_TIMEOUT_X * d))
+                if rc is None and method == "mci":
+                    INTERP_STATE["mci_slow"] = True
+                    out(f"interpolation: motion method needs more than {INTERP_TIMEOUT_X:.0f}x real time on this PC - blend is used instead")
+                    continue
+                why = "timeout (more than %gx the segment)" % INTERP_TIMEOUT_X if rc is None else (None if rc == 0 else "ffmpeg error: " + err.strip()[-120:])
+                break
+            if CANCEL.is_set():
+                raise RuntimeError("cancelled")
+            if why is None:
+                why = interp_validate(srcs[si]["path"], seg, s0, d, i["eff"])
+            if why:
+                fell += 1
+                out(f"interpolation skipped: {nm} ({why})")
+                try:
+                    seg.unlink()
+                except OSError:
+                    pass
+                continue
+            out(f"interpolated {nm} {s0:.2f}-{e:.2f} s {i['eff']:.0f} -> {OUT_FPS} fps method={method} in {time.time() - t_start:.1f} s")
+            srcs[si].update(path=str(seg), shift=round(srcs[si]["shift"] + s0, 6))
+            done += 1
+            changed = True
+        new_takes.append(dict(t, srcs=srcs) if changed else t)
+    out(f"fps: {len(paths)} clips probed, {len(cand)} low-fps candidate(s) ({names}), {done} interpolated, {fell} fell back")
+    return dict(plan, takes=new_takes) if done else plan
+
+
+def cmd_fpscheck(args):
+    """V6.9.3: python montage.py fpscheck [game] [--limit N] [--all]. Read-only: the real frame rate (ffprobe) of the clips of the newest saved dry plan
+    (montage_data\\plans), or with --all of every cached clip; how many would be interpolation candidates in a montage of OUT_FPS. Writes fpscheck.txt
+    next to montage.py, never a cache."""
+    game = getattr(args, "game", None)
+    if getattr(args, "all", False):
+        clips = load_json(CLIPS_CACHE, {})
+        paths = sorted(r["path"] for r in clips.values() if isinstance(r, dict) and r.get("path") and os.path.exists(r["path"]) and not r.get("error"))
+        if game:
+            cfg = load_config()
+            paths = [p_ for p_ in paths if tag_game(p_, cfg)[0] == game]
+        what = f"all cached clips{' of ' + game if game else ''}"
+    else:
+        plans = sorted((DATA / "plans").glob("*.dry.json"), key=lambda p_: p_.stat().st_mtime) if (DATA / "plans").is_dir() else []
+        plans = [p_ for p_ in plans if not game or load_json(p_, {}).get("game") == game]
+        if not plans:
+            print("fpscheck: no saved dry plan found - run a Dry plan first, or use --all")
+            return
+        pl = load_json(plans[-1], {})
+        paths = []
+        for t in pl.get("takes", []):
+            for s_ in (t.get("srcs") or [{"path": t.get("path")}]):
+                if s_.get("path") and s_["path"] not in paths and os.path.exists(s_["path"]):
+                    paths.append(s_["path"])
+        what = f"the clips of the newest dry plan ({plans[-1].name})"
+    lim = int(getattr(args, "limit", 0) or 0)
+    if lim:
+        paths = paths[:lim]
+    lines, n_cand = [], 0
+    for p_ in paths:
+        try:
+            i = probe_fps(p_)
+        except Exception as ex:
+            lines.append(f"{p_}  unreadable ({ex})")
+            continue
+        cand = 0 < i["eff"] < INTERP_FRAC * OUT_FPS
+        n_cand += cand
+        lines.append(f"{Path(p_).name}  {i['eff']:.2f} fps (avg {i['avg']:.2f}, r {i['r']:.2f}, frames {i['nb']}{', variable' if i['vfr'] else ''})"
+                     + ("  -> interpolation candidate" if cand else ""))
+    head = f"fpscheck: {len(paths)} clips from {what}; {n_cand} would be interpolation candidates in a {OUT_FPS} fps montage (below {INTERP_FRAC * OUT_FPS:.0f} fps)"
+    text = "\n".join([head] + lines)
+    (HERE / "fpscheck.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(written to {HERE / 'fpscheck.txt'}; nothing else was changed)")
+
+
+def render_tmpdir(outfile):
+    return Path(outfile).with_name(Path(outfile).stem + ".interp")
+
+
 def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, effects=True):
     """Encode with all effects; if ffmpeg fails, retry without the failing effect, then without all effects. NVENC -> x264.
     The finished file must last exactly as long as the plan (else it is reported as a failure, never silently kept)."""
@@ -6743,8 +6990,24 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     elog = LOG_DIR / "last_render_stderr.txt"
     gp = LOG_DIR / "last_filter.txt"
     fx, failed = (set(FX_ALL) if effects else {"slow"}), []
+    itmp = render_tmpdir(outfile)
+    try:                                                   # V6.9.3: low-fps clips are interpolated first (only the ranges the plan uses)
+        pr_ = interp_prepare(p, cfg, itmp, fx)
+    except Exception as ex:
+        if CANCEL.is_set():
+            shutil.rmtree(itmp, ignore_errors=True)
+            raise RuntimeError("cancelled")
+        out(f"interpolation skipped: {type(ex).__name__}: {ex}")
+        pr_ = p
+    try:
+        return _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nvenc, tmp, elog, gp, fx, failed, D)
+    finally:
+        shutil.rmtree(itmp, ignore_errors=True)
+
+
+def _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nvenc, tmp, elog, gp, fx, failed, D):
     while True:
-        inputs, graph = build_filter(p, cfg, preview, fx)
+        inputs, graph = build_filter(pr_, cfg, preview, fx)
         gp.write_text(graph, encoding="utf-8")
         txt = ""
         for use_nv in ((nvenc, False) if nvenc else (False,)):
@@ -12656,6 +12919,11 @@ def main():
     rw.add_argument("--all", action="store_true", help="one table of every cached CS2 clip, sorted by the largest difference (rowdebug_cs2.txt)")
     rw.add_argument("--rebuild", action="store_true", help="rebuild the sidecar(s) first")
     rw.set_defaults(fn=cmd_rowdebug)
+    fc = sp.add_parser("fpscheck", help="V6.9.3: frame rate of the clips of the newest dry plan (or --all cached clips) and how many would be interpolated (read-only)")
+    fc.add_argument("game", nargs="?", choices=GAMES)
+    fc.add_argument("--limit", type=int, default=0)
+    fc.add_argument("--all", action="store_true")
+    fc.set_defaults(fn=cmd_fpscheck)
     pc = sp.add_parser("pairscan", help="V6.9: candidate neighbour clip pairs among all cached CS2 clips (read-only, writes pairscan_cs2.txt)")
     pc.add_argument("game", choices=["cs2"])
     pc.add_argument("--limit", type=int, default=30)

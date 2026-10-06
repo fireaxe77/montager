@@ -3,7 +3,9 @@
 - Single-file app: `montage.py` (GUI + engine). Data lives in `montage_data\` next to it.
 - **Every new version must add an entry to `CHANGELOG.md`** (newest first, at the top) in the same commit that bumps `APP_VERSION`. If you cannot tell what a version contained, write "Details not recorded" instead of guessing.
 - Frozen unless a task says otherwise: detection, planner and render logic. GUI / config / test changes must not touch them.
-- Tests: `python montage.py smoketest` (full, includes a real render; Windows). Fast GUI/audio-mode checks without rendering: `python test_v557.py` (needs a display; on Linux use `xvfb-run -a python3 test_v557.py`).
-- V5.58 checks (live theme, tab switching, settings audit; no render): `xvfb-run -a -s "-screen 0 1920x1200x24" python3 test_v558.py` (optional args: live tabs audit).
+- Tests: `python montage.py smoketest` (full, includes a real render; Windows). Fast GUI/audio-mode checks without rendering: `python tests/test_v557.py` (needs a display; on Linux use `xvfb-run -a python3 tests/test_v557.py`).
+- V5.58 checks (live theme, tab switching, settings audit; no render): `xvfb-run -a -s "-screen 0 1920x1200x24" python3 tests/test_v558.py` (optional args: live tabs audit).
 - Run only the new version's test file plus the Valorant guard; older tests are frozen and run only if the user asks.
 - CS2 detection engine frozen (V6.9); only touch it on explicit request.
+- Layout (V6.9.3, details in `docs/REPO_LAYOUT.md`, audit in `docs/REPO_AUDIT.md`): `montage.py`, launchers, icons, `fixtures/`, CHANGELOG / README / CLAUDE.md stay at the root and everything runs from the root. Tests live in `tests/` (`python tests/test_v693.py`); the older `test_v67*.py`, `test_v68*.py`, `test_v69.py` stay at the root because they use their own folder as the repo root. Docs in `docs/`. Generated diagnostics (`rowdebug_*`, `regiontest_*`, `pairscan_cs2.txt`, `fpscheck.txt`, `perflog*`) are git-ignored.
+- Test policy: only the new version's test file (+ the Valorant / CS2 guards); older tests are frozen and run only on request; the only allowed edit to a moved test is a one-line repo-root bootstrap.

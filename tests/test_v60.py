@@ -1,6 +1,7 @@
 """V6.0 targeted tests (no render, generated data): auto length fill, per-clip audio fallback, player names + cache, weekly pick."""
 import sys, tempfile
 from pathlib import Path
+import sys as _sys, pathlib as _pl; _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))   # repo root (the file lives in tests/)
 import montage as m
 
 
