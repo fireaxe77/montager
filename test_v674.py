@@ -175,7 +175,10 @@ def part_gui():
 def gui(tmp):
     M.messagebox.askyesno = lambda *a, **k: True
     M.messagebox.showerror = lambda *a, **k: None
-    M.save_json(M.CONFIG_PATH, dict(M.load_config(), mp3_dir=""))
+    # V6.8: isolate the app from the PC it runs on. App() starts its own clip load (ensure_bars + scan_clips over the configured clip
+    # folders): on a PC whose default folders exist that is the user's real library (hundreds of clips, far more than the 10 s this test
+    # used to wait), so "load_clips filled the list with the 5 clips" failed and every later tree.set() raised TclError "Item ... not found".
+    M.save_json(M.CONFIG_PATH, dict(M.load_config(), mp3_dir="", clip_dirs={"valorant": [], "cs2": []}))
     d = tmp / "clips"
     d.mkdir()
     names = ["c0.mp4", "c1.mp4", "c2.mp4", "c3.mp4", "c4.mp4"]
@@ -199,6 +202,10 @@ def gui(tmp):
     M.save_json(M.USED_FLAGS, dict(M.load_json(M.USED_FLAGS, {}), **{pk(clips[2]): "2026-08-15"}))
     M.save_json(M.USED_TITLES, {k: v for k, v in M.load_json(M.USED_TITLES, {}).items() if k != pk(clips[2])})
 
+    recs = [{"path": str(c), "game": "valorant", "dur": 10, "w": 1920, "h": 1080, "audio": True} for c in clips]
+    real_sc, real_eb = M.scan_clips, M.ensure_bars
+    M.scan_clips = lambda cfg, rescan=False: [dict(r) for r in recs]          # the app's own startup load sees only these 5 clips
+    M.ensure_bars = lambda cfg, force=False: None
     app = M.App(0)
     root = app.root
     root.geometry("1500x900+0+0")
@@ -208,23 +215,26 @@ def gui(tmp):
     logs = []
     real_out = M.out
     M.out = lambda *a: (logs.append(" ".join(map(str, a))), real_out(*a))[1]
-    recs = [{"path": str(c), "game": "valorant", "dur": 10, "w": 1920, "h": 1080, "audio": True} for c in clips]
-    real_sc = M.scan_clips
-    M.scan_clips = lambda cfg, rescan=False: [dict(r) for r in recs]
     try:
-        app.m_game.set("valorant")
-        app.run_task("clips", app.load_clips)
-        for _ in range(200):
+        for _ in range(100):                                       # whatever the startup load was still doing: wait until the app is idle
             root.update()
             time.sleep(0.05)
-            if not app.busy and len(app.byp) == len(clips):
+            if not app.busy and not app.pending:
+                break
+        app.m_game.set("valorant")
+        app.run_task("clips", app.load_clips)
+        for _ in range(1200):                                      # up to 60 s: idle AND the list holds exactly the 5 clips AND the tree shows them
+            root.update()
+            time.sleep(0.05)
+            if not app.busy and not app.pending and len(app.byp) == len(clips) and len(tree.get_children()) == len(clips):
                 break
     finally:
-        M.scan_clips = real_sc
+        M.scan_clips, M.ensure_bars = real_sc, real_eb
     for _ in range(10):
         root.update()
         time.sleep(0.05)
-    check(len(app.byp) == len(clips), f"load_clips filled the list with the {len(clips)} clips")
+    check(len(app.byp) == len(clips) and len(tree.get_children()) == len(clips),
+          f"load_clips filled the list with the {len(clips)} clips (app has {len(app.byp)}: {sorted(Path(p).name for p in app.byp)[:6]}, tree shows {len(tree.get_children())})")
     cell = lambda i: tree.set(str(clips[i]), "used")
     check([cell(i) for i in range(5)] == ["L_VAL_V6.7.2_2026-10-06", "S_VAL_V6.5_2026-09-01", "2026-08-15", "", ""], f"Used column through load_clips: {[cell(i) for i in range(5)]}")
     check(all(tree.set(str(c), "trash") == app.TRASH_GLYPH for c in clips), "every row shows the trash symbol")
