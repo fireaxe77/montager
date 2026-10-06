@@ -1,3 +1,12 @@
 montage_data/
 __pycache__/
 perflog*.txt
+# generated / local diagnostic output (V6.9.3): stays on the PC, never tracked
+rowdebug_images/
+regiontest_images/
+rowdebug_cs2.txt
+regiontest_cs2.txt
+pairscan_cs2.txt
+fpscheck.txt
+*.part.mp4
+*.interp/

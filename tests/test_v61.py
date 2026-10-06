@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 os.environ.setdefault("MONTAGER_DATA", tempfile.mkdtemp(prefix="montager_v61_"))
+import sys as _sys, pathlib as _pl; _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent))   # repo root (the file lives in tests/)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tkinter as tk
 
