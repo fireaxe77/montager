@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.8"
+APP_VERSION = "V6.8.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2017,6 +2017,679 @@ def compute_kills(entry, cfg, game=None):
     return a["kills"], a["deaths"]
 
 
+# ======================================================================= CS2 RED-BORDER ROW TRACKER (V6.8.1)
+# In CS2 every killfeed row that involves the local player has a red outline; other rows have none. Detection through the NAME alone
+# (OCR: fireaxo, flreaxe, 火茶 ...) misses kills and invents new ones from re-reads. This tracker finds the outlined rows by COLOUR (no
+# OCR), tracks each one as ONE event, and only then reads its text (a few clear frames per row) to say kill / assist / death / utility.
+# Everything here runs only for game == "cs2". Results live in a SEPARATE sidecar cache (montage_data\cs2_rows_v1\), so the existing kill
+# cache entries and keys stay valid. Without a sidecar the V6.7.2 name-based list is used unchanged.
+BORDER_DIR = DATA / "cs2_rows_v1"
+BORDER_V = 1                     # bump when the tracker / sidecar format changes (old sidecars are then rebuilt lazily)
+BORDER_FPS = 30                  # decode rate of the killfeed region for the tracker (every 2nd frame of a 60 fps clip)
+BORDER_GAP_S = 1.0               # a row track survives this long without a detected border (compression flicker, fade)
+BORDER_VOTES = 3                 # clear frames per row that are read with OCR
+BORDER_LINE_MIN = 60             # px (1920-wide normalised space): shortest horizontal red line that can be part of an outline
+BORDER_H = (16, 90)              # px: outer height of an outlined row (1920x1080 space; the clip is stretched into it)
+BORDER_PRE_F = 3                 # a track already there in the first frames = on screen when the clip starts (pre-clip)
+BORDER_FAILED = set()            # clips whose sidecar could not be built in this process (not retried every time)
+
+
+def border_mask(fr):
+    """Red-outline pixels: clearly red (R >= 1.5 x max(G, B), R - max >= 35, R >= 75). Thresholds are relative, so a faded row and a
+    chroma-smeared 1 px line (4:2:0 compression) still pass, while orange / yellow team names (G close to R) and skin tones do not."""
+    import cv2
+    b, g, r = cv2.split(fr)
+    mx = cv2.max(g, b)
+    return (r >= 75) & (cv2.subtract(r, mx) >= 35) & (cv2.addWeighted(r, 1.0, mx, -1.5, 0) > 0)
+
+
+def border_rects(fr):
+    """Outlined rows in one killfeed frame: [{x0, y0, x1, y1}]. Horizontal red lines (gaps of compression bridged) are paired top /
+    bottom (same left / right end, outer height BORDER_H) and each pair must have red on its left and right side."""
+    import cv2
+    import numpy as np
+    m = border_mask(fr).astype(np.uint8)
+    if int(m.sum()) < 2 * BORDER_LINE_MIN:
+        return []
+    mh = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((1, 7), np.uint8))
+    hl = cv2.morphologyEx(mh, cv2.MORPH_OPEN, np.ones((1, BORDER_LINE_MIN), np.uint8))
+    if not hl.any():
+        return []
+    n, _, st, _ = cv2.connectedComponentsWithStats(hl, connectivity=8)
+    lines = sorted((int(st[i][1]), int(st[i][1] + st[i][3] - 1), int(st[i][0]), int(st[i][0] + st[i][2] - 1))
+                   for i in range(1, n) if st[i][2] >= BORDER_LINE_MIN and st[i][3] <= 14)          # (y_top, y_bot, x0, x1)
+    thin = sorted(l[1] - l[0] + 1 for l in lines if l[1] - l[0] + 1 <= 5)
+    lt = thin[len(thin) // 2] if thin else 3                       # typical thickness of one outline line
+    rects = []
+    for i, (ya, yb, xa0, xa1) in enumerate(lines):
+        a_thick = yb - ya + 1 > 5                                  # two touching rows (bottom line + top line) blurred into one thick line
+        y0 = yb - (lt - 1) if a_thick else ya                      # such a line is the TOP of the row below it ...
+        for yc, yd, xb0, xb1 in lines[i + 1:]:
+            b_thick = yd - yc + 1 > 5
+            y1 = yc + (lt - 1) if b_thick else yd                  # ... and the BOTTOM of the row above it
+            if y1 - y0 < BORDER_H[0] or yc - yb < 3:
+                continue
+            if y1 - y0 > BORDER_H[1]:
+                break
+            if abs(xa1 - xb1) > 12:
+                continue
+            if a_thick or b_thick:                                 # a merged line is as wide as the wider of its two rows: the clean line decides x0
+                x0 = xb0 if a_thick and not b_thick else xa0 if b_thick and not a_thick else max(xa0, xb0)
+                if a_thick != b_thick and (xa0 if a_thick else xb0) > x0 + 12:
+                    continue                                       # the merged line must reach at least as far left as the clean one
+            elif abs(xa0 - xb0) > 12:
+                continue
+            else:
+                x0 = min(xa0, xb0)
+            x1 = max(xa1, xb1)
+            side = m[y0:y1 + 1, :]
+            fl = float(side[:, max(0, x0 - 1):x0 + 5].any(axis=1).mean())
+            fr_ = float(side[:, max(0, x1 - 4):x1 + 2].any(axis=1).mean())
+            if max(fl, fr_) >= 0.5 and min(fl, fr_) >= 0.25:
+                rects.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1})
+            break                                                  # the nearest matching line below closes this row
+    out_ = []
+    for r in sorted(rects, key=lambda r: r["y1"] - r["y0"]):       # smallest first: of two rects with one bottom edge only the row itself stays
+        if not any(abs(r["y0"] - o["y0"]) <= 4 and abs(r["x0"] - o["x0"]) <= 8 and abs(r["x1"] - o["x1"]) <= 8 for o in out_) and \
+                not any(abs(r["y1"] - o["y1"]) <= 4 and abs(r["x1"] - o["x1"]) <= 12 and o["y0"] > r["y0"] + 8 for o in out_):
+            out_.append(r)
+    return sorted(out_, key=lambda r: r["y0"])
+
+
+def _border_inner(fr, rc, ins=3):
+    return fr[rc["y0"] + ins:rc["y1"] - ins + 1, rc["x0"] + ins:rc["x1"] - ins + 1]
+
+
+def border_desc(fr, rc):
+    """Text-independent appearance of a row: the stroke energy of its text / icons along x (high-pass grey, collapsed vertically, 160 bins,
+    zero mean, unit norm). Collapsing makes it insensitive to a few pixels of vertical misalignment and to fade (contrast) and compression;
+    a different row of the same width reads clearly lower (about 0.3-0.8) than the same row again (0.85-1.0). None = empty / too small."""
+    import cv2
+    import numpy as np
+    inner = _border_inner(fr, rc, 5)
+    if inner.shape[0] < 4 or inner.shape[1] < 8:
+        return None
+    g = cv2.cvtColor(inner, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    prof = np.abs(g - cv2.GaussianBlur(g, (0, 0), 1.5)).mean(axis=0)
+    d = cv2.resize(prof.reshape(1, -1), (160, 1), interpolation=cv2.INTER_AREA).ravel()
+    d = d - d.mean()
+    nrm = float(np.linalg.norm(d))
+    return (d / nrm).astype(np.float32) if nrm > 1e-3 else None
+
+
+def border_quality(fr, rc):
+    """How clear a row is for OCR: white text / icon pixels inside the outline."""
+    inner = _border_inner(fr, rc)
+    return int(bright_mask(inner).sum()) if inner.size else 0
+
+
+class BorderTracker:
+    """Tracks outlined rows over the frames of one clip. A row is identified by its outline width, its appearance (text independent)
+    and its position; when the list shifts (a new row pushes the others down) the shift is measured from the rows that agree on it. A
+    track survives BORDER_GAP_S without a detected outline; after that the same row appearing again is a NEW track (= a new kill)."""
+
+    def __init__(self, fps=BORDER_FPS, keep_crops=True):
+        self.fps, self.tracks, self.n, self.keep = fps, [], 0, keep_crops
+        self.gap = int(round(BORDER_GAP_S * fps))
+        self.pairs_dy = []
+
+    def feed(self, f, fr):
+        import numpy as np
+        self.n = f + 1
+        rects = border_rects(fr)
+        live = [t for t in self.tracks if f - t["last"] <= self.gap]
+        descs = [border_desc(fr, rc) if live else None for rc in rects]
+        pairs = []
+        for t in live:
+            for i, rc in enumerate(rects):
+                w = rc["x1"] - rc["x0"]
+                if abs(w - t["w"]) > 6:
+                    continue
+                c = 0.5 if (t["desc"] is None or descs[i] is None) else float(np.dot(t["desc"], descs[i]))
+                pairs.append((c, rc["y0"] - t["y0"], t, i))
+        vote = {}
+        for c, dy, t, i in pairs:                                  # the shift of the whole list: the distance most rows agree on
+            if c >= 0.8:
+                vote.setdefault(round(dy / 4.0), []).append(dy)
+        shift = 0.0
+        if vote:
+            k = max(vote, key=lambda k: (len(vote[k]), -abs(k)))
+            shift = float(sum(vote[k]) / len(vote[k]))
+        sc = []
+        for c, dy, t, i in pairs:
+            pos_ok = abs(dy - shift) <= max(6.0, 0.35 * (t["y1"] - t["y0"]))
+            if c >= 0.8 or (pos_ok and c >= 0.35):
+                sc.append((c + (0.5 if pos_ok else 0.0) - 0.002 * abs(dy - shift), id(t), i, t))
+        sc.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+        used_t, used_r, got = set(), set(), {}
+        for s_, _tid, i, t in sc:
+            if id(t) in used_t or i in used_r:
+                continue
+            used_t.add(id(t))
+            used_r.add(i)
+            got[i] = t
+        for i, rc in enumerate(rects):
+            t = got.get(i)
+            d = descs[i] if live else border_desc(fr, rc)
+            if t is None:
+                t = {"id": len(self.tracks), "first": f, "last": f, "hits": 0, "y0": rc["y0"], "y1": rc["y1"], "x0": rc["x0"], "x1": rc["x1"],
+                     "w": rc["x1"] - rc["x0"], "desc": d, "slots": [[f, rc["y0"]]], "crops": {}}
+                self.tracks.append(t)
+            else:
+                if abs(rc["y0"] - t["y0"]) >= 2:
+                    t["slots"].append([f, rc["y0"]])
+                t.update(y0=rc["y0"], y1=rc["y1"], x0=rc["x0"], x1=rc["x1"], w=rc["x1"] - rc["x0"], desc=d if d is not None else t["desc"])
+            t["last"] = f
+            t["hits"] += 1
+            if self.keep:
+                q = border_quality(fr, rc)
+                b = f // 4
+                if b not in t["crops"] or q > t["crops"][b][0]:
+                    t["crops"][b] = (q, f, _border_inner(fr, rc, 0).copy(), dict(rc))
+                    if len(t["crops"]) > 10:
+                        t["crops"].pop(min(t["crops"], key=lambda k: t["crops"][k][0]))
+
+    def finish(self):
+        """Tracks seen at least BORDER_MIN_HITS frames (or still on screen at the very end), each with its clearest crops."""
+        res = []
+        for t in self.tracks:
+            if t["hits"] < 2 and t["last"] < self.n - 2:
+                continue
+            ranked = sorted(t["crops"].items(), key=lambda kv: -kv[1][0])
+            late = [kv for kv in ranked if kv[1][1] >= t["first"] + 2] or ranked      # skip the slide-in frames when there are later ones
+            pick = []
+            for b, cr in late:                                     # clearest first, spread over time
+                if all(abs(b - pb) >= 2 for pb, _ in pick):
+                    pick.append((b, cr))
+            for b, cr in late:
+                if len(pick) >= BORDER_VOTES:
+                    break
+                if all(b != pb for pb, _ in pick):
+                    pick.append((b, cr))
+            t["picked"] = [cr for _, cr in pick[:BORDER_VOTES]]
+            res.append(t)
+        ys = sorted({s[1] for t in res for s in t["slots"]})
+        hs = sorted(t["y1"] - t["y0"] for t in res)
+        pitch = (hs[len(hs) // 2] + 2) if hs else 36
+        diffs = [b - a for a, b in zip(ys, ys[1:]) if b - a >= 0.6 * pitch]
+        if diffs:
+            pitch = min(diffs)
+        top = ys[0] if ys else 0
+        for t in res:
+            t["slots"] = [[f, y, int(round((y - top) / float(max(8, pitch))))] for f, y in t["slots"]]
+        return res
+
+
+def border_ocr(crop):
+    """OCR one row crop (outline cut off, upscaled when small, padded) -> (boxes, blobs) of ocr_frame()."""
+    import cv2
+    import numpy as np
+    img = crop
+    if img.shape[0] < 60:
+        k = 2 if img.shape[0] >= 24 else 3
+        img = cv2.resize(img, None, fx=k, fy=k, interpolation=cv2.INTER_CUBIC)
+    img = cv2.copyMakeBorder(img, 14, 14, 20, 20, cv2.BORDER_REPLICATE)
+    boxes, blobs = ocr_frame(np.ascontiguousarray(img))
+    return [[int(b[0]), int(b[1]), int(b[2]), int(b[3]), str(b[4]), float(b[5])] + [x for x in b[6:] if isinstance(x, str)] for b in boxes], \
+        [[int(v) if i < 4 else float(v) for i, v in enumerate(g)] for g in blobs]
+
+
+def border_path(rec, det):
+    key = f"{file_key(rec['path'])}|cs2|{det.d['stamp']}|" + (hashlib.md5(rec.get("bar_sig", "").encode()).hexdigest()[:6] if rec.get("bars") else "nb")
+    stem = re.sub(r"[^\w.-]+", "_", Path(rec["path"]).stem)[:48]
+    return BORDER_DIR / f"{stem}_{hashlib.md5(key.encode()).hexdigest()[:12]}.json", key
+
+
+def border_load(rec, det=None):
+    """The sidecar of a clip (valid: same tracker version, file, killfeed region and bar crop) or None."""
+    try:
+        det = det or Detector("cs2")
+        p, key = border_path(rec, det)
+        j = json.loads(p.read_text(encoding="utf-8"))
+        return j if j.get("v") == BORDER_V and j.get("key") == key else None
+    except Exception:
+        return None
+
+
+def border_build(rec, det, cfg, write=True, keep_images=False):
+    """Decode the killfeed region of one CS2 clip at BORDER_FPS, track the outlined rows, read each row's clearest frames with OCR, and
+    write the sidecar. Returns the sidecar dict (with "secs", "decode_secs", "ocr_secs", "ms_per_frame" = the cost)."""
+    t0 = time.time()
+    tr = BorderTracker(BORDER_FPS, keep_crops=True)
+    for f, fr in enumerate(frame_stream(rec["path"], rec, det, cfg, BORDER_FPS)):
+        tr.feed(f, fr)
+    if CANCEL.is_set():
+        raise RuntimeError("cancelled")
+    if tr.n == 0:
+        raise RuntimeError("no frames decoded")
+    t1 = time.time()
+    tracks = tr.finish()
+    if tracks:
+        ocr_engine()
+    out_tracks, images = [], {}
+    for t in tracks:
+        votes = []
+        for q, f, crop, rc in t["picked"]:
+            boxes, blobs = border_ocr(crop)
+            votes.append({"f": f, "q": q, "boxes": boxes, "blobs": blobs})
+            if len(votes) >= 2:                                    # two clear reads that name me and agree are enough
+                vs_ = [cs2_vote_verdict(r, cfg) if r else ("empty", 0, "") for _, r in cs2_track_rows({"votes": votes[-2:]})]
+                if vs_[0][0] == vs_[1][0] and vs_[0][1] >= 3 and vs_[0][0] in ("kill", "death", "assist", "utility"):
+                    break
+        best = t["picked"][0] if t["picked"] else None
+        out_tracks.append({"id": t["id"], "first": t["first"], "last": t["last"], "hits": t["hits"], "x0": t["x0"], "x1": t["x1"],
+                           "y0": t["y0"], "y1": t["y1"], "slots": t["slots"], "votes": votes,
+                           "best_f": best[1] if best else None, "best_rect": best[3] if best else None})
+        if keep_images and best:
+            images[t["id"]] = best[2]
+    t2 = time.time()
+    p, key = border_path(rec, det)
+    sc = {"v": BORDER_V, "key": key, "stamp": det.d["stamp"], "fps": BORDER_FPS, "frames": tr.n, "size": [det.dw, det.dh],
+          "v_off": rec.get("v_off", 0.0), "built": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "tracks": out_tracks,
+          "secs": round(t2 - t0, 2), "decode_secs": round(t1 - t0, 2), "ocr_secs": round(t2 - t1, 2),
+          "ms_per_frame": round(1000 * (t1 - t0) / max(1, tr.n), 2)}
+    if write:
+        BORDER_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sc, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, p)
+    if keep_images:
+        sc["_images"] = images
+    return sc
+
+
+def border_build_many(recs, cfg, det, label="CS2 row borders", force=False):
+    """Build the missing sidecars of `recs` (a few clips in parallel). Returns {path: sidecar or None}."""
+    todo = [r for r in recs if force or (border_load(r, det) is None and r["path"] not in BORDER_FAILED)]
+    res = {}
+    if not todo:
+        return res
+    out(f"{label}: building {len(todo)} sidecar(s) in montage_data\\cs2_rows_v1 (the killfeed region is decoded at {BORDER_FPS} fps and "
+        "the outlined rows are tracked, once per clip) ...")
+
+    def work(r):
+        try:
+            return r, border_build(r, det, cfg), None
+        except Exception as ex:
+            return r, None, f"{type(ex).__name__}: {ex}"
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, int(cfg.get("scan_workers", 2)))) as ex:
+        for r, sc, err in ex.map(work, todo):
+            done += 1
+            progress(done / len(todo), f"{label} {done}/{len(todo)}")
+            if err:
+                BORDER_FAILED.add(r["path"])
+                out(f"[{done}/{len(todo)}] {label}: {Path(r['path']).name} FAILED ({err}); the name-based kills are used for it")
+            else:
+                res[r["path"]] = sc
+                out(f"[{done}/{len(todo)}] {Path(r['path']).name}: {len(sc['tracks'])} outlined rows, {sc['frames']} frames in {sc['secs']}s "
+                    f"(decode+track {sc['decode_secs']}s = {sc['ms_per_frame']} ms/frame, OCR {sc['ocr_secs']}s)")
+    return res
+
+
+# ---- classification of one track (names / OCR confusion normalisation) -------------------------------------------------------
+def cs2_norm_match(text):
+    """(score 0-100, start index in the OCR-normalised text) of my Latin name in `text` after the CS2 OCR-confusion normalisation
+    (l/I/1/|, O/0/D, Cyrillic look-alikes, rn -> m ...), so 'flreaxe' / 'f1reaxe' / 'fireaxo' still match 'fireaxe'."""
+    from rapidfuzz import fuzz
+    t = ocr_norm(text)
+    best = (0.0, 0)
+    for nm_ in names_split("cs2")[0] or [MY_NAME]:
+        n2 = ocr_norm(nm_)
+        if len(n2) < 4 or len(t) < 3:
+            continue
+        if len(t) <= len(n2):
+            s = float(fuzz.ratio(t, n2)) if len(t) >= 5 else (100.0 if t == n2 else 0.0)
+            st = 0
+        else:
+            al = fuzz.partial_ratio_alignment(n2, t)
+            s, st = float(al.score), int(al.dest_start)
+        if s > best[0]:
+            best = (s, st)
+    return best
+
+
+def _cs2_prefix(text, st):
+    """The raw text in front of normalised position `st` ('mate +' in 'mate + fireaxe'); '' when it is no other name / no '+'."""
+    i = next((i for i in range(len(text) + 1) if len(ocr_norm(text[:i])) >= st), len(text))
+    pre = text[:i]
+    return pre.strip() if ("+" in pre or len(_alnum(pre)) >= 3) else ""
+
+
+def cs2_lenient_me(text):
+    """True when `text` looks a LITTLE like my name (OCR-normalised partial match >= 62, or one of the CJK name characters)."""
+    from rapidfuzz import fuzz
+    if any(c in (text or "") for n in names_split("cs2")[1] for c in n):
+        return True
+    t = ocr_norm(text)
+    return len(t) >= 3 and any(len(ocr_norm(n)) >= 4 and fuzz.partial_ratio(ocr_norm(n), t) >= 62 for n in names_split("cs2")[0])
+
+
+def cs2_vote_verdict(r, cfg=None):
+    """One OCR read of a bordered row -> (verdict, weight, why). Verdicts: kill, assist, death, utility, none, nosplit, kill?
+    (kill, name unreadable). weight 3 = my name was found, 1 = decided without a readable name."""
+    thr = float((cfg or {}).get("name_match", NAME_MIN))
+    kt, vt = r.get("ktext", ""), r.get("vtext", "")
+    if r.get("split") is None:
+        return "nosplit", 0, "no weapon icon / gap to split the row"
+    ks, vs, before = float(r.get("ks", 0)), float(r.get("vs", 0)), r.get("before", "")
+    k_how = v_how = "name"
+    if ks < thr:
+        s, st = cs2_norm_match(kt)
+        if s >= thr:
+            ks, before, k_how = s, _cs2_prefix(kt, st), "OCR-normalised name"
+    if vs < thr:
+        s, _ = cs2_norm_match(vt)
+        if s >= thr:
+            vs, v_how = s, "OCR-normalised name"
+    cj = "".join(names_split("cs2")[1])
+    if ks < thr and cj and any(c in kt for c in cj):               # 火茶 / 火年: part of my CJK name is there
+        i = min(kt.find(c) for c in cj if c in kt)
+        j = kt.rfind("+", 0, i)
+        ks, before, k_how = 100.0, (kt[:j + 1].strip() if j >= 0 else ""), "partial CJK name"
+    if vs < thr and cj and any(c in vt for c in cj):
+        vs, v_how = 100.0, "partial CJK name"
+    me_k, me_v, gun = ks >= thr, vs >= thr, bool(r.get("gun"))
+    if me_k and me_v:
+        return "none", 3, f"my name on both sides ('{kt}' / '{vt}')"
+    if me_v:
+        return "death", 3, f"my name on the victim side ('{vt}', {v_how} {vs:.0f})"
+    if me_k:
+        if not gun:
+            return "utility", 3, f"utility: small / square icon ('{kt}')"
+        if before:
+            return "assist", 3, f"assist: '{before}' comes before my name ('{kt}')"
+        return "kill", 3, f"kill: my name first on the killer side ('{kt}', {k_how} {ks:.0f})"
+    if not gun or not (r.get("killer") or r.get("victim")):
+        return "none", 0, "no readable name and no weapon icon"
+    if vt and cs2_lenient_me(vt):
+        return "death", 1, f"death (name unreadable: '{vt}' looks like my name)"
+    if "+" in kt:
+        a, b = kt.split("+", 1)
+        if cs2_lenient_me(b) and not cs2_lenient_me(a):
+            return "assist", 1, f"assist (name unreadable: '{b.strip()}' after '+' looks like my name)"
+    return "kill?", 1, f"kill (name unreadable, border confirmed; '{kt or '-'}' -> '{vt or '-'}')"
+
+
+def cs2_track_rows(track):
+    """The best OCR row of each stored vote of a track: [(vote dict, row dict | None)]."""
+    res = []
+    for v in track.get("votes", []):
+        try:
+            rows = ocr_rows(v["boxes"], v["blobs"], "cs2")
+        except Exception:
+            rows = []
+        rows = [r for r in rows if r.get("killer") or r.get("victim")] or rows
+        res.append((v, max(rows, key=lambda r: (r.get("split") is not None, sum(b[2] - b[0] for b in r["boxes"]))) if rows else None))
+    return res
+
+
+def cs2_classify_track(track, cfg=None):
+    """Vote over the clearest frames of one outlined row. Returns {verdict, name_read, why, ktext, vtext, gun, hs, ks, vs, votes}."""
+    tally, votes, rows_ = {}, [], cs2_track_rows(track)
+    for v, r in rows_:
+        if r is None:
+            votes.append(("empty", 0, "OCR found nothing", "", ""))
+            continue
+        ver, w, why = cs2_vote_verdict(r, cfg)
+        votes.append((ver, w, why, r.get("ktext", ""), r.get("vtext", "")))
+        if ver in ("nosplit", "empty") or (ver == "none" and not w):
+            continue
+        key = "kill" if ver == "kill?" else ver
+        t = tally.setdefault(key, [0, 0, why, r])
+        t[0] += w
+        t[1] += 1 if w >= 3 else 0
+        if w >= 3 or t[1] == 0:
+            t[2], t[3] = why, r
+    if not tally:
+        return {"verdict": "none", "name_read": False, "why": "border row, but its text could not be split into killer / weapon / victim",
+                "ktext": "", "vtext": "", "gun": False, "hs": False, "ks": 0.0, "vs": 0.0, "votes": votes}
+    top = max(tally, key=lambda k: (tally[k][0], tally[k][1]))
+    wsum, definite, why, r = tally[top]
+    return {"verdict": top, "name_read": definite > 0, "why": why, "ktext": r.get("ktext", ""), "vtext": r.get("vtext", ""),
+            "gun": bool(r.get("gun")), "hs": any(x.get("hs") for _, x in rows_ if x), "ks": float(r.get("ks", 0)),
+            "vs": float(r.get("vs", 0)), "votes": votes}
+
+
+def border_analysis(sc, cfg):
+    """Sidecar -> kills / deaths / rejected rows, in the format of analyse_entry(). ONE kill per outlined-row track, time = the FIRST
+    frame the track appeared. Utility, assists, pre-clip rows, one-frame blips and deaths are never kills; a border-confirmed kill is never
+    rejected for a missing gunshot (needs_shot is False); more than 5 kills in one round drop the weakest reads."""
+    off, fps, n = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS)), int(sc.get("frames", 0))
+    kills, deaths, rej, vis, mine, tracks = [], [], [], [], [], sc.get("tracks", [])
+    det_rows = []
+    tok = hashlib.md5((sc.get("key") or "").encode()).hexdigest()[:4]       # an unreadable victim gets a name unique to this clip and row (never merged with another)
+    for t in sorted(tracks, key=lambda t: t["first"]):
+        tt = round(t["first"] / fps + off, 3)
+        c = cs2_classify_track(t, cfg)
+        row = f"[{c['ktext'] or '-'}] {'gun' if c['gun'] else 'util'} [{c['vtext'] or '-'}]"
+        v = c["verdict"]
+        mine.append({"t": tt, "row": row, "verdict": "kill" if v == "kill" else ("death" if v == "death" else "reject" if v in ("assist", "utility") else "none"),
+                     "why": c["why"], "hits": t["hits"]})
+        det_rows.append({"track": t, "cls": c, "t": tt})
+        last = round(t["last"] / fps + off, 3)
+        if v == "none":
+            continue
+        if t["hits"] < 2 and t["last"] < n - 2:
+            rej.append({"t": tt, "reason": f"one-frame blip ({row})", "ks": c["ks"] / 100})
+            continue
+        if t["first"] <= BORDER_PRE_F:
+            rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(c["ks"], c["vs"]) / 100})
+            continue
+        if v == "kill":
+            vis.append((tt, round(last + 0.3, 3)))
+            kills.append({"t": tt, "ks": (c["ks"] / 100) if c["name_read"] else 0.6, "hs": bool(c["hs"]), "row": row, "hits": t["hits"],
+                          "victim": c["vtext"] or f"(unread {tok}{t['id']})", "weapon": "gun", "box": None, "t_last": last, "needs_shot": False,
+                          "border": True, "name_read": c["name_read"], "track": t["id"], "why": c["why"]})
+        elif v == "death":
+            deaths.append(tt)
+            rej.append({"t": tt, "reason": f"{c['why']} - not a kill", "ks": c["vs"] / 100})
+        else:
+            vis.append((tt, round(last + 0.3, 3)))
+            rej.append({"t": tt, "reason": c["why"], "ks": c["ks"] / 100})
+    while True:                                                    # a round has 5 enemies: more than 5 kills in 115 s, the weakest reads go
+        over = next(([x for x in kills if 0 <= x["t"] - a["t"] <= CS2_ROUND_S] for a in kills
+                     if len([x for x in kills if 0 <= x["t"] - a["t"] <= CS2_ROUND_S]) > 5), None)
+        cand = [x for x in over if x["hits"] <= 2] if over else []
+        if not cand:
+            break
+        d = min(cand, key=lambda k: (k["name_read"], k["hits"]))
+        kills.remove(d)
+        rej.append({"t": d["t"], "reason": f"duplicate kill: more than 5 of my kills in one CS2 round ({d['row']})", "ks": d["ks"]})
+    return {"kills": kills, "deaths": sorted(deaths), "revives": [], "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis,
+            "best_k": max([d["cls"]["ks"] for d in det_rows], default=0.0) / 100, "best_v": max([d["cls"]["vs"] for d in det_rows], default=0.0) / 100,
+            "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(tracks), "rows_max": len(tracks), "ocr_calls": sum(len(t.get("votes", [])) for t in tracks),
+            "cjk": {}, "border": True, "rows": det_rows}
+
+
+def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
+    """analyse_entry() plus the CS2 red-border list: when the clip's sidecar exists (or `build` creates it), the border-based list replaces the
+    name-based one; otherwise - and for every other game - this IS analyse_entry(). A clip whose sidecar holds no outlined row at all keeps the
+    name-based list (the border colour was not found: nothing is dropped on that evidence)."""
+    a = analyse_entry(entry, cfg, game)
+    if (game or entry.get("game")) != "cs2" or not rec:
+        return a
+    try:
+        det = Detector("cs2")
+        sc = border_load(rec, det)
+        if sc is None and build and rec["path"] not in BORDER_FAILED:
+            sc = border_build(rec, det, cfg)
+    except Exception as ex:
+        BORDER_FAILED.add(rec.get("path"))
+        out(f"CS2 row borders: {Path(rec.get('path', '?')).name}: {ex} - name-based kills used")
+        return a
+    if sc is None:
+        return a
+    b = border_analysis(sc, cfg)
+    if not sc.get("tracks"):
+        a["border_note"] = "no red-outlined row found in this clip: the name-based list is kept"
+        return a
+    b["old"] = a
+    return b
+
+
+# ---- commands: bordercache / rowdebug ----------------------------------------------------------------------------------------
+def _cs2_recs(cfg, only_scanned=False, det=None):
+    det = det or Detector("cs2")
+    store = load_kills_cache() if only_scanned else None
+    return [r for r in scan_clips(cfg) if r.get("game") == "cs2" and not r.get("error") and r.get("w")
+            and (store is None or kills_key(r, "cs2", det) in store)]
+
+
+def cmd_bordercache(args):
+    """V6.8.1: python montage.py bordercache cs2 [--all]. Builds the red-border sidecars (montage_data\\cs2_rows_v1) of the CS2 clips that have a
+    kill-cache entry and no sidecar. --all: every CS2 clip in the clip folders, existing sidecars rebuilt too. Prints the cost per clip."""
+    cfg = load_config()
+    det = Detector("cs2")
+    recs = _cs2_recs(cfg, only_scanned=not args.all, det=det)
+    if not shutil.which("ffmpeg"):
+        raise SystemExit("ffmpeg not found")
+    t0 = time.time()
+    res = border_build_many(recs, cfg, det, force=bool(args.all))
+    done = [sc for sc in res.values() if sc]
+    out(f"bordercache cs2: {len(recs)} clips in scope, {len(done)} sidecars built in {time.time() - t0:.0f}s"
+        + (f"; per clip: decode+track {sum(s['decode_secs'] for s in done) / len(done):.1f}s on average "
+           f"({sum(s['ms_per_frame'] for s in done) / len(done):.1f} ms per decoded frame at {BORDER_FPS} fps), "
+           f"OCR of the rows {sum(s['ocr_secs'] for s in done) / len(done):.1f}s on average; "
+           f"outlined rows per clip {sum(len(s['tracks']) for s in done) / len(done):.1f}" if done else "")
+        + f"; failed {len([r for r in recs if r['path'] in BORDER_FAILED])}")
+
+
+def grab_region_frame(rec, det, cfg, t):
+    """One killfeed-region frame (BGR, 1920x1080 space) at stream time t, or None."""
+    import numpy as np
+    r = run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", rec["path"], "-frames:v", "1", "-vf", region_filter(rec, det, cfg),
+             "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], timeout=60)
+    n = det.dw * det.dh * 3
+    if len(r.stdout) < n:
+        return None
+    return np.frombuffer(r.stdout[:n], np.uint8).reshape(det.dh, det.dw, 3).copy()
+
+
+def _kill_diff(old_ts, new_ts, tol=1.0):
+    """(only in the old list, only in the new list, matched pairs): kills match when they are within `tol` s."""
+    old_ts, new_ts, used, only_old, pairs = sorted(old_ts), sorted(new_ts), set(), [], []
+    for o in old_ts:
+        j = next((j for j, n in enumerate(new_ts) if j not in used and abs(n - o) <= tol), None)
+        if j is None:
+            only_old.append(o)
+        else:
+            used.add(j)
+            pairs.append((o, new_ts[j]))
+    return only_old, [n for j, n in enumerate(new_ts) if j not in used], pairs
+
+
+def rowdebug_clip(rec, cfg, det, store, images=False, rebuild=False, write=True):
+    """V6.8.1: everything rowdebug prints about one CS2 clip. Reads the sidecar (builds it when missing / --rebuild); never writes the real
+    kill cache or region files. Returns {"name", "lines", "old", "new", "only_old", "only_new", "cost"}."""
+    import cv2
+    name = Path(rec["path"]).name
+    lines = [f"=== {name}"]
+    sc = None if rebuild else border_load(rec, det)
+    imgs, how = {}, "loaded from the sidecar"
+    if sc is None:
+        sc = border_build(rec, det, cfg, write=write, keep_images=images)
+        imgs = sc.pop("_images", {})
+        how = "built now" + (" and saved" if write else " (not saved)")
+    cost = f"{how}: {sc['frames']} frames at {sc['fps']} fps, decode+track {sc['decode_secs']}s ({sc['ms_per_frame']} ms/frame), OCR of the rows {sc['ocr_secs']}s"
+    lines.append(f"border sidecar {cost}")
+    b = border_analysis(sc, cfg)
+    e = store.get(kills_key(rec, "cs2", det)) if store is not None else None
+    old = analyse_entry(e, cfg, "cs2") if e and not e.get("error") else None
+    lines.append(f"border tracks ({len(b['rows'])}):")
+    for i, d in enumerate(b["rows"], 1):
+        t, c = d["track"], d["cls"]
+        sl = [s[2] for s in t["slots"]]
+        slot = f"slot {sl[0]}" + (f"->{sl[-1]}" if sl[-1] != sl[0] else "") + (f" (moved {len(sl) - 1}x)" if len(sl) > 1 else "")
+        lines.append(f"  #{i}  first {ts(t['first'] / sc['fps'] + sc['v_off'])}  last {ts(t['last'] / sc['fps'] + sc['v_off'])}  frames {t['hits']}  {slot}"
+                     f"  -> {c['verdict'].upper()}{'' if c['name_read'] or c['verdict'] in ('none', 'death') else ' (name unreadable, border confirmed)'}")
+        lines.append(f"       killer side: '{c['ktext']}'   victim side: '{c['vtext']}'   {'gun' if c['gun'] else 'util'}{' HS' if c['hs'] else ''}   {c['why']}")
+        lines.append("       votes: " + "; ".join(f"{v[0]}({v[1]}) '{v[3]}' > '{v[4]}'" for v in c["votes"]))
+        if images and t.get("best_f") is not None:
+            try:
+                img = imgs.get(t["id"])
+                if img is None:
+                    fr = grab_region_frame(rec, det, cfg, t["best_f"] / sc["fps"])
+                    rc = t["best_rect"]
+                    img = fr[max(0, rc["y0"] - 2):rc["y1"] + 3, max(0, rc["x0"] - 2):rc["x1"] + 3] if fr is not None else None
+                if img is not None:
+                    d_ = HERE / "rowdebug_images" / re.sub(r"[^\w.-]+", "_", Path(rec["path"]).stem)
+                    d_.mkdir(parents=True, exist_ok=True)
+                    tm = t["best_f"] / sc["fps"] + sc["v_off"]
+                    fp = d_ / f"row{i}_{int(tm // 60)}m{tm % 60:05.2f}s.png"
+                    cv2.imencode(".png", img)[1].tofile(str(fp))
+                    lines.append(f"       crop saved: {fp}")
+            except Exception as ex:
+                lines.append(f"       (crop not saved: {ex})")
+    new_t = [k["t"] for k in b["kills"]]
+    old_t = [k["t"] for k in old["kills"]] if old else []
+    lines.append("old name-based kills: " + (", ".join(ts(t) for t in old_t) or "none") if old else "old name-based kills: (clip has no cached scan)")
+    lines.append("border-based kills:   " + (", ".join(ts(t) for t in new_t) or "none"))
+    only_old, only_new, _ = _kill_diff(old_t, new_t)
+    if old is not None:
+        lines.append(f"difference: {len(new_t)} border kills vs {len(old_t)} name-based"
+                     + (f"; only name-based: {', '.join(ts(t) for t in only_old)}" if only_old else "")
+                     + (f"; only border-based: {', '.join(ts(t) for t in only_new)}" if only_new else "")
+                     + ("" if only_old or only_new else "; same kills"))
+    if not sc.get("tracks"):
+        lines.append("NOTE: no red-outlined row found in this clip, so the name-based list stays in use for it")
+    for j in b["rej"]:
+        lines.append(f"   not a kill @ {ts(j['t'])}: {j['reason']}")
+    return {"name": name, "lines": lines, "old": old_t if old else None, "new": new_t, "only_old": only_old, "only_new": only_new,
+            "cost": sc["secs"], "tracks": len(sc.get("tracks", []))}
+
+
+def cmd_rowdebug(args):
+    """V6.8.1: python montage.py rowdebug cs2 <clip name or path> [--all] [--rebuild]. Diagnostic: border tracks, their classification and
+    the OCR text of both sides, the old name-based kills and the difference; crops of each track in rowdebug_images\\<clip>\\. --all: one table
+    of every cached CS2 clip sorted by the largest difference, saved to rowdebug_cs2.txt. Never writes the real kill cache or region files."""
+    cfg = load_config()
+    det = Detector("cs2")
+    store = load_kills_cache()
+    if args.all:
+        recs = _cs2_recs(cfg, only_scanned=True, det=det)
+        rows = []
+        for i, r in enumerate(recs, 1):
+            try:
+                d = rowdebug_clip(r, cfg, det, store, images=False, rebuild=args.rebuild)
+            except Exception as ex:
+                rows.append({"name": Path(r["path"]).name, "old": None, "new": [], "only_old": [], "only_new": [], "err": str(ex)})
+                continue
+            rows.append(d)
+            progress(i / len(recs), f"rowdebug {i}/{len(recs)}")
+        rows.sort(key=lambda d: (-(len(d["only_old"]) + len(d["only_new"])), -abs(len(d["new"]) - len(d["old"] or []))))
+        hdr = f"{'clip':58} {'name':>5} {'border':>6} {'diff':>5}  differences"
+        table = [f"rowdebug cs2 - {len(rows)} cached clips, sorted by the largest difference (name-based = V6.7.2 list, border = V6.8.1 list)", hdr, "-" * len(hdr)]
+        for d in rows:
+            if d.get("err"):
+                table.append(f"{d['name'][:58]:58} {'-':>5} {'-':>6} {'-':>5}  ERROR {d['err']}")
+                continue
+            table.append(f"{d['name'][:58]:58} {len(d['old'] or []):5d} {len(d['new']):6d} {len(d['new']) - len(d['old'] or []):+5d}  "
+                         + ("; ".join(([f"name-only {', '.join(ts(t) for t in d['only_old'])}"] if d["only_old"] else [])
+                                      + ([f"border-only {', '.join(ts(t) for t in d['only_new'])}"] if d["only_new"] else [])) or "-"))
+        table.append(f"total: name-based {sum(len(d['old'] or []) for d in rows)} kills, border-based {sum(len(d['new']) for d in rows)} kills, "
+                     f"clips that differ {sum(1 for d in rows if d['only_old'] or d['only_new'])}")
+        txt = "\n".join(table)
+        out(txt)
+        (HERE / "rowdebug_cs2.txt").write_text(txt + "\n", encoding="utf-8")
+        out(f"saved {HERE / 'rowdebug_cs2.txt'}")
+        return
+    if not args.clip:
+        raise SystemExit("rowdebug cs2 <clip name or path> [--all]")
+    q = args.clip.lower()
+    recs = [r for r in _cs2_recs(cfg, det=det) if Path(r["path"]).name.lower() == q or r["path"].lower() == q]
+    recs = recs or [r for r in _cs2_recs(cfg, det=det) if q in r["path"].lower()]
+    if not recs and os.path.isfile(args.clip):
+        rec = analyse_clip(os.path.abspath(args.clip), load_json(CLIPS_CACHE, {}), False, cfg.get("bar"))[1]
+        rec["game"] = "cs2"
+        recs = [rec]
+    if not recs:
+        raise SystemExit(f"no CS2 clip matches '{args.clip}' (give the file name, a part of it, or a full path)")
+    for r in recs[:10]:
+        for ln in rowdebug_clip(r, cfg, det, store, images=True, rebuild=args.rebuild)["lines"]:
+            out(ln)
+
+
 _CS2_STREAM = {}
 
 
@@ -2737,6 +3410,99 @@ def cmd_regiondefault(args):
     out(f"{args.game}: saved default region set to {reg} (hash {region_stamp(reg)}) from {src}; 'Reset to default' and '--use default' now use it. The current region is unchanged.")
 
 
+def _hash_arg(h):
+    h = str(h or "").strip().lower()
+    return h if h.startswith("ocr") else "ocr" + h
+
+
+def _entry_key(p):
+    """The cache key stored at the start of a kill-entry file (the OCR payload is not loaded)."""
+    with open(p, "rb") as f:
+        head = f.read(3000).decode("utf-8", "ignore")
+    return json.loads('"' + re.match(r'\{"key": "((?:[^"\\]|\\.)*)"', head).group(1) + '"')
+
+
+def rescan_group_clips(game, h_old, cfg=None):
+    """V6.8.1: the clips of a game that have a kill entry under region hash `h_old` and NO entry under the current region, found by
+    their file (name, size, time) in the clip folders of Settings. Returns {"current", "recs", "old_keys" {path: key under h_old},
+    "missing" (clips with an old entry whose file is no longer in the folders), "have_current" (already scanned under the current region)}."""
+    cfg = cfg or load_config()
+    cur = Detector(game).d["stamp"]
+    det = Detector(game)
+    store = load_kills_cache()
+    idx = _cache_index()
+    old, has_cur = {}, set()
+    for (name, size, mt, g), lst in idx.items():
+        if g != game:
+            continue
+        if any(e[3] == cur and e[4] == ALGO[1:] for e in lst):
+            has_cur.add((name, size, mt))
+        olds = [e for e in lst if e[3] == h_old and e[4] == ALGO[1:]]
+        if olds:
+            old[(name, size, mt)] = olds
+    recs, old_keys, found = [], {}, set()
+    for r in scan_clips(cfg):
+        if r.get("error") or not r.get("w") or r.get("game") != game:
+            continue
+        try:
+            path, size, mt = file_key(r["path"]).split("|")[:3]
+        except OSError:
+            continue
+        k3 = (os.path.basename(path).lower(), size, mt)
+        if k3 not in old:
+            continue
+        found.add(k3)
+        if k3 in has_cur or kills_key(r, game, det) in store:
+            continue
+        recs.append(r)
+        try:
+            old_keys[r["path"]] = _entry_key(old[k3][0][0])
+        except Exception:
+            old_keys[r["path"]] = None
+    return {"current": cur, "recs": recs, "old_keys": old_keys, "missing": len(set(old) - found), "have_current": len(found & has_cur)}
+
+
+def rescan_group(game, h_old, cfg=None, info=None):
+    """V6.8.1: scan ONLY the clips of rescan_group_clips() under the current region and ADD their entries (old entries are never deleted
+    or overwritten). Valorant: the old entry is first copied into valorant_cache_backup.json (first copy per clip only); the caller has
+    asked the user, which counts as the explicit confirmation. Cancel = CANCEL: clips already scanned keep their new entries."""
+    cfg = cfg or load_config()
+    info = info or rescan_group_clips(game, h_old, cfg)
+    if not info["recs"]:
+        out(f"rescan {h_old}: no clips to scan")
+        return 0
+    if game == "valorant":
+        store = load_kills_cache()
+        nb = sum(bool(info["old_keys"].get(r["path"]) and backup_valorant_entry(store, info["old_keys"][r["path"]])) for r in info["recs"])
+        out(f"Valorant: {nb} old entries copied into valorant_cache_backup.json before the rescan")
+    out(f"rescanning {len(info['recs'])} clips from {h_old} to the current region {info['current']} (old entries stay)")
+    return run_scan(cfg, [game], [r["path"] for r in info["recs"]], 0, False, True)
+
+
+def cmd_rescanhash(args):
+    """V6.8.1: python montage.py rescanhash <game> <hash> [--confirm]. Without --confirm it only prints the clips and the count."""
+    game, h = args.game, _hash_arg(args.hash)
+    cfg = load_config()
+    info = rescan_group_clips(game, h, cfg)
+    n = len(info["recs"])
+    if h == info["current"]:
+        out(f"rescanhash: {h} is the current {game} region - nothing to do")
+        return
+    for r in info["recs"]:
+        out(f"  {Path(r['path']).name}")
+    extra = (f"; {info['missing']} clip(s) with an entry under {h} are not in the clip folders any more" if info["missing"] else "") + \
+            (f"; {info['have_current']} already have an entry under the current region" if info["have_current"] else "")
+    out(f"{n} {game} clips have an entry under {h} and none under the current region {info['current']}{extra}")
+    if not args.confirm:
+        out("Nothing was changed. Add --confirm to rescan these clips under the current region (old entries stay).")
+        return
+    if job_active():
+        out(f"rescanhash: refused, {job_active()} is running")
+        return
+    out(f"Rescan {n} clips from {h} to the current region {info['current']}: --confirm given")
+    rescan_group(game, h, cfg, info)
+
+
 def region_options(game):
     """V6.8: every saved region of a game, as rows for the Settings picker (the data regioncheck prints): current, built-in default,
     saved default, dated backups, and each hash found in the cached entries."""
@@ -2885,6 +3651,13 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
             if g == "valorant":
                 backup_valorant_entry(cache, kills_key(r, g, dets[g]))      # V6.7.6: an entry about to be overwritten is copied first
             cache.put(kills_key(r, g, dets[g]), res)           # saved the moment this clip finishes
+            if g == "cs2" and not CANCEL.is_set():             # V6.8.1: the red-border sidecar of this clip (separate cache; failure keeps the name-based list)
+                try:
+                    if border_load(r, dets[g]) is None:
+                        border_build(r, dets[g], cfg)
+                except Exception as ex:
+                    BORDER_FAILED.add(r["path"])
+                    LOGONLY(f"CS2 row borders: {Path(r['path']).name}: {ex}")
             return r, g, res, None
         except Exception as ex:
             return r, g, None, f"{type(ex).__name__}: {ex}"
@@ -2899,7 +3672,7 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
                 errs += 1
                 out(f"[{done}/{len(jobs)}] {g:8} ERROR {name}: {err}")
             else:
-                a = analyse_entry(res, cfg, g)
+                a = analyse_clip_entry(r, res, cfg, g)
                 out(f"[{done}/{len(jobs)}] {g:8} {len(a['kills'])} kills {' '.join(ts(k['t']) for k in a['kills']) or '-'}"
                     f" | rows found {a['rows_max']} max/frame, {a['ocr_calls']} OCR calls | best name killer-side {a['best_k']:.2f},"
                     f" victim-side {a['best_v']:.2f} | rect {content_rect(r, cfg)} crop {'yes' if r.get('bars') else 'no'} | {name} ({res['secs']}s)")
@@ -2928,6 +3701,7 @@ def game_pool(cfg, game, paths=None):
     ps = set(paths) if paths is not None else None
     stats = {"tagged": 0, "scanned": 0, "with_kills": 0}
     pool, allrej, cjk = [], [], {}
+    cands = []
     for r in scan_clips(cfg):
         if r.get("error") or not r.get("w") or r.get("game") != game or (ps is not None and r["path"] not in ps):
             continue
@@ -2937,8 +3711,15 @@ def game_pool(cfg, game, paths=None):
         e = cache.get(kills_key(r, game, det))
         if not e or e.get("error"):
             continue
+        cands.append((r, e))
+    if game == "cs2" and cands:                            # V6.8.1: red-border row sidecars, built once per clip when missing
+        try:
+            border_build_many([r for r, _ in cands], cfg, det)
+        except Exception as ex:
+            out(f"CS2 row borders: {type(ex).__name__}: {ex} - name-based kills used where a sidecar is missing")
+    for r, e in cands:
         stats["scanned"] += 1
-        a = analyse_entry(e, cfg, game)
+        a = analyse_clip_entry(r, e, cfg, game)
         for k_, v_ in a.get("cjk", {}).items():
             cjk[k_] = cjk.get(k_, 0) + v_
         for j in a["rej"]:
@@ -7675,6 +8456,7 @@ class App:
                     self.busy = self.scan_active = False
                     self._prog_ui(0, "Idle")
                     self.set_buttons(True)
+                    self.rp_state()
                     bb_, self._busy_btn = self._busy_btn, None
                     if bb_:
                         self.flash_button(*bb_)
@@ -7971,16 +8753,14 @@ class App:
         self.m_incl_used = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="Include used clips", variable=self.m_incl_used).pack(side="left", padx=(12, 3))
         self.btn(top2, "Unflag all", self.unflag_all, name="manual:unflag_all").pack(side="left", padx=(12, 3))
-        top3 = ttk.Frame(s1)                                        # V6.8: live clip search above the list
-        top3.pack(fill="x", pady=(2, 0))
-        ttk.Label(top3, text="Search clips").pack(side="left", padx=(3, 4))
+        ttk.Label(top, text="Search clips").pack(side="left", padx=(14, 4))      # V6.8.1: on the first row of Step 1, right of 'Show'
         self.m_csearch = tk.StringVar()
         self.m_csearch.trace_add("write", lambda *a: self.csearch_changed())
-        self.e_csearch = ttk.Entry(top3, textvariable=self.m_csearch, width=34)
+        self.e_csearch = ttk.Entry(top, textvariable=self.m_csearch, width=28)
         self.e_csearch.pack(side="left")
-        self.btn(top3, "Clear", lambda: self.m_csearch.set(""), name="manual:clear_search").pack(side="left", padx=4)
+        self.btn(top, "Clear", lambda: self.m_csearch.set(""), name="manual:clear_search").pack(side="left", padx=4)
         self.m_cshown = tk.StringVar(value="")
-        ttk.Label(top3, textvariable=self.m_cshown, style="Dim.TLabel").pack(side="left", padx=8)
+        ttk.Label(top, textvariable=self.m_cshown, style="Dim.TLabel").pack(side="left", padx=8)
         fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used", "open", "trash"), height=20, selectmode="none")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 230, "Used"),
@@ -8272,7 +9052,7 @@ class App:
             e = kc.get(kills_key(r, g, det)) if det else None
             ks = None
             if e and not e.get("error"):
-                ks = [k["t"] for k in compute_kills(e, cfg, g)[0]]
+                ks = [k["t"] for k in analyse_clip_entry(r, e, cfg, g)["kills"]]
             try:
                 mt = os.path.getmtime(r["path"])
             except OSError:
@@ -8848,7 +9628,7 @@ class App:
         if not e:
             out("Not scanned yet: press Rescan this clip")
             return
-        a = analyse_entry(e, cfg, g)
+        a = analyse_clip_entry(rec, e, cfg, g)
         ks, ds = a["kills"], a["deaths"]
         out(f"{Path(p).name}: {len(ks)} kills (before the gunshot check): " + ", ".join(ts(k['t']) + ("*HS" if k.get("hs") else "") for k in ks) +
             f"; my deaths at {', '.join(ts(d) for d in ds) or '-'}; rows found {a['rows_max']} max/frame, {a['ocr_calls']} OCR calls;"
@@ -9079,6 +9859,8 @@ class App:
         self.b_rp_use.pack(side="left", padx=(0, PX))
         self.b_rp_def = self.btn(h, "Set as default", self.rp_set_default, name="region:default")
         self.b_rp_def.pack(side="left", padx=(0, PX))
+        self.b_rp_resc = self.btn(h, "Rescan this group to the current region", self.rp_rescan, name="region:rescan")
+        self.b_rp_resc.pack(side="left", padx=(0, PX))
         self.btn(h, "Refresh", self.rp_refresh, name="region:refresh").pack(side="left")
         r[0] += 1
         self.rp_rows, self._rp_loaded = {}, False
@@ -9212,8 +9994,18 @@ class App:
                                 values=(row["hash"], row["entries"] or "", row["first"], row["last"], ("[" + ", ".join(f"{v:g}" for v in row["region"]) + "]") if row["region"] else "values not stored in these entries"))
         if keep and self.rp_tree.exists(keep[0]):
             self.rp_tree.selection_set(keep[0])
+            self.rp_state()
         else:
             self.rp_info.set("Select a region to see how many cached clips it would keep valid.")
+
+    def rp_state(self):
+        """V6.8.1: 'Rescan this group' is disabled for the row that is the current region (and while a task runs)."""
+        try:
+            row = self.rp_selected()
+            off = self.busy or (row is not None and row["hash"] == Detector(self.rp_game.get()).d["stamp"])
+            self.b_rp_resc.state(["disabled"] if off else ["!disabled"])
+        except (tk.TclError, AttributeError):
+            pass
 
     def rp_selected(self):
         sel = self.rp_tree.selection()
@@ -9224,8 +10016,35 @@ class App:
         if not row:
             return
         v, vc, need = region_effect(self.rp_game.get(), row["hash"])
+        self.rp_state()
         self.rp_info.set(f"{row['label']} ({row['hash']}): {vc} cached clips ({v} entries) would be valid under it, {need} would need a scan."
                          + ("" if row["usable"] else "  Its region values are not stored: it cannot be used."))
+
+    def rp_rescan(self):
+        """V6.8.1: scan only the clips that have an entry under the selected hash and none under the current region (adds entries)."""
+        row, g = self.rp_selected(), self.rp_game.get()
+        if not row:
+            messagebox.showinfo("Killfeed region", "Select a region first.")
+            return
+        cur = Detector(g).d["stamp"]
+        if row["hash"] == cur:
+            messagebox.showinfo("Killfeed region", "This is the current region - nothing to rescan.")
+            return
+        busy = job_active() or (self.busy and "a task") or None
+        if busy:
+            messagebox.showinfo("Killfeed region", f"Not now: {busy} is running. Wait for it to finish (or cancel it) first.")
+            return
+        info = rescan_group_clips(g, row["hash"], load_config())
+        n = len(info["recs"])
+        if not n:
+            messagebox.showinfo("Killfeed region", f"No clips to rescan: every clip with an entry under {row['hash']} already has one under {cur}"
+                                + (f" ({info['missing']} are not in the clip folders any more)." if info["missing"] else "."))
+            return
+        if not messagebox.askyesno("Killfeed region", f"Rescan {n} clips from {row['hash']} to the current region {cur}?\n\n"
+                                   "The old entries stay; new ones are added. Cancel stops it, clips already scanned keep their new entries."
+                                   + ("\nValorant: each old entry is first copied into valorant_cache_backup.json." if g == "valorant" else "")):
+            return
+        self.run_task("rescan", lambda: (rescan_group(g, row["hash"], load_config(), info), self.q.put(("call", self.rp_refresh))))
 
     def rp_use(self):
         """Same code path as 'regionrestore --use' (region_apply). Never starts a scan."""
@@ -9452,7 +10271,7 @@ def grab_gray_bgr(path, t, w, h):
 
 
 DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "VAL_BACKUP", "REGION_DEFAULTS", "JOB_LOCK", "USED_SONGS",
-                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE")
+                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE", "BORDER_DIR")
 
 
 def use_data_dir(d):
@@ -11356,6 +12175,21 @@ def main():
     rd.add_argument("game", choices=GAMES)
     rd.add_argument("target", help="<hash> | current | backup:<file> | file:<path>")
     rd.set_defaults(fn=cmd_regiondefault)
+    bc = sp.add_parser("bordercache", help="V6.8.1: build the CS2 red-border row sidecars (montage_data\\cs2_rows_v1)")
+    bc.add_argument("game", choices=["cs2"])
+    bc.add_argument("--all", action="store_true", help="every CS2 clip in the clip folders, existing sidecars rebuilt (default: scanned clips without a sidecar)")
+    bc.set_defaults(fn=cmd_bordercache)
+    rw = sp.add_parser("rowdebug", help="V6.8.1: CS2 red-border tracks of a clip, their classification, the old name-based kills and the difference")
+    rw.add_argument("game", choices=["cs2"])
+    rw.add_argument("clip", nargs="?", help="clip file name (or part of it) or path")
+    rw.add_argument("--all", action="store_true", help="one table of every cached CS2 clip, sorted by the largest difference (rowdebug_cs2.txt)")
+    rw.add_argument("--rebuild", action="store_true", help="rebuild the sidecar(s) first")
+    rw.set_defaults(fn=cmd_rowdebug)
+    rh = sp.add_parser("rescanhash", help="V6.8.1: rescan only the clips that have an entry under <hash> and none under the current region")
+    rh.add_argument("game", choices=GAMES)
+    rh.add_argument("hash")
+    rh.add_argument("--confirm", action="store_true", help="really scan (without it only the list and the count are printed)")
+    rh.set_defaults(fn=cmd_rescanhash)
     rr = sp.add_parser("regionrestore", help="V6.7.6: list / set the killfeed region (never chosen automatically)")
     rr.add_argument("game", choices=GAMES)
     rr.add_argument("--use", help="<hash> | default | backup:<file> | file:<path>")
