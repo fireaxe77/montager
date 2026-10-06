@@ -15,7 +15,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-REAL = (HERE / "montage_data").is_dir() and "MONTAGER_DATA" not in os.environ
+REAL = "MONTAGER_DATA" not in os.environ and any((HERE / "montage_data").glob("kills_v*/*.json"))      # an empty folder (made by an import) is not a real cache
 import montage as M                                                                           # noqa: E402
 import test_v67 as T                                                                          # noqa: E402
 
