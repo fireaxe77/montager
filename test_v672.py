@@ -182,8 +182,11 @@ def main():
     real_checks(old)
     print("== test_v67.py ==")
     import subprocess
-    r = subprocess.run([sys.executable, str(HERE / "test_v67.py")], capture_output=True, text=True, cwd=str(HERE))
-    check(r.returncode == 0 and "ALL OK" in r.stdout, "test_v67.py still passes" + ("" if r.returncode == 0 else "\n" + r.stdout[-800:]))
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")           # V6.7.4: clip names with non-ANSI letters must not crash the piped child
+    r = subprocess.run([sys.executable, str(HERE / "test_v67.py")], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       cwd=str(HERE), env=env)
+    bad = [ln for ln in (r.stdout or "").splitlines() if "FAIL" in ln] + ((r.stderr or "").strip().splitlines()[-6:] if r.returncode else [])
+    check(r.returncode == 0 and "ALL OK" in r.stdout, "test_v67.py still passes" + ("" if r.returncode == 0 else "\n    " + "\n    ".join(bad)))
     print(("\nALL OK" if not FAILS and not T.FAILS else f"\n{len(FAILS) + len(T.FAILS)} FAILED:\n  " + "\n  ".join(FAILS + T.FAILS)))
     return 1 if (FAILS or T.FAILS) else 0
 
