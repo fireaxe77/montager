@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.7.6"
+APP_VERSION = "V6.8"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2321,8 +2321,9 @@ def region_report(game):
     det = Detector(game)
     dflt = DEFAULT_REGION[game]
     groups, other = region_groups(game)
+    sd = saved_default(game)
     return {"game": game, "current": det.d["region"], "current_hash": det.d["stamp"], "calibrated": det.calibrated,
-            "default": list(dflt), "default_hash": region_stamp(dflt),
+            "default": list(dflt), "default_hash": region_stamp(dflt), "saved_default": sd, "saved_default_hash": region_stamp(sd) if sd else None,
             "backups": [(b, _read_region(b)) for b in region_backups(game)], "groups": groups, "other_format": other}
 
 
@@ -2339,7 +2340,9 @@ def cmd_regioncheck(args):
     rep = region_report(args.game)
     out(f"== {args.game}: killfeed region ({DATA / ('detect_' + args.game + '.json')}) ==")
     out(f"current region  {rep['current']}  hash {rep['current_hash']}  ({'calibrated' if rep['calibrated'] else 'default'})")
-    out(f"default region  {rep['default']}  hash {rep['default_hash']}")
+    out(f"default region  {rep['default']}  hash {rep['default_hash']}  (built-in)")
+    if rep["saved_default"]:
+        out(f"saved default   {rep['saved_default']}  hash {rep['saved_default_hash']}  (Reset to default / --use default)")
     out(f"dated backups of the region file: {len(rep['backups'])}")
     for b, reg in rep["backups"]:
         out(f"  {b.name}  {_fmt_t(b.stat().st_mtime)}  region {reg if reg else 'default (none stored)' if reg is None else 'unreadable'}"
@@ -2355,11 +2358,115 @@ def cmd_regioncheck(args):
         out(f"  current hash {rep['current_hash']} matches {len(g[rep['current_hash']]['files'])} entries")
 
 
+JOB_LOCK = DATA / "job_running.lock"                   # V6.8: present while a scan or render runs (regiontest refuses to start then)
+_JOB_DEPTH = [0]
+_JOB_MUTEX = threading.Lock()
+
+
+def job_enter(name):
+    with _JOB_MUTEX:
+        _JOB_DEPTH[0] += 1
+        try:
+            JOB_LOCK.parent.mkdir(parents=True, exist_ok=True)
+            JOB_LOCK.write_text(json.dumps({"pid": os.getpid(), "job": name, "t": time.time()}), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def job_exit():
+    with _JOB_MUTEX:
+        _JOB_DEPTH[0] = max(0, _JOB_DEPTH[0] - 1)
+        if not _JOB_DEPTH[0]:
+            try:
+                JOB_LOCK.unlink()
+            except OSError:
+                pass
+
+
+def _pid_alive(pid):
+    try:
+        if os.name == "nt":
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))      # PROCESS_QUERY_LIMITED_INFORMATION
+            if h:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def job_active():
+    """Name of the scan / render / task running in this or another Montager process, else None (a lock of a dead process is ignored)."""
+    if _JOB_DEPTH[0]:
+        return (load_json(JOB_LOCK, {}) or {}).get("job") or "a job"
+    if JOB_LOCK.exists():
+        d = load_json(JOB_LOCK, {}) or {}
+        if d.get("pid") and _pid_alive(d["pid"]):
+            return d.get("job") or "a job"
+    return None
+
+
+def with_job(name):
+    def deco(fn):
+        def w(*a, **k):
+            job_enter(name)
+            try:
+                return fn(*a, **k)
+            finally:
+                job_exit()
+        w.__name__, w.__doc__ = fn.__name__, fn.__doc__
+        return w
+    return deco
+
+
+REGION_DEFAULTS = DATA / "region_defaults.json"      # V6.8: {game: [x0, y0, x1, y1]} the saved default the user chose (never set automatically)
+
+
+def _valid_region(reg):
+    try:
+        reg = [float(v) for v in reg]
+    except Exception:
+        return None
+    return [round(v, 4) for v in reg] if len(reg) == 4 and 0 <= reg[0] < reg[2] <= 1 and 0 <= reg[1] < reg[3] <= 1 else None
+
+
+def saved_default(game):
+    """V6.8: the user's saved default region of a game, or None (then the built-in DEFAULT_REGION is the default)."""
+    return _valid_region((load_json(REGION_DEFAULTS, {}) or {}).get(game) or [])
+
+
+def set_saved_default(game, region):
+    reg = _valid_region(region)
+    if not reg:
+        raise ValueError("not a valid killfeed region")
+    d = load_json(REGION_DEFAULTS, {}) or {}
+    d[game] = reg
+    save_json(REGION_DEFAULTS, d)
+    return reg
+
+
+def apply_default_region(game):
+    """V6.8: 'Reset to default': the saved default when there is one (written as the game's region), else the built-in default (no region
+    key = the built-in constants). Only Reset / --use default use the saved default; a game without a region file always reads the built-in one."""
+    reg = saved_default(game)
+    if reg:
+        return save_region(game, reg)
+    reset_region(game)
+    return None
+
+
 def _resolve_region(game, use):
-    """(region|None for default, hash, source text) or (False, None, why). Never guesses: only what the user named."""
+    """(region|None for the built-in default, hash, source text) or (False, None, why). Never guesses: only what the user named."""
     rep = region_report(game)
     dflt_h = rep["default_hash"]
+    if use == "builtin":
+        return None, dflt_h, "the built-in default region"
     if use == "default":
+        if rep["saved_default"]:
+            return list(rep["saved_default"]), rep["saved_default_hash"], "the saved default region"
         return None, dflt_h, "the default region"
     for pre in ("backup:", "file:"):
         if use.startswith(pre):
@@ -2375,6 +2482,8 @@ def _resolve_region(game, use):
     h = use if use.startswith("ocr") else "ocr" + use
     if not re.fullmatch(r"ocr[0-9a-f]{8}", h):
         return False, None, f"'{use}' is not a hash, 'default', 'backup:<file>' or 'file:<path>'"
+    if rep["saved_default"] and h == rep["saved_default_hash"]:
+        return list(rep["saved_default"]), h, "the saved default region"
     if h == dflt_h:
         return None, h, "the default region"
     if h == rep["current_hash"]:
@@ -2388,14 +2497,45 @@ def _resolve_region(game, use):
     return False, None, f"no region values are available for hash {h} (its entries do not store the region and no backup matches); nothing changed"
 
 
-def _valid_counts(game, stamp):
-    """(entries valid under this hash, clips of the game's cache that would need a rescan)."""
+def region_effect(game, stamp):
+    """(entries valid under this hash, clips valid, clips of the game's cache that would need a scan)."""
     groups, _ = region_groups(game)
     clips = set()
     for gr in groups.values():
         clips |= gr["clips"]
     mine = groups.get(stamp, {"files": [], "clips": set()})
-    return len(mine["files"]), len(clips - mine["clips"])
+    return len(mine["files"]), len(mine["clips"]), len(clips - mine["clips"])
+
+
+def _valid_counts(game, stamp):
+    v, _vc, need = region_effect(game, stamp)
+    return v, need
+
+
+def region_apply(game, use):
+    """V6.8: the ONE code path behind 'regionrestore --use' and the Settings picker. Saves a dated backup of the current region file, sets
+    the region named by `use`, verifies the hash, and returns (ok, [message lines], info). Never starts a scan."""
+    reg, h, src = _resolve_region(game, use)
+    if reg is False:
+        return False, [f"regionrestore: {src}"], {}
+    p = DATA / f"detect_{game}.json"
+    keep = p.read_bytes() if p.exists() else None
+    if reg is None:
+        reset_region(game)
+    else:
+        save_region(game, reg)
+    bk = region_backups(game)[-1].name
+    new = Detector(game)
+    if new.d["stamp"] != h:                                   # the values did not reproduce the hash: put everything back
+        if keep is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.write_bytes(keep)
+        return False, [f"regionrestore: the region from {src} gives hash {new.d['stamp']}, not {h}; the previous region was put back (backup {bk})"], {"backup": bk}
+    valid, vclips, rescan = region_effect(game, h)
+    return True, [f"{game} region set to {src}: {new.d['region']} hash {h} (backup of the previous region file: {bk})",
+                  f"cached entries valid under this region: {valid}; clips that would need a rescan: {rescan} (their old entries stay on disk)"], \
+        {"backup": bk, "hash": h, "valid": valid, "rescan": rescan}
 
 
 def cmd_regionrestore(args):
@@ -2404,7 +2544,10 @@ def cmd_regionrestore(args):
     rep = region_report(game)
     if not args.use:
         out(f"== {game}: region options (nothing is chosen for you, nothing was changed) ==")
-        out(f"  --use default         {rep['default']}  hash {rep['default_hash']}  ({_valid_counts(game, rep['default_hash'])[0]} cached entries valid)")
+        out(f"  --use default         {rep['saved_default'] or rep['default']}  hash {rep['saved_default_hash'] or rep['default_hash']}  "
+            f"({'saved default' if rep['saved_default'] else 'built-in default'}; {_valid_counts(game, rep['saved_default_hash'] or rep['default_hash'])[0]} cached entries valid)")
+        if rep["saved_default"]:
+            out(f"  --use builtin         {rep['default']}  hash {rep['default_hash']}  (built-in default; {_valid_counts(game, rep['default_hash'])[0]} cached entries valid)")
         out(f"  (current)             {rep['current']}  hash {rep['current_hash']}  ({_valid_counts(game, rep['current_hash'])[0]} cached entries valid)")
         for b, reg in rep["backups"]:
             if reg is not False:
@@ -2416,29 +2559,213 @@ def cmd_regionrestore(args):
                 out("      (these entries do not store their region: usable only if a backup or --use file:<path> provides the values)")
         out(f"run again with --use <option> to set one. A dated backup of the current region file is saved first.")
         return
-    reg, h, src = _resolve_region(game, args.use)
-    if reg is False:
-        out(f"regionrestore: {src}")
-        return
-    bk = None
-    keep = (DATA / f"detect_{game}.json").read_bytes() if (DATA / f"detect_{game}.json").exists() else None
-    if reg is None:
-        reset_region(game)
-    else:
-        save_region(game, reg)
-    bk = region_backups(game)[-1].name
-    new = Detector(game)
-    if new.d["stamp"] != h:                                   # the values did not reproduce the hash: put everything back
-        p = DATA / f"detect_{game}.json"
-        if keep is None:
-            p.unlink(missing_ok=True)
+    ok, lines, _info = region_apply(game, args.use)
+    for ln in lines:
+        out(ln)
+
+
+REGIONTEST_WIDE = [0.50, 0.0, 1.0, 0.45]
+REGIONTEST_MUST = ("Replay 2026-06-25 01-27-36.mov", "Counter-strike 2 2025.02.03 - 09.12.42.24.DVR.mp4",
+                   "Counter-strike 2 2025.02.04 - 09.46.26.11.DVR.mp4")
+
+
+def _vdc_order(n):
+    """0..n-1 in an evenly spreading order (middle first, then the quarters, ...), so any prefix is spread over the whole list."""
+    seen, order, i = set(), [], 0
+    while len(order) < n and i < 4096:
+        i += 1
+        f, b, d = 0.0, 0.5, i
+        while d:
+            f += (d & 1) * b
+            d >>= 1
+            b /= 2
+        k = min(n - 1, int(f * n))
+        if k not in seen:
+            seen.add(k)
+            order.append(k)
+    order += [k for k in range(n) if k not in seen]
+    return order
+
+
+def regiontest_pick(clips, n=15):
+    """V6.8: the default clip set of regiontest from [{path, w, h, ...}] (existing CS2 clips): the three named clips (when present), then
+    up to three .mov files, then clips spread over every resolution (round robin) up to n."""
+    by = {os.path.basename(c["path"]).lower(): c for c in clips}
+    sel = []
+    for nm in REGIONTEST_MUST:
+        c = by.get(nm.lower())
+        if c and c not in sel:
+            sel.append(c)
+    rest = sorted((c for c in clips if c not in sel), key=lambda c: (c.get("w", 0), c.get("h", 0), c.get("mtime", 0), c["path"]))
+    mov_all = [c for c in rest if c["path"].lower().endswith(".mov")]
+    movs = [mov_all[k] for k in _vdc_order(len(mov_all))]
+    for c in movs[:3]:
+        if len(sel) < n:
+            sel.append(c)
+    groups = {}
+    for c in rest:
+        if c not in sel:
+            groups.setdefault((c.get("w"), c.get("h")), []).append(c)
+    queues = [[g[k] for k in _vdc_order(len(g))] for _, g in sorted(groups.items(), key=lambda kv: str(kv[0]))]
+    while len(sel) < n and any(queues):
+        for q in queues:
+            if q and len(sel) < n:
+                sel.append(q.pop(0))
+    return sel
+
+
+def regiontest_disagree(kill_lists, tol=0.5):
+    """V6.8: True when the regions found different kills: another count, or a timestamp more than tol seconds apart."""
+    ls = [sorted(k) for k in kill_lists]
+    if any(len(x) != len(ls[0]) for x in ls):
+        return True
+    return any(abs(a - b) > tol for x in ls[1:] for a, b in zip(ls[0], x))
+
+
+def _safe_name(n):
+    return re.sub(r'[^A-Za-z0-9._ -]+', "_", n)[:80].strip(" .")
+
+
+def cmd_regiontest(args):
+    """V6.8: python montage.py regiontest cs2 [--clips <file>] [--regions calibrated,default,wide] [--out <folder>]: the normal CS2 scan of
+    clips under several killfeed regions, in a temporary EMPTY data folder (the real montage_data is only read: never used for results,
+    never written). Prints one table, saves regiontest_cs2.txt and regiontest_images\\<clip>_<region>.png."""
+    game = args.game
+    busy = job_active()
+    if busy:
+        out(f"regiontest: {busy} is running - refusing to start (finish or cancel it first)")
+        raise SystemExit(1)
+    import cv2
+    import tempfile
+    out_dir = Path(args.out) if getattr(args, "out", None) else HERE
+    # --- read-only look at the real data
+    real_cfg = load_json(CONFIG_PATH, {}) or {}
+    real_clips = load_json(CLIPS_CACHE, {}) or {}
+    cur_region = list(Detector(game).d["region"])
+    avail = {"calibrated": cur_region, "default": list(DEFAULT_REGION[game]), "wide": list(REGIONTEST_WIDE)}
+    names = [x.strip() for x in (args.regions or "calibrated,default,wide").split(",") if x.strip()]
+    bad = [x for x in names if x not in avail]
+    if bad:
+        out(f"regiontest: unknown region {bad} (use calibrated, default, wide)")
+        raise SystemExit(2)
+    regions = [(x, avail[x]) for x in names]
+    tmp = Path(tempfile.mkdtemp(prefix="regiontest_"))
+    old = use_data_dir(tmp)
+    try:
+        save_json(CONFIG_PATH, real_cfg)
+        cfg = load_config()
+        recs = [dict(v) for v in real_clips.values() if isinstance(v, dict) and v.get("path") and not v.get("error") and v.get("w")]
+        for r in recs:
+            r["game"] = tag_game(r["path"], cfg)[0]
+        recs = [r for r in recs if r["game"] == game and os.path.exists(r["path"])]
+        if args.clips:
+            wanted = [x.strip() for x in Path(args.clips).read_text(encoding="utf-8-sig").splitlines() if x.strip() and not x.strip().startswith("#")]
+            byname = {os.path.basename(r["path"]).lower(): r for r in recs}
+            sel, unknown = [], []
+            for w in wanted:
+                r = byname.get(os.path.basename(w).lower())
+                if r is None and os.path.isfile(w):
+                    r = dict(analyse_clip(w, {}, False, cfg.get("bar"))[1], game=game)
+                (sel.append(r) if r else unknown.append(w))
         else:
-            p.write_bytes(keep)
-        out(f"regionrestore: the region from {src} gives hash {new.d['stamp']}, not {h}; the previous region was put back (backup {bk})")
-        return
-    valid, rescan = _valid_counts(game, h)
-    out(f"{game} region set to {src}: {new.d['region']} hash {h} (backup of the previous region file: {bk})")
-    out(f"cached entries valid under this region: {valid}; clips that would need a rescan: {rescan} (their old entries stay on disk)")
+            sel, unknown = regiontest_pick(recs, 15), []
+            sel_names = {os.path.basename(c["path"]).lower() for c in sel}
+            unknown = [m for m in REGIONTEST_MUST if m.lower() not in sel_names]
+        for u in unknown:
+            out(f"regiontest: unknown clip '{u}' (not in the clip cache / not found): skipped")
+        if not sel:
+            out("regiontest: no clips to test")
+            raise SystemExit(1)
+        out(f"regiontest {game}: {len(sel)} clips x {len(regions)} regions ({', '.join(f'{n} {r} {region_stamp(r)}' for n, r in regions)}), temporary data folder {tmp}")
+        ocr_engine()
+        img_dir = out_dir / "regiontest_images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        results, lines = [], []
+        for ci, rec in enumerate(sel, 1):
+            t_clip = time.time()
+            per = {}
+            for rn, reg in regions:
+                save_json(DATA / f"detect_{game}.json", {"region": reg, "ocr": True})
+                det = Detector(game)
+                res = scan_clip(rec["path"], rec, det, cfg)
+                a = analyse_entry(res, cfg, game)
+                per[rn] = {"kills": [round(k["t"], 1) for k in a["kills"]], "rows": a["rows_max"], "rej": len(a["rej"])}
+                if res.get("ocr"):
+                    busiest = max(res["ocr"], key=lambda o: len(o[2]))
+                    fr, _rows = grab_kill_crop(rec, det, cfg, {"t": busiest[0] / FPS - 0.3 + res.get("v_off", 0.0)})
+                    if fr is not None:
+                        cv2.imwrite(str(img_dir / f"{_safe_name(Path(rec['path']).stem)}_{rn}.png"), fr)
+            secs = time.time() - t_clip
+            dis = regiontest_disagree([v["kills"] for v in per.values()]) if len(per) > 1 else False
+            results.append({"clip": os.path.basename(rec["path"]), "res": f"{rec.get('w')}x{rec.get('h')}", "per": per, "disagree": dis, "secs": secs})
+            out(f"[{ci}/{len(sel)}] {os.path.basename(rec['path'])}  {secs:.0f} s")
+        head = f"{'clip':50s} {'res':>9s}  " + "  ".join(f"{rn + ' (kills/rows/rej  times)':<58s}" for rn, _ in regions) + "  sec"
+        lines.append(f"REGIONTEST {game} - regions: " + "; ".join(f"{n} {r} {region_stamp(r)}" for n, r in regions))
+        lines.append(head)
+        for r in results:
+            cells = []
+            for rn, _ in regions:
+                v = r["per"][rn]
+                cells.append(f"{len(v['kills'])}/{v['rows']}/{v['rej']}  {' '.join(ts(t) for t in v['kills']) or '-'}".ljust(58))
+            lines.append(f"{r['clip'][:50]:50s} {r['res']:>9s}  " + "  ".join(cells) + f"  {r['secs']:.0f}" + ("   <-- REGIONS DISAGREE" if r["disagree"] else ""))
+        nd = sum(1 for r in results if r["disagree"])
+        lines.append(f"{nd} of {len(results)} clips where the regions disagree. Total time {sum(r['secs'] for r in results):.0f} s "
+                     f"({sum(r['secs'] for r in results) / len(results):.0f} s per clip, {len(regions)} regions each).")
+        txt = "\n".join(lines)
+        (out_dir / f"regiontest_{game}.txt").write_text(txt + "\n", encoding="utf-8")
+        for ln in lines:
+            out(ln)
+        out(f"saved {out_dir / ('regiontest_' + game + '.txt')} and the cropped images in {img_dir}")
+        return results
+    finally:
+        restore_data_dir(old)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_regiondefault(args):
+    """V6.8: python montage.py regiondefault <game> <hash|current>: saves that region as the game's saved default (region_defaults.json)."""
+    if args.target == "current":
+        reg, h, src = list(Detector(args.game).d["region"]), Detector(args.game).d["stamp"], "the current region"
+    else:
+        reg, h, src = _resolve_region(args.game, args.target)
+        if reg is False:
+            out(f"regiondefault: {src}")
+            return
+        if reg is None:
+            reg = list(DEFAULT_REGION[args.game])
+    set_saved_default(args.game, reg)
+    out(f"{args.game}: saved default region set to {reg} (hash {region_stamp(reg)}) from {src}; 'Reset to default' and '--use default' now use it. The current region is unchanged.")
+
+
+def region_options(game):
+    """V6.8: every saved region of a game, as rows for the Settings picker (the data regioncheck prints): current, built-in default,
+    saved default, dated backups, and each hash found in the cached entries."""
+    rep = region_report(game)
+    groups = rep["groups"]
+
+    def row(kind, label, reg, h, use):
+        gr = groups.get(h)
+        t = gr["times"] if gr else []
+        return {"kind": kind, "label": label, "region": reg, "hash": h, "use": use, "entries": len(gr["files"]) if gr else 0,
+                "first": _fmt_t(min(t)) if t else "", "last": _fmt_t(max(t)) if t else ""}
+    rows = [row("current", "current" + ("" if rep["calibrated"] else " (default)"), list(rep["current"]), rep["current_hash"], rep["current_hash"]),
+            row("built-in default", "built-in default", list(rep["default"]), rep["default_hash"], "builtin")]
+    if rep["saved_default"]:
+        rows.append(row("saved default", "saved default", list(rep["saved_default"]), rep["saved_default_hash"], "default"))
+    for b, reg in rep["backups"]:
+        if reg is not False:
+            r_ = reg if reg else list(DEFAULT_REGION[game])
+            rows.append(row("backup", f"backup {b.name}", r_, region_stamp(r_), f"backup:{b.name}"))
+    shown = {r["hash"] for r in rows}
+    for h, gr in sorted(groups.items(), key=lambda kv: -len(kv[1]["files"])):
+        if h not in shown:
+            rows.append(row("cache", "cached entries", gr["region"], h, h))
+    for r in rows:
+        if r["kind"] == "cache":
+            r["usable"] = _resolve_region(game, r["use"])[0] is not False
+        else:
+            r["usable"] = True
+    return rows
 
 
 def save_region(game, region_frac):
@@ -2519,6 +2846,7 @@ def auto_scan_set(cfg, game):
     return [p for _, p in new] + [p for _, p in old[:int(cfg.get("auto_old_per_run", 150))]]
 
 
+@with_job("scan")
 def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False):
     """Scans only what is needed (paths) - or every uncached tagged clip if paths is None. Returns clips scanned."""
     if not shutil.which("ffmpeg"):
@@ -5837,6 +6165,7 @@ def audio_guard(plan, outfile, cfg, redo):
     return True
 
 
+@with_job("render")
 def run_job(game, mode="render", force=False, paths=None, song_path=None, target=None, style=None,
             seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True):
     """mode: dry | preview | render. weekly=True is Auto. Always prints a plan or a plain-language reason."""
@@ -6243,8 +6572,9 @@ class CalibDialog:
     def use_default(self):
         if not messagebox.askyesno("Killfeed region", f"Reset the {self.game.get().upper()} killfeed region to the default?"):
             return
-        reset_region(self.game.get())
-        out(f"{self.game.get()}: default killfeed region {DEFAULT_REGION[self.game.get()]}")
+        g = self.game.get()
+        reg = apply_default_region(g)                                # V6.8: the saved default when there is one, else the built-in default
+        out(f"{g}: {'saved' if reg else 'built-in'} default killfeed region {reg or DEFAULT_REGION[g]}")
         self.show_region()
         self.app.refresh_auto()
 
@@ -7278,6 +7608,7 @@ class App:
             return
         self.snap_vars()                                           # V6.1.2: Tk variables are read here, on the UI thread; workers use the snapshot
         self.busy = True
+        job_enter(name)                                            # V6.8: regiontest (another process) refuses to run next to a task
         self.scan_active = name == "clips"                         # V5.6: no list refills while clips are being scanned
         if self.scan_active:
             self._prog_ui(None, "Scanning ...")
@@ -7290,6 +7621,7 @@ class App:
             except Exception as ex:
                 out(f"ERROR in {name}: {ex}\n{traceback.format_exc()}")
             finally:
+                job_exit()
                 self.q.put(("done", None))
         threading.Thread(target=target, daemon=True).start()
 
@@ -7639,6 +7971,16 @@ class App:
         self.m_incl_used = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="Include used clips", variable=self.m_incl_used).pack(side="left", padx=(12, 3))
         self.btn(top2, "Unflag all", self.unflag_all, name="manual:unflag_all").pack(side="left", padx=(12, 3))
+        top3 = ttk.Frame(s1)                                        # V6.8: live clip search above the list
+        top3.pack(fill="x", pady=(2, 0))
+        ttk.Label(top3, text="Search clips").pack(side="left", padx=(3, 4))
+        self.m_csearch = tk.StringVar()
+        self.m_csearch.trace_add("write", lambda *a: self.csearch_changed())
+        self.e_csearch = ttk.Entry(top3, textvariable=self.m_csearch, width=34)
+        self.e_csearch.pack(side="left")
+        self.btn(top3, "Clear", lambda: self.m_csearch.set(""), name="manual:clear_search").pack(side="left", padx=4)
+        self.m_cshown = tk.StringVar(value="")
+        ttk.Label(top3, textvariable=self.m_cshown, style="Dim.TLabel").pack(side="left", padx=8)
         fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used", "open", "trash"), height=20, selectmode="none")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 230, "Used"),
@@ -7965,7 +8307,15 @@ class App:
                 PERF.stage("load_clips: fill() on UI thread (apply_filter + refresh_songs)", _f0)
         self.q.put(("call", fill))
 
+    def csearch_changed(self):
+        """V6.8: the search box filters live (a short pause after the last key, so typing stays smooth)."""
+        if getattr(self, "_cs_after", None):
+            self.root.after_cancel(self._cs_after)
+        self._cs_after = self.root.after(120, self.apply_filter)
+
     def apply_filter(self):
+        self._cs_after = None
+        words = self.m_csearch.get().lower().split()
         fo, days = self.m_folder.get(), self.DATES.get(self.m_date.get())
         lim = time.time() - days * 86400 if days else 0
         hi = 9e18
@@ -7985,6 +8335,10 @@ class App:
             uf = self.m_used.get()
             if (uf == "Used" and not c.get("used")) or (uf == "Unused" and c.get("used")):
                 continue
+            if words:                                               # V6.8: every word must be in the file name, date, montage title or folder
+                hay = f"{c['name']} {time.strftime('%Y-%m-%d', time.localtime(c['mtime']))} {c.get('used_label') or ''} {c.get('used') or ''} {c['folder']}".lower()
+                if not all(w in hay for w in words):
+                    continue
             rows.append((c["path"], self.row_text(c["path"]),
                          (time.strftime("%Y-%m-%d", time.localtime(c["mtime"])), f"{int(c['dur'] // 60)}:{int(c['dur'] % 60):02d}",
                           "not scanned" if c["kills"] is None else str(c["kills"]), c.get("used_label") or c.get("used", ""), "\u25b6 Open",
@@ -8123,6 +8477,7 @@ class App:
         """Status line. The length comes from the REAL planner (make_plan on the already-scanned ticked clips, same song, style
         and seed as the render), run quietly in the background after a short pause, so the estimate is the plan."""
         tk_ = [self.byp[p] for p in self.ticked if p in getattr(self, "byp", {})]
+        self.m_cshown.set(f"{len(tk_)} ticked, {len(self.ctree.get_children())} shown")      # V6.8: ticks count hidden rows too
         kills = sum(c["kills"] or 0 for c in tk_)
         uns = sum(1 for c in tk_ if c["kills"] is None)
         self.m_len_sc.state(["disabled"] if self.m_opt.get() else ["!disabled"])
@@ -8699,6 +9054,35 @@ class App:
             self.sn[k] = v
             ttk.Entry(f, textvariable=v, width=10).grid(row=r[0], column=1, sticky="w", padx=(0, PX), pady=PY)
             r[0] += 1
+        section("Killfeed region")
+        label("Game")
+        self.rp_game = tk.StringVar(value="valorant")
+        h = holder()
+        cbg = ttk.Combobox(h, textvariable=self.rp_game, values=list(GAMES), width=10, state="readonly")
+        cbg.pack(side="left", padx=(0, PX))
+        cbg.bind("<<ComboboxSelected>>", lambda e: self.rp_refresh())
+        hint(h, "applies at once (not part of Save settings); a dated backup of the region file is saved first")
+        r[0] += 1
+        self.rp_tree = ttk.Treeview(f, columns=("hash", "entries", "first", "last", "region"), height=7, selectmode="browse")
+        for c, w_, t_ in (("#0", 190, "Saved region"), ("hash", 100, "Hash"), ("entries", 60, "Entries"), ("first", 120, "Earliest scan"),
+                          ("last", 120, "Latest scan"), ("region", 260, "Region")):
+            self.rp_tree.column(c, width=int(w_ * sc), minwidth=40, stretch=(c == "#0"), anchor="w")
+            self.rp_tree.heading(c, text=t_)
+        self.rp_tree.grid(row=r[0], column=0, columnspan=3, sticky="ew", padx=PX, pady=PY)
+        self.rp_tree.bind("<<TreeviewSelect>>", lambda e: self.rp_select())
+        r[0] += 1
+        self.rp_info = tk.StringVar(value="Select a region to see how many cached clips it would keep valid.")
+        ttk.Label(f, textvariable=self.rp_info, style="Dim.TLabel", wraplength=int(900 * sc)).grid(row=r[0], column=0, columnspan=3, sticky="w", padx=PX, pady=(0, PY))
+        r[0] += 1
+        h = holder()
+        self.b_rp_use = self.btn(h, "Use this region", self.rp_use, name="region:use")
+        self.b_rp_use.pack(side="left", padx=(0, PX))
+        self.b_rp_def = self.btn(h, "Set as default", self.rp_set_default, name="region:default")
+        self.b_rp_def.pack(side="left", padx=(0, PX))
+        self.btn(h, "Refresh", self.rp_refresh, name="region:refresh").pack(side="left")
+        r[0] += 1
+        self.rp_rows, self._rp_loaded = {}, False
+        self.rp_tree.bind("<Map>", lambda e: None if self._rp_loaded else (setattr(self, "_rp_loaded", True), self.root.after_idle(self.rp_refresh)))   # read the cache index when first shown, not at startup
         section("Game audio")
         label("Game audio level under the music (0-1)")
         v = tk.StringVar(value=str(self.cfg.get("game_audio_level", "")))
@@ -8814,6 +9198,61 @@ class App:
                                      "Rescan them now? It runs in the background, can be cancelled and resumes later. "
                                      "Nothing is rescanned unless you say yes."):
             self.run_task("rescan", lambda: rescan_stale_names(load_config()))
+
+    def rp_refresh(self):
+        """V6.8: the Settings region picker: every saved region of the selected game (same data as regioncheck)."""
+        g = self.rp_game.get()
+        keep = self.rp_tree.selection()
+        self.rp_tree.delete(*self.rp_tree.get_children())
+        self.rp_rows = {}
+        for i, row in enumerate(region_options(g)):
+            iid = f"r{i}"
+            self.rp_rows[iid] = row
+            self.rp_tree.insert("", "end", iid=iid, text=row["label"],
+                                values=(row["hash"], row["entries"] or "", row["first"], row["last"], ("[" + ", ".join(f"{v:g}" for v in row["region"]) + "]") if row["region"] else "values not stored in these entries"))
+        if keep and self.rp_tree.exists(keep[0]):
+            self.rp_tree.selection_set(keep[0])
+        else:
+            self.rp_info.set("Select a region to see how many cached clips it would keep valid.")
+
+    def rp_selected(self):
+        sel = self.rp_tree.selection()
+        return self.rp_rows.get(sel[0]) if sel else None
+
+    def rp_select(self):
+        row = self.rp_selected()
+        if not row:
+            return
+        v, vc, need = region_effect(self.rp_game.get(), row["hash"])
+        self.rp_info.set(f"{row['label']} ({row['hash']}): {vc} cached clips ({v} entries) would be valid under it, {need} would need a scan."
+                         + ("" if row["usable"] else "  Its region values are not stored: it cannot be used."))
+
+    def rp_use(self):
+        """Same code path as 'regionrestore --use' (region_apply). Never starts a scan."""
+        row, g = self.rp_selected(), self.rp_game.get()
+        if not row:
+            messagebox.showinfo("Killfeed region", "Select a region first.")
+            return
+        if not messagebox.askyesno("Killfeed region", f"Switch the {g.upper()} killfeed region to {row['hash']}?"):
+            return
+        ok, lines, _info = region_apply(g, row["use"])
+        for ln in lines:
+            out(ln)
+        if not ok:
+            messagebox.showerror("Killfeed region", lines[0])
+        self.rp_refresh()
+        self.refresh_auto()
+
+    def rp_set_default(self):
+        row, g = self.rp_selected(), self.rp_game.get()
+        if not row or not row["region"]:
+            messagebox.showinfo("Killfeed region", "Select a region with known values first.")
+            return
+        if not messagebox.askyesno("Killfeed region", f"Set {row['hash']} as the saved default {g.upper()} killfeed region?"):
+            return
+        reg = set_saved_default(g, row["region"])
+        out(f"{g}: saved default region set to {reg} (hash {region_stamp(reg)}); the current region is unchanged")
+        self.rp_refresh()
 
     def save_settings(self):
         self.flush_settings()
@@ -9012,7 +9451,7 @@ def grab_gray_bgr(path, t, w, h):
     return np.frombuffer(r.stdout[:w * h * 3], np.uint8).reshape(h, w, 3).copy()
 
 
-DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "VAL_BACKUP", "USED_SONGS",
+DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "VAL_BACKUP", "REGION_DEFAULTS", "JOB_LOCK", "USED_SONGS",
                 "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE")
 
 
@@ -10907,6 +11346,16 @@ def main():
     rg = sp.add_parser("regioncheck", help="V6.7.6: killfeed region of a game, its hash, backups, and the region hashes stored in the cache")
     rg.add_argument("game", choices=GAMES)
     rg.set_defaults(fn=cmd_regioncheck)
+    rt = sp.add_parser("regiontest", help="V6.8: scan CS2 clips under several killfeed regions in a temporary data folder and compare")
+    rt.add_argument("game", choices=["cs2"])
+    rt.add_argument("--clips", help="file with clip names, one per line")
+    rt.add_argument("--regions", help="calibrated,default,wide (default: all three)")
+    rt.add_argument("--out", help="folder for regiontest_cs2.txt and regiontest_images (default: next to montage.py)")
+    rt.set_defaults(fn=cmd_regiontest)
+    rd = sp.add_parser("regiondefault", help="V6.8: save a region as the game's saved default (used by Reset to default / --use default)")
+    rd.add_argument("game", choices=GAMES)
+    rd.add_argument("target", help="<hash> | current | backup:<file> | file:<path>")
+    rd.set_defaults(fn=cmd_regiondefault)
     rr = sp.add_parser("regionrestore", help="V6.7.6: list / set the killfeed region (never chosen automatically)")
     rr.add_argument("game", choices=GAMES)
     rr.add_argument("--use", help="<hash> | default | backup:<file> | file:<path>")
