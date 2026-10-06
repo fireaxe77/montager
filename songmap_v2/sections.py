@@ -32,8 +32,9 @@ def bar_table(beats, down, dur, y, sr, low, events):
         i1 = min(i1, len(y))
         if i1 <= i0:
             continue
-        rms = (cs[i1] - cs[i0]) / (i1 - i0)
-        lw = (cl[min(i1, len(cl) - 1)] - cl[i0]) / (i1 - i0)
+        # differences of running sums can come out slightly NEGATIVE on digital silence (float cancellation): clamp before the log
+        rms = max(0.0, float((cs[i1] - cs[i0]) / (i1 - i0)))
+        lw = max(0.0, float((cl[min(i1, len(cl) - 1)] - cl[i0]) / (i1 - i0)))
         m = (et >= t0) & (et < t1)
         bars.append({"beat0": a, "beat1": b, "t0": t0, "t1": t1, "loud": 10 * np.log10(rms + 1e-12), "low": 10 * np.log10(lw + 1e-12),
                      "act": float(es[m].sum() / (t1 - t0)) if len(es) else 0.0})
@@ -41,7 +42,7 @@ def bar_table(beats, down, dur, y, sr, low, events):
 
 
 def _norm(x, rng_min):
-    x = np.asarray(x, float)
+    x = np.nan_to_num(np.asarray(x, float), nan=-120.0, posinf=0.0, neginf=-120.0)       # never NaN into the change-point logic
     lo, hi = np.percentile(x, 5), np.percentile(x, 95)
     return np.clip((x - lo) / max(hi - lo, rng_min), 0, 1)
 
@@ -49,6 +50,9 @@ def _norm(x, rng_min):
 def analyse(bars, bar_s):
     """Returns {"S","drops","labels","share"}; drops = [{"bar","t","strength","jump","bass_jump"}] (V1 field names)."""
     n = len(bars)
+    for b in bars:
+        for k in ("loud", "low", "act"):
+            b[k] = float(np.nan_to_num(b[k], nan=-120.0 if k != "act" else 0.0, posinf=0.0, neginf=-120.0))
     if n < 4:
         return {"S": np.zeros(n), "drops": [], "labels": ["verse"] * n, "share": 0.0, "low_n": np.zeros(n)}
     loud = _norm([b["loud"] for b in bars], MIN_RANGE["loud"])

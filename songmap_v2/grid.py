@@ -23,15 +23,24 @@ def band_signals(y, sr):
     return out
 
 
+def n_frames(n_samples):
+    """Number of hop-HOP frames covering n_samples: ceil(n / HOP). (The 6.9.5 code used n // HOP + 1, one frame too many whenever the sample
+    count is an exact multiple of HOP, so the band envelopes (ceil) and the mix array (floor + 1) were one frame apart -> ValueError.)"""
+    return (int(n_samples) + HOP - 1) // HOP
+
+
 def _env(x, w, n):
-    """Centered mean-square envelope sampled every HOP samples."""
+    """Centered mean-square envelope sampled every HOP samples, exactly n frames (padded with the last value if the slice is short)."""
     e = uniform_filter1d(x.astype(np.float64) ** 2, w, mode="constant")
-    return np.maximum(e[::HOP][:n], 0.0)
+    e = np.maximum(e[::HOP][:n], 0.0)
+    if len(e) < n:
+        e = np.concatenate([e, np.full(n - len(e), e[-1] if len(e) else 0.0)])
+    return e
 
 
 def features(y, sr):
     """Per band: linear RMS envelope R (timing), log-energy rise A (detection), at hop HOP. All arrays have the same length."""
-    n = len(y) // HOP + 1
+    n = n_frames(len(y))
     sig = band_signals(y, sr)
     F = {"sr": sr, "dt": HOP / sr, "n": n, "sig": sig, "R": {}, "A": {}, "E": {}}
     for b, x in sig.items():
