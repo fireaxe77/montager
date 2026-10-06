@@ -57,7 +57,7 @@ def main():
     ud = M.used_dates()
     check(ud.get(M._pkey(str(clips[0]))) == today and len(ud) == 1, f"clicking an empty Used cell flags only that clip with today's date ({ud})")
     check(M.load_json(M.USED_FLAGS, {}).get(M._pkey(str(clips[0]))) == today, "the flag is saved in the used-flags file (the same one a render writes)")
-    check(tree.set(str(clips[0]), "used") == today and tree.set(str(clips[1]), "used") == "", "the row shows the date, the others stay empty")
+    check(tree.set(str(clips[0]), "used") == "flagged by hand" and tree.set(str(clips[1]), "used") == "", "the row shows 'flagged by hand' (V6.7.4; was the date), the others stay empty")
     check(any(l == f"flagged {clips[0].name}" for l in logs), "log line: flagged <clip>")
     check(app.ticked == {str(clips[2])}, "the click did not tick or untick any row")
     # the weekly pick treats it as used

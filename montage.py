@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.7.2"
+APP_VERSION = "V6.7.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2631,6 +2631,7 @@ def selftest_detection(cfg, per_game=20):
 SONG_CACHE = DATA / "song_cache.json"
 USED_CLIPS = DATA / "used_clips.json"
 USED_FLAGS = DATA / "used_flags.json"      # V5.55 (GUI): {clip path: date of the montage it was used in}
+USED_TITLES = DATA / "used_titles.json"    # V6.7.4: {clip path key: {"date", "title"}} the montage a flag came from (title "" = flagged by hand)
 USED_SONGS = DATA / "used_songs.json"
 SONG_ALGO = "s3"
 
@@ -5539,12 +5540,12 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     return plan, fmt_plan(plan, events, sinfo, runners, unmatched, csvname)
 
 
-def record_history(plan):
+def record_history(plan, title=None):
     game = plan["game"]
     now = datetime.datetime.now().strftime("%Y-%m-%d")
     uc, us = load_json(USED_CLIPS, {}), load_json(USED_SONGS, {})
     uc.setdefault(game, []).append({"date": now, "headline": plan["headline"], "recipe": plan["recipe"],
-                                    "clips": sorted({t["path"] for t in plan["takes"]})})
+                                    "clips": sorted({t["path"] for t in plan["takes"]}), **({"title": title} if title else {})})
     us.setdefault(game, []).append({"date": now, "path": plan["song"]["path"]})
     uc[game], us[game] = uc[game][-12:], us[game][-12:]
     save_json(USED_CLIPS, uc)
@@ -5626,9 +5627,9 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
         logs.mkdir(parents=True, exist_ok=True)
         (logs / (outfile.stem + ".plan.txt")).write_text(text, encoding="utf-8")
         save_json(logs / (outfile.stem + ".plan.json"), plan)
-        record_history(plan)
+        record_history(plan, outfile.stem)
         try:                                               # V6.0: flagged used only now, after the render succeeded
-            mark_used({t["path"] for t in plan["takes"]} | {x["path"] for t in plan["takes"] for x in t.get("srcs", [])})
+            mark_used({t["path"] for t in plan["takes"]} | {x["path"] for t in plan["takes"] for x in t.get("srcs", [])}, title=outfile.stem)
         except Exception as ex:
             out(f"Used flags not saved: {ex}")
         if cfg.get("sync_report", True):
@@ -6010,20 +6011,49 @@ def used_dates():
     return d
 
 
-def mark_used(paths, date=None):
-    """A montage rendered successfully: every clip in it is 'used' as of that date."""
+HAND_LABEL = "flagged by hand"
+
+
+def mark_used(paths, date=None, title=None):
+    """A montage rendered successfully: every clip in it is 'used' as of that date. V6.7.4: the montage title (output file name without
+    extension) is stored with the flag in used_titles.json; no title = flagged by hand."""
     date = date or datetime.datetime.now().strftime("%Y-%m-%d")
     flags = load_json(USED_FLAGS, {})
+    titles = load_json(USED_TITLES, {})
     for p_ in paths:
         flags[_pkey(p_)] = date
+        titles[_pkey(p_)] = {"date": date, "title": title or ""}
     save_json(USED_FLAGS, flags)
+    save_json(USED_TITLES, titles)
+
+
+def used_info():
+    """V6.7.4: {clip path key: (date, label)} for the Manual list's Used column. label = the title of the montage that set the date
+    (stored with the flag, else found in the montage history), 'flagged by hand' for a hand flag, else the date itself."""
+    dates = used_dates()
+    titles = load_json(USED_TITLES, {})
+    hist = {}
+    for game_hist in load_json(USED_CLIPS, {}).values():
+        for h in game_hist if isinstance(game_hist, list) else []:
+            if h.get("title"):
+                for c in h.get("clips", []):
+                    hist[(_pkey(c), h.get("date", ""))] = h["title"]
+    info = {}
+    for k, d in dates.items():
+        t = titles.get(k) if isinstance(titles.get(k), dict) else None
+        if t and t.get("date") == d:
+            label = t.get("title") or HAND_LABEL
+        else:
+            label = hist.get((k, d)) or d
+        info[k] = (d, label)
+    return info
 
 
 def backup_used_flags():
     """V6.5.1: a dated copy of the used-flags file (and of the montage history that also flags clips) next to it; returns the flags copy's name."""
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     dst = None
-    for src, tag in ((USED_FLAGS, "used_flags"), (USED_CLIPS, "used_clips")):
+    for src, tag in ((USED_FLAGS, "used_flags"), (USED_CLIPS, "used_clips"), (USED_TITLES, "used_titles")):
         d_ = src.with_name(f"{tag}_backup_{stamp}.json")
         if src.exists():
             shutil.copy2(src, d_)
@@ -6042,12 +6072,65 @@ def unflag_clips(paths=None):
         keys &= {_pkey(p_) for p_ in paths}
     flags = load_json(USED_FLAGS, {})
     save_json(USED_FLAGS, {k: v for k, v in flags.items() if k not in keys})
+    if USED_TITLES.exists():
+        save_json(USED_TITLES, {k: v for k, v in load_json(USED_TITLES, {}).items() if k not in keys})
     hist = load_json(USED_CLIPS, {})
     for lst in hist.values():
         for h in lst if isinstance(lst, list) else []:
             h["clips"] = [c for c in h.get("clips", []) if _pkey(c) not in keys]
     save_json(USED_CLIPS, hist)
     return len(keys)
+
+
+def _shell_trash(path):
+    """V6.7.4: Windows Recycle Bin through the shell API (SHFileOperationW with FOF_ALLOWUNDO: never a permanent delete)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _pack_ = 1 if ctypes.sizeof(ctypes.c_void_p) == 4 else 8
+        _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL), ("hNameMappings", ctypes.c_void_p),
+                    ("lpszProgressTitle", wintypes.LPCWSTR)]
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI = 3, 0x4, 0x10, 0x40, 0x400
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = os.path.abspath(path) + "\0"                 # a second NUL ends the (single-entry) list
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+    rc = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    if rc != 0 or op.fAnyOperationsAborted:
+        raise OSError(f"the Recycle Bin refused the file (shell error 0x{rc:X})")
+
+
+def trash_file(path):
+    """V6.7.4: move a file to the Recycle Bin (send2trash if importable, else the Windows shell API). Raises on failure; never deletes
+    permanently."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"file not found: {path}")
+    try:
+        from send2trash import send2trash
+    except ImportError:
+        send2trash = None
+    if send2trash is not None:
+        send2trash(os.path.abspath(path))
+    elif os.name == "nt":
+        _shell_trash(path)
+    else:
+        raise OSError("no Recycle Bin available here (install send2trash)")
+    if os.path.exists(path):
+        raise OSError("the file is still there after the move")
+
+
+def forget_clip(path, fk=None):
+    """V6.7.4: drop everything stored about a clip file that is gone: its scan-cache entries (kills, clip record), its used flag and title.
+    fk = file_key(path) taken BEFORE the file was moved (the key holds its size and time)."""
+    if fk:
+        load_kills_cache().drop_file(fk)
+    cc = load_json(CLIPS_CACHE, {})
+    keep = {k: v for k, v in cc.items() if k != fk and not (isinstance(v, dict) and v.get("path") and _pkey(v["path"]) == _pkey(path))}
+    if len(keep) != len(cc):
+        save_json(CLIPS_CACHE, keep)
+    unflag_clips([path])
 
 
 def default_song_map(dur=180.0, bpm=120.0):
@@ -7092,7 +7175,7 @@ class App:
                     pj = load_json(res.parent / "logs" / (res.stem + ".plan.json"), {})
                     used = {t["path"] for t in pj.get("takes", [])} | {x["path"] for t in pj.get("takes", []) for x in t.get("srcs", [])}
                     if used:
-                        mark_used(used)
+                        mark_used(used, title=res.stem)
                 except Exception as ex:
                     out(f"Used flags not saved: {ex}")
             if isinstance(res, Path):
@@ -7286,11 +7369,12 @@ class App:
         self.m_incl_used = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="Include used clips", variable=self.m_incl_used).pack(side="left", padx=(12, 3))
         self.btn(top2, "Unflag all", self.unflag_all, name="manual:unflag_all").pack(side="left", padx=(12, 3))
-        fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used", "open"), height=20, selectmode="none")
+        fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used", "open", "trash"), height=20, selectmode="none")
         fr.pack(fill="both", expand=True)
-        for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 100, "Used"),
-                        ("open", 74, "")):
-            self.ctree.column(c, width=w, minwidth=56 if c != "open" else 64, stretch=(c == "#0"), anchor="center" if c == "open" else "w")
+        for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 230, "Used"),
+                        ("open", 74, ""), ("trash", 40, "")):
+            self.ctree.column(c, width=w, minwidth=(56 if c not in ("open", "trash") else 36 if c == "trash" else 64), stretch=(c == "#0"),
+                              anchor="center" if c in ("open", "trash") else "w")
             self.ctree.heading(c, text=t)
         self.make_sortable(self.ctree, self.apply_filter, {"#0": "Clip", "date": "Date", "len": "Length", "kills": "Kills",
                                                            "used": "Used"})
@@ -7384,8 +7468,10 @@ class App:
         ttk.Button(bb, text="Apply", style="Accent.TButton", command=ok).pack(side="left")
         self.reveal(win)
 
-    OPEN_COL = "#5"                                        # the "▶ Open" column (last)
-    USED_COL = "#4"                                        # the Used column (date of the montage the clip was used in)
+    OPEN_COL = "#5"                                        # the "▶ Open" column
+    TRASH_COL = "#6"                                       # V6.7.4: the Recycle Bin column (last)
+    USED_COL = "#4"                                        # the Used column (V6.7.4: title of the montage the clip was used in)
+    TRASH_GLYPH = "\U0001F5D1"
 
     def unflag_all(self):
         """V6.5.1: every used flag (Valorant and CS2) is cleared after a Yes; a dated backup of the flags file is written first."""
@@ -7402,7 +7488,7 @@ class App:
             out(f"Unflag all failed: {ex}")
             return
         for c in self.clips:
-            c["used"] = ""
+            c["used"] = c["used_label"] = ""
         self.apply_filter()
         out(f"unflagged {n} clips (backup: {bk})")
 
@@ -7417,9 +7503,9 @@ class App:
             except Exception as ex:
                 out(f"Flag failed: {ex}")
                 return
-            c["used"] = today
+            c["used"], c["used_label"] = today, HAND_LABEL
             if self.ctree.exists(iid):
-                self.ctree.set(iid, "used", today)
+                self.ctree.set(iid, "used", HAND_LABEL)
             getattr(self, "_fill_sig", {}).pop(self.ctree, None)     # the cell changed by hand: the next refill must not be skipped as "same data"
             out(f"flagged {c.get('name') or Path(iid).name}")
             return
@@ -7428,11 +7514,47 @@ class App:
         except Exception as ex:
             out(f"Unflag failed: {ex}")
             return
-        c["used"] = ""
+        c["used"] = c["used_label"] = ""
         if self.ctree.exists(iid):
             self.ctree.set(iid, "used", "")
         getattr(self, "_fill_sig", {}).pop(self.ctree, None)
         out(f"unflagged {c.get('name') or Path(iid).name}")
+
+    def trash_clip(self, iid):
+        """V6.7.4: the trash cell: after a Yes the clip file goes to the Recycle Bin (never a permanent delete); the row, its scan-cache
+        entries and its used flag go with it. Refused while a scan or render runs; on failure the error is shown and the row stays."""
+        c = self.byp.get(iid)
+        if not c:
+            return
+        name = c.get("name") or Path(iid).name
+        if self.busy or getattr(self, "est_running", False) or getattr(self, "scan_active", False):
+            self.status_flash("Busy (scan or render running) - try again when it is done")
+            out(f"not moved to the Recycle Bin (a scan or render is running): {name}")
+            return
+        if not messagebox.askyesno("Recycle Bin", f"Move {name} to the Recycle Bin?"):
+            return
+        try:
+            fk = file_key(iid)                             # the cache key needs the file's size / time: taken before it moves
+        except OSError:
+            fk = None
+        try:
+            trash_file(iid)
+        except Exception as ex:
+            out(f"Recycle Bin failed for {name}: {ex}")
+            messagebox.showerror("Recycle Bin", f"Could not move {name} to the Recycle Bin:\n{ex}")
+            return
+        try:
+            forget_clip(iid, fk)
+        except Exception as ex:
+            out(f"clip moved, but its cache entries were not all cleared: {ex}")
+        self.clips = [x for x in self.clips if x["path"] != iid]
+        self.byp.pop(iid, None)
+        self.ticked.discard(iid)
+        if self.last_click == iid:
+            self.last_click = None
+        getattr(self, "_fill_sig", {}).pop(self.ctree, None)
+        self.apply_filter()
+        out(f"moved to Recycle Bin: {name}")
 
     def open_clip_player(self, path):
         """Opens a clip in the default video player without waiting (Windows: os.startfile, Linux: xdg-open)."""
@@ -7450,6 +7572,8 @@ class App:
         if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
             return None
         iid = self.ctree.identify_row(e.y)
+        if iid and self.ctree.identify_column(e.x) == self.TRASH_COL:
+            return "break"                                 # the trash cell never opens the clip
         if iid:
             self.open_clip_player(iid)
         return "break"
@@ -7463,6 +7587,9 @@ class App:
             return "break"
         if iid and self.ctree.identify_column(e.x) == self.OPEN_COL:
             self.open_clip_player(iid)                     # the Open cell never ticks or unticks the row
+            return "break"
+        if iid and self.ctree.identify_column(e.x) == self.TRASH_COL:
+            self.trash_clip(iid)                           # V6.7.4: the trash cell never ticks or unticks the row
             return "break"
         if iid:
             if (e.state & 0x1) and self.last_click and self.ctree.exists(self.last_click):
@@ -7522,7 +7649,7 @@ class App:
         with pstage("load_clips: read kills cache"):
             kc = load_kills_cache()
         with pstage("load_clips: used_dates"):
-            ud = used_dates()                                      # V5.55: date of the montage each clip was used in
+            ud = used_info()                                       # V5.55 / V6.7.4: (date, montage title) of the montage each clip was used in
         rows = []
         with pstage("load_clips: scan_clips (total)"):
             scanned = scan_clips(load_config())
@@ -7540,7 +7667,7 @@ class App:
                 continue
             rows.append({"path": r["path"], "name": Path(r["path"]).name, "folder": clip_folder(r["path"], cfg), "mtime": mt,
                          "dur": r.get("dur", 0), "kills": None if ks is None else len(ks), "ks": ks or [],
-                         "used": ud.get(_pkey(r["path"]), "")})
+                         "used": ud.get(_pkey(r["path"]), ("", ""))[0], "used_label": ud.get(_pkey(r["path"]), ("", ""))[1]})
         rows.sort(key=lambda c: -c["mtime"])
         if PERF is not None:
             PERF.stages.append(((_t1 - PERF_T0) * 1000, (time.perf_counter() - _t1) * 1000, "load_clips: per-clip rows (kills lookup, compute_kills, getmtime)", threading.current_thread().name))
@@ -7590,7 +7717,8 @@ class App:
                 continue
             rows.append((c["path"], self.row_text(c["path"]),
                          (time.strftime("%Y-%m-%d", time.localtime(c["mtime"])), f"{int(c['dur'] // 60)}:{int(c['dur'] % 60):02d}",
-                          "not scanned" if c["kills"] is None else str(c["kills"]), c.get("used", ""), "\u25b6 Open")))
+                          "not scanned" if c["kills"] is None else str(c["kills"]), c.get("used_label") or c.get("used", ""), "\u25b6 Open",
+                          self.TRASH_GLYPH)))
         self.fill_chunked(self.ctree, self.sorted_rows(self.ctree, rows))
         self.update_status()
 
@@ -7602,6 +7730,9 @@ class App:
         v = str(v).strip()
         if col == "#0":
             return (1, 0.0, v.lstrip("\u2610\u2611\u2605 ").lower())
+        if col == "used" and tree is getattr(self, "ctree", None):       # V6.7.4: the cell shows a title; the order is by date
+            d = (getattr(self, "byp", {}).get(iid) or {}).get("used", "")
+            return (1, 0.0, f"{d} {v.lower()}") if d else (-1, 0.0, "")
         m = re.fullmatch(r"(\d+):(\d\d)", v)
         if m:
             return (0, int(m.group(1)) * 60 + int(m.group(2)), "")
@@ -8583,7 +8714,7 @@ def grab_gray_bgr(path, t, w, h):
     return np.frombuffer(r.stdout[:w * h * 3], np.uint8).reshape(h, w, 3).copy()
 
 
-DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_SONGS",
+DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "USED_SONGS",
                 "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE")
 
 
