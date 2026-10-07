@@ -4,6 +4,7 @@ import json
 import os
 import re
 import subprocess
+import _run as R                                                                              # noqa: E402  (V6.9.7 shared subprocess helper)
 import sys
 import time
 import wave
@@ -56,7 +57,7 @@ def snapshot(d):
 
 
 def ff(args):
-    r = subprocess.run(["ffmpeg", "-y", "-v", "error"] + args, capture_output=True)
+    r = R.run(["ffmpeg", "-y", "-v", "error"] + args, capture_output=True)
     assert r.returncode == 0, r.stderr.decode()[-400:]
 
 
@@ -77,7 +78,7 @@ def mvf(n="N", flash_frames=()):
 
 
 def clip_info(path):
-    r = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames,avg_frame_rate,r_frame_rate,start_time:format=duration",
+    r = R.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames,avg_frame_rate,r_frame_rate,start_time:format=duration",
                         "-of", "json", str(path)], capture_output=True)
     j = json.loads(r.stdout)
     s = j["streams"][0]
@@ -113,7 +114,7 @@ def run_graph(plan, out, tmp, fx=None):
 
 
 def out_frames(path):
-    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf", "scale=160:90,format=gray", "-f", "rawvideo", "-"], capture_output=True)
+    r = R.run(["ffmpeg", "-v", "error", "-i", str(path), "-vf", "scale=160:90,format=gray", "-f", "rawvideo", "-"], capture_output=True)
     return np.frombuffer(r.stdout, np.uint8).reshape(-1, 90, 160).astype(float)
 
 

@@ -10,6 +10,7 @@ import random
 import re
 import shutil
 import subprocess
+import _run as R                                                                              # noqa: E402  (V6.9.7 shared subprocess helper)
 import sys
 import tempfile
 import time
@@ -63,7 +64,7 @@ def snapshot(d):
 
 
 def ff(args, **k):
-    return subprocess.run(["ffmpeg", "-y", "-v", "error"] + args, capture_output=True, **k)
+    return R.run(["ffmpeg", "-y", "-v", "error"] + args, capture_output=True, **k)
 
 
 def gen_clip(path, fps="30", dur=10, vf=None, extra=None, src="testsrc2", size="320x180"):
@@ -91,7 +92,7 @@ def names(n, seed):
 
 def load_baseline(tmp, ref):
     for r_ in (ref, "origin/main", "main"):
-        r = subprocess.run(["git", "show", f"{r_}:montage.py"], cwd=str(ROOT), capture_output=True)
+        r = R.run(["git", "show", f"{r_}:montage.py"], cwd=str(ROOT), capture_output=True)
         if r.returncode == 0 and r.stdout:
             break
     else:
@@ -212,7 +213,7 @@ def part_guard60(tmp):
 
 
 def seg_info(path):
-    r = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames,avg_frame_rate,start_time:format=duration",
+    r = R.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames,avg_frame_rate,start_time:format=duration",
                         "-of", "json", str(path)], capture_output=True)
     j = json.loads(r.stdout)
     return int(j["streams"][0]["nb_read_frames"]), float(j["format"]["duration"]), float(j["streams"][0].get("start_time") or 0), j["streams"][0]["avg_frame_rate"]
@@ -315,12 +316,12 @@ def part_method(tmp):
         for name in ("mci", "blend"):
             o = d / f"o_{name}.mov"
             t0 = time.time()
-            r = subprocess.run(M.interp_segment_cmd(src30, 0.0, 1.5, o, name), capture_output=True)
+            r = R.run(M.interp_segment_cmd(src30, 0.0, 1.5, o, name), capture_output=True)
             dt = time.time() - t0
             assert r.returncode == 0, r.stderr.decode()[-300:]
             vals = {}
             for rn, crop in regions.items():
-                rr = subprocess.run(["ffmpeg", "-hide_banner", "-i", str(o), "-i", true60, "-lavfi",
+                rr = R.run(["ffmpeg", "-hide_banner", "-i", str(o), "-i", true60, "-lavfi",
                                      f"[0:v]trim=end_frame=88,crop={crop},select='mod(n,2)',setpts=N/(30*TB)[a];[1:v]trim=end_frame=88,crop={crop},select='mod(n,2)',setpts=N/(30*TB)[b];[a][b]ssim",
                                      "-f", "null", "-"], capture_output=True)
                 m_ = re.findall(r"All:([\d.]+)", rr.stderr.decode())
@@ -410,7 +411,7 @@ def part_sync(tmp):
         newp, lines = logged(M.interp_prepare, plan, M.load_config(), Path(d) / "tmp")
         sn = newp["takes"][0]["srcs"][0]
         check(sn["path"] != clip, "the marker clip was interpolated")
-        r = subprocess.run(["ffmpeg", "-hide_banner", "-v", "error", "-i", sn["path"], "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-", "-f", "null", "-"], capture_output=True)
+        r = R.run(["ffmpeg", "-hide_banner", "-v", "error", "-i", sn["path"], "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-", "-f", "null", "-"], capture_output=True)
         pts = [(float(a), float(b)) for a, b in re.findall(r"pts_time:([\d.]+)\s+lavfi\.signalstats\.YAVG=([\d.]+)", r.stdout.decode())]
         t_marker = next(t for t, y in pts if y > 128)
         planned = 4.0                                              # frame 120 of the 30 fps source
@@ -520,20 +521,20 @@ def part_b(tmp):
         py = [p for p in ROOT.rglob("*.py") if ".git" not in p.parts and "montage_data" not in p.parts and "__pycache__" not in p.parts]
         bad = []
         for p in py:
-            r = subprocess.run([sys.executable, "-W", "ignore", "-m", "py_compile", str(p)], capture_output=True)
+            r = R.run([sys.executable, "-W", "ignore", "-m", "py_compile", str(p)], capture_output=True)
             if r.returncode:
                 bad.append(p.name)
         check(not bad, f"py_compile passes for all {len(py)} .py files {bad}")
         env = dict(os.environ, MONTAGER_DATA=str(Path(tmp) / "bdata"))
-        r = subprocess.run([sys.executable, "-W", "ignore", "montage.py", "cfgdump"], cwd=str(ROOT), capture_output=True, env=env, timeout=60)
+        r = R.run([sys.executable, "-W", "ignore", "montage.py", "cfgdump"], cwd=str(ROOT), capture_output=True, env=env, timeout=60)
         check(r.returncode == 0 and b"config" in r.stdout.lower(), "'python montage.py cfgdump' starts from the repo root")
-        r = subprocess.run([sys.executable, "-W", "ignore", "-c", "import montage"], cwd=str(ROOT), capture_output=True, env=env, timeout=60)
+        r = R.run([sys.executable, "-W", "ignore", "-c", "import montage"], cwd=str(ROOT), capture_output=True, env=env, timeout=60)
         check(r.returncode == 0, "import montage works from the repo root")
         def run_test(path):
             cmd = [sys.executable, "-W", "ignore", str(path)]
             if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
                 cmd = ["xvfb-run", "-a", "-s", "-screen 0 1920x1200x24"] + cmd
-            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, timeout=170)
+            r = R.run(cmd, cwd=str(ROOT), capture_output=True, timeout=170)
             tail = (r.stdout.decode(errors="replace") + r.stderr.decode(errors="replace")).strip().splitlines()[-1:]
             return r.returncode, tail
         for t in ("test_v65.py", "test_v652.py"):
@@ -547,7 +548,7 @@ def part_b(tmp):
                 check(True, f"{f.relative_to(ROOT)} passes ({time.time() - t0:.0f} s)")
                 continue
             # not passing here: it must then behave exactly like the untouched original at the old location (an environment limit, not the move)
-            orig = subprocess.run(["git", "show", f"{BASE_REF}:{t}"], cwd=str(ROOT), capture_output=True)
+            orig = R.run(["git", "show", f"{BASE_REF}:{t}"], cwd=str(ROOT), capture_output=True)
             tmpf = ROOT / ("_orig_" + t)
             tmpf.write_bytes(orig.stdout)
             try:
@@ -558,12 +559,12 @@ def part_b(tmp):
             print(f"      NOTE: {t} does not pass in this environment (also not at its old location): {tail}")
             check(same, f"{f.relative_to(ROOT)} gives exactly the same result as the untouched original (rc {rc} vs {rc0}) - the failure is the environment, not the move")
         txt = audit.read_text(encoding="utf-8")
-        gone = subprocess.run(["git", "diff", "--name-status", "--diff-filter=D", BASE_REF, "HEAD"], cwd=str(ROOT), capture_output=True, text=True).stdout.split()
+        gone = R.run(["git", "diff", "--name-status", "--diff-filter=D", BASE_REF, "HEAD"], cwd=str(ROOT), capture_output=True, text=True).stdout.split()
         gone = [x for x in gone if x != "D"]
         check(all(Path(x).name in txt for x in gone), f"no tracked file deleted without being listed in the audit ({len(gone)} deleted)")
-        anc = subprocess.run(["git", "merge-base", "--is-ancestor", BASE_REF, "HEAD"], cwd=str(ROOT)).returncode == 0
-        n0 = subprocess.run(["git", "rev-list", "--count", BASE_REF], cwd=str(ROOT), capture_output=True, text=True).stdout.strip()
-        n1 = subprocess.run(["git", "rev-list", "--count", "HEAD"], cwd=str(ROOT), capture_output=True, text=True).stdout.strip()
+        anc = R.run(["git", "merge-base", "--is-ancestor", BASE_REF, "HEAD"], cwd=str(ROOT)).returncode == 0
+        n0 = R.run(["git", "rev-list", "--count", BASE_REF], cwd=str(ROOT), capture_output=True, text=True).stdout.strip()
+        n1 = R.run(["git", "rev-list", "--count", "HEAD"], cwd=str(ROOT), capture_output=True, text=True).stdout.strip()
         check(anc and int(n1) >= int(n0), f"git history intact (base commit is an ancestor; {n0} -> {n1} commits)")
 
 

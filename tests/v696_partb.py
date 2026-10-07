@@ -154,13 +154,14 @@ def part_group(tmp):
 def part_v69():
     with section("8c) the existing tests/test_v69.py (pairing) still ends with ALL OK"):
         import subprocess
+        import _run as R
         import sys
         import time
         from v696_common import ROOT
         f = ROOT / "tests" / "test_v69.py"
         f = f if f.exists() else ROOT / "test_v69.py"
         t0 = time.time()
-        r = subprocess.run([sys.executable, str(f)], capture_output=True, text=True, cwd=str(ROOT), encoding="utf-8", errors="replace")
+        r = R.run([sys.executable, str(f)], capture_output=True, text=True, cwd=str(ROOT), encoding="utf-8", errors="replace")
         lines = (r.stdout or "").strip().splitlines()
         check(r.returncode == 0 and lines and lines[-1].strip() == "ALL OK", f"{f.relative_to(ROOT)} ends with '{lines[-1].strip() if lines else r.stderr[-200:]}' ({time.time() - t0:.1f} s)")
 
