@@ -546,3 +546,207 @@ def main(args, say=print):
     for e in state["errors"]:
         say(f"   skipped: {e['song']}: {e['error']}")
     return 0
+
+
+# ====================================================================================================================== V7
+# python songmap_compare.py v7bench   -> the song-level benchmark (V1 / V2 / auto) on the independent kicks
+# python songmap_compare.py v7plan    -> the plan-level test (existing dry planner, V1 map vs V2-auto map) + listening files + compare_out/report.md
+V7_REAL = ["Silicon XX", "pretty afternoon", "prety - ", "Beautiful Now - Zedd", "Beautiful Now - Yosuf", "life kinda sucks", "too much (hardtekk)"]
+V7_PROBLEM = ["#eurodab", "ALWAYS BEEN MINE", "530 - DONDA", "24 songs - Six Zeta", "AI Slop", "16 - Baby Keem", "A Bar Song", "(nendest)"]
+V7_CLUSTERS = [("chill", "No Time To Die"), ("acoustic / live-drum-like (mid energy, low danceability)", "Better Now - Post Malone"),
+               ("hip-hop", "2 time zones"), ("fast / high energy", "INSONAMIA")]
+
+
+def v7_song_list(M, say=print):
+    """[(label, path, csv_bpm, why)] for the benchmark songs (cap 20)."""
+    files = sorted(Path(M.load_config().get("mp3_dir")).glob("*.mp3"))
+    pool = {str(s["path"]).replace("\\", "/"): s for s in M.song_pool(M.load_config(), cached_only=True)[0]}
+    out = []
+    for frag, why in [(f, "real montage song") for f in V7_REAL] + [(f, "earlier problem song") for f in V7_PROBLEM] + [(f, c) for c, f in V7_CLUSTERS]:
+        f = next((p for p in files if frag.lower() in p.name.lower()), None)
+        if f is None:
+            say(f"  not found in the songs folder: {frag!r} ({why})")
+            continue
+        p = str(f).replace("\\", "/")
+        out.append((f.stem, p, (pool.get(p) or {}).get("csv_bpm"), why))
+    return out[:20]
+
+
+def v7_bench(argv=None, say=print):
+    """BASELINE / after table: per song V1 vs V2 vs auto on the independent kicks (bench.py)."""
+    from songmap_v2 import bench
+    M = _montage()
+    rows = []
+    t0 = time.time()
+    for label, p, csv, why in v7_song_list(M, say):
+        try:
+            rows.append(dict(bench.bench_song(M, p, csv, say=say), why=why))
+        except Exception as ex:
+            say(f"  ERROR {label}: {type(ex).__name__}: {ex}")
+    out = Path(M.HERE) / "compare_out"
+    out.mkdir(exist_ok=True)
+    (out / "v7_bench.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    say(f"v7bench: {len(rows)} songs in {time.time() - t0:.0f} s -> compare_out/v7_bench.json")
+    return rows
+
+
+def _click_track(times_roles, sr, n):
+    y = np.zeros(n, np.float32)
+    tone = {"first": _tone(sr, 1400, 0.03, 0.55, 0.01), "last": _tone(sr, [700, 2100], 0.08, 0.7, 0.03)}
+    for t, role in times_roles:
+        s = int(round(t * sr))
+        if 0 <= s < n:
+            e = min(n, s + len(tone[role]))
+            y[s:e] += tone[role][:e - s]
+    return y
+
+
+def _mix(song, clicks_, gain=0.8):
+    m = min(len(song), len(clicks_))
+    return np.clip(song[:m] * 0.7 + clicks_[:m] * gain, -1, 1)
+
+
+def v7_plan(argv=None, say=print):
+    """B4 + B6: the existing dry planner on the same takes / seed / song with the V1 map, the V2-auto map and the plain V2 map, kills judged on the
+    independent kicks, listening files, compare_out/report.md. Everything runs on a COPY of montage_data."""
+    from songmap_v2 import bench, planbench as PB, timebase
+    M = _montage()
+    out = Path(M.HERE) / "compare_out"
+    out.mkdir(exist_ok=True)
+    songs = v7_song_list(M, say)
+    if argv:
+        songs = [x for x in songs if any(f.lower() in x[0].lower() for f in argv)]
+    results = []
+    t0 = time.time()
+    with PB.data_copy(M):
+        sets = PB.take_sets(M)
+        for label, p, csv, why in songs:
+            say(f"== {label}")
+            try:
+                y, sr = timebase.decode(p)
+                kicks = bench.strong_kicks(y, sr)
+                drops = PB.indep_drops(y, sr)
+                r = {"song": label, "path": p, "why": why, "chance": PB.chance_stats(kicks, len(y) / sr), "drops": drops, "n_kicks": int(len(kicks)), "modes": {}}
+                for mode in ("v1", "v2auto", "v2"):
+                    r["modes"][mode] = {}
+                    for sname, (game, paths) in sets.items():
+                        ts = time.time()
+                        try:
+                            plan, lines = PB.run_plan(M, game, paths, p, mode)
+                        except Exception as ex:
+                            r["modes"][mode][sname] = {"error": f"{type(ex).__name__}: {ex}"}
+                            say(f"   {mode} {sname}: ERROR {ex}")
+                            continue
+                        mm = PB.measure(plan, kicks, drops)
+                        mm["auto_line"] = next((l for l in lines if l.startswith("songmap auto:")), None)
+                        mm["fallback_line"] = next((l for l in lines if l.startswith("songmap v2 fallback:")), None)
+                        kt = PB.kill_times(plan)
+                        mm["kill_list"] = [(round(t, 3), role, n) for t, role, n, _ in kt]
+                        mm["secs"] = round(time.time() - ts, 1)
+                        r["modes"][mode][sname] = mm
+                        if sname == "val7":
+                            top = max((x[2] for x in kt), default=0)
+                            r["modes"][mode]["_plan_val7"] = {"song_start": float(plan["song"]["start_t"]), "duration": float(plan["duration"]),
+                                                              "kills": [(round(t, 3), role) for t, role, n, _ in kt],
+                                                              "headline": next(((round(t, 3), n) for t, role, n, _ in kt if role == "first" and n == top), None)}
+                    r["modes"][mode]["_all"] = PB.summarize(sum((r["modes"][mode][s].get("dists", []) for s in sets), []))
+                    s1 = r["modes"][mode]["_all"]
+                    say(f"   {mode:7} kills {s1['n']:3} median {s1['median_ms']} p95 {s1['p95_ms']} within30 {s1['within30']}  (chance: median {r['chance']['median_ms']} within30 {r['chance']['within30']})")
+                r["auto_line"] = next((r["modes"]["v2auto"][s].get("auto_line") for s in sets if r["modes"]["v2auto"].get(s, {}).get("auto_line")), None)
+                _v7_listening(out, r, y, sr)
+                results.append(r)
+            except Exception as ex:
+                say(f"   ERROR {label}: {type(ex).__name__}: {ex}")
+                results.append({"song": label, "path": p, "why": why, "error": f"{type(ex).__name__}: {ex}"})
+    (out / "v7_plan.json").write_text(json.dumps(results, indent=1), encoding="utf-8")
+    text = v7_report(results, out)
+    say(text)
+    say(f"v7plan: {len(results)} songs in {time.time() - t0:.0f} s -> compare_out/report.md, v7_plan.json, listening files")
+    return results
+
+
+def _v7_listening(out, r, y, sr):
+    """Three 20 s clips around the headline multikill (original / V1-plan kill clicks / V2-plan kill clicks) + full-length click tracks."""
+    base = safe(r["song"])
+    p1, p2 = r["modes"]["v1"].get("_plan_val7"), r["modes"]["v2auto"].get("_plan_val7")
+    if not p1 or not p2:
+        return
+    h1 = (p1["headline"] or (p1["song_start"] + 5, 1))[0]
+    a1, b1 = clip_bounds(h1, len(y) / sr)
+    h2 = (p2["headline"] or (p2["song_start"] + 5, 1))[0]
+    a2, b2 = clip_bounds(h2, len(y) / sr)
+
+    def clip(plan, a, b):
+        n = int((b - a) * sr)
+        ck = _click_track([(t - a, role) for t, role in plan["kills"]], sr, n)
+        return _mix(y[int(a * sr):int(a * sr) + n], ck)
+    write_wav(out / f"{base}_plan_original.wav", y[int(a1 * sr):int(b1 * sr)], sr)
+    write_wav(out / f"{base}_plan_v1_clicks.wav", clip(p1, a1, b1), sr)
+    write_wav(out / f"{base}_plan_v2_clicks.wav", clip(p2, a2, b2), sr)
+    for tag, pl in (("v1", p1), ("v2", p2)):
+        a = pl["song_start"]
+        n = int(min(len(y) - a * sr, (pl["duration"] + 1) * sr))
+        ck = _click_track([(t - a, role) for t, role in pl["kills"]], sr, n)
+        write_wav(out / f"{base}_plan_full_{tag}_clicks.wav", _mix(y[int(a * sr):int(a * sr) + n], ck), sr)
+    r["listening"] = {"original": f"{base}_plan_original.wav", "v1": f"{base}_plan_v1_clicks.wav", "v2": f"{base}_plan_v2_clicks.wav",
+                      "same_window": abs(a1 - a2) < 0.5, "window_v1": [round(a1, 1), round(b1, 1)], "window_v2": [round(a2, 1), round(b2, 1)]}
+
+
+def v7_verdict(r):
+    """('V2 better' | 'V1 better' | 'tie', numbers line, delta_ms) for one song from the v1 vs v2auto kill-to-kick numbers."""
+    a, b = r["modes"]["v1"]["_all"], r["modes"]["v2auto"]["_all"]
+    if not a["n"] or not b["n"]:
+        return "tie", "no kills to compare", 0.0
+    d = a["median_ms"] - b["median_ms"]
+    used = "V2" if "-> V2" in (r.get("auto_line") or "") else "V1"
+    nums = f"median {a['median_ms']} -> {b['median_ms']} ms, p95 {a['p95_ms']} -> {b['p95_ms']} ms, within 30 ms {a['within30']:.0%} -> {b['within30']:.0%}"
+    if used == "V1":
+        return "tie", f"auto kept V1 (same plan): {nums}", 0.0
+    if d >= 3 and b["p95_ms"] <= a["p95_ms"] + 1:
+        return "V2 better", nums, d
+    if d <= -3 or b["p95_ms"] > a["p95_ms"] + 5:
+        return "V1 better", nums, d
+    return "tie", nums, d
+
+
+def v7_report(results, out):
+    rows = [r for r in results if "modes" in r]
+    verd = [(r, *v7_verdict(r)) for r in rows]
+    verd.sort(key=lambda x: -abs(x[3]))
+    L = ["# SONGMAP V7 - plan-level test: V1 map vs V2 (auto) map", "",
+         "Kills = the first kill of every take and the last kill of every multikill, judged against an independent low-band kick detector on the render timebase.",
+         "Same takes / seed / song for both maps (existing dry planner, no render). 'chance' = the same measure for random times (what no alignment looks like).", ""]
+    L += ["## Listen to these first (largest difference)", ""]
+    for r, v, line, d in verd[:6]:
+        if r.get("listening") and v != "tie":
+            L.append(f"1. **{r['song']}** - {v} ({line}) - files: `{r['listening']['original']}`, `{r['listening']['v1']}`, `{r['listening']['v2']}`")
+    L += ["", "## Per song", "", "| song | map used by auto | V1 median / p95 / within30 | V2-auto median / p95 / within30 | plain V2 median / p95 | chance median / within30 | takes/events V1 -> V2-auto | verdict |",
+          "|---|---|---|---|---|---|---|---|"]
+
+    def te(r, m):
+        ss = [r["modes"][m][s] for s in ("val7", "cs2trio", "cs2singles") if "takes" in r["modes"][m].get(s, {})]
+        return f"{sum(x['takes'] for x in ss)}/{sum(x['events'] for x in ss)}"
+    for r, v, line, d in sorted(verd, key=lambda x: x[0]["song"]):
+        a, b, c = r["modes"]["v1"]["_all"], r["modes"]["v2auto"]["_all"], r["modes"]["v2"]["_all"]
+        used = "V2" if "-> V2" in (r.get("auto_line") or "") else "V1"
+        L.append(f"| {r['song'][:34]} | {used} | {a['median_ms']} / {a['p95_ms']} / {a['within30']:.0%} | {b['median_ms']} / {b['p95_ms']} / {b['within30']:.0%} | {c['median_ms']} / {c['p95_ms']} | "
+                 f"{r['chance']['median_ms']} / {r['chance']['within30']:.0%} | {te(r, 'v1')} -> {te(r, 'v2auto')} | {v} |")
+    L += ["", "## One line per song", ""]
+    for r, v, line, d in sorted(verd, key=lambda x: x[0]["song"]):
+        L.append(f"- {r['song']}: **{v}** - {line}. {r.get('auto_line') or ''}")
+    for r in results:
+        if "error" in r:
+            L.append(f"- {r['song']}: ERROR {r['error']}")
+    text = "\n".join(L)
+    (out / "report.md").write_text(text, encoding="utf-8")
+    return text
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "v7bench":
+        v7_bench(sys.argv[2:])
+    elif cmd == "v7plan":
+        v7_plan(sys.argv[2:])
+    else:
+        print("usage: python songmap_compare.py v7bench | v7plan   (the V6.9.5 tool stays: python montage.py songmapcompare --auto 10)")

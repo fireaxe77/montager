@@ -11,6 +11,9 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - KNOWN ISSUE: Valorant clip 21.04.36.03 (4K) often cannot form a take.
 - KNOWN ISSUE: low-bitrate OBS clips need a kill-detection check.
 
+## V7 test - 2026-10-08: Song map V2 improvement (test branch, not merged)
+- The better beat grid is tested on 19 songs. It locks better on several (e.g. Silicon XX) but is not clearly better in real montages, so V1 stays default.
+
 ## V6.9.11 - 2026-10-07: Readable changelog in Settings
 - The changelog in Settings now shows this short plain-language history.
 
