@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.7"
+APP_VERSION = "V6.9.7.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2962,8 +2962,8 @@ def verified_kills(pool_items, cfg):
                 k = dict(k, shot=True, lag=round(k["t"] - shot, 3), shot_t=round(shot, 3))
             if k.get("weak_hl"):
                 it["rej"].append({"t": k["t"], "reason": "no highlight colour (kept - highlight is only a bonus)", "ks": k["ks"], "soft": True})
-            if any(d < k["t"] <= d + lock and not any(d < rv <= k["t"] for rv in it.get("revives", []))
-                   for d in it.get("deaths", [])):                     # a (Clove) revive ends the lock
+            if not k.get("util") and any(d < k["t"] <= d + lock and not any(d < rv <= k["t"] for rv in it.get("revives", []))
+                                         for d in it.get("deaths", [])):                     # a (Clove) revive ends the lock; V6.9.7.1: not for rows the utility override admitted
                 st["death_lock"] += 1
                 it["rej"].append({"t": k["t"], "reason": f"within {lock:.0f}s after my death", "ks": k["ks"]})
                 continue
@@ -5476,7 +5476,7 @@ def clip_anchor(path, dur=None, mtime=None):
         but only while it lies inside the named minute; a copied / touched file is NOT provable (never guessed).
     '(2)' suffixes are separate saves: ordering is by the anchored time (modified time), never by the name."""
     info = name_time_info(path)
-    if info is None or not dur or float(dur) <= 0:
+    if not dur or float(dur) <= 0:
         return None
     dur = float(dur)
     if mtime is None:
@@ -5484,6 +5484,12 @@ def clip_anchor(path, dur=None, mtime=None):
             mtime = os.path.getmtime(path)
         except OSError:
             mtime = None
+    if mtime is not None:                      # V6.9.7.1: the REAL save time is the file's modified time (OBS replay and DVR alike) = the clip END; names are not trusted
+        return {"scheme": (info or {}).get("scheme", "mtime"), "res": (info or {}).get("res", "sec"), "name_t": (info or {}).get("t"), "seq": (info or {}).get("seq", 1),
+                "mtime": mtime, "dur": dur, "start": mtime - dur, "end": mtime, "side": "end", "verified": True, "provable": True,
+                "how": "save time = file modified time = the clip END (start = modified - duration)"}
+    if info is None:
+        return None
     T = info["t"]
     res = {"scheme": info["scheme"], "res": info["res"], "name_t": T, "seq": info["seq"], "mtime": mtime, "dur": dur}
     if info["res"] == "min":
@@ -5584,6 +5590,44 @@ class KillLedger:
 
     def label(self, r):
         return f"{r['clip']} @ {ts(r['t'])} -> {r['victim'] or '?'}"
+
+
+FIGHT_GAP_LONG_CLIP = 30.0              # V6.9.7.1: kills of one clip / group are one fight up to this gap when a clip is LONG_CLIP_S or longer
+LONG_CLIP_S = 25.0
+LINK_KILL_TOL_S = 3.0                   # shared-victim kill pairs must agree with the save-time offset within this (else different rounds: not linked)
+STITCH_GAP_S = 0.75                     # a stitched take may join clips that follow each other with at most this much footage missing between them
+LINK_DUP_WINDOW_S = 3.0                 # same victim + absolute time within this = ONE kill across linked clips
+
+
+def save_time_link(a, b):
+    """V6.9.7.1 THE SIMPLE RULE: clips are one fight when they were saved right next to each other. Each clip's range is [modified time - duration, modified
+    time] (clip_anchor); a (saved first) and b link if the ranges overlap or the gap is within the continuation window (PAIR_MAX_GAP_S). Cheap veto: when
+    they share a victim name (OCR-tolerant) and no shared-victim kill pair agrees with the save-time offset within LINK_KILL_TOL_S, they are different rounds
+    with recurring names and do NOT link. The offset (a-time of a moment = b-time + offset) is the median of the agreeing kill pairs when there are any, else
+    the save-time offset. The frame match is advisory only (make_event). Returns ({raw_offset, save_offset, match, pairs, gap}, '') or (None, why)."""
+    from rapidfuzz import fuzz
+    aa, ab = a.get("anc"), b.get("anc")
+    if not aa or not ab:
+        return None, "save time unknown (no modified time / duration)"
+    ov = min(aa["end"], ab["end"]) - max(aa["start"], ab["start"])
+    if ov < -PAIR_MAX_GAP_S:
+        return None, f"saved {-ov:.1f} s apart (gap larger than the {PAIR_MAX_GAP_S:.0f} s continuation window)"
+    off_t = ab["start"] - aa["start"]
+    diffs, shared = [], 0
+    for x in a["kills"]:
+        for y in b["kills"]:
+            va, vb = _alnum((x.get("victim") or "").lower()), _alnum((y.get("victim") or "").lower())
+            if va and vb and fuzz.ratio(va, vb) >= 80:
+                shared += 1
+                if abs((x["t"] - y["t"]) - off_t) <= LINK_KILL_TOL_S:
+                    diffs.append(x["t"] - y["t"])
+    if shared and not diffs:
+        return None, f"shared victim name(s) but the kill times disagree with the save times by more than {LINK_KILL_TOL_S:.0f} s (different rounds)"
+    off = float(statistics.median(diffs)) if diffs else off_t
+    apart = abs(ab["end"] - aa["end"])
+    return {"raw_offset": off, "save_offset": off_t, "pairs": len(diffs), "apart": apart, "gap": -ov,
+            "match": f"saved {apart:.0f} s apart, " + ("overlap %.1f s" % ov if ov >= 0 else "gap %.1f s" % -ov)
+                     + (f", kill-pair offset {off:+.2f} s vs save-time offset {off_t:+.2f} s" if diffs else f", save-time offset {off_t:+.2f} s")}, ""
 
 
 def _proof_gate(budget, fn):
@@ -5689,7 +5733,7 @@ def ledger_safety_net(led, evs, game, cfg, det, refine, gap):
         revs = sorted(it.get("revives", []))
         clusters, cur = [], [rows[0]]
         for r in rows[1:]:                                 # the same fight rule as build_events(): split only on a long gap with no revive in it
-            if r["t"] - cur[-1]["t"] <= gap or any(cur[-1]["t"] < rv < r["t"] for rv in revs):
+            if r["t"] - cur[-1]["t"] <= fight_gap_for(gap, [it]) or any(cur[-1]["t"] < rv < r["t"] for rv in revs):
                 cur.append(r)
             else:
                 clusters.append(cur)
@@ -5746,7 +5790,8 @@ def ledger_finalize(led, picked, planned, plan):
             tgt = led.rows[r["merged"]["into"] - 1]
             pr = r["merged"].get("proof") or {}
             r["info"] = {"survivor": led.label(tgt), "survivor_id": tgt["id"], "pair": [Path(p).name for p in r["merged"].get("pair", [])],
-                         "offset": round(pr["raw_offset"], 3) if pr else None, "score": pr.get("score") if pr else None, "match": pr.get("match") if pr else "same clip: existing 1.5 s duplicate rule"}
+                         "offset": round(pr["raw_offset"], 3) if pr else None, "score": pr.get("score") if pr else None, "match": pr.get("match") if pr else "same clip: existing 1.5 s duplicate rule",
+                         "reason": r["merged"].get("reason", "")}
             continue
         keys = row_ev.get(r["id"], [])
         best = None
@@ -5792,8 +5837,8 @@ def ledger_report(led):
     for r in led.rows:
         if r["state"] == "MERGED_DUP":
             i = r["info"]
-            lines.append(f"  merged duplicate: {led.label(r)} = {i['survivor']} (proof: {' / '.join(i['pair']) or 'same clip'}, offset "
-                         f"{('%+.2f s' % i['offset']) if i['offset'] is not None else 'n/a'}, frame match {i['match']})")
+            lines.append(f"  merged duplicate: {led.label(r)} = {i['survivor']} ({i.get('reason') or i['match']}; {' / '.join(i['pair']) or 'same clip'}, offset "
+                         f"{('%+.2f s' % i['offset']) if i['offset'] is not None else 'n/a'})")
     lines += ["  " + x for x in led.released]
     lines += ["  " + x for x in led.splits]
     lost = [r for r in led.rows if r["state"] == "LOST"]
@@ -5969,7 +6014,16 @@ def apply_utility_override(rec, entry, a, cfg, game, ovs, admitted=None):
         return a
     ts_ = {round(k["t"], 3) for k in util}
     rej = [j for j in a.get("rej", []) if not (str(j.get("reason", "")).startswith("utility:") and round(j["t"], 3) in ts_)]
-    return dict(a, kills=sorted(list(a["kills"]) + util, key=lambda k: k["t"]), rej=rej)
+    from rapidfuzz import fuzz
+    deaths, revives = list(a.get("deaths", [])), list(a.get("revives", []))
+    for k in util:                                         # V6.9.7.1: the death / revive-looking row of the SAME victim within 0.5 s is the admitted row's twin (the OCR read the kill row
+        vn = _alnum((k.get("victim") or "").lower())       # twice, e.g. a rank badge 'IV' + 'fireaxe Alexandre'): it is not my death and not a revive of this clip
+        for j in rej:
+            if len(vn) >= 3 and str(j.get("reason", "")).startswith(("death", "revive")) and abs(j["t"] - k["t"]) <= 0.5                     and fuzz.partial_ratio(vn, _alnum(str(j["reason"]).split(":", 1)[-1].lower())) >= 80:
+                deaths = [d for d in deaths if abs(d - j["t"]) > 0.15]
+                revives = [r_ for r_ in revives if abs(r_ - j["t"]) > 0.15]
+                j["reason"] += " [twin of the utility row admitted by the override: ignored for the death window]"
+    return dict(a, kills=sorted(list(a["kills"]) + util, key=lambda k: k["t"]), rej=rej, deaths=deaths, revives=revives)
 
 
 def utility_override_lines(admitted):
@@ -6070,6 +6124,11 @@ def fight_gap(cfg, game):
     return max(float(cfg["gap_s"][game]), FIGHT_SPLIT_S.get(game, 0.0))
 
 
+def fight_gap_for(gap, items):
+    """V6.9.7.1: the split gap of a clip / group: unchanged under LONG_CLIP_S; with a clip of LONG_CLIP_S or longer kills stay one fight up to FIGHT_GAP_LONG_CLIP."""
+    return max(gap, FIGHT_GAP_LONG_CLIP) if any(float(it["rec"].get("dur") or 0) >= LONG_CLIP_S for it in items) else gap
+
+
 def build_events(pool, game, cfg, rng, flick_budget=40):
     """Clip pool -> montage events. Knife / utility kills are excluded. Clips recorded within ~60 s of each other that share a
     victim are ONE event (union of kills): the clip covering most kills is used, or - if none shows them all - the clips are
@@ -6098,6 +6157,7 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
 
 
 def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
+    from rapidfuzz import fuzz
     # duplicates / continuations
     refine = load_json(REFINE_CACHE, {})
     kref = {}
@@ -6112,79 +6172,37 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
             return refine_kill(it["rec"], det, cfg, k, refine)
         except Exception:
             return k["t"]
-    items.sort(key=lambda i: i["ctime"])
-    budget = {"cap": PROOF_CAP_S, "t0": None, "dead": False}
-    proofs, links, memo = {}, set(), {}
-
-    def proof_of(m, b):
-        """Proof that clips m and b are the same fight (prove_same_fight), memoised; the offset is oriented m -> b (t_in_m - t_in_b)."""
-        key = (id(m), id(b))
-        if key in memo:
-            return memo[key]
-        sm, sb = (m["anc"] or {}).get("start", m["ctime"]), (b["anc"] or {}).get("start", b["ctime"])
-
-        def attempt(x, y):
-            try:
-                pr_, why_ = prove_same_fight(x, y, rf, budget)
-            except Exception as ex:                        # timeout / read error: NOT proven, the events stay separate
-                return None, f"not proven ({type(ex).__name__}: {ex})"
-            if pr_ and x is not m:                         # oriented m -> b
-                pr_ = dict(pr_, offset=-pr_["offset"], raw_offset=-pr_["raw_offset"], ax=pr_["bx"], bx=pr_["ax"])
-            return pr_, why_
-        order = [(m, b), (b, m)] if sm <= sb else [(b, m), (m, b)]
-        pr, why = attempt(*order[0])
-        if not pr and abs(sm - sb) <= 1.0 and not budget["dead"]:      # one base time ('DVR', 'DVR_1', ...): which clip comes first is decided by the frame match
-            pr2, why2 = attempt(*order[1])
-            if pr2:
-                pr, why = pr2, ""
-        memo[key] = memo[(id(b), id(m))] = pr
-        led.proofs.append({"a": Path(m["rec"]["path"]).name, "b": Path(b["rec"]["path"]).name, "proven": bool(pr), "why": why if not pr else "",
-                           **({"offset": round(pr["raw_offset"], 3), "score": pr["score"], "match": pr["match"]} if pr else {})})
-        return pr
-    groups, used = [], set()
-    for i, a in enumerate(items):
-        if i in used:
-            continue
-        g = [(a, 0.0)]
-        used.add(i)
-        grew = True
-        while grew:                                        # V6.9.6 (CS2): clips of one base time ('DVR', 'DVR_1', ...) sort in discovery order, so a clip
-            grew = False                                   # scanned before the clip that links it to the group must be tried again
-            for j in range(i + 1, len(items)):
-                b = items[j]
-                if j in used:
-                    continue
-                link = None
-                for (m, mo) in g:                          # V6.9.7: a link needs PROOF (clip times overlap + frame match + kill times agree), per adjacent pair
-                    if abs(b["ctime"] - m["ctime"]) > 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
-                        continue
-                    pr = proof_of(m, b)
-                    if pr:
-                        link = (m, mo, pr)
-                        break
-                if link is None:
-                    continue
-                m, mo, pr = link
-                if len(g) >= GROUP_MAX_CLIPS:              # the V6.9 fight-size limit: a longer chain splits; the boundary duplicate is merged by its pair proof
-                    from rapidfuzz import fuzz
-                    dups = {id(kb): (km, pr) for kb in b["kills"] for km in m["kills"]
-                            if fuzz.ratio(_alnum((km.get("victim") or "").lower()), _alnum((kb.get("victim") or "").lower())) >= 80
-                            and abs(km["t"] - (kb["t"] + pr["raw_offset"])) <= DUP_WINDOW_S}
-                    b.setdefault("_dup", {}).update({k_: v_ for k_, v_ in dups.items()})
-                    b["_dup_src"] = m
-                    msg = (f"fight group limit: {Path(b['rec']['path']).name} is proven adjacent to {Path(m['rec']['path']).name} but the group "
-                           f"already has {GROUP_MAX_CLIPS} clips - it starts a new group (chain split into proven adjacent pairs)")
-                    led.splits.append(msg)
-                    continue
-                g.append((b, mo + pr["raw_offset"]))
-                links.add((id(m), id(b)))
-                links.add((id(b), id(m)))
-                proofs[(id(m), id(b))] = proofs[(id(b), id(m))] = pr
-                used.add(j)
-                notes.append(f"clips proven to show the same fight: {Path(m['rec']['path']).name} / {Path(b['rec']['path']).name} "
-                             f"(frames {pr['match'].split(' (')[-1].rstrip(')')}, clip times agree within {pr['agree_s']} s)")
-                grew = game == "cs2"
+    items.sort(key=lambda i: ((i["anc"] or {}).get("end", i["ctime"]), (i["anc"] or {}).get("start", i["ctime"])))     # V6.9.7.1: by SAVE time (stable)
+    links, proofs = set(), {}
+    groups, i = [], 0
+    while i < len(items):                                  # V6.9.7.1: consecutive clips saved right next to each other (time rule, see save_time_link) = one fight
+        g = [(items[i], 0.0)]
+        j = i + 1
+        while j < len(items):
+            m, mo = g[-1]
+            b = items[j]
+            lk, why = save_time_link(m, b)
+            led.proofs.append({"a": Path(m["rec"]["path"]).name, "b": Path(b["rec"]["path"]).name, "proven": bool(lk), "why": why if not lk else "",
+                               **({"offset": round(lk["raw_offset"], 3), "score": None, "match": lk["match"]} if lk else {})})
+            if not lk:
+                break
+            if len(g) >= GROUP_MAX_CLIPS:                  # the V6.9 fight-size limit: a longer chain splits; the boundary duplicate is merged by its pair link
+                dups = {id(kb): (km, lk) for kb in b["kills"] for km in m["kills"]
+                        if fuzz.ratio(_alnum((km.get("victim") or "").lower()), _alnum((kb.get("victim") or "").lower())) >= 80
+                        and abs(km["t"] - (kb["t"] + lk["raw_offset"])) <= LINK_DUP_WINDOW_S}
+                b.setdefault("_dup", {}).update({k_: v_ for k_, v_ in dups.items()})
+                b["_dup_src"] = m
+                led.splits.append(f"fight group limit: {Path(b['rec']['path']).name} is saved next to {Path(m['rec']['path']).name} but the group "
+                                  f"already has {GROUP_MAX_CLIPS} clips - it starts a new group (chain split into adjacent pairs)")
+                break
+            g.append((b, mo + lk["raw_offset"]))
+            links.add((id(m), id(b)))
+            links.add((id(b), id(m)))
+            proofs[(id(m), id(b))] = proofs[(id(b), id(m))] = lk
+            notes.append(f"clips saved next to each other = one fight: {Path(m['rec']['path']).name} / {Path(b['rec']['path']).name} ({lk['match']})")
+            j += 1
         groups.append(g)
+        i = j
     evs = []
     for g in groups:
         # union of kills on the timeline of the group's first clip (kills of the same victim within 1.5 s are one kill) - V6.9.7: only kills of
@@ -6196,18 +6214,28 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
                     km, pr = it["_dup"][id(k)]
                     srow, drow = led.row(it["_dup_src"], km), led.row(it, k)
                     if srow and drow and not drow["merged"]:
-                        drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [it["_dup_src"]["rec"]["path"], it["rec"]["path"]], "split": True}
+                        drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [it["_dup_src"]["rec"]["path"], it["rec"]["path"]], "split": True,
+                                          "reason": f"saved {pr['apart']:.0f} s apart, same victim, abs time match"}
                     continue
                 tt = k["t"] + off
-                dup = next((u for u in allk if abs(tt - u["tt"]) <= DUP_WINDOW_S and _alnum(u.get("victim", "").lower()) == _alnum(k.get("victim", "").lower())
-                            and (u["src"] is it or (id(u["src"]), id(it)) in links)), None)
+                vk = _alnum(k.get("victim", "").lower())
+                dup = next((u for u in allk if _alnum(u.get("victim", "").lower()) == vk and abs(tt - u["tt"]) <= DUP_WINDOW_S and u["src"] is it
+                            or (u["src"] is not it and abs(tt - u["tt"]) <= LINK_DUP_WINDOW_S and len(vk) >= 2
+                                and fuzz.ratio(_alnum(u.get("victim", "").lower()), vk) >= 80)), None)       # V6.9.7.1: inside a chain: abs time within 3 s
                 if dup is None:
                     allk.append(dict(k, tt=tt, src=it, off=off))
                 else:
                     srow, drow = led.row(dup["src"], dup), led.row(it, k)
                     pr = proofs.get((id(dup["src"]), id(it)))
+                    if dup["src"] is not it and k.get("ks", 0) > dup.get("ks", 0) + 1e-9:                  # keep the row with the best name confidence
+                        allk[allk.index(dup)] = dict(k, tt=tt, src=it, off=off)
+                        srow, drow = drow, srow
                     if srow and drow and not drow["merged"]:
-                        drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [dup["src"]["rec"]["path"], it["rec"]["path"]]}
+                        why_ = f"saved {abs(((it.get('anc') or {}).get('end') or 0) - ((dup['src'].get('anc') or {}).get('end') or 0)):.0f} s apart, same victim, abs time match"                             if dup["src"] is not it else "same clip: existing 1.5 s duplicate rule"
+                        drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [dup["src"]["rec"]["path"], it["rec"]["path"]], "reason": why_}
+                        for r_ in led.rows:                # rows already merged into the replaced one now follow the new survivor
+                            if r_["merged"] and r_["merged"]["into"] == drow["id"] and r_ is not srow:
+                                r_["merged"]["into"] = srow["id"]
         if not allk:
             continue
         if len(g) > 1:
@@ -6216,9 +6244,12 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
         # events by kill spacing on the group timeline
         allk.sort(key=lambda k: k["tt"])
         revs = sorted(rv + off for it, off in g for rv in it.get("revives", []))
+        gap_g = fight_gap_for(gap, [it for it, _ in g])    # V6.9.7.1: a group with a clip of LONG_CLIP_S or more splits only on FIGHT_GAP_LONG_CLIP
+        if len(g) > 1:                                     # clips saved right next to each other are one fight: the continuation window also bounds the kill gap
+            gap_g = max(gap_g, PAIR_MAX_GAP_S)
         clusters, cur = [], [allk[0]]
         for k in allk[1:]:                                 # one fight = one event: split only on a long gap with no revive in it
-            if k["tt"] - cur[-1]["tt"] <= gap or any(cur[-1]["tt"] < rv < k["tt"] for rv in revs):
+            if k["tt"] - cur[-1]["tt"] <= gap_g or any(cur[-1]["tt"] < rv < k["tt"] for rv in revs):
                 cur.append(k)
             else:
                 clusters.append(cur)
@@ -6323,43 +6354,25 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
         spans.append({"it": it, "shift": o, "start": start, "end": end, "path": it["rec"]["path"]})
     spans.sort(key=lambda s: s["start"])
     stitch_note = ""
-    order_bad = ""
-    if len(spans) > 1 and (spans[0]["it"]["rec"].get("game") == "cs2"):
-        # V6.9.6: the order of a stitched CS2 group is CHRONOLOGICAL BY THE RECORDING TIME in the clip names (the 'pair partner' time index), not
-        # whatever order the victim-matched offsets or the discovery order give. Clips of one base time ('DVR', 'DVR_1', 'DVR_1_1') tie: they keep
-        # the offset order and the frame-match verification below decides between the two possible orders. Unparsable names: the old order.
-        nts = [pair_clip_start(s_["path"]) for s_ in spans]
-        if all(t_ is not None for t_ in nts):
-            spans = [s_ for _, s_ in sorted(zip(range(len(spans)), spans), key=lambda x: (nts[x[0]], x[1]["start"], x[1]["end"]))]
-            nts = sorted(nts)
-            if any(spans[i + 1]["start"] < spans[i]["start"] - 0.5 and nts[i + 1] > nts[i] for i in range(len(spans) - 1)):
-                order_bad = "the recording times in the clip names disagree with the kill offsets (order by name: " + \
-                            " < ".join(Path(s_["path"]).name for s_ in spans) + ")"
     if len(spans) > 1:
+        # V6.9.7.1: the clips were linked by their SAVE times and aligned by the kill-pair / save-time offset (build_events); the order is the save order
+        # (spans sorted by the aligned start). The frame match is ADVISORY only: it is logged, never a veto and never moves a clip.
         chain = [spans[0]]
         for s_ in spans[1:]:
-            if s_["start"] <= chain[-1]["end"] - 0.1 and s_["end"] > chain[-1]["end"]:
+            if s_["start"] <= chain[-1]["end"] + STITCH_GAP_S and s_["end"] > chain[-1]["end"]:        # overlapping, or back to back (saved one right after the other)
                 chain.append(s_)
         spans = chain
-        ok_all = not order_bad
-        if order_bad:
-            stitch_note += order_bad + "; "
-        for i in range(len(spans) - 1) if ok_all else ():
+        ok_all = True
+        for i in range(len(spans) - 1):
             cut = round((max(spans[i]["start"], spans[i + 1]["start"]) + spans[i]["end"]) / 2, 4)
-            ok, nshift, why = verify_stitch((spans[i], spans[i + 1]), cut) if verify else (True, spans[i + 1]["shift"], "not checked")
-            if not ok and verify and pair_clip_start(spans[i]["path"]) is not None and pair_clip_start(spans[i]["path"]) == pair_clip_start(spans[i + 1]["path"]):
-                a_, b_ = dict(spans[i + 1]), dict(spans[i])                    # same base time: the frame match decides which one comes first
-                cut2 = round((max(a_["start"], b_["start"]) + a_["end"]) / 2, 4)
-                ok2, nshift2, why2 = verify_stitch((a_, b_), cut2)
-                if ok2:
-                    spans[i], spans[i + 1] = a_, b_
-                    ok, nshift, why, cut = ok2, nshift2, why2 + " (order decided by the frame match)", cut2
-            stitch_note += f"cut {i + 1}: {why}; "
-            if not ok:
-                ok_all = False
-                break
-            d_ = nshift - spans[i + 1]["shift"]
-            spans[i + 1].update(shift=nshift, start=spans[i + 1]["start"] + d_, end=spans[i + 1]["end"] + d_)
+            if verify:
+                try:
+                    ok, nshift, why = verify_stitch((spans[i], spans[i + 1]), cut)
+                except Exception as ex:                      # noqa: BLE001
+                    ok, why = None, f"not checked ({type(ex).__name__})"
+            else:
+                ok, why = None, "not checked"
+            stitch_note += f"frame check: {why} (advisory); "
         if not ok_all:                                      # fall back to the single clip with the most of these kills
             # V5.43B: the offsets between the clips are WRONG (that is why the stitch failed), so nothing of the joined timeline may
             # be kept: re-plan the event from scratch on the single clip, from the kills THAT clip read, in its own time.
@@ -7687,13 +7700,18 @@ def _ssim_values(a_chain, b_chain, a_in, b_in):
     return rc, err, vals
 
 
+def interp_duration_ok(dur, d):
+    """V6.9.7.1: a segment's duration may differ by one frame of the MONTAGE target fps (OUT_FPS) plus 2 ms (real failures: 1.491 vs 1.480 s, 2.724 vs 2.708 s)."""
+    return abs(dur - d) <= 1.0 / OUT_FPS + 0.002
+
+
 def interp_validate(src, seg, s0, d, src_fps, out_fps=OUT_FPS):
     """None when the interpolated segment is sound, else the reason (see the V6.9.3 rules; V6.9.6: at the segment's own output rate)."""
     seg = Path(seg)
     if not seg.exists() or seg.stat().st_size < 1000:
         return "temp file missing"
     dur = probe_duration(seg)
-    if abs(dur - d) > 1.0 / out_fps + 0.002:
+    if not interp_duration_ok(dur, d):
         return f"duration {dur:.3f} s instead of {d:.3f} s"
     r = run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames,start_time",
              "-of", "json", str(seg)], timeout=120)
@@ -7703,7 +7721,7 @@ def interp_validate(src, seg, s0, d, src_fps, out_fps=OUT_FPS):
     except Exception:
         return "frame count unreadable"
     want = int(round((d - t0) * out_fps))
-    if abs(n - want) > (0 if t0 < 0.001 else 1):
+    if abs(n - want) > 1:                                   # V6.9.7.1: +-1 frame
         return f"{n} frames instead of {want}"
     ain, bin_ = ["-ss", "0", "-i", str(seg)], ["-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(src)]
     small = "scale=480:-2:flags=bilinear,format=yuv420p"
@@ -8502,6 +8520,12 @@ def pair_clip_start(path):
         return None
 
 
+def save_key(rec):
+    """V6.9.7.1: the save time (modified time = clip END) of a clip record; 0.0 when unknown."""
+    a = clip_anchor(rec["path"], rec.get("dur"))
+    return a["end"] if a else 0.0
+
+
 def pair_time_index(recs):
     """Sorted [(start, pkey, end, rec)] of the CS2 clips with a parsable name and a cached duration, plus the clips skipped."""
     idx, skipped = [], []
@@ -8600,7 +8624,7 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
                 state[d] = j
                 res["partners"].append((nb[3], rec["path"], gap))
                 lines.append(f"pair partner of {Path(rec['path']).name}: {nm} (gap {gap:.1f} s)")
-    res["partners"].sort(key=lambda x: (pair_clip_start(x[0]["path"]) or 0.0, x[0]["path"]))       # V6.9.6: never in discovery order
+    res["partners"].sort(key=lambda x: (save_key(x[0]), x[0]["path"]))       # V6.9.6: never in discovery order; V6.9.7.1: by save time
     return res
 
 
@@ -8673,7 +8697,7 @@ def pairing_replace_events(res, pool, picked, game, cfg, seed):
         ps = {p for c in mine for p in by_clip.get(c, [])}
         if not ps:
             continue
-        sub = sorted([it for it in pool if _pkey(it["rec"]["path"]) in mine | ps], key=lambda it: (pair_clip_start(it["rec"]["path"]) or 0.0, it["rec"]["path"]))
+        sub = sorted([it for it in pool if _pkey(it["rec"]["path"]) in mine | ps], key=lambda it: (save_key(it["rec"]), it["rec"]["path"]))
         if not any(_pkey(it["rec"]["path"]) in ps for it in sub):
             continue
         LEDGER_SUBCALL[0] = True

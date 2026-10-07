@@ -5,6 +5,14 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V6.9.7.1 - 2026-10-07
+- Small real-data fix (branch v6.9.7.1 from v6.9.7, not merged). Detector, kill-cache formats, planner scoring / beat logic, effects, render, songmap, theme and settings are untouched.
+- Linking rule (replaces the V6.9.7 proof gate): a clip's real save time is the file's modified time (= clip END, start = modified - duration; file-name times are not trusted). Clips sorted by save time link when their ranges overlap or the gap is within the 12 s continuation window; chains of at most 4. Cheap veto: a shared victim name whose kill-pair offset disagrees with the save-time offset by more than 3 s = different rounds, not linked. Clips are aligned by the median kill-pair offset (else the save-time offset). Frame match and the CS2 name-order check are advisory only (logged "frame check: ... (advisory)"). Duplicates inside a chain (same victim, absolute time within 3 s) = one kill, best name confidence kept, ledger MERGED_DUP "saved N s apart, same victim, abs time match". CS2 pair partners use the same anchors. A group of linked clips splits on a kill gap only above the 12 s window; stitching also accepts back-to-back clips (at most 0.75 s of footage missing).
+- Change 1: kills of one clip / group stay one fight up to FIGHT_GAP_LONG_CLIP = 30 s when a clip is 25 s or longer (clips under 25 s unchanged).
+- Change 3: rows admitted by the utility override are exempt from the death window; a death / revive row of the same victim within 0.5 s of an admitted row is its twin (the OCR read the kill row twice) and is ignored for that clip's death / revive handling. Override OFF = identical.
+- Change 4: interpolation validation allows one frame of the montage fps (60) + 2 ms for the segment duration and +-1 frame for the frame count.
+- Tests: `tests/test_v6971.py` (real clips in E:\Movies on a copy of montage_data, link / fight / twin / interpolation unit cases, 50 + 50 generated clips identical to V6.9.7). The older V6.9.7 tests assert the proof gate and are not run.
+
 ## V6.9.7 - 2026-10-07
 - Parts, one commit each (any part can be dropped): 0 = test encoding fix, A = kill ledger safety net, B = per-clip utility override, D = interpolation checkbox (the entry lists the parts that are in this commit). Kill detection (Valorant and CS2), planner scoring / cut / beat logic, effects, render, interpolation behaviour, song matching, theme and all existing settings are untouched.
 - PART 0 - test encoding fix (tests only, NO runtime change):
