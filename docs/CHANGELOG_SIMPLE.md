@@ -1,73 +1,85 @@
-# Montager - short history (plain language)
+# Montager - what changed (plain language)
 
-Newest first. The full technical history is `CHANGELOG.md`. Not shown in the app.
+Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
 ## Known issues / on hold
-- **ON HOLD:** SONGMAPV2 (new beat grid). Songmap V1 is the default and the only one used for real montages.
-- **ABANDONED:** frame interpolation for slow-motion. Off by default (setting kept, code kept).
-- **KNOWN ISSUE:** the CS2 "sync report" after a render undercounts kills on slow-mo and zoom takes. The montage itself is fine.
-- **KNOWN ISSUE:** CS2 clip `2026.02.10 - 19.09.46.22` shows its kill dated late (killfeed shape filter), so the take starts after the kill. Not fixed.
-- **KNOWN ISSUE:** the Valorant 4K `21.04.36.03` often cannot form a take (it does not fit the song's beats).
-- **KNOWN ISSUE:** low-bitrate OBS clips need a kill-detection check; killfeed text can be misread.
-- **KNOWN ISSUE:** a stale kill whose victim is read very differently (for example `s0ul` / `$oul`) can still count once as a new kill.
+- ON HOLD: song map V2 (better beat grid). Song map V1 stays the default; a V7 test is running.
+- ABANDONED: frame interpolation for low-fps clips. It is off by default.
+- KNOWN ISSUE: the CS2 sync report undercounts kills. The montage itself is fine.
+- KNOWN ISSUE: CS2 clip 2026.02.10 - 19.09.46.22 shows its kill dated late, so the take cuts away before it.
+- KNOWN ISSUE: CS2 stale kill rows with very different spelling can still survive (13.53.24.09).
+- KNOWN ISSUE: Valorant clip 21.04.36.03 (4K) often cannot form a take.
+- KNOWN ISSUE: low-bitrate OBS clips need a kill-detection check.
 
-## V6.9.10 - 2026-10-07
-- CS2: a kill that was already on the killfeed when the clip started is no longer counted again a few seconds in (it made takes start after the kill or with kills already showing).
+## V6.9.11 - 2026-10-07: Readable changelog in Settings
+- The changelog in Settings now shows this short plain-language history.
 
-## V6.9.9 - 2026-10-07
-- Valorant weekly "Force new" can render again: clips saved back to back no longer leave a hole that made the whole render stop.
-- One bad take no longer cancels the render; it is skipped and logged. The kill ledger no longer reports hundreds of "lost" kills in weekly runs.
+## V6.9.10 - 2026-10-07: CS2 phantom kills from stale feed rows removed
+- A kill that was already on the killfeed when the clip started is no longer counted again a few seconds in.
+- This stops takes that started after the kill or showed a kill twice.
 
-## V6.9.8.1 - 2026-10-07
-- Frame interpolation is OFF by default (it caused a repeated slow-mo kill).
-- Random pick and weekly picks now pull in the other clips of a multikill even if they were used before, so a 3K stays a 3K (both games).
+## V6.9.9 - 2026-10-07: Weekly render fix
+- Valorant weekly "Force new" can render again; clips saved back to back no longer leave a gap that stopped the render.
+- One bad take no longer cancels the whole render; it is skipped and logged.
+- Weekly runs no longer report hundreds of "lost" kills that were not lost.
 
-## V6.9.8 - 2026-10-07
-- CS2: a victim read twice in one clip is one kill (a 2K was planned as a 3K).
-- Random / weekly picks add the neighbouring clips of a multikill for Valorant too.
+## V6.9.8 - 2026-10-07: Companion clips for random and weekly picks
+- Random and weekly picks now pull in the other clips of a multikill, even if used before, so a 3K stays a 3K (both games).
+- CS2: a victim read twice in one clip is one kill (a 2K was shown as a 3K).
+- Frame interpolation is now off by default (it caused a repeated slow-mo kill).
 
-## V6.9.7 - V6.9.7.2 - 2026-10-07
-- Clips are linked by their real save time: clips saved right after each other become one fight and one stitched take (Valorant OBS clips, CS2 DVR clips).
-- Kill ledger: every kill ends as placed, merged duplicate, ranked out or lost, with a log line. Per-clip override to count utility kills (Valorant). Settings checkbox for interpolation.
+## V6.9.7 - 2026-10-07: Kill ledger + per-clip utility kills
+- Clips saved right after each other are linked by their real save time and become one fight and one stitched take.
+- Every kill now ends up as placed, merged duplicate, ranked out or lost, and the log says which.
+- Valorant: a per-clip override can count utility kills.
 - Fights inside a long clip stay one fight up to 30 s.
 
-## V6.9.6 - 2026-10-07
-- Repository tidied (tests and docs in their own folders); tools to inspect clip pairs and their order. No behaviour change.
+## V6.9.6 - 2026-10-06: Smarter fps check + stitch order fix
+- The low-fps check looks at the frame rate you actually see on screen.
+- Stitched clips are put in the right order.
+- Tools added to inspect clip pairs and their order.
 
-## V6.9.5 - V6.9.5.2 - 2026-10-06/07
-- ON HOLD: Songmap V2 added as a separate, optional beat analysis with a comparison tool. Default stays Songmap V1.
+## V6.9.5 - 2026-10-06: Song map V2 (on hold, V1 stays default)
+- ON HOLD: an optional new beat analysis with a comparison tool. Not used for real montages.
 
-## V6.9.3 - 2026-10-06
-- Low-fps clips could be interpolated at render time (later abandoned, see top).
+## V6.9.3 - 2026-10-06: Repo cleanup + frame interpolation (later turned off)
+- Low-fps clips could be smoothed at render time. Later abandoned (see top).
 
-## V6.9 - 2026-10-06
-- CS2: when a fight was recorded as 2-3 consecutive clips, the neighbour clips are pulled into the selection and stitched into one take.
+## V6.9 - 2026-10-06: Multikills split across clips
+- CS2: when a fight was recorded as 2-3 consecutive clips, the neighbouring clips are pulled in and stitched into one take.
 
-## V6.8 - V6.8.2 - 2026-10-06
-- CS2 kill detection reworked around the red border of your killfeed rows (more reliable, fewer phantom kills). Settings region picker, search bar in Step 1, a row-debug tool.
+## V6.8 - 2026-10-06: CS2 kill detection around the red border
+- CS2 kills are found through the red outline of your killfeed rows: more reliable, fewer phantom kills.
+- New killfeed region picker in Settings and a search bar in Step 1.
 
-## V6.7 - V6.7.6 - 2026-10-05/06
-- CS2: garbled name reads no longer inflate the kill count; knife and revive rows handled.
+## V6.7 - 2026-10-05: CS2 kill count fixes
+- Garbled name reads no longer inflate the kill count; knife and revive rows are handled.
 - The killfeed region is remembered and protected against bad values.
+- The 150 s length setting now really gives 150 s.
 
-## V6.5 - V6.5.2 - 2026-10-05
-- Song matching fixed for files named "Title - Artist1, Artist2".
-- Weekly / Auto montages are at least 60 s (reused clips only if needed).
-- V6.5.2 = the Valorant kill-detection baseline: later versions must give the same Valorant kills.
+## V6.5 - 2026-10-05: Song matching and weekly length fixes
+- Song files named "Title - Artist1, Artist2" are matched to the right track.
+- Weekly / Auto montages are at least 60 s.
+- Manual list: clicking an empty "used" cell flags the clip, and there is an "Unflag all" button.
+- V6.5.2 is the Valorant kill-detection baseline.
 
-## V6.0 - V6.2 - 2026-10-05
-- Auto / weekly length uses the same fit rule as Manual (80-150 s, never past the song).
-- Faster start (loading window, one-step window build), calmer Manual tab summary line, a performance log.
+## V6.0 - V6.2 - 2026-10-05: Faster start and calmer Manual tab
+- Auto / weekly length follows the same 80-150 s fit rule as Manual and never goes past the song.
+- Loading window, quicker tab switching and no widgets appearing one by one.
+- A silent game audio track is replaced by the loudest one for that clip only.
 
-## V5.x - 2026-10-05
-- Looks and handling: Sun Valley theme with live accent colour, draggable dividers, "used" column and filter, Random pick, plan shown before rendering, own taskbar icon, launcher, mouse wheel never changes values.
-- Editing rules: montage never longer than the song section; adaptive jump-cuts in long multikills; green victim = revive, not a kill; Clove self-revive is not a kill; zoom punches only (no flashes); render never aborts on a kill row outside the take.
+## V5.x - 2026-10-05: Looks, handling and editing rules
+- Sun Valley theme with live accent colour, draggable dividers, "used" column and filter, Random pick, own taskbar icon.
+- The mouse wheel never changes a value any more.
+- A montage is never longer than the song section; long multikills get adaptive jump-cuts.
+- A green victim means revive, not a kill; Clove self-revive is not a kill; zoom punches only.
 
-## V5 - V5.1 - 2026-10-04
-- Explicit Valorant / CS2 clip folders. The V4 engine became the base with frame-exact kill placement.
+## V5 - V5.1 - 2026-10-04: Clip folders and frame-exact kills
+- Explicit Valorant and CS2 clip folders. Kills are placed frame-exactly.
+- Songs get a beat map with downbeats and sections.
 
-## V4 - 2026-10-04
-- Kills are read from the killfeed with OCR (replaces image matching): a kill is a row with your name first.
+## V4 - 2026-10-04: Kills read with OCR
+- Kills are read from the killfeed text instead of image matching.
 
-## V3, megafix, first builder, stage 0 - 2026-10-04
-- First versions: GUI, clip and kill detection, song matching, planner and renderer. Details not recorded.
+## V3 and earlier - 2026-10-04: First versions
+- GUI, clip and kill detection, song matching, planner and renderer. Details not recorded.
