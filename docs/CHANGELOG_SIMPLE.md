@@ -2,8 +2,14 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## Song map V2 (still being tuned)
+- Song map V2 now finds drops where the kick actually comes back, so the montage starts on a steady beat instead of a quiet build-up.
+- On many songs the kills land much closer to the beat; a few songs are still better with Song map V1, so V1 stays the default.
+- Settings now offers just "Songmap V1" and "Songmap V2".
+- If V2 ever fails on a song, that song silently uses V1.
+
 ## Known issues / on hold
-- ON HOLD: song map V2 (better beat grid). Song map V1 stays the default; a V7 test is running.
+- ON HOLD: making song map V2 the default. V1 stays the default until V2 is never worse on any song.
 - ABANDONED: frame interpolation for low-fps clips. It is off by default.
 - KNOWN ISSUE: the CS2 sync report undercounts kills. The montage itself is fine.
 - KNOWN ISSUE: CS2 clip 2026.02.10 - 19.09.46.22 shows its kill dated late, so the take cuts away before it.

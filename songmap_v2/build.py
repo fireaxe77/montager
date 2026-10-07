@@ -23,9 +23,22 @@ def file_signature(path):
 ALGO_REV = "v7.1"              # V7: invalidates ONLY the V2 cache entries made by earlier V2 grids (ALGO_V in __init__.py is untouched)
 
 
+def _code_sig():
+    """Short hash of the analysis sources: any edit of the V2 algorithm invalidates ONLY the V2 cache (V7.1)."""
+    h = hashlib.sha1()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for n in ("grid", "events", "events7", "sections", "adapter", "build", "timebase", "judge"):
+        try:
+            with open(os.path.join(here, n + ".py"), "rb") as f:
+                h.update(f.read())
+        except OSError:
+            pass
+    return h.hexdigest()[:8]
+
+
 def cache_key(path, csv_bpm=None, v1_bpm=None):
     """V2 cache key. The V1 BPM (read-only, a candidate of the tempo lock) is part of the key only when it was used."""
-    return f"{CACHE_NS}|{ALGO_V}|{file_signature(path)}|{round(float(csv_bpm or 0), 3)}|{ALGO_REV}" + (f"|v1:{round(float(v1_bpm), 2)}" if v1_bpm else "")
+    return f"{CACHE_NS}|{ALGO_V}|{file_signature(path)}|{round(float(csv_bpm or 0), 3)}|{ALGO_REV}|{_code_sig()}" + (f"|v1:{round(float(v1_bpm), 2)}" if v1_bpm else "")
 
 
 AUTO_MIN_CONF = 0.5             # V7 gate ('Songmap V2 (auto, V1 fallback)'): V2 is used for a song only if ALL of these hold
@@ -137,6 +150,7 @@ def build_songmap_v2(path, csv_bpm=None, deadline=None, hook=None, v1_bpm=None):
         if len(off) >= 8 and abs(float(np.median(off))) > 0.0003:
             phase_corr = float(np.median(off))
             beats = beats + phase_corr
+    beats, lp_info = grid.local_phase(beats, kt, ks)            # V7.1: per-window phase from the kicks folded on the half beat (live drums, drift, wrong global phase)
     G["beats"] = beats
     lo_ev = [e for e in ev if e["type"] in ("kick", "bass") and e["strength"] >= 0.3]       # V7: bass notes carry the bar start too (the root changes with every bar)
     bt = np.array([e["raw_time"] for e in lo_ev])
@@ -153,7 +167,9 @@ def build_songmap_v2(path, csv_bpm=None, deadline=None, hook=None, v1_bpm=None):
                 f"({conf_parts['n_kicks']} kicks), tempo {bpm_final:.2f}")
     EV = events.associate(ev, beats, bpb)
     chk("associate")
-    bars = sections.bar_table(beats, down, dur, y, sr, F["sig"]["low"], EV)
+    kick_ev = np.sort(np.array([e["raw_time"] for e in ev if e["type"] == "kick" and e["strength"] >= 0.4 and e.get("sharp", 1.0) >= events7.SHARP_MIN
+                                or e["type"] == "bass" and e["strength"] >= 0.5]))
+    bars = sections.bar_table(beats, down, dur, y, sr, F["sig"]["low"], EV, kick_ev)
     SEC = sections.analyse(bars, float(np.median([b["t1"] - b["t0"] for b in bars])) if bars else period * bpb)
     SEC["bars"] = bars
     SEC["labels"] = SEC["labels"] if len(SEC["labels"]) == len(bars) else (SEC["labels"] + ["verse"] * len(bars))[:len(bars)]
@@ -161,7 +177,7 @@ def build_songmap_v2(path, csv_bpm=None, deadline=None, hook=None, v1_bpm=None):
     G.update(bpm=bpm_final, bpb=bpb, down=down, conf=conf, down_conf=dconf, csv_used=csv_used)
     n_on = sum(1 for e in EV if e["on_grid"])
     jk = judge.strong(y, sr)
-    extras = {"judge_kicks": [round(float(t), 3) for t in jk[:4000]], "phase_correction_ms": round(phase_corr * 1000, 3), "tempo": tinfo, "lock": G["lock"], "confidence_parts": conf_parts, "confidence_log": log_line, "events_on_grid": n_on, "events_total": len(EV),
+    extras = {"local_phase": lp_info, "judge_kicks": [round(float(t), 3) for t in jk[:4000]], "phase_correction_ms": round(phase_corr * 1000, 3), "tempo": tinfo, "lock": G["lock"], "confidence_parts": conf_parts, "confidence_log": log_line, "events_on_grid": n_on, "events_total": len(EV),
               "pre_intro_beats": int(np.argmax(G["observed"])) if len(G["observed"]) else 0,
               "analysis_s": round(time.time() - t0, 2)}
     m = adapter.to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras)

@@ -4709,13 +4709,13 @@ def analyse_song(path, csv_bpm=None):
 SONGMAP_DEFAULT = "v1"                   # V6.9.5: the default song map; switching the default to SONGMAPV2 is this one line ("v2")
 SONGMAP_CHOICES = {"v1": "Songmap V1", "v2": "Songmap V2"}
 SONGMAP_AUTO = "v2auto"                  # V6.9.5.2: per song, V2 only where its grid is confident and measurably better than V1, else the V1 map
-SONGMAP_CHOICES_UI = dict(SONGMAP_CHOICES, **{SONGMAP_AUTO: "Songmap V2 (auto, V1 fallback)"})     # what the Settings dropdown offers
+SONGMAP_CHOICES_UI = dict(SONGMAP_CHOICES)     # V7.1: the Settings dropdown offers only Songmap V1 and Songmap V2 (a stored "v2auto" still works internally)
 SONGMAP_V2_HOOK = [None]                 # tests only: called at the start of a V2 analysis (inject an error / a delay)
 
 
 def songmap_version(cfg=None):
     v = str((cfg if cfg is not None else load_config()).get("songmap_version") or SONGMAP_DEFAULT).lower()
-    if v in (SONGMAP_AUTO, SONGMAP_CHOICES_UI[SONGMAP_AUTO].lower()):
+    if v in (SONGMAP_AUTO, "songmap v2 (auto, v1 fallback)"):
         return SONGMAP_AUTO
     return "v2" if v in ("v2", "songmap v2") else "v1"
 
@@ -12148,7 +12148,7 @@ class App:
         label("Kill placement (see synccompare)")
         ttk.Combobox(holder(), textvariable=self.set_place, values=["v5", "v4"], width=10, state="readonly").pack(side="left")
         r[0] += 1
-        self.set_songmap = tk.StringVar(value=SONGMAP_CHOICES_UI[songmap_version(self.cfg)])
+        self.set_songmap = tk.StringVar(value=SONGMAP_CHOICES_UI.get(songmap_version(self.cfg), SONGMAP_CHOICES_UI['v2']))
         label("Songmap version")
         ttk.Combobox(holder(), textvariable=self.set_songmap, values=list(SONGMAP_CHOICES_UI.values()), width=28, state="readonly").pack(side="left")
         r[0] += 1
@@ -14457,6 +14457,9 @@ def main():
     sm.add_argument("--song", action="append", help="analyse the songs whose file name contains this text (repeatable)")
     sm.add_argument("--out", help="output folder (default compare_out next to montage.py)")
     sm.set_defaults(fn=lambda a: __import__("songmap_compare").main(a))
+    sc_ = sp.add_parser("songmapcheck", help="V7.1: one song, Songmap V1 vs V2 numbers + three 20 s listening clips in compare_out/ (runs on a copy of montage_data)")
+    sc_.add_argument("song", nargs="+", help="part of the song file name")
+    sc_.set_defaults(fn=lambda a: __import__("songmap_compare").songmapcheck(" ".join(a.song)))
     pc = sp.add_parser("pairscan", help="V6.9: candidate neighbour clip pairs among all cached CS2 clips (read-only, writes pairscan_cs2.txt)")
     pc.add_argument("game", choices=["cs2"])
     pc.add_argument("--limit", type=int, default=30)

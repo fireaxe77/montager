@@ -5,6 +5,12 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V7.1 (branch v7.1-songmap, NOT merged, APP_VERSION unchanged, default stays Songmap V1) - 2026-10-08
+- SONGMAPV2 as the only song map: success rule NOT met on the 19-song plan-level set (see compare_out/report.md): V2 improves the median by >= 15 ms on 10/19 songs (needs 60 %), is worse than V1 on 6.
+- `songmap_v2/grid.py`: 3:2 / 2:3 tempo candidates; octave variants (both phases) of every refined fit; V1/CSV tempo wins a near tie; the drift tracker runs only for the winning constant grid and only if it is smooth (+-6 % wander) and gains on a beat-or-8th kick fraction; `local_phase` (kicks folded on the half beat, per window). `sections.py`/`adapter.py`: bar kick share, drop moved to the kick entry, uniformly loud songs keep one capped drop, the main drop must have a kicky planner window (else an anchor inside the drop, else none). `build.py`: V2 cache key includes a hash of the V2 sources.
+- `montage.py` (only): dropdown shows Songmap V1 / V2 only (`SONGMAP_CHOICES_UI`), `songmapcheck` command wiring. `songmap_compare.py`: `songmapcheck`, song listing runs on the data copy. New tools in `songmap_v2/` (iter, diag, gridcmp, lockdbg, renders, report), `tests/test_v71.py`. CLAUDE.md changelog line reworded.
+- Harness bug fixed: the V7 `v7_song_list` called `song_pool()` on the REAL montage_data before the data copy (it refreshes audio_cache.json / clips_cache3.json / song_matches.csv); everything now runs on the copy.
+
 ## V7 test (branch v7-songmapv2, NOT merged, APP_VERSION unchanged) - 2026-10-08
 - SONGMAPV2 improvement test. Only `songmap_v2/`, `songmap_compare.py`, `tests/test_v7.py`, docs changed; `montage.py`, SONGMAPV1, detection, planner, placement, render untouched. Default stays Songmap V1.
   - Tempo: the audio tempo estimate is no longer pulled by the CSV tempo (the CSV is only one more candidate); the other strong comb peaks are candidates too; a refined candidate may never leave 60-200 BPM. V1 trusts the CSV tempo (`bpm0 = csv`), e.g. Silicon XX 115 in V1 while the audio locks at 175.
