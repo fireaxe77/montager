@@ -235,7 +235,9 @@ def main():
     part_trio(tmp)
     part_valorant(tmp)
     with section("5) real montage_data byte-identical (no excluded files)"):
-        check(snapshot(REAL_DATA) == real_before, f"real montage_data byte-identical after the tests ({len(real_before)} files)")
+        after = snapshot(REAL_DATA)                                    # V6.9.8.1: on a mismatch the message names the changed files (the guard itself is unchanged)
+        changed = sorted(k for k in set(after) | set(real_before) if after.get(k) != real_before.get(k))
+        check(after == real_before, f"real montage_data byte-identical after the tests ({len(real_before)} files; changed: {changed})")
     total = time.time() - T_ALL
     print("section times: " + ", ".join(f"{t.split(')')[0]} {s:.0f}s" for t, s in SECTIONS) + f"; total {total:.1f} s")
     print("ALL OK" if not FAILS else f"FAILED ({len(FAILS)}):\n  " + "\n  ".join(FAILS))

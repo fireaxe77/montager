@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.8"
+APP_VERSION = "V6.9.8.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -7649,7 +7649,7 @@ def probe_duration(path):
 #   (a) slow-mo (speed < 1), (b) duplicated content / a low-fps source, (c) VFR gaps (>= 10% of the intervals above 1.5x the median, or a gap above 4 frames).
 # Only the source ranges the takes use (+0.5 s margin) are converted to a temporary file that replaces the clip as that take's input (same timeline:
 # the take's shift moves by the range start). The filter graph is NOT edited (the existing retime consumes the denser segment); everything that is not a
-# candidate produces the byte-identical render command. Any problem uses the original clip. Hidden switch: config.json "interpolate_low_fps" (default true).
+# candidate produces the byte-identical render command. Any problem uses the original clip. Hidden switch: config.json "interpolate_low_fps" (default false since V6.9.8.1).
 INTERP_FRAC = 0.75                      # candidate: effective fps below this share of the montage fps
 INTERP_MARGIN_S = 0.5
 INTERP_TIMEOUT_X = 4.0                  # a segment taking longer than this x its duration is abandoned
@@ -7956,7 +7956,7 @@ def detect_dup_chain(path, s0, d):
 
 def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
     """Returns the plan to build the filter from (the SAME plan object when nothing is interpolated)."""
-    if not cfg.get("interpolate_low_fps", True):
+    if not cfg.get("interpolate_low_fps", False):
         out("fps: interpolation off (setting)")                # V6.9.7: also the Settings checkbox (config key interpolate_low_fps); nothing is probed
         return plan
     res = analyse_takes(plan, fx)
@@ -8587,7 +8587,7 @@ def pair_is_candidate(ts, dur):
     return len(ts) == 1 and (ts[0] <= PAIR_SINGLE_EDGE_S or ts[0] >= dur - PAIR_SINGLE_EDGE_S)
 
 
-def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=None, game="cs2"):
+def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=None, game="cs2", allow_used=False):
     """Neighbour lookup for the selected CS2 clips. Returns {"partners": [(partner rec, selected clip path, gap s)], "checked": N,
     "lookups": L, "skip": {...}, "lines": [log lines]}. recs = cached clip records, selected = set of path keys."""
     kills_fn = kills_fn or (lambda r: pair_player_kills(r, store, det, cfg, game))
@@ -8640,7 +8640,7 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
                     sk["not scanned"] += 1
                     lines.append(f"neighbour not scanned: {nm}")
                     continue
-                if nb[1] in used:
+                if nb[1] in used and not allow_used:
                     alive[d] = False
                     sk["used"] += 1
                     lines.append(f"neighbour already used: {nm}")
@@ -8650,6 +8650,8 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
                     sk["no kills"] += 1
                     lines.append(f"neighbour has no kills of the player: {nm}")
                     continue
+                if nb[1] in used:                                 # V6.9.8.1: random / weekly picks keep the multikill whole even if a part was used before
+                    lines.append(f"companion already used, added to keep the multikill together: {nm}")
                 added.add(nb[1])
                 n_extra += 1
                 state[d] = j
@@ -8667,7 +8669,7 @@ def pair_summary(res):
             "reusable outside the selection)")
 
 
-def pairing_run(cfg, recs, selected_paths, quiet=False, game="cs2"):
+def pairing_run(cfg, recs, selected_paths, quiet=False, game="cs2", allow_used=False):
     """The whole neighbour step, guarded: any error / unparsable name / missing cache / more than PAIR_CAP_S = one 'pairing skipped:
     <reason>' line and None (the original selection stays). Runs in a helper thread so a hang cannot hold the plan up."""
     sel = {_pkey(p) for p in selected_paths}
@@ -8681,7 +8683,7 @@ def pairing_run(cfg, recs, selected_paths, quiet=False, game="cs2"):
                 PAIR_TEST_HOOK[0]()
             det = Detector(game)
             store = load_kills_cache()
-            box["res"] = pair_find(cfg, recs, sel, store, det, used_dates(), deadline=time.monotonic() + PAIR_CAP_S, game=game)
+            box["res"] = pair_find(cfg, recs, sel, store, det, used_dates(), deadline=time.monotonic() + PAIR_CAP_S, game=game, allow_used=allow_used)
         except BaseException as ex:                          # noqa: BLE001 - nothing may escape the step
             box["err"] = f"{type(ex).__name__}: {ex}"
     log = LOGONLY if quiet else out
@@ -8699,6 +8701,26 @@ def pairing_run(cfg, recs, selected_paths, quiet=False, game="cs2"):
     for l_ in res["lines"]:
         log(l_)
     return res
+
+
+def random_companions(cfg, game, paths):
+    """V6.9.8.1 Random pick: the companion clips (used or not) of the randomly picked clips, so the ticked list is what renders. Returns
+    (extra paths not in `paths`, log lines). Any problem = no companions. Clips the user ticks by hand never go through here."""
+    try:
+        tagged = [r for r in scan_clips(cfg) if r.get("game") == game]
+        res = pairing_run(cfg, tagged, paths, quiet=True, game=game, allow_used=True)
+    except Exception as ex:                                   # noqa: BLE001
+        return [], [f"random pick: companion step skipped: {type(ex).__name__}: {ex}"]
+    have = {_pkey(p) for p in paths}
+    extra = []
+    for p_, _, _ in (res["partners"] if res else []):
+        if _pkey(p_["path"]) not in have:
+            have.add(_pkey(p_["path"]))
+            extra.append(p_["path"])
+    lines = [l_ for l_ in (res["lines"] if res else []) if l_.startswith("companion already used")]
+    if extra:
+        lines.append(f"random pick: added {len(extra)} companion clip(s) to keep multikills together: " + ", ".join(Path(x).name for x in extra))
+    return extra, lines
 
 
 def pairing_result_line(res, plan):
@@ -8950,7 +8972,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
             out(n_)
         if game in ("cs2", "valorant"):                    # V6.9 (CS2) / V6.9.8 (both): companion clips of the picked clips (same slot, same count)
             sel_ = set().union(*[pair_event_clips(e) for e in events]) if events else set()
-            pair = pairing_run(cfg, tagged, sel_, quiet=not scan, game=game)
+            pair = pairing_run(cfg, tagged, sel_, quiet=not scan, game=game, allow_used=True)
             if pair and pair["partners"]:
                 try:
                     events = pairing_replace_events(pair, pool, events, game, cfg, seed)
@@ -11570,7 +11592,11 @@ class App:
                         out(f"Random pick: song map unavailable ({ex}), sizing for a plain 120 BPM song")
                 paths, fit = random_pick(cands, an, style)
                 why = fit["why"] if fit else ""
-            msg = f"Random pick: {len(paths)} of {len(cands)} {'' if inc else 'unused '}clips ticked ({why})"
+            extra, plines = random_companions(load_config(), self._snap.get("m_game", "valorant"), paths)       # V6.9.8.1: companions are ticked too
+            for l_ in plines:
+                out(l_)
+            paths = list(paths) + extra
+            msg = f"Random pick: {len(paths) - len(extra)} of {len(cands)} {'' if inc else 'unused '}clips ticked ({why})" +                   (f" + {len(extra)} companion clip(s)" if extra else "")
 
             def apply():
                 self.ticked = set(paths)
@@ -12107,7 +12133,7 @@ class App:
         ttk.Radiobutton(h, text="NVENC p7 cq18 (fast)", variable=self.set_q, value="nvenc").pack(side="left", padx=(0, PX))
         ttk.Radiobutton(h, text="Max quality x264 CRF15", variable=self.set_q, value="max").pack(side="left")
         r[0] += 1
-        self.set_interp = tk.BooleanVar(value=bool(self.cfg.get("interpolate_low_fps", True)))      # V6.9.7: the existing hidden key, now a checkbox
+        self.set_interp = tk.BooleanVar(value=bool(self.cfg.get("interpolate_low_fps", False)))      # V6.9.7: the existing hidden key, now a checkbox
         label("Low-fps takes")
         ttk.Checkbutton(holder(), text="Interpolate low-fps takes (slow-mo, duplicated frames, VFR)", variable=self.set_interp).pack(side="left")
         r[0] += 1
