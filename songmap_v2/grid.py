@@ -8,7 +8,12 @@ from scipy.signal import butter, find_peaks, sosfiltfilt
 HOP = 32                                  # attack-envelope hop in samples (1.45 ms at 22050 Hz): finer than the 256 required
 BAND_WIN = {"low": 384, "mid": 192, "high": 96}          # timing windows (samples)
 BAND_W = {"low": 1.0, "mid": 0.8, "high": 0.35}          # weights in the grid's onset-strength mix
-TEMPO_RANGE = (70.0, 190.0)
+TEMPO_RANGE = (70.0, 190.0)               # range of the comb estimate
+TEMPO_MIN, TEMPO_MAX = 60.0, 200.0        # V6.9.5.2: the grid never has a tempo (or a segment tempo) outside this range
+ON_GRID_S = 0.025                         # a kick is "on the grid" within +-25 ms
+MERGE_FRAC = 0.015                        # candidate tempos closer than this are one candidate
+LOCAL_FRAC = 0.03                         # local tempo refinement range around a candidate (+-3 %)
+FAST_PEN = (180.0, 0.002)                 # score penalty per BPM above 180 (200 BPM = -0.04)
 MIN_SEG_BEATS = 24                        # a tempo segment needs at least this many observed beats
 SEG_SLOPE_TOL = 0.015                     # tempo change smaller than 1.5 % is not a new segment
 BEAT_WIN_FRAC = 0.22                      # beat search window (fraction of the period) while tracking
@@ -135,150 +140,270 @@ def estimate_tempo(o, dt, csv_bpm=None, o_lm=None):
     return bpm, info
 
 
-def _peak_near(a, i, w):
-    lo, hi = max(0, i - w), min(len(a), i + w + 1)
-    if hi <= lo:
-        return None
-    j = lo + int(np.argmax(a[lo:hi]))
-    return j
+def candidate_tempos(est, v1_bpm=None, csv_bpm=None):
+    """Tempo hypotheses: the V2 estimate, the V1 BPM and the CSV tempo, each at 0.5x / 1x / 2x, only 60-200 BPM, candidates within 1.5 % merged.
+    Returns [{"bpm", "src": [...]}] sorted by BPM."""
+    raw = []
+    for src, b in (("v2", est), ("v1", v1_bpm), ("csv", csv_bpm)):
+        try:
+            b = float(b)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(b) or b <= 0:
+            continue
+        for f in (0.5, 1.0, 2.0):
+            if TEMPO_MIN <= b * f <= TEMPO_MAX:
+                raw.append((b * f, f"{src}{'' if f == 1.0 else ' x' + format(f, 'g')}"))
+    raw.sort()
+    groups = []
+    for b, src in raw:
+        if groups and b / groups[-1][-1][0] - 1 <= MERGE_FRAC:
+            groups[-1].append((b, src))
+        else:
+            groups.append([(b, src)])
+    return [{"bpm": float(np.mean([g[0] for g in grp])), "src": [g[1] for g in grp]} for grp in groups]
 
 
-def track_beats(o, dt, bpm, n_total):
-    """Beat tracking by prediction + local peak search; the period adapts so tempo changes are followed. Returns (times, strengths, observed)."""
-    P0 = 60.0 / bpm
-    oS = maximum_filter1d(o, 5)
-    # anchor: the strongest onset-comb position of the global tempo
-    nfr = len(o)
-    Pf = P0 / dt
-    best, a0 = -1.0, 0
-    for ph in range(0, int(Pf)):
-        v = oS[np.clip(np.round(ph + Pf * np.arange(int((nfr - ph) / Pf))).astype(int), 0, nfr - 1)].mean()
-        if v > best:
-            best, a0 = v, ph
-    # move the anchor onto the strongest beat of the song
-    ks = np.arange(int((nfr - a0) / Pf))
-    pos = np.clip(np.round(a0 + Pf * ks).astype(int), 0, nfr - 1)
-    anchor = int(pos[int(np.argmax(oS[pos]))])
-    anchor = _peak_near(o, anchor, int(0.05 / dt))
-    floor = 0.25 * float(np.percentile(o[o > 0], 90)) if np.any(o > 0) else 1.0
-
-    def walk(direction):
-        t, P = anchor * dt, P0
-        res = []
-        last_obs = []
-        while True:
-            pred = t + direction * P
-            i = int(round(pred / dt))
-            if i < 0 or i >= nfr:
-                break
-            w = int(BEAT_WIN_FRAC * P / dt)
-            lo, hi = max(0, i - w), min(nfr, i + w + 1)
-            seg = o[lo:hi] * (1.0 - 0.5 * np.abs(np.arange(lo, hi) - i) / max(w, 1))
-            j = lo + int(np.argmax(seg))
-            if o[j] >= floor:
-                tn = j * dt
-                obs = True
-                step = abs(tn - t)
-                last_obs.append(step)
-                P = 0.5 * P + 0.5 * float(np.clip(step, 0.7 * P, 1.4 * P)) if len(last_obs) > 3 else P
-                # a long run of agreeing intervals pins the period
-                if len(last_obs) >= 8:
-                    P = float(np.median(last_obs[-8:])) * 0.5 + P * 0.5
-            else:
-                tn, obs = pred, False
-            res.append((tn, float(o[j]) if obs else 0.0, obs))
-            t = tn
-        return res
-    fwd = walk(+1)
-    bwd = walk(-1)[::-1]
-    allb = bwd + [(anchor * dt, float(o[anchor]), True)] + fwd
-    t = np.array([a[0] for a in allb])
-    s = np.array([a[1] for a in allb])
-    ob = np.array([a[2] for a in allb])
-    return t, s, ob
+def _rayleigh(t, w, bpm, frac=LOCAL_FRAC, step=0.0001):
+    """Phase-coherence scan of the onset times over tempo bpm*(1 +- frac): returns (period, first_beat_time) of the most coherent grid."""
+    lo, hi = max(bpm * (1 - frac), TEMPO_MIN), min(bpm * (1 + frac), TEMPO_MAX)
+    bpms = np.arange(lo, hi + 1e-9, bpm * step)
+    per = 60.0 / bpms
+    best, bz, bp = -1.0, 0j, per[0]
+    for s in range(0, len(per), 150):                                   # chunks keep the (kicks x tempos) matrix small
+        pp = per[s:s + 150]
+        z = (w[:, None] * np.exp(2j * np.pi * t[:, None] / pp[None, :])).sum(0)
+        j = int(np.argmax(np.abs(z)))
+        if abs(z[j]) > best:
+            best, bz, bp = float(abs(z[j])), z[j], float(pp[j])
+    return bp, float(np.angle(bz) / (2 * np.pi) * bp)
 
 
-def _robust_line(i, t, w=None, iters=3, tol=0.025):
-    """Weighted least squares t = a + b*i with outlier rejection (residual > tol seconds)."""
-    w = np.ones(len(i)) if w is None else np.asarray(w, float)
-    m = np.ones(len(i), bool)
-    a = b = 0.0
-    for _ in range(iters):
-        if m.sum() < 2:
+def _refine(t, w, a, P, bpm0, tols=(0.04, 0.03, ON_GRID_S)):
+    """Least squares of beat index against onset time (onsets within a shrinking tolerance of the grid), tempo kept within +-3 % of the candidate."""
+    for tol in tols:
+        k = np.round((t - a) / P)
+        m = np.abs(t - (a + k * P)) <= tol
+        if m.sum() < 4 or np.ptp(k[m]) < 3:
             break
-        A = np.vstack([np.ones(m.sum()), i[m]]).T
-        W = np.sqrt(w[m])
-        sol = np.linalg.lstsq(A * W[:, None], t[m] * W, rcond=None)[0]
-        a, b = float(sol[0]), float(sol[1])
-        r = t - (a + b * i)
-        m = np.abs(r) <= tol
-    return a, b, m
+        sw = np.sqrt(w[m])
+        sol = np.linalg.lstsq(np.vstack([np.ones(m.sum()), k[m]]).T * sw[:, None], t[m] * sw, rcond=None)[0]
+        a2, P2 = float(sol[0]), float(sol[1])
+        if not (60.0 / (bpm0 * (1 + LOCAL_FRAC)) <= P2 <= 60.0 / (bpm0 * (1 - LOCAL_FRAC))):
+            break
+        a, P = a2, P2
+    return a, P
 
 
-def _split(i, t, w, lo, hi, depth=0):
-    """Binary segmentation of the observed beats [lo, hi): split where two lines fit clearly better than one."""
-    n = hi - lo
-    if n < 2 * MIN_SEG_BEATS or depth > 4:
-        return [(lo, hi)]
-    a, b, m = _robust_line(i[lo:hi], t[lo:hi], w[lo:hi])
-    res0 = np.abs(t[lo:hi] - (a + b * i[lo:hi]))
-    sse0 = float(np.sum(np.minimum(res0, 0.1) ** 2))
-    if np.median(res0) < 0.006 and sse0 < 0.0004 * n:
-        return [(lo, hi)]
+def _near(times, ref):
+    """Signed distance of every time to the nearest reference time."""
+    if not len(times) or not len(ref):
+        return np.array([])
+    j = np.clip(np.searchsorted(ref, times), 1, len(ref) - 1)
+    d0, d1 = times - ref[j - 1], times - ref[j]
+    return np.where(np.abs(d0) <= np.abs(d1), d0, d1)
+
+
+def _grid_times(a, P, dur):
+    k0 = int(np.ceil((-0.02 - a) / P))
+    k1 = int(np.floor((dur - a) / P))
+    return a + P * np.arange(k0, k1 + 1)
+
+
+def score_candidate(a, P, kick_t, hit_t, dur):
+    """On-grid kick fraction (+-25 ms), on-grid share of all strong low / mid hits (snares too), beat hit rate (share of the beats inside the
+    active span with such a hit on them) and the penalised score (0.6 / 0.2 / 0.2). A faster tempo has to explain MORE kicks than the slower one to win (double time is penalised above 180 BPM)."""
+    g = _grid_times(a, P, dur)
+    bpm = 60.0 / P
+    kf = float(np.mean(np.abs(_near(kick_t, g)) <= ON_GRID_S)) if len(kick_t) else 0.0
+    lo, hi = (float(kick_t.min()), float(kick_t.max())) if len(kick_t) else (0.0, dur)
+    span = g[(g >= lo - 0.5 * P) & (g <= hi + 0.5 * P)]
+    cov = float(np.mean(np.abs(_near(span, hit_t)) <= ON_GRID_S)) if len(span) and len(hit_t) else 0.0
+    hf = float(np.mean(np.abs(_near(hit_t, g)) <= ON_GRID_S)) if len(hit_t) else 0.0
+    pen = FAST_PEN[1] * max(0.0, bpm - FAST_PEN[0]) + 0.003 * max(0.0, 75.0 - bpm)
+    prior = 0.01 * (np.log2(min(bpm, 180.0)) - np.log2(120.0))      # tie-breaker only: between equal explanations the faster (<= 180) wins
+    return {"kick_frac": kf, "hit_frac": hf, "coverage": cov, "penalty": float(pen), "score": float(0.6 * kf + 0.2 * hf + 0.2 * cov + prior - pen)}
+
+
+def _fit_span(kt, ks, bpm0, t0, t1):
+    """Tempo / phase of the kicks inside [t0, t1): coherence scan within +-3 % of bpm0 (60-200 only), then the least-squares refinement."""
+    m = (kt >= t0) & (kt < t1)
+    if m.sum() < 8:
+        return None
+    P, a = _rayleigh(kt[m], ks[m], bpm0)
+    return _refine(kt[m], ks[m], a, P, bpm0)
+
+
+def tempo_segments(kt, ks, a, P, dur):
+    """Tempo changes: windows of 24 beats are locked on their own kicks (+-25 % around the global tempo, 60-200 BPM only); consecutive windows
+    that agree within 2 % form a segment, windows that fit badly (a change happens inside them) are skipped. Returns [(t_start, a, P)] with the
+    segment's own line, or [] when the song is one steady tempo. Segments outside 60-200 BPM are never created."""
+    bpm0 = 60.0 / P
+    win = 24 * P
+    wins = []
+    for t0 in np.arange(0.0, max(dur - win, 0.0) + 1e-9, 8 * P):
+        m = (kt >= t0) & (kt < t0 + win)
+        if m.sum() < 12:
+            continue
+        Pw, aw = _rayleigh(kt[m], ks[m], bpm0, frac=0.25)
+        aw, Pw = _refine(kt[m], ks[m], aw, Pw, 60.0 / Pw)
+        kf = float(np.mean(np.abs(_near(kt[m], aw + Pw * np.arange(-2, int(win / Pw) + 4) + np.floor((t0 - aw) / Pw) * Pw)) <= ON_GRID_S))
+        if kf >= 0.8 and TEMPO_MIN <= 60.0 / Pw <= TEMPO_MAX:
+            wins.append((t0, t0 + win, 60.0 / Pw))
+    groups = []
+    for w in wins:
+        if groups and abs(w[2] / np.median([x[2] for x in groups[-1]]) - 1) <= 0.02:
+            groups[-1].append(w)
+        else:
+            groups.append([w])
+    groups = [g for g in groups if len(g) >= 2]                       # one window alone is not a segment (>= 32 beats of agreement)
+    if len(groups) < 2:
+        return []
+    out = []
+    for i, g in enumerate(groups):
+        t0 = 0.0 if i == 0 else 0.5 * (groups[i - 1][-1][1] + g[0][0])
+        t1 = dur if i == len(groups) - 1 else 0.5 * (g[-1][1] + groups[i + 1][0][0])
+        fit = _fit_span(kt, ks, float(np.median([x[2] for x in g])), t0, t1)
+        if fit is None or not (TEMPO_MIN <= 60.0 / fit[1] <= TEMPO_MAX):
+            return []
+        out.append((t0, fit[0], fit[1]))
+    return out
+
+
+def _assemble(lines, dur):
+    """Beat times from per-segment lines [(t_start, a, P)]: every segment lays beats a + k P from its start; a segment's first beat is the first
+    of its line that is a plausible beat after the previous segment's last. None when the result is not a plausible beat sequence (an interval
+    outside 60-200 BPM)."""
+    t_all, seg_all = [], []
+    for s, (t0, a_, P_) in enumerate(lines):
+        t1 = lines[s + 1][0] if s + 1 < len(lines) else dur + 1.0
+        k0 = int(np.ceil((max(t0, -0.02) - a_) / P_))
+        if t_all and len(t_all[-1]):
+            k0 = max(k0, int(np.ceil((t_all[-1][-1] + 0.6 * P_ - a_) / P_)))
+        k1 = int(np.floor((min(t1 - 1e-9, dur) - a_) / P_))
+        if k1 < k0:
+            continue
+        t_all.append(a_ + P_ * np.arange(k0, k1 + 1))
+        seg_all.append(np.full(k1 - k0 + 1, s))
+    if not t_all:
+        return None
+    t, sid = np.concatenate(t_all), np.concatenate(seg_all)
+    d = np.diff(t)
+    if len(t) < 16 or np.any(d < 60.0 / TEMPO_MAX * 0.93) or np.any(d > 60.0 / TEMPO_MIN * 1.07):
+        return None
+    keep = (t >= -0.02) & (t <= dur)
+    return t[keep], sid[keep]
+
+
+def lock_grid(kick_t, kick_s, hit_t, dur, est_bpm, v1_bpm=None, csv_bpm=None):
+    """V6.9.5.2 tempo lock. Candidates (V2 estimate, V1 BPM, CSV tempo; x0.5 / x1 / x2; 60-200 only; merged within 1.5 %) -> for each the phase from
+    the kick onsets (coherence scan), local tempo refinement (+-3 %, least squares of beat index vs onset time), score = on-grid kick fraction
+    (+-25 ms) blended with the beat hit rate, penalised above 180 BPM. The best candidate is split into tempo segments only where the evidence
+    asks for it (never outside 60-200 BPM). Returns (beats, seg ids, segments, info)."""
+    kt = np.asarray(kick_t, float)
+    ks = np.asarray(kick_s, float)
+    if len(kt) < 8:
+        raise RuntimeError("no steady beat found")
+    cands = candidate_tempos(est_bpm, v1_bpm, csv_bpm) or [{"bpm": float(np.clip(est_bpm, TEMPO_MIN, TEMPO_MAX)), "src": ["v2 clipped"]}]
     best = None
-    for k in range(lo + MIN_SEG_BEATS, hi - MIN_SEG_BEATS + 1, 2):
-        a1, b1, _ = _robust_line(i[lo:k], t[lo:k], w[lo:k])
-        a2, b2, _ = _robust_line(i[k:hi], t[k:hi], w[k:hi])
-        r = np.concatenate([np.abs(t[lo:k] - (a1 + b1 * i[lo:k])), np.abs(t[k:hi] - (a2 + b2 * i[k:hi]))])
-        sse = float(np.sum(np.minimum(r, 0.1) ** 2))
-        if best is None or sse < best[0]:
-            best = (sse, k, b1, b2)
-    if best and best[0] < 0.5 * sse0 and abs(best[2] / best[3] - 1) > SEG_SLOPE_TOL:
-        return _split(i, t, w, lo, best[1], depth + 1) + _split(i, t, w, best[1], hi, depth + 1)
-    return [(lo, hi)]
-
-
-def fit_grid(o, dt, bpm, dur):
-    """Tracker -> robust per-segment constant-tempo fit -> final beat times. Returns a dict (beats, seg, segments, conf, observed...)."""
-    t, s, ob = track_beats(o, dt, bpm, len(o))
-    idx = np.arange(len(t), dtype=float)
-    oi = np.where(ob)[0]
-    if len(oi) < 8:
-        raise RuntimeError("no steady beat found")
-    # observed beats only
-    segs = _split(idx[oi], t[oi], s[oi] + 1e-6, 0, len(oi))
-    lines = []
-    for lo, hi in segs:
-        a, b, m = _robust_line(idx[oi][lo:hi], t[oi][lo:hi], s[oi][lo:hi] + 1e-6)
-        lines.append((int(oi[lo]), int(oi[hi - 1]), a, b, float(np.mean(m))))
-    # segment boundaries in beat-index space: midway between the last beat of one segment and the first of the next
-    bounds = [0] + [int((lines[k][1] + lines[k + 1][0]) // 2) + 1 for k in range(len(lines) - 1)] + [len(t)]
-    new_t = np.zeros(len(t))
-    seg_id = np.zeros(len(t), int)
-    for k, (f, l, a, b, _) in enumerate(lines):
-        for i in range(bounds[k], bounds[k + 1]):
-            new_t[i] = a + b * i
-            seg_id[i] = k
-    # keep the beat list inside the song; beats before 0 / after the end are dropped, indices renumbered
-    keep = (new_t >= -0.02) & (new_t <= dur)
-    new_t, seg_id, ob2, s2 = new_t[keep], seg_id[keep], ob[keep], s[keep]
-    if len(new_t) < 16:
-        raise RuntimeError("no steady beat found")
+    table = []
+    for c in cands:
+        P, a = _rayleigh(kt, ks, c["bpm"])
+        a, P = _refine(kt, ks, a, P, c["bpm"])
+        sc = score_candidate(a, P, kt, hit_t, dur)
+        row = {"bpm_in": round(c["bpm"], 3), "src": c["src"], "bpm": round(60.0 / P, 3), **{k: round(v, 4) for k, v in sc.items()}}
+        table.append(row)
+        if best is None or sc["score"] > best[0]:
+            best = (sc["score"], a, P)
+    _, a, P = best
+    lines = [(0.0, a, P)]
+    kf1 = float(np.mean(np.abs(_near(kt, _grid_times(a, P, dur))) <= ON_GRID_S))
+    seg_lines = tempo_segments(kt, ks, a, P, dur) if kf1 < 0.97 else []       # a grid that already explains the kicks is one steady tempo
+    asm = None
+    if seg_lines:
+        asm = _assemble(seg_lines, dur)
+        if asm is not None and float(np.mean(np.abs(_near(kt, asm[0])) <= ON_GRID_S)) >= kf1 + 0.05:      # clearly more kicks explained
+            lines = seg_lines
+        else:
+            asm = None
+    if asm is None:
+        lines = [(0.0, a, P)]
+        asm = _assemble(lines, dur)
+        if asm is None:
+            raise RuntimeError("no steady beat found")
+    beats, sid = asm
     segments = []
-    for k, (f, l, a, b, frac) in enumerate(lines):
-        sel = np.where(seg_id == k)[0]
+    for s, (_, a_, b_) in enumerate(lines):
+        sel = np.where(sid == s)[0]
         if len(sel):
-            segments.append({"id": k, "start_beat": int(sel[0]), "end_beat": int(sel[-1]) + 1, "bpm": round(60.0 / b, 3),
-                             "start_t": round(float(new_t[sel[0]]), 4), "inlier": round(frac, 3)})
-    # residual of the observed beats against their final line
-    final_full = np.zeros(len(t))
-    for k in range(len(lines)):
-        for i in range(bounds[k], bounds[k + 1]):
-            final_full[i] = lines[k][2] + lines[k][3] * i
-    resid = np.abs(t[ob] - final_full[ob])
-    obs_frac = float(np.mean(ob[keep])) if keep.any() else 0.0
-    return {"beats": new_t, "seg": seg_id, "observed": ob2, "strength": s2, "segments": segments,
-            "resid_ms": float(np.median(resid) * 1000), "obs_frac": obs_frac}
+            segments.append({"id": s, "start_beat": int(sel[0]), "end_beat": int(sel[-1]) + 1, "bpm": round(60.0 / b_, 3),
+                             "start_t": round(float(beats[sel[0]]), 4), "inlier": round(float(np.mean(np.abs(_near(kt, beats)) <= ON_GRID_S)), 3)})
+    return beats, sid, segments, {"candidates": table, "chosen_bpm": round(60.0 / P, 3)}
+
+
+def periodicity(o, dt, period, tol=ON_GRID_S):
+    """Periodicity of the onset envelope at the chosen tempo: the normalised autocorrelation of the (mean-removed) envelope at the beat period,
+    two beats and a bar (4 beats), each taken at its best lag within +-25 ms; the largest of the three, 0..1."""
+    x = np.asarray(o, float)
+    if len(x) < 64 or period <= 0:
+        return 0.0
+    x = x - x.mean()
+    e0 = float(np.dot(x, x))
+    if e0 <= 1e-12:
+        return 0.0
+    n = 1 << int(np.ceil(np.log2(2 * len(x))))
+    f = np.fft.rfft(x, n)
+    ac = np.fft.irfft(f * np.conj(f), n)[:len(x)] / e0
+    w = max(1, int(round(tol / dt)))
+    best = 0.0
+    for mult in (1, 2, 4):
+        L = int(round(mult * period / dt))
+        if L + w >= len(ac):
+            continue
+        best = max(best, float(ac[max(1, L - w):L + w + 1].max()))
+    return float(np.clip(best, 0.0, 1.0))
+
+
+def grid_confidence(beats, kick_t, o, dt):
+    """HONEST confidence in 0..1: 0.7 x the share of the strong low-band onsets (kicks / bass) that land within +-25 ms of the grid, 0.3 x the
+    periodicity of the onset envelope `o` at the grid's tempo (see periodicity()). Returns (confidence, components)."""
+    beats = np.asarray(beats, float)
+    kt = np.asarray(kick_t, float)
+    kf = float(np.mean(np.abs(_near(kt, beats)) <= ON_GRID_S)) if len(kt) and len(beats) > 1 else 0.0
+    per = periodicity(o, dt, float(np.median(np.diff(beats)))) if len(beats) > 3 else 0.0
+    conf = float(np.clip(0.7 * kf + 0.3 * per, 0.0, 1.0))
+    return conf, {"kick_on_grid": round(kf, 4), "periodicity": round(per, 4), "n_kicks": int(len(kt))}
+
+
+def kick_grid_stats(beats, kick_t):
+    """Median / p95 distance (ms) of the kicks to their nearest beat (no window)."""
+    d = np.abs(_near(np.asarray(kick_t, float), np.asarray(beats, float))) * 1000.0
+    if not len(d):
+        return {"n": 0, "median_ms": None, "p95_ms": None}
+    return {"n": int(len(d)), "median_ms": round(float(np.median(d)), 2), "p95_ms": round(float(np.percentile(d, 95)), 2)}
+
+
+def fit_grid(o, dt, bpm, dur, kick_t=None, kick_s=None, hit_t=None, v1_bpm=None, csv_bpm=None):
+    """Onset envelope + tempo estimate (+ optional kick onsets, V1 BPM, CSV tempo) -> the locked grid as a dict (beats, seg, segments, observed,
+    strength, resid_ms, obs_frac, lock). Without kick onsets the peaks of the envelope are used."""
+    if kick_t is None:
+        pk, _ = find_peaks(o, height=float(np.percentile(o, 90)) if len(o) else 1.0, distance=max(1, int(0.06 / dt)))
+        kick_t, kick_s = pk * dt, np.asarray(o)[pk]
+    kt = np.asarray(kick_t, float)
+    ks = np.asarray(kick_s, float) if kick_s is not None else np.ones(len(kt))
+    ht = np.asarray(hit_t if hit_t is not None else kt, float)
+    beats, sid, segments, lock = lock_grid(kt, ks, ht, dur, bpm, v1_bpm, csv_bpm)
+    d = np.abs(_near(kt, beats))
+    near_ok = np.zeros(len(beats), bool)
+    stren = np.zeros(len(beats))
+    if len(kt):
+        j = np.clip(np.searchsorted(beats, kt), 1, len(beats) - 1)
+        nb = np.where(np.abs(beats[j] - kt) < np.abs(beats[j - 1] - kt), j, j - 1)
+        okk = np.abs(beats[nb] - kt) <= ON_GRID_S
+        near_ok[nb[okk]] = True
+        np.maximum.at(stren, nb[okk], ks[okk])
+    return {"beats": beats, "seg": sid, "observed": near_ok, "strength": stren, "segments": segments,
+            "resid_ms": float(np.median(d) * 1000) if len(d) else 0.0, "obs_frac": float(np.mean(near_ok)), "lock": lock}
 
 
 def kick_offsets(beats, kick_times, window=0.06):
