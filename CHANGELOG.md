@@ -5,6 +5,14 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V6.9.7 - 2026-10-07
+- Parts, one commit each (any part can be dropped): 0 = test encoding fix, A = kill ledger safety net, B = per-clip utility override, D = interpolation checkbox. Kill detection (Valorant and CS2), planner scoring / cut / beat logic, effects, render, interpolation behaviour, song matching, theme and all existing settings are untouched.
+- PART 0 - test encoding fix (tests only, NO runtime change):
+  - Seen on the user's PC (`python tests\test_v696.py`, section 9): `UnicodeDecodeError: 'charmap' codec can't decode byte 0x81` in a subprocess reader thread, then `AttributeError: 'NoneType' object has no attribute 'strip'` (`r.stdout` was None for `python montage.py cfgdump`); everything after section 9 never ran there.
+  - Cause: `cfgdump` prints the config with `ensure_ascii=False`; the default CS2 player name `火斧` is the bytes E7 81 AB in UTF-8, and byte 0x81 is undefined in cp1252, the codec the test used to decode the child's output on a Windows console (cloud reproduction: parent run under a cp1252 locale, same traceback). The app function that prints it is `cmd_cfgdump` (montage.py); it is NOT changed here (a child without `PYTHONIOENCODING` on a cp1252 console would fail to encode the name; reported only).
+  - New `tests/_run.py` (shared helper for every V6.9.x test that starts a subprocess): UTF-8 decoding with `errors="replace"`, child env `PYTHONIOENCODING=utf-8` + `PYTHONUTF8=1`, `None` output treated as empty, a timeout is a result (not an exception), `require()` gives a clear failure text. All subprocess calls of `v696_common`, `v696_partb`, `v696_partc`, `test_v69` and `test_v693` (imported by the V6.9.6 tests) go through it.
+  - `tests/v696_partc.py` section 9 no longer depends on the branch state: the version check accepts V6.9.6 or newer, the history check counts from the V6.9.6 merge into main (max 4 commits, no merge commits), and branches created after `docs/BRANCHES.md` are not required in it. Acceptance: the full `tests/test_v696.py` (which also runs `tests/test_v69.py`) ends with ALL OK, also with a forced cp1252 parent console.
+
 ## V6.9.6 - 2026-10-07
 - Three independent parts, one commit each (any part can be dropped). Valorant / CS2 kill detection and registration, planner cut / beat logic, effects, songmap V1 / V2, song matching, theme, settings UI and all other settings stayed FROZEN (guard test: kills, timestamps and plans of 100 generated clips per game identical to the base).
 - PART A - fps check rebuilt around the EFFECTIVE on-screen frame rate (code: the interpolation decision / measurement and the render input preparation only; the filter graph, including slow-mo / ramp retiming, is unchanged: only which file / segment feeds it).

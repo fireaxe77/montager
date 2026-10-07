@@ -9,6 +9,7 @@ import json
 import os
 import random
 import subprocess
+import _run as R                                                                              # noqa: E402  (V6.9.7 shared subprocess helper)
 import sys
 import tempfile
 import time
@@ -362,7 +363,7 @@ def part_guard_and_cap(tmp):
 
 
 def load_baseline(tmp, ref):
-    r = subprocess.run(["git", "show", f"{ref}:montage.py"], cwd=str(HERE), capture_output=True)
+    r = R.run(["git", "show", f"{ref}:montage.py"], cwd=str(HERE), capture_output=True)
     if r.returncode != 0 or not r.stdout:
         return None
     bdir = Path(tmp) / "base"
