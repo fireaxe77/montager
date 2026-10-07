@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.9"
+APP_VERSION = "V6.9.10"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2597,6 +2597,10 @@ def border_merge(tracks, cfg):
     return res
 
 
+CS2_STALE_S = 10.0               # V6.9.10: a kill row this early whose victim matches a pre-clip row of the clip is that same row read again (stale)
+CS2_STALE_ON = [True]            # test / impact-scan switch
+
+
 def border_analysis(sc, cfg, deaths=None):
     """Sidecar -> kills / rejected rows, in the format of analyse_entry() (V6.8.2). The stored tracks are interpreted at load time (nothing is
     rebuilt): shape validation (non-row blobs are discarded), fragment merge, then classification. ONE kill per distinct outlined-row event, time =
@@ -2607,6 +2611,7 @@ def border_analysis(sc, cfg, deaths=None):
     legacy = sc.get("ext", 1) < 2
     rows_t, blob_t = border_shape_filter(sc.get("tracks", []), n)
     kills, rej, vis, mine, det_rows, sus, others, merges = [], [], [], [], [], [], [], []
+    pre_victims = []
     blobs_n = len(blob_t) + int(sc.get("blobs", 0))
     tok = hashlib.md5((sc.get("key") or "").encode()).hexdigest()[:4]       # an unreadable victim gets a name unique to this clip and row
     for t, c, ids in sorted(border_merge(rows_t, cfg), key=lambda x: x[0]["first"]):
@@ -2636,6 +2641,8 @@ def border_analysis(sc, cfg, deaths=None):
                                               ((op0 is not None and op0 >= 0.85) or (op0 is None and _slot_at(t, t["first"]) > 0)))
         if pre:
             rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(c["ks"], c["vs"]) / 100})
+            if c["vtext"]:
+                pre_victims.append(c["vtext"])
         elif v == "kill":
             vis.append((tt, round(last + 0.3, 3)))
             kills.append({"t": tt, "ks": (c["ks"] / 100) if c["name_read"] else 0.6, "hs": bool(c["hs"]), "row": row, "hits": t["hits"],
@@ -2646,6 +2653,14 @@ def border_analysis(sc, cfg, deaths=None):
         else:
             vis.append((tt, round(last + 0.3, 3)))
             rej.append({"t": tt, "reason": c["why"], "ks": c["ks"] / 100})
+    if CS2_STALE_ON[0] and pre_victims:                      # V6.9.10: the row of a pre-clip kill read again a few seconds in (tracker lost it / re-found it) is not a new kill
+        keep_k = []
+        for k in kills:
+            if k["name_read"] and k["t"] <= CS2_STALE_S + off and any(cs2_same_victim(k["victim"], pv) for pv in pre_victims):
+                rej.append({"t": k["t"], "reason": f"CS2 stale feed row: already on screen at clip start ([{k['victim']}] matches a pre-clip row)", "ks": k["ks"]})
+            else:
+                keep_k.append(k)
+        kills = keep_k
     victims = [ocr_norm(k["victim"]) for k in kills if k["name_read"] and ocr_norm(k["victim"])]
     rep = any(cs2_same_victim(a, b) for i, a in enumerate(victims) for b in victims[i + 1:])
     return {"kills": kills, "deaths": sorted(deaths or []), "revives": [], "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis,
