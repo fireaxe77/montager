@@ -42,7 +42,7 @@ def part_guards(tmp):
                 p = vdir / f"{game}_{i}.mov"
                 p.write_bytes(b"x")
                 ks = sorted(rng.sample(range(2, 40), rng.randint(1, 4)))
-                items.append(T.pool_item(T.rec_of(p, 45, game), [(float(k), vn[3 * i + j]) for j, k in enumerate(ks)]))
+                items.append(T.pool_item(T.rec_of(p, 45, game), [(float(k), vn[4 * i + j]) for j, k in enumerate(ks)]))  # V6.9.7: one victim name per kill (3*i+j shared names between neighbouring clips: linked clips, whose kills the base loses)
                 items[-1]["rec"]["path"] = str(p)
             cfg = M.load_config()
             M.verify_stitch = T.REAL_VS

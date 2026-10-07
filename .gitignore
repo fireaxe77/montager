@@ -14,3 +14,5 @@ grouporder.txt
 *.interp/
 compare_out/
 interpbench_*/
+ledger.txt
+timeanchor.txt
