@@ -5,6 +5,15 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V6.9.9 - 2026-10-07
+- Small fix (Valorant weekly / Force new could not render). Detectors, OCR, kill thresholds, utility logic, planner / selection scoring, songmap, effects, theme, sync detector and interpolation untouched.
+- Proven cause: NOT a kill from the previous clip without a stitch. 23.05.17.12 + 31.13 are saved back to back with 0.38 s of footage missing between them; the stitch was built (17.12 first, kills -1.78 / 0.63 / 9.5 / 12.7 s on the group timeline) but `split_parts` put the clip switch in the middle of that gap, so one segment ended past clip 12 and the next started before clip 13 (footage outside both clips). The check at render time refused the whole montage. Fix (`_build_events`): when stitched clips leave footage missing between them, the gap is closed on the group timeline (later clips and their kills move earlier by the gap, logged in the stitch note); the clip switch then falls on a real frame of both clips.
+- Cut-list repair (make_plan): any per-take problem (footage outside its clip, speed / tail / minimum rules) drops and re-plans only that take, log "take skipped: <clip> (<reason>)"; the render is never cancelled for one take (kill-row repair unchanged).
+- Kill ledger: a pairing sub-call (companions) no longer replaces the main run's event list (`final_events`), which turned every row of a non-selected clip into LOST (276 lost); they are RANKED_OUT again, real losses are still detected.
+- `ts()` shows negative times as -0:01.8 (was -1:58.2).
+- 21.04.36.03 (+ 21.04.50.04): not this bug. The clip's 4-kill event (span 11.4 s, 0.6 s of footage after the last kill, a death 1.1 s later) does not fit the song's beats in `place()` ("no run-up / tail fits the song's beats"); the pairing partner's kill is 14 s later and is a separate fight. Unchanged.
+- Tests: `tests/test_v699.py`.
+
 ## V6.9.8.1 - 2026-10-07
 - Small real-data fix (branch v6.9.8.1 from v6.9.8) + merge of v6.9.8 / v6.9.8.1 into main. Detectors, kill thresholds, planner / selection scoring, songmap, beat logic, effects, theme and the sync detector untouched.
 - Interpolation is OFF by default: the default of the existing `interpolate_low_fps` setting is now false (missing key / new installs; the Settings checkbox starts unchecked). An existing config.json value is respected; no interpolation code removed.
