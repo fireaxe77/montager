@@ -25,6 +25,20 @@ def norm(s):
     return M._alnum(str(s).lower())
 
 
+def use_data(d):
+    """use_data_dir plus MATCH_CACHE: montage.py defines it outside DATA_GLOBALS, so use_data_dir leaves it pointing at the REAL montage_data
+    (song_pool rewrites match_cache.json there when the CSV / MP3 folder signature changed). Returns the restore closure."""
+    old = M.use_data_dir(d)
+    old_mc, M.MATCH_CACHE = M.MATCH_CACHE, Path(d) / "match_cache.json"
+
+    def restore():
+        M.restore_data_dir(old)
+        M.MATCH_CACHE = old_mc
+    stray = [k for k, v in vars(M).items() if isinstance(v, Path) and str(v).lower().startswith(str(REAL_DATA).lower())]
+    check(not stray, f"every data path of montage.py points at the copy, none at the real montage_data ({stray})")
+    return restore
+
+
 def real_copy(tmp):
     """A copy of the real montage_data (no logs / plans) the tests work on; the used flags of the CS2 trio are cleared in the COPY only."""
     dst = tmp / "data"
@@ -60,7 +74,7 @@ def part_real(tmp):
     with section("1) REAL clips (E:\\Movies), data copy, Manual-dry path: Valorant override OFF / ON, CS2 trio"):
         for p in [CLIPS / n for n in VAL] + [CS2_DIR / n for n in CS2]:
             check(p.exists(), f"real clip present: {p.name}")
-        old = M.use_data_dir(real_copy(tmp))
+        restore = use_data(real_copy(tmp))
         try:
             plan, led = run_real("valorant", [CLIPS / n for n in VAL], False)
             tv = takes_view(plan)
@@ -95,7 +109,7 @@ def part_real(tmp):
                   f"CS2 trio (middle clip ticked): ONE stitched take, kills 1, 2, 3 in order ({tv})")
             check(len(takes_view(run_real("cs2", [CS2_DIR / n for n in CS2], False)[0])) == 1, "CS2 trio (all three ticked): one take")
         finally:
-            M.restore_data_dir(old)
+            restore()
 
 
 def it_of(p, dur, kills=()):
@@ -229,12 +243,12 @@ def part_guard(tmp):
 def main():
     real_before = snapshot(REAL_DATA)
     tmp = Path(tempfile.mkdtemp(prefix="t6971_"))
-    old = M.use_data_dir(tmp / "gen_data")
+    restore = use_data(tmp / "gen_data")
     try:
         for fn in (part_interp, part_twin, part_link, part_fight, part_guard):
             fn(tmp)
     finally:
-        M.restore_data_dir(old)
+        restore()
     part_real(tmp)
     with section("7) real montage_data untouched"):
         check(snapshot(REAL_DATA) == real_before, "real montage_data byte-identical after the tests")
