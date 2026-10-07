@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.10"
+APP_VERSION = "V6.9.11"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -12486,14 +12486,20 @@ class App:
 
 ACCENT_NAMES = {"lime": "Lime green", "yellow": "Yellow", "orange": "Orange", "red": "Red", "pink": "Pink", "purple": "Purple"}
 CHANGELOG_PATH = HERE / "CHANGELOG.md"          # next to montage.py (absolute): works from any working folder
+CHANGELOG_SIMPLE_PATH = HERE / "docs" / "CHANGELOG_SIMPLE.md"   # V6.9.11: the readable history shown in Settings (falls back to CHANGELOG_PATH)
 
 
 def changelog_lines(path=None):
-    """CHANGELOG.md as (kind, text) lines for the popout: ver = '## ' version heading, sub = '### ', bul = '- ' bullet, '' = text."""
-    try:
-        raw = Path(path or CHANGELOG_PATH).read_text(encoding="utf-8").splitlines()
-    except OSError as ex:
-        return [("", f"CHANGELOG.md was not found next to montage.py ({ex}).")]
+    """The readable changelog (docs/CHANGELOG_SIMPLE.md, else CHANGELOG.md) as (kind, text) lines for the popout: ver = '## ' version heading, sub = '### ', bul = '- ' bullet, '' = text."""
+    raw = None
+    for p in ([path] if path else [CHANGELOG_SIMPLE_PATH, CHANGELOG_PATH]):
+        try:
+            raw = Path(p).read_text(encoding="utf-8").splitlines()
+            break
+        except (OSError, UnicodeError):
+            continue
+    if raw is None:
+        return [("", "The changelog was not found next to montage.py.")]
     res = []
     for ln in raw:
         if not res and not ln.startswith("## "):
