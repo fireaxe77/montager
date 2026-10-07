@@ -87,7 +87,10 @@ def part_order(tmp):
             new = M.pairing_replace_events(res, pool, single, "cs2", cfg, 1)
             check(len(new) == 1 and new[0] is single[0] and not new[0]["stitched"], "stitch rejected by the frame match: the single clip stays, the partners are dropped (as before)")
             evs, _ = M.build_events(pool, "cs2", cfg, random.Random(1))
-            check(all(not e["stitched"] and "stitch rejected" in e["stitch_note"] for e in evs if e["stitch_note"]) and len(evs) == 1, f"build_events falls back to one single clip ({evs[0]['stitch_note'][:70]})")
+            # V6.9.7: a clip is only linked to a group when the frame match PROVES it (prove_same_fight). With a frame match that never matches nothing is linked, so
+            # nothing can be 'stitch rejected and the other clips' kills lost' any more: every clip stays its own event (the old expectation: ONE event, kills lost).
+            check(all(not e["stitched"] for e in evs) and len(evs) == 3 and sum(e["n"] for e in evs) == sum(len(k) for k in kills),
+                  f"build_events with a rejecting frame match: no stitch, every clip keeps its own event ({len(evs)} events, {sum(e['n'] for e in evs)} kills)")
 
             # the cause: the order came ONLY from the victim-matched offsets. A wrong offset for the middle clip put it after the last one (1-3-2) and a weak
             # frame match (similar frames) did not object.
@@ -104,11 +107,22 @@ def part_order(tmp):
             M._victim_offset = wrong
             B._victim_offset = wrong
             B.verify_stitch = lambda spans, cut: (True, spans[1]["shift"], "stub: frames match")
+            real_ps = M.prove_same_fight                                   # V6.9.7: the offsets now come from prove_same_fight(): inject the same 8 s error there
+
+            def wrong_ps(a, b, rf, budget):
+                pr, why = real_ps(a, b, rf, budget)
+                if pr:
+                    mid = lambda x: len(x["kills"]) == 3 and x["kills"][0]["t"] == 2.5
+                    d = 8.0 if mid(b) else (-8.0 if mid(a) else 0.0)
+                    pr = dict(pr, offset=pr["offset"] + d, raw_offset=pr["raw_offset"] + d)
+                return pr, why
+            M.prove_same_fight = wrong_ps
             try:
                 evs_new, notes = M.build_events(pool4, "cs2", cfg, random.Random(1))
                 evs_old, _ = B.build_events([dict(p) for p in pool4], "cs2", B.load_config(), random.Random(1))
             finally:
                 M._victim_offset = real_vo
+                M.prove_same_fight = real_ps
             old_order = [Path(p["path"]).name[-22:-12] for p in max(evs_old, key=lambda e: e["n"])["parts"]] if evs_old else []
             en = max(evs_new, key=lambda e: e["n"])
             w4n = [Path(r["path"]).name[-22:-12] for r in r4]

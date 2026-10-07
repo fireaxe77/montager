@@ -5426,6 +5426,448 @@ def _same_kills(ia, ib, rf, cache):
     return None
 
 
+# ======================================================================= CLIP TIME ANCHORS + KILL LEDGER (V6.9.7)
+# A clip's file-name time is NOT always its start: OBS replay names ("Replay 2026-09-11 17-00-37.mov", "VALORANT 2026-10-07 03-40.mov",
+# "... 03-40 (2).mov") show the SAVE time = the END of the clip; ShadowPlay / Outplayed "... 22.55.31.02.DVR.mp4" names are start times (V6.9).
+# clip_anchor() gives every clip an absolute [start, end] with the evidence used; the file's modified time (the moment OBS closed the file) is
+# the cross-check. Nothing here changes detection: the anchors only decide which clips MAY be merged (proof rule below) and how the CS2 clip
+# time index orders clips.
+_OBS_NAME = re.compile(r"(20\d\d)-(\d\d)-(\d\d)[ _T](\d\d)-(\d\d)(?:-(\d\d))?(?:\s*\((\d+)\))?\s*\.[A-Za-z0-9]{2,4}$")
+ANCHOR_TOL_S = 6.0                      # the file's modified time may differ from the name time by this much (name seconds, OBS flush)
+
+
+def name_time_info(path):
+    """{t, res ('sec' | 'min'), scheme ('obs' | 'dvr' | 'name'), default ('end' | 'start'), seq} from the file name, or None (unparsable: never guessed)."""
+    name = Path(str(path)).name
+    m = _OBS_NAME.search(name)
+    try:
+        if m:
+            y, mo, d, h, mi, s, n = m.groups()
+            return {"t": datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s or 0)).timestamp(), "res": "sec" if s is not None else "min",
+                    "scheme": "obs", "default": "end", "seq": int(n) if n else 1}
+        m = _FN_TIME.search(name)
+        if m:
+            return {"t": datetime.datetime(*[int(x) for x in m.groups()]).timestamp(), "res": "sec", "scheme": "dvr" if "DVR" in name else "name",
+                    "default": "start", "seq": 1}
+    except ValueError:
+        pass
+    return None
+
+
+def clip_anchor(path, dur=None, mtime=None):
+    """Absolute time range of a clip: {start, end, side ('start' | 'end': what the name time means), verified (modified time agrees), provable
+    (usable as proof evidence), how, scheme, res, name_t, seq} or None (unparsable name / no duration).
+      second-resolution names: the scheme's default (OBS = save time = END, DVR / Outplayed = START) is checked against the modified time:
+        mtime ~ name time -> END, mtime ~ name time + duration -> START (the evidence overrides the default); neither (a copied file) ->
+        the default, marked unverified.
+      minute-only names (OBS without seconds): the name only gives the minute, so the modified time (second precision) IS the save time = END,
+        but only while it lies inside the named minute; a copied / touched file is NOT provable (never guessed).
+    '(2)' suffixes are separate saves: ordering is by the anchored time (modified time), never by the name."""
+    info = name_time_info(path)
+    if info is None or not dur or float(dur) <= 0:
+        return None
+    dur = float(dur)
+    if mtime is None:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+    T = info["t"]
+    res = {"scheme": info["scheme"], "res": info["res"], "name_t": T, "seq": info["seq"], "mtime": mtime, "dur": dur}
+    if info["res"] == "min":
+        if mtime is not None and T - ANCHOR_TOL_S <= mtime < T + 60 + ANCHOR_TOL_S:
+            return dict(res, start=mtime - dur, end=mtime, side="end", verified=True, provable=True,
+                        how="minute-only name: the modified time (second precision) is the save time = the clip END")
+        return dict(res, start=T + 30 - dur, end=T + 30, side="end", verified=False, provable=False,
+                    how="minute-only name and the modified time is not inside that minute: time unknown (never guessed)")
+    ev_end = mtime is not None and abs(mtime - T) <= ANCHOR_TOL_S
+    ev_start = mtime is not None and abs(mtime - (T + dur)) <= ANCHOR_TOL_S
+    if ev_end and not ev_start:
+        side, ver, how = "end", True, "name time = save time (modified time agrees)"
+    elif ev_start and not ev_end:
+        side, ver, how = "start", True, "name time = start (modified time = name time + duration)"
+    elif ev_end and ev_start:
+        side, ver, how = info["default"], True, f"short clip: modified time fits both ends, scheme default ({info['default']})"
+    else:
+        side, ver, how = info["default"], False, f"modified time fits neither end, scheme default ({info['default']}) - unverified"
+    st = T if side == "start" else T - dur
+    return dict(res, start=st, end=st + dur, side=side, verified=ver, provable=True, how=how)
+
+
+def clip_ctime(rec):
+    """Anchored START of a clip (events are ordered by it); the old modified-time fallback for unparsable names."""
+    a = clip_anchor(rec["path"], rec.get("dur"))
+    return a["start"] if a else clip_time(rec["path"])
+
+
+KILL_STATES = ("PLACED", "MERGED_DUP", "RANKED_OUT", "CLIP_UNUSABLE", "OVERRIDE_ADMITTED", "LOST")
+GROUP_MAX_CLIPS = 4                     # the V6.9 fight-size limit (PAIR_MAX_EXTRA + 1)
+DUP_WINDOW_S = 1.5                      # the existing duplicate window (same victim within 1.5 s = one kill)
+PROOF_CAP_S = 5.0                       # the whole proof step of one build_events() call (frame matching included); then 'not proven'
+PROOF_TEST_HOOK = [None]                # tests only: called inside a proof (inject an error / a delay)
+LEDGER_TEST_HOOK = [None]               # tests only: called with (events, ledger) before the loss check (drop an event artificially)
+CUR_LEDGER = [None]                     # the ledger of the build_events() call in progress
+LAST_LEDGER = [None]                    # the ledger of the last top-level build_events() call (make_plan completes it with the plan)
+LEDGER_SUBCALL = [False]                # build_events() called by pairing_replace_events(): partners are never planned alone, no safety net there
+
+
+class KillLedger:
+    """Every usable kill row gets an ID when selection starts and ends in exactly one state: PLACED, MERGED_DUP (survivor + proof), RANKED_OUT,
+    CLIP_UNUSABLE or OVERRIDE_ADMITTED (utility override, part B); a row in none of them is LOST (and the safety net re-queues it once)."""
+
+    def __init__(self, game=None):
+        self.game, self.rows, self.idx, self.events = game, [], {}, {}
+        self.released, self.lines, self.proofs, self.warn, self.splits = [], [], [], [], []
+        self.final_events = []
+
+    @staticmethod
+    def rkey(path, t, victim):
+        return (_pkey(path), round(float(t), 3), _alnum((victim or "").lower()))
+
+    def add_pool(self, items):
+        for it in items:
+            for k in it["kills"]:
+                key = self.rkey(it["rec"]["path"], k["t"], k.get("victim"))
+                if key in self.idx:
+                    continue
+                row = {"id": len(self.rows) + 1, "clip": Path(it["rec"]["path"]).name, "path": it["rec"]["path"], "t": float(k["t"]),
+                       "victim": k.get("victim") or "", "state": None, "info": {}, "tag": "util" if k.get("util") else "", "gone": None,
+                       "unusable": None, "merged": None, "released": False, "k": k, "it": it}
+                self.rows.append(row)
+                self.idx[key] = row
+
+    def row(self, it, k):
+        return self.idx.get(self.rkey(it["rec"]["path"], k["t"], k.get("victim")))
+
+    def row_of_cl(self, kd):
+        return self.row(kd["src"], kd)
+
+    @staticmethod
+    def evkey(ev):
+        return (ev["path"], tuple(ev["times"]))
+
+    def note_event(self, ev, rows):
+        self.events[self.evkey(ev)] = [r["id"] for r in rows if r]
+
+    def reconcile(self, evs):
+        """A duplicate row that an event covers while its survivor is in no event (the survivor's event was rebuilt without it, e.g. after a rejected stitch):
+        the covered row becomes the survivor, so the kill is placed exactly once (never twice, never lost)."""
+        cov = self.covered(evs)
+        for d in self.rows:
+            m = d["merged"]
+            if m and d["id"] in cov and m["into"] not in cov:
+                r = self.rows[m["into"] - 1]
+                r["merged"] = dict(m, into=d["id"], pair=list(reversed(m.get("pair", []))))
+                d["merged"] = None
+
+    def covered(self, evs):
+        got = set()
+        for e in evs:
+            got.update(self.events.get(self.evkey(e), []))
+        return got
+
+    def lost_rows(self, evs):
+        cov = self.covered(evs)
+        return [r for r in self.rows if r["id"] not in cov and not r["merged"] and not r["unusable"]]
+
+    def label(self, r):
+        return f"{r['clip']} @ {ts(r['t'])} -> {r['victim'] or '?'}"
+
+
+def _proof_gate(budget, fn):
+    """Runs fn() inside the proof budget: a hang / error / timeout is 'not proven' (the caller keeps the events separate)."""
+    if budget["t0"] is None:
+        budget["t0"] = time.monotonic()
+    left = budget["cap"] - (time.monotonic() - budget["t0"])
+    if budget["dead"] or left <= 0:
+        budget["dead"] = True
+        raise TimeoutError(f"proof step over its {budget['cap']:.0f} s cap")
+    box = {}
+
+    def work():
+        try:
+            if PROOF_TEST_HOOK[0]:
+                PROOF_TEST_HOOK[0]()
+            box["r"] = fn()
+        except BaseException as ex:                          # noqa: BLE001
+            box["e"] = ex
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(left)
+    if th.is_alive():
+        budget["dead"] = True
+        raise TimeoutError(f"proof step over its {budget['cap']:.0f} s cap")
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
+
+
+def prove_same_fight(a, b, rf, budget):
+    """PROOF that clip b continues / duplicates clip a (a starts first by its anchored time). Returns ({offset, ...proof}, '') or (None, why).
+    ALL of: (a) the clips' absolute time ranges (corrected anchors) overlap; (b) the overlap is verified with the existing frame match
+    (verify_stitch at the aligned offset, inside the overlap); (c) a same-victim kill pair agrees after applying the offset (the existing
+    1.5 s duplicate window after the frame-verified offset is applied, and the offset itself within the 12 s continuation window of the clip times). Victim name alone, time proximity alone or a chain
+    of such links never links two clips. offset = time in a - time in b of the same moment (the same convention as _victim_offset)."""
+    from rapidfuzz import fuzz
+    aa, ab = a.get("anc"), b.get("anc")
+    if not aa or not ab or not aa["provable"] or not ab["provable"]:
+        return None, "clip time not provable (" + (", ".join(Path(x["rec"]["path"]).name for x, an in ((a, aa), (b, ab)) if not an or not an["provable"])) + ")"
+    ov = min(aa["end"], ab["end"]) - max(aa["start"], ab["start"])
+    if ov < -PAIR_MAX_GAP_S:                                    # (a) the existing continuation window (V6.9): overlapping, or at most PAIR_MAX_GAP_S apart
+        return None, f"time ranges neither overlap nor lie within the {PAIR_MAX_GAP_S:.0f} s continuation window (gap {-ov:.1f} s)"
+    off_abs = ab["start"] - aa["start"]                         # a-time of a moment = b-time + off_abs
+    win = PAIR_MAX_GAP_S                                        # the kill pair's offset must agree with the clip times within that same window
+    cands = []
+    for x in a["kills"]:
+        for y in b["kills"]:
+            va, vb = _alnum((x.get("victim") or "").lower()), _alnum((y.get("victim") or "").lower())
+            if va and vb and fuzz.ratio(va, vb) >= 80:
+                d = abs((x["t"] - y["t"]) - off_abs)
+                if d <= win:
+                    cands.append((d, -fuzz.ratio(va, vb), x, y))
+    if not cands:
+        return None, "no same-victim kill pair whose times agree with the clip times"
+    cands.sort(key=lambda c: (c[0], c[1]))
+    why = "no candidate"
+    for d, _, x, y in cands[:2]:                                # frames decide: a bogus name match from another round never matches
+        o = rf(x) - rf(y)
+        va_, vb_ = a["rec"].get("v_off", 0.0), b["rec"].get("v_off", 0.0)
+        ea, eb = a["rec"].get("dur", 0) - 0.08, o + b["rec"].get("dur", 0) - 0.08
+        lo, hi = max(max(0.05, va_), o + max(0.05, vb_)), min(ea, eb)
+        if hi - lo < 0.1:
+            why = "overlap at the aligned offset is under 0.1 s"
+            continue
+        cut = round((lo + hi) / 2, 4)
+        ok, nshift, vw = _proof_gate(budget, lambda: verify_stitch(({"path": a["rec"]["path"], "shift": 0.0}, {"path": b["rec"]["path"], "shift": o}), cut))
+        if ok:
+            m = re.search(r"difference ([\d.]+)", vw)
+            return {"offset": float(nshift), "raw_offset": float(o), "cut": cut, "victim": x.get("victim") or "", "ax": float(x["t"]), "bx": float(y["t"]),
+                    "agree_s": round(d, 2), "score": float(m.group(1)) if m else None, "match": vw, "overlap_s": round(ov, 1)}, ""
+        why = "frames do not match: " + vw
+    return None, why
+
+
+def _ledger_gone(cl, ev, why):
+    """Rows of cluster cl that the rebuilt event ev does not cover (all of them when ev is None) get the reason they would be lost."""
+    led = CUR_LEDGER[0]
+    if led is None:
+        return
+    cov = set(led.events.get(led.evkey(ev), [])) if ev else set()
+    for kd in cl:
+        r_ = led.row_of_cl(kd)
+        if r_ and r_["id"] not in cov and not r_["gone"]:
+            r_["gone"] = why
+
+
+def ledger_safety_net(led, evs, game, cfg, det, refine, gap):
+    """A4: rows that no event covers (removed by a rejected stitch / a failed group / an earlier stage) are re-queued ONCE as independent events
+    (single clip, never stitched, the same make_event()), so ranking and planning treat them like any other event. A run in which nothing was lost
+    is not touched. Rows still lost after the retry stay LOST and finish with a loud warning (ledger_finalize)."""
+    led.reconcile(evs)
+    lost = led.lost_rows(evs)
+    if not lost:
+        return
+    by_clip = {}
+    for r in lost:
+        by_clip.setdefault(r["path"], []).append(r)
+    made = []
+    for path, rows in by_clip.items():
+        it = rows[0]["it"]
+        rows.sort(key=lambda r: r["t"])
+        revs = sorted(it.get("revives", []))
+        clusters, cur = [], [rows[0]]
+        for r in rows[1:]:                                 # the same fight rule as build_events(): split only on a long gap with no revive in it
+            if r["t"] - cur[-1]["t"] <= gap or any(cur[-1]["t"] < rv < r["t"] for rv in revs):
+                cur.append(r)
+            else:
+                clusters.append(cur)
+                cur = [r]
+        clusters.append(cur)
+        for cl_rows in clusters:
+            cl = [dict(r["k"], tt=float(r["k"]["t"]), src=it, off=0.0) for r in cl_rows]
+            try:
+                ev = make_event(cl, [(it, 0.0)], det, cfg, refine)
+            except Exception:                              # noqa: BLE001
+                ev = None
+            if ev:
+                evs.append(ev)
+                made.append((ev, cl_rows))
+    for n_, (ev, cl_rows) in enumerate(made, 1):
+        for r in cl_rows:
+            r["released"] = True
+        r0 = cl_rows[0]
+        why = r0["gone"] or "removed between grouping and event building"
+        extra = f" (+{len(cl_rows) - 1} more kill(s) of that fight)" if len(cl_rows) > 1 else ""
+        line = f"safety net: released {len(made)} event(s): {led.label(r0)}{extra} (it would have been lost: {why})"
+        led.lines.append(line)
+        led.released.append(line)
+        out(line)
+
+
+def ledger_finalize(led, picked, planned, plan):
+    """Ends every row in exactly one state (see KillLedger) from the events that were built, picked (weekly / pairing) and planned and the plan itself."""
+    evmap = {}
+    for e in list(led.final_events) + list(picked or []) + list(planned or []):
+        evmap[KillLedger.evkey(e)] = e
+    picked_k = {KillLedger.evkey(e) for e in (picked or [])}
+    planned_k = {KillLedger.evkey(e) for e in (planned or [])}
+    takes = plan.get("takes", [])
+    skipped_names = [x[0] for x in (plan.get("fit") or {}).get("skipped", [])]
+
+    def placed(e):
+        for t in takes:
+            for ts_ in (e["times"], e.get("times_v4") or e["times"]):
+                if t["path"] == e["path"] and len(t.get("kills", [])) == len(ts_) and all(abs(a - b) < 2e-4 for a, b in zip(t["kills"], ts_)):
+                    return True
+        return False
+    order = sorted(evmap, key=lambda k: -(evmap[k].get("score") or 0))
+    rank = {k: i + 1 for i, k in enumerate(order)}
+    row_ev = {}
+    for k, ids in led.events.items():
+        if k in evmap:
+            for i in ids:
+                row_ev.setdefault(i, []).append(k)
+    for r in led.rows:
+        r["state"], r["info"] = None, {}
+        if r["merged"]:
+            r["state"] = "MERGED_DUP"
+            tgt = led.rows[r["merged"]["into"] - 1]
+            pr = r["merged"].get("proof") or {}
+            r["info"] = {"survivor": led.label(tgt), "survivor_id": tgt["id"], "pair": [Path(p).name for p in r["merged"].get("pair", [])],
+                         "offset": round(pr["raw_offset"], 3) if pr else None, "score": pr.get("score") if pr else None, "match": pr.get("match") if pr else "same clip: existing 1.5 s duplicate rule"}
+            continue
+        keys = row_ev.get(r["id"], [])
+        best = None
+        for k in keys:
+            e = evmap[k]
+            nm = Path(e["path"]).name
+            if placed(e):
+                st, inf = ("OVERRIDE_ADMITTED" if r["tag"] == "util" else "PLACED"), {"take": nm}
+            elif k in planned_k and nm in skipped_names:
+                st, inf = "CLIP_UNUSABLE", {"reason": "cannot form a take: " + why_no_take(e)}
+            elif k not in picked_k:
+                st, inf = "RANKED_OUT", {"rank": rank.get(k), "reason": "not picked: already used in a montage / outside this week's pick"}
+            elif k not in planned_k:
+                st, inf = "CLIP_UNUSABLE", {"reason": "cut list repair: its kill row lies outside the take's footage"}
+            else:
+                st, inf = "RANKED_OUT", {"rank": rank.get(k), "reason": "left out by the target / length limit"}
+            pri = {"PLACED": 0, "OVERRIDE_ADMITTED": 0, "CLIP_UNUSABLE": 1, "RANKED_OUT": 2}[st]
+            if best is None or pri < best[0]:
+                best = (pri, st, inf)
+        if best:
+            r["state"], r["info"] = best[1], best[2]
+        elif r["unusable"]:
+            r["state"], r["info"] = "CLIP_UNUSABLE", {"reason": r["unusable"]}
+        else:
+            r["state"], r["info"] = "LOST", {"reason": r["gone"] or "no event covers it"}
+        if r["released"]:
+            r["info"]["released"] = True
+    return led
+
+
+def ledger_summary(led):
+    c = {s: sum(1 for r in led.rows if r["state"] == s) for s in KILL_STATES}
+    ov = c["OVERRIDE_ADMITTED"]
+    rel = sum(1 for r in led.rows if r["released"])
+    line = (f"kill ledger: {len(led.rows)} usable, {c['PLACED'] + ov} placed, {c['MERGED_DUP']} merged as proven duplicates, {c['RANKED_OUT']} ranked out, "
+            f"{c['CLIP_UNUSABLE']} unusable, {c['LOST']} lost, {rel} released by safety net")
+    return line + (f" [{ov} of the placed via utility override]" if ov else "")
+
+
+def ledger_report(led):
+    """The ledger lines of one run: the summary, one line per MERGED_DUP with its proof, one per released event, the loud warning when rows are LOST."""
+    lines = [ledger_summary(led)]
+    for r in led.rows:
+        if r["state"] == "MERGED_DUP":
+            i = r["info"]
+            lines.append(f"  merged duplicate: {led.label(r)} = {i['survivor']} (proof: {' / '.join(i['pair']) or 'same clip'}, offset "
+                         f"{('%+.2f s' % i['offset']) if i['offset'] is not None else 'n/a'}, frame match {i['match']})")
+    lines += ["  " + x for x in led.released]
+    lines += ["  " + x for x in led.splits]
+    lost = [r for r in led.rows if r["state"] == "LOST"]
+    if lost:
+        lines.append(f"!!! KILL LEDGER WARNING: {len(lost)} kill row(s) are LOST and could not be recovered by the safety net:")
+        lines += [f"!!!   {led.label(r)} ({r['info'].get('reason')})" for r in lost]
+    return lines
+
+
+def ledger_save(led, plan=None):
+    rows = [{"id": r["id"], "clip": r["clip"], "t": round(r["t"], 3), "victim": r["victim"], "state": r["state"], "info": r["info"], "tag": r["tag"],
+             "released": r["released"]} for r in led.rows]
+    obj = {"saved": time.strftime("%Y-%m-%d %H:%M:%S"), "game": led.game, "summary": ledger_summary(led), "lines": ledger_report(led), "rows": rows,
+           "proofs": led.proofs, "splits": led.splits}
+    save_json(DATA / "ledger_last.json", obj)
+
+
+def cmd_timeanchor(args):
+    """V6.9.7: python montage.py timeanchor. Read-only audit of what the time in a clip's file name means (START or END of the clip) per naming
+    scheme, from the cached clip records (name time, duration) and the file's modified time (the cache key): prints one table, writes timeanchor.txt next to
+    montage.py, changes no cache, flag or config file."""
+    clips = load_json(CLIPS_CACHE, {})
+    sch = {}
+    for key, rec in clips.items():
+        try:
+            path, _size, mt = key.rsplit("|", 2)
+            mt = float(mt)
+        except ValueError:
+            continue
+        info, dur = name_time_info(path), rec.get("dur")
+        label = "unparsable name" if info is None else {"obs": "OBS replay (YYYY-MM-DD HH-MM[-SS])", "dvr": "ShadowPlay / Outplayed DVR (YYYY.MM.DD - HH.MM.SS.cc)",
+                                                        "name": "other name with a time"}[info["scheme"]] + (" [minute-only]" if info["res"] == "min" else "")
+        d = sch.setdefault(label, {"n": 0, "end": 0, "start": 0, "both": 0, "neither": 0, "diffs_end": [], "diffs_start": [], "ex": []})
+        d["n"] += 1
+        if info is None or not dur:
+            continue
+        T, dur = info["t"], float(dur)
+        e_end, e_start = abs(mt - T), abs(mt - (T + dur))
+        d["diffs_end"].append(mt - T)
+        d["diffs_start"].append(mt - (T + dur))
+        ev_end, ev_start = e_end <= ANCHOR_TOL_S + (60 if info["res"] == "min" else 0), e_start <= ANCHOR_TOL_S
+        d["end" if ev_end and not ev_start else "start" if ev_start and not ev_end else "both" if ev_end and ev_start else "neither"] += 1
+        if len(d["ex"]) < 3:
+            d["ex"].append(f"{Path(path).name}: dur {dur:.1f} s, modified {mt - T:+.1f} s from the name time, {mt - T - dur:+.1f} s from name time + duration")
+    lines = ["timeanchor: what the file-name time means per naming scheme (modified time cross-check; END = the name time is the save time)"]
+    for label, d in sorted(sch.items()):
+        med = lambda v: statistics.median(v) if v else 0.0
+        lines.append(f"  {label}: {d['n']} clips; modified time = name time (END): {d['end']}, = name time + duration (START): {d['start']}, both: {d['both']}, neither: {d['neither']}"
+                     f" (median modified - name time {med(d['diffs_end']):+.1f} s, median modified - (name time + duration) {med(d['diffs_start']):+.1f} s)")
+        lines += ["      e.g. " + x for x in d["ex"]]
+    if not sch:
+        lines.append("  no cached clip records: run a scan first")
+    text = "\n".join(lines)
+    (HERE / "timeanchor.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(read-only; written to {HERE / 'timeanchor.txt'}; nothing else was changed)")
+
+
+def cmd_ledger(args):
+    """V6.9.7: python montage.py ledger. Read-only: reprints the last run's kill ledger from montage_data\\ledger_last.json (written by the run) or, failing
+    that, from the log; writes ledger.txt next to montage.py; changes no cache, flag or config file."""
+    obj = load_json(DATA / "ledger_last.json", None)
+    if obj and obj.get("rows") is not None:
+        lines = [f"last run's kill ledger ({obj.get('game')}, saved {obj.get('saved')}):"] + obj.get("lines", [])
+        lines.append("")
+        for r in obj["rows"]:
+            inf = r.get("info") or {}
+            det = inf.get("reason") or inf.get("survivor") or inf.get("take") or ""
+            lines.append(f"  #{r['id']:<3} {r['state']:<18} {r['clip']} @ {ts(r['t'])} -> {r['victim'] or '?'}"
+                         + (f"  [rank {inf['rank']}]" if inf.get("rank") else "") + ("  [util]" if r.get("tag") == "util" else "") + ("  [released]" if r.get("released") else "")
+                         + (f"  ({det})" if det else ""))
+    else:
+        lines = []
+        try:
+            for l_ in (LOG_DIR / "montage.log").read_text(encoding="utf-8", errors="replace").splitlines():
+                if "kill ledger:" in l_:
+                    lines = ["(from montage.log; no ledger_last.json) " + l_]
+        except OSError:
+            pass
+        lines = lines or ["no kill ledger saved yet: run a Dry plan first"]
+    text = "\n".join(lines)
+    (HERE / "ledger.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(read-only; written to {HERE / 'ledger.txt'}; nothing else was changed)")
+
+
 FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
 
 
@@ -5445,7 +5887,22 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
     for it in pool:
         ks = list(it["kills"])                             # V5.5: Valorant knife kills are normal kills
         if ks:
-            items.append(dict(it, kills=sorted(ks, key=lambda k: k["t"]), ctime=clip_time(it["rec"]["path"])))
+            items.append(dict(it, kills=sorted(ks, key=lambda k: k["t"]), ctime=clip_ctime(it["rec"]), anc=clip_anchor(it["rec"]["path"], it["rec"].get("dur"))))
+    if LEDGER_SUBCALL[0] and LAST_LEDGER[0] is not None:   # partners (pairing_replace_events): known rows only, nothing new is 'usable' here
+        led = LAST_LEDGER[0]
+    else:
+        led = KillLedger(game)                             # V6.9.7: every usable kill row gets an ID here (see KillLedger)
+        led.add_pool(items)
+    prev_led, CUR_LEDGER[0] = CUR_LEDGER[0], led
+    try:
+        return _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led)
+    finally:
+        CUR_LEDGER[0] = prev_led
+        if not LEDGER_SUBCALL[0]:
+            LAST_LEDGER[0] = led
+
+
+def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
     # duplicates / continuations
     refine = load_json(REFINE_CACHE, {})
     kref = {}
@@ -5461,6 +5918,34 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
         except Exception:
             return k["t"]
     items.sort(key=lambda i: i["ctime"])
+    budget = {"cap": PROOF_CAP_S, "t0": None, "dead": False}
+    proofs, links, memo = {}, set(), {}
+
+    def proof_of(m, b):
+        """Proof that clips m and b are the same fight (prove_same_fight), memoised; the offset is oriented m -> b (t_in_m - t_in_b)."""
+        key = (id(m), id(b))
+        if key in memo:
+            return memo[key]
+        sm, sb = (m["anc"] or {}).get("start", m["ctime"]), (b["anc"] or {}).get("start", b["ctime"])
+
+        def attempt(x, y):
+            try:
+                pr_, why_ = prove_same_fight(x, y, rf, budget)
+            except Exception as ex:                        # timeout / read error: NOT proven, the events stay separate
+                return None, f"not proven ({type(ex).__name__}: {ex})"
+            if pr_ and x is not m:                         # oriented m -> b
+                pr_ = dict(pr_, offset=-pr_["offset"], raw_offset=-pr_["raw_offset"], ax=pr_["bx"], bx=pr_["ax"])
+            return pr_, why_
+        order = [(m, b), (b, m)] if sm <= sb else [(b, m), (m, b)]
+        pr, why = attempt(*order[0])
+        if not pr and abs(sm - sb) <= 1.0 and not budget["dead"]:      # one base time ('DVR', 'DVR_1', ...): which clip comes first is decided by the frame match
+            pr2, why2 = attempt(*order[1])
+            if pr2:
+                pr, why = pr2, ""
+        memo[key] = memo[(id(b), id(m))] = pr
+        led.proofs.append({"a": Path(m["rec"]["path"]).name, "b": Path(b["rec"]["path"]).name, "proven": bool(pr), "why": why if not pr else "",
+                           **({"offset": round(pr["raw_offset"], 3), "score": pr["score"], "match": pr["match"]} if pr else {})})
+        return pr
     groups, used = [], set()
     for i, a in enumerate(items):
         if i in used:
@@ -5474,34 +5959,62 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
                 b = items[j]
                 if j in used:
                     continue
-                near = b["ctime"] - a["ctime"] <= 60 + a["rec"].get("dur", 0)
-                off = None
-                for (m, mo) in g:
-                    o = _victim_offset(m["kills"], b["kills"], rf) if near else None
-                    if o is not None and abs(b["ctime"] - m["ctime"]) <= 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
-                        off = mo + o
+                link = None
+                for (m, mo) in g:                          # V6.9.7: a link needs PROOF (clip times overlap + frame match + kill times agree), per adjacent pair
+                    if abs(b["ctime"] - m["ctime"]) > 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
+                        continue
+                    pr = proof_of(m, b)
+                    if pr:
+                        link = (m, mo, pr)
                         break
-                    o = _same_kills(m, b, rf, refine)          # V5.42B: same kills = same event, whatever the file times say
-                    if o is not None:
-                        off = mo + o
-                        notes.append(f"same kills in two files: {Path(m['rec']['path']).name} = {Path(b['rec']['path']).name} "
-                                     "(one event, never placed twice)")
-                        break
-                if off is not None:
-                    g.append((b, off))
-                    used.add(j)
-                    grew = game == "cs2"
+                if link is None:
+                    continue
+                m, mo, pr = link
+                if len(g) >= GROUP_MAX_CLIPS:              # the V6.9 fight-size limit: a longer chain splits; the boundary duplicate is merged by its pair proof
+                    from rapidfuzz import fuzz
+                    dups = {id(kb): (km, pr) for kb in b["kills"] for km in m["kills"]
+                            if fuzz.ratio(_alnum((km.get("victim") or "").lower()), _alnum((kb.get("victim") or "").lower())) >= 80
+                            and abs(km["t"] - (kb["t"] + pr["raw_offset"])) <= DUP_WINDOW_S}
+                    b.setdefault("_dup", {}).update({k_: v_ for k_, v_ in dups.items()})
+                    b["_dup_src"] = m
+                    msg = (f"fight group limit: {Path(b['rec']['path']).name} is proven adjacent to {Path(m['rec']['path']).name} but the group "
+                           f"already has {GROUP_MAX_CLIPS} clips - it starts a new group (chain split into proven adjacent pairs)")
+                    led.splits.append(msg)
+                    continue
+                g.append((b, mo + pr["raw_offset"]))
+                links.add((id(m), id(b)))
+                links.add((id(b), id(m)))
+                proofs[(id(m), id(b))] = proofs[(id(b), id(m))] = pr
+                used.add(j)
+                notes.append(f"clips proven to show the same fight: {Path(m['rec']['path']).name} / {Path(b['rec']['path']).name} "
+                             f"(frames {pr['match'].split(' (')[-1].rstrip(')')}, clip times agree within {pr['agree_s']} s)")
+                grew = game == "cs2"
         groups.append(g)
     evs = []
     for g in groups:
-        # union of kills on the timeline of the group's first clip (kills of the same victim within 1.5 s are one kill)
+        # union of kills on the timeline of the group's first clip (kills of the same victim within 1.5 s are one kill) - V6.9.7: only kills of
+        # the SAME clip or of a PROVEN adjacent pair (proofs of the group links) are ever merged; no chaining through a third clip
         allk = []
         for it, off in g:
             for k in it["kills"]:
+                if id(k) in it.get("_dup", {}):            # duplicate of a kill in the previous group (chain split): never placed twice
+                    km, pr = it["_dup"][id(k)]
+                    srow, drow = led.row(it["_dup_src"], km), led.row(it, k)
+                    if srow and drow and not drow["merged"]:
+                        drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [it["_dup_src"]["rec"]["path"], it["rec"]["path"]], "split": True}
+                    continue
                 tt = k["t"] + off
-                if not any(abs(tt - u["tt"]) <= 1.5 and _alnum(u.get("victim", "").lower()) == _alnum(k.get("victim", "").lower())
-                           for u in allk):
+                dup = next((u for u in allk if abs(tt - u["tt"]) <= DUP_WINDOW_S and _alnum(u.get("victim", "").lower()) == _alnum(k.get("victim", "").lower())
+                            and (u["src"] is it or (id(u["src"]), id(it)) in links)), None)
+                if dup is None:
                     allk.append(dict(k, tt=tt, src=it, off=off))
+                else:
+                    srow, drow = led.row(dup["src"], dup), led.row(it, k)
+                    pr = proofs.get((id(dup["src"]), id(it)))
+                    if srow and drow and not drow["merged"]:
+                        drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [dup["src"]["rec"]["path"], it["rec"]["path"]]}
+        if not allk:
+            continue
         if len(g) > 1:
             notes.append("merged continuation/duplicate clips: " + " + ".join(Path(it["rec"]["path"]).name for it, _ in g)
                          + f" ({len(allk)} distinct kills)")
@@ -5516,7 +6029,7 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
                 clusters.append(cur)
                 cur = [k]
         clusters.append(cur)
-        best_ev = None
+        best_ev, cands = None, []
         for cl in clusters:
             # which clips cover which kills (a clip covers a kill it detected itself)
             cover = {id(it): [k for k in cl if k["src"] is it or any(abs(k["tt"] - (x["t"] + off)) <= 0.3 for x in it["kills"])]
@@ -5530,10 +6043,32 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
                         continue
                     parts.append((it2, off2))
             ev = make_event(cl, parts, det, cfg, refine)
-            if ev and (best_ev is None or ev["score_pre"] > best_ev["score_pre"]):
-                best_ev = ev
+            if ev:
+                cands.append((ev, cl))
+                if best_ev is None or ev["score_pre"] > best_ev["score_pre"]:
+                    best_ev = ev
+            else:
+                for kd in cl:
+                    r_ = led.row_of_cl(kd)
+                    if r_ and not r_["gone"]:
+                        r_["gone"] = "no event could be built for its fight (stitch rejected and no single clip shows it, or it is outside the footage)"
+        for ev, cl in cands:
+            if ev is not best_ev:
+                for kd in cl:
+                    r_ = led.row_of_cl(kd)
+                    if r_ and not r_["gone"] and not r_["unusable"]:
+                        r_["unusable"] = "second fight of the same group: one event per clip / group (existing planner rule)"
         if best_ev:
             evs.append(best_ev)
+    if LEDGER_TEST_HOOK[0]:
+        LEDGER_TEST_HOOK[0](evs, led)
+    if not LEDGER_SUBCALL[0]:
+        try:
+            ledger_safety_net(led, evs, game, cfg, det, refine, gap)
+        except Exception as ex:                            # the safety net never fails a run
+            led.lines.append(f"safety net skipped: {type(ex).__name__}: {ex}")
+    for msg in led.splits:
+        notes.append(msg)
     save_json(REFINE_CACHE, refine)
     singles = [e for e in evs if e["n"] == 1 and not e["hs"]]
     rng.shuffle(singles)
@@ -5546,6 +6081,7 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
         e["score"] = base_score(e) + 2.0 * e["shots"]
         e["plain"] = e["n"] == 1 and not e["hs"] and not e["flick"]
     evs.sort(key=lambda e: -e["score"])
+    led.final_events = list(evs)
     return evs, notes
 
 
@@ -5573,7 +6109,7 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
                 shot = None
         v4t = k.get("shot_t", k["t"] - 0.1) if k.get("shot") else k["t"] - 0.1
         raw.append({"row": row + off - moff, "shot": None if shot is None else shot + off - moff, "v4": v4t + off - moff,
-                    "victim": k.get("victim", ""), "hs": bool(k.get("hs")), "has_shot": bool(k.get("shot"))})
+                    "victim": k.get("victim", ""), "hs": bool(k.get("hs")), "has_shot": bool(k.get("shot")), "k": k})
     lags = [r["row"] - r["shot"] for r in raw if r["shot"] is not None]
     lag = float(statistics.median(lags)) if lags else 0.10
     for r in raw:
@@ -5643,10 +6179,22 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
                 ev = make_event(own(best), [(best["it"], 0.0)], det, cfg, refine, verify)
                 if ev:
                     ev["stitch_note"] = note
+                _ledger_gone(cl, ev, "its group's stitch was rejected (" + stitch_note.strip().rstrip(";").split(";")[-1].strip() + ") and the event was re-planned on " +
+                             Path(best["path"]).name)
                 return ev
+            _ledger_gone(cl, None, "its group's stitch was rejected and no single clip shows these kills by itself")
             return None
     cover_start, cover_end = spans[0]["start"], spans[-1]["end"]
     keep = [i for i, (t, r) in enumerate(zip(times, rows)) if cover_start + 0.05 <= t and r <= cover_end - 0.05]
+    led = CUR_LEDGER[0]
+    if led is not None:                                     # V6.9.7: a row outside the footage of ONE clip cannot form a take (existing rule); in a stitched span it is only 'gone'
+        for i, r_ in enumerate(raw):
+            if i not in keep:
+                row_ = led.row_of_cl(r_["k"])
+                if row_ and len(spans) == 1:
+                    row_["unusable"] = "kill / killfeed row outside the footage of its clip (needs 0.05 s margin)"
+                elif row_ and not row_["gone"]:
+                    row_["gone"] = "outside the footage of the stitched clips"
     if not keep:
         return None
     times, rows, victims = [times[i] for i in keep], [rows[i] for i in keep], [victims[i] for i in keep]
@@ -5674,6 +6222,8 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
           "stitched": len(spans) > 1, "stitch_note": stitch_note.strip(), "lags": [0.0] * len(times),
           "vis": spans[0]["it"].get("vis", []) if len(spans) == 1 else main.get("vis", [])}
     ev["score_pre"] = base_score(ev)
+    if led is not None:
+        led.note_event(ev, [led.row_of_cl(raw[i]["k"]) for i in keep])
     return ev
 
 
@@ -7763,12 +8313,12 @@ def pair_time_index(recs):
     for r in recs:
         if r.get("game", "cs2") != "cs2" or r.get("error") or not r.get("w"):
             continue
-        t0 = pair_clip_start(r["path"])
         dur = r.get("dur")
-        if t0 is None or not dur:
+        anc = clip_anchor(r["path"], dur) if dur else None                 # V6.9.7: the name time is START for DVR names, END (save time) for OBS names
+        if anc is None or not anc["provable"]:
             skipped.append(r["path"])
             continue
-        idx.append((t0, _pkey(r["path"]), t0 + float(dur), r))
+        idx.append((anc["start"], _pkey(r["path"]), anc["end"], r))
     idx.sort(key=lambda x: (x[0], x[1]))
     return idx, skipped
 
@@ -7931,7 +8481,11 @@ def pairing_replace_events(res, pool, picked, game, cfg, seed):
         sub = sorted([it for it in pool if _pkey(it["rec"]["path"]) in mine | ps], key=lambda it: (pair_clip_start(it["rec"]["path"]) or 0.0, it["rec"]["path"]))
         if not any(_pkey(it["rec"]["path"]) in ps for it in sub):
             continue
-        evs2, _ = build_events(sub, game, cfg, random.Random(seed))
+        LEDGER_SUBCALL[0] = True
+        try:
+            evs2, _ = build_events(sub, game, cfg, random.Random(seed))
+        finally:
+            LEDGER_SUBCALL[0] = False
         # accepted: an event that uses a partner clip, was not a fallback after a rejected stitch, shows MORE kills than the single
         # event and still contains all of its kills (so it is that fight, not a separate event of the partner clip)
         have = lambda x: [_alnum((v or "").lower()) for v in x["victims"]]
@@ -8194,6 +8748,16 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         pr_ = pairing_result_line(pair, plan)
         if pr_:
             (out if scan else LOGONLY)(pr_)
+    try:                                                   # V6.9.7: the kill ledger of this run (never fails or changes a run)
+        led_ = LAST_LEDGER[0]
+        if led_ is not None and led_.rows:
+            ledger_finalize(led_, events, pool_ev, plan)
+            for l_ in ledger_report(led_):
+                out(l_)
+            if scan:
+                ledger_save(led_, plan)
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"kill ledger skipped: {type(ex).__name__}: {ex}")
     if plan["duration"] > plan["song"]["section_s"] + 1e-3:              # never render past the end of the music
         raise RuntimeError(f"plan is {plan['duration']:.1f} s but the song only has {plan['song']['section_s']:.1f} s from "
                            f"{ts(plan['song']['start_t'])} - not rendered")
@@ -13551,6 +14115,8 @@ def main():
     scp.add_argument("paths", nargs="*")
     scp.set_defaults(fn=cmd_songcheck)
     sp.add_parser("cfgdump", help="print the config file path + contents").set_defaults(fn=cmd_cfgdump)
+    sp.add_parser("timeanchor", help="V6.9.7: what the file-name time means (clip START or END) per naming scheme; read-only, writes timeanchor.txt").set_defaults(fn=cmd_timeanchor)
+    sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
     st_.add_argument("--no-gui", action="store_true")
