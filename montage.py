@@ -3876,6 +3876,8 @@ def game_pool(cfg, game, paths=None):
         pass
     ps = set(paths) if paths is not None else None
     stats = {"tagged": 0, "scanned": 0, "with_kills": 0}
+    ovs = load_clip_overrides() if game == "valorant" else {}          # V6.9.7: per-clip 'allow utility kills' (default OFF: empty = nothing below runs)
+    util_adm = {}
     pool, allrej, cjk = [], [], {}
     cands = []
     for r in scan_clips(cfg):
@@ -3896,6 +3898,8 @@ def game_pool(cfg, game, paths=None):
     for r, e in cands:
         stats["scanned"] += 1
         a = analyse_clip_entry(r, e, cfg, game)
+        if ovs:
+            a = apply_utility_override(r, e, a, cfg, game, ovs, util_adm)
         for k_, v_ in a.get("cjk", {}).items():
             cjk[k_] = cjk.get(k_, 0) + v_
         for j in a["rej"]:
@@ -3903,6 +3907,14 @@ def game_pool(cfg, game, paths=None):
         if a["kills"]:
             pool.append({"rec": r, "kills": a["kills"], "deaths": a["deaths"], "revives": a["revives"], "vis": a["vis"], "rej": []})
     stats["with_kills"] = len(pool)
+    if ovs:
+        seen_ = {_pkey(r["path"]) for r, _ in cands}
+        for k_, e_ in ovs.items():                                     # a moved / renamed clip is reported, never applied to another clip
+            if k_ not in seen_ and (ps is None or k_ in {_pkey(p_) for p_ in ps}) and clip_override_state(k_, ovs)[0] == "missing":
+                util_adm.setdefault("warn", []).append(f"utility override: {clip_override_state(k_, ovs)[1]}")
+        for l_ in utility_override_lines(util_adm):
+            out(l_)
+        stats["util_admitted"] = len(util_adm.get("rows", []))
     if game == "cs2":
         stats["cjk"] = cjk
         out(f"CS2 name '{MY_NAME_CS2}': {sum(cjk.values())} rows recovered that 'fireaxe' alone missed"
@@ -5838,6 +5850,189 @@ def cmd_timeanchor(args):
     (HERE / "timeanchor.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
     print(f"(read-only; written to {HERE / 'timeanchor.txt'}; nothing else was changed)")
+
+
+# ======================================================================= PER-CLIP "ALLOW UTILITY KILLS" OVERRIDE (V6.9.7, Valorant only)
+# The detector rejects a killer-side row with a small / square weapon icon (grenade, molotov, ability) as "utility: ...". The kill cache holds the RAW OCR frames
+# of a clip (not verdicts): every analysis re-derives kills / rejected rows from them, so the rejected utility rows of a clip are available WITHOUT a rescan.
+# An override re-runs the SAME analyse_entry() on that clip's cached frames with exactly one verdict mapped: 'reject: utility' counts as 'kill' (a thread-local
+# switch on the classify_row result; the detector code itself is untouched, every other filter - one-frame blip, gunshot, pre-clip, duplicate, revive, death,
+# assist - still applies to those rows like to any kill). The new rows join the clip's kills and travel through duplicate resolution, grouping, stitching, ranking,
+# planning and the ledger like any kill (tag "util"). Default OFF for every clip; the state lives in montage_data\clip_overrides.json (never in a kill cache).
+UTIL_ROW_TAG = " [U]"                   # Manual clip list: display-only suffix of a clip that has the override ON (verified: nothing parses the row text)
+_UTIL_LOCAL = threading.local()
+_UTIL_LOCK = threading.RLock()
+_OVR_WARNED = [None]
+
+
+def _util_overrides_file():
+    return DATA / "clip_overrides.json"
+
+
+def load_clip_overrides(quiet=False):
+    """{clip key: entry} of the clips that have an override ON. Missing file = all OFF; a corrupt file = all OFF and ONE log line (never a crash)."""
+    p = _util_overrides_file()
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError("not an object")
+        return {k: v for k, v in d.items() if isinstance(v, dict) and v.get("allow_utility_kills")}
+    except Exception as ex:                                # noqa: BLE001
+        if not quiet and _OVR_WARNED[0] != str(p):
+            _OVR_WARNED[0] = str(p)
+            (LOGONLY if QUIET_OVR[0] else out)(f"clip_overrides.json unreadable ({type(ex).__name__}: {ex}): every utility override is OFF")
+        return {}
+
+
+QUIET_OVR = [False]
+
+
+def save_clip_overrides(d):
+    """Atomic (temp file, then replace); entries only for clips that are ON."""
+    save_json(_util_overrides_file(), {k: v for k, v in d.items() if v.get("allow_utility_kills")})
+
+
+def clip_override_state(path, ovs=None):
+    """(state, why): 'on' | 'off' | 'size' (file size differs from the one stored: not applied) | 'missing' (the file is gone: moved / renamed, not applied)."""
+    ovs = load_clip_overrides(quiet=True) if ovs is None else ovs
+    e = ovs.get(_pkey(path))
+    if not e:
+        return "off", ""
+    try:
+        sz = os.path.getsize(path)
+    except OSError:
+        return "missing", f"file not found ({e.get('name', Path(path).name)}): moved or renamed? switch it on again at the new place"
+    if e.get("size") and int(e["size"]) != sz:
+        return "size", f"{e.get('name', Path(path).name)}: size changed since the override was set ({e['size']} -> {sz} bytes): not applied"
+    return "on", ""
+
+
+def set_clip_override(paths, on, ovs=None):
+    """Switches the override for the given clips; writes only clip_overrides.json. Returns the new dict."""
+    cur = dict(load_clip_overrides(quiet=True))
+    for p in paths:
+        k = _pkey(p)
+        if on:
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                sz = 0
+            cur[k] = {"allow_utility_kills": True, "set": datetime.datetime.now().strftime("%Y-%m-%d"), "name": Path(p).name, "size": sz}
+        else:
+            cur.pop(k, None)
+    save_clip_overrides(cur)
+    return cur
+
+
+def utility_kill_rows(entry, cfg, game="valorant", base=None):
+    """The kill-shaped rows the detector rejected with the reason 'utility' in this clip's cached OCR frames: {kills: [...admitted rows...], base: analysis}.
+    The rows come from the one analyse_entry(); only rows whose track is a utility track ('util' icon) and that are not kills without the switch are returned."""
+    base = base or analyse_entry(entry, cfg, game)
+    real = classify_row
+
+    def mapped(r, cfg_=None, lg=0.0, game_=None):
+        v = real(r, cfg_, lg, game_)
+        if not getattr(_UTIL_LOCAL, "on", False):
+            return v
+        return [("kill", "utility kill allowed by override: " + why.split(":", 1)[1].strip()) if (a == "reject" and why.startswith("utility:")) else (a, why) for a, why in v]
+    with _UTIL_LOCK:
+        globals()["classify_row"] = mapped
+        _UTIL_LOCAL.on = True
+        try:
+            a = analyse_entry(entry, cfg, game)
+        finally:
+            _UTIL_LOCAL.on = False
+            globals()["classify_row"] = real
+    have = [(round(k["t"], 3), _alnum((k.get("victim") or "").lower())) for k in base["kills"]]
+    new = [dict(k, util=True) for k in a["kills"] if "] util [" in k.get("row", "") and (round(k["t"], 3), _alnum((k.get("victim") or "").lower())) not in have]
+    return new
+
+
+def apply_utility_override(rec, entry, a, cfg, game, ovs, admitted=None):
+    """a = analyse_clip_entry(...) of the clip. When the clip's override is ON (Valorant), its admitted utility rows join its kills (sorted by time) and leave
+    its rejected list; otherwise a is returned unchanged (default OFF: nothing changes anywhere)."""
+    if game != "valorant" or not ovs or entry is None or entry.get("error"):
+        return a
+    st, why = clip_override_state(rec["path"], ovs)
+    if st != "on":
+        if st != "off" and admitted is not None:
+            admitted.setdefault("warn", []).append(why)
+        return a
+    util = utility_kill_rows(entry, cfg, game, a)
+    if admitted is not None:
+        admitted.setdefault("clips", []).append(Path(rec["path"]).name)
+        for k in util:
+            admitted.setdefault("rows", []).append((Path(rec["path"]).name, k))
+    if not util:
+        return a
+    ts_ = {round(k["t"], 3) for k in util}
+    rej = [j for j in a.get("rej", []) if not (str(j.get("reason", "")).startswith("utility:") and round(j["t"], 3) in ts_)]
+    return dict(a, kills=sorted(list(a["kills"]) + util, key=lambda k: k["t"]), rej=rej)
+
+
+def utility_override_lines(admitted):
+    """B6: one line per run when any override is active (nothing when none is enabled); plus one line per admitted row."""
+    if not admitted or not (admitted.get("clips") or admitted.get("warn")):
+        return []
+    rows = admitted.get("rows", [])
+    lines = list(admitted.get("warn", []))
+    for nm, k in rows:
+        lines.append(f"utility kill allowed by override: {nm} @ {ts(k['t'])} -> {k.get('victim') or '?'}")
+    lines.insert(len(admitted.get("warn", [])), f"utility override: {len(admitted.get('clips', []))} clip(s) enabled, {len(rows)} utility kill(s) admitted"
+                 + (" (" + ", ".join(f"{nm} @ {ts(k['t'])} -> {k.get('victim') or '?'}" for nm, k in rows) + ")" if rows else ""))
+    return lines
+
+
+def cmd_utilclip(args):
+    """V6.9.7: python montage.py utilclip <name fragment | --list> [on|off]. --list prints the clips that are ON and how many utility rows each has (from the kill
+    cache, no scan). With on / off it switches every Valorant clip whose file name contains the fragment; writes only clip_overrides.json."""
+    cfg = load_config()
+    det = Detector("valorant")
+    store = load_kills_cache()
+    clips = load_json(CLIPS_CACHE, {})
+    recs = {}
+    for key, rec in clips.items():
+        try:
+            p = key.rsplit("|", 2)[0]
+        except ValueError:
+            continue
+        if rec and not rec.get("error") and tag_game(p, cfg)[0] == "valorant":
+            recs[_pkey(p)] = dict(rec, path=p, game="valorant")
+
+    def util_count(path):
+        r = recs.get(_pkey(path))
+        e = store.get(kills_key(r, "valorant", det)) if r else None
+        if not e or e.get("error"):
+            return None
+        return len(utility_kill_rows(e, cfg, "valorant"))
+
+    def show():
+        ovs = load_clip_overrides()
+        if not ovs:
+            print("utility override: no clip has it ON (default: OFF for every clip)")
+        for k, e in sorted(ovs.items(), key=lambda kv: kv[1].get("name", "")):
+            path = next((r["path"] for kk, r in recs.items() if kk == k), k)
+            st, why = clip_override_state(path, ovs)
+            n = util_count(path)
+            print(f"  ON  {e.get('name', Path(path).name)}  ({e.get('set', '?')})  utility rows in the cache: {'not scanned yet' if n is None else n}" + ("" if st == "on" else f"  [{why}]"))
+    t = (args.target or "").strip()
+    if not t or t == "--list" or args.list:
+        show()
+        return
+    st = (args.state or "").lower()
+    if st not in ("on", "off"):
+        raise SystemExit("utilclip: say on or off, e.g.  python montage.py utilclip 03-40 on   (or --list)")
+    hits = sorted(p["path"] for p in recs.values() if t.lower() in Path(p["path"]).name.lower())
+    if not hits:
+        raise SystemExit(f"utilclip: no Valorant clip in the clip cache has '{t}' in its name (scan the clips first; CS2 clips have no utility rows)")
+    set_clip_override(hits, st == "on")
+    for p in hits:
+        n = util_count(p)
+        print(f"  {st.upper():3} {Path(p).name}  utility rows in the cache: {'not scanned yet' if n is None else n}")
+    print(f"(written: {_util_overrides_file()}; no scan, no render, nothing else changed)")
+    show()
 
 
 def cmd_ledger(args):
@@ -10636,6 +10831,8 @@ class App:
         self.make_sortable(self.ctree, self.apply_filter, {"#0": "Clip", "date": "Date", "len": "Length", "kills": "Kills",
                                                            "used": "Used"})
         self.ctree.bind("<Button-1>", self.on_tree_click)
+        self.ctree.bind("<Button-3>", self.on_tree_context)          # V6.9.7: right-click menu (Valorant): Allow utility kills (this clip)
+        self.ctree.bind("<Button-2>", self.on_tree_context)
         self.ctree.bind("<Double-1>", self.on_tree_double)
         s2 = ttk.LabelFrame(mid, text="Step 2: choose the song (newest added first)", padding=4)
         mid.add(s1, minsize=int(180 * UI_SCALE[0]), stretch="always", padx=2, pady=2)
@@ -10862,9 +11059,66 @@ class App:
             self.update_status()
         return "break"
 
+    def util_targets(self, iid):
+        """V6.9.7: (targets, is_on_for_the_first) for the right-click menu, or None (hidden: not a Valorant list). The ticked rows are the selection when the clicked row
+        is ticked (the toggle follows the FIRST of them in list order), else only the clicked row."""
+        if self.m_game.get() != "valorant" or iid not in self.byp:
+            return None
+        vis = list(self.ctree.get_children())
+        targets = [x for x in vis if x in self.ticked] if iid in self.ticked else [iid]
+        return targets, bool(self.byp[targets[0]].get("util"))
+
+    def toggle_util(self, targets, new_state):
+        """Switches the override of the given clips (writes only clip_overrides.json). Never changes ticks, used flags or selection, never scans or renders."""
+        try:
+            set_clip_override(targets, new_state)
+        except Exception as ex:                             # noqa: BLE001
+            out(f"utility override not saved: {ex}")
+            return
+        cfg, det = load_config(), Detector("valorant")
+        clips, store, ovs = load_json(CLIPS_CACHE, {}), load_kills_cache(), load_clip_overrides(quiet=True)
+        for iid in targets:
+            c = self.byp.get(iid)
+            if not c:
+                continue
+            c["util"] = bool(new_state)
+            try:                                            # the kill count follows from the CACHED rows (no scan)
+                r = clips.get(file_key(iid))
+                e = store.get(kills_key(dict(r, path=iid, game="valorant"), "valorant", det)) if r else None
+                if e and not e.get("error"):
+                    a_ = analyse_clip_entry(dict(r, path=iid, game="valorant"), e, cfg, "valorant")
+                    a_ = apply_utility_override(dict(r, path=iid), e, a_, cfg, "valorant", ovs)
+                    c["ks"], c["kills"] = [k["t"] for k in a_["kills"]], len(a_["kills"])
+            except Exception as ex:                         # noqa: BLE001
+                LOGONLY(f"utility override: kill count not refreshed for {c.get('name')}: {ex}")
+            if self.ctree.exists(iid):
+                self.ctree.item(iid, text=self.row_text(iid))
+                self.ctree.set(iid, "kills", "not scanned" if c["kills"] is None else str(c["kills"]))
+        getattr(self, "_fill_sig", {}).pop(self.ctree, None)
+        out(f"utility kills {'allowed' if new_state else 'not allowed'} for {len(targets)} clip(s): " + ", ".join(self.byp[x]["name"] for x in targets[:5] if x in self.byp)
+            + (" ..." if len(targets) > 5 else ""))
+
+    def on_tree_context(self, e):
+        if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
+            return None
+        iid = self.ctree.identify_row(e.y)
+        info = self.util_targets(iid) if iid else None
+        if info is None:
+            return "break"                                  # CS2 (no utility rows) / empty space: no menu
+        targets, cur = info
+        m = tk.Menu(self.root, tearoff=0)
+        var = tk.BooleanVar(value=cur)
+        m.add_checkbutton(label="Allow utility kills (this clip)" if len(targets) == 1 else f"Allow utility kills ({len(targets)} selected clips)",
+                          variable=var, command=lambda: self.toggle_util(targets, not cur))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
     def row_text(self, iid):
         c = self.byp.get(iid)
-        return ("\u2611 " if iid in self.ticked else "\u2610 ") + (c["name"] if c else Path(iid).name)
+        return ("\u2611 " if iid in self.ticked else "\u2610 ") + (c["name"] if c else Path(iid).name) + (UTIL_ROW_TAG if c and c.get("util") else "")
 
     def tick(self, how):
         vis = list(self.ctree.get_children())
@@ -10908,6 +11162,7 @@ class App:
         with pstage("load_clips: used_dates"):
             ud = used_info()                                       # V5.55 / V6.7.4: (date, montage title) of the montage each clip was used in
         rows = []
+        ovs = load_clip_overrides() if g == "valorant" else {}      # V6.9.7: clips with 'allow utility kills' ON (default: none)
         with pstage("load_clips: scan_clips (total)"):
             scanned = scan_clips(load_config())
         _t1 = time.perf_counter()
@@ -10917,14 +11172,18 @@ class App:
             e = kc.get(kills_key(r, g, det)) if det else None
             ks = None
             if e and not e.get("error"):
-                ks = [k["t"] for k in analyse_clip_entry(r, e, cfg, g)["kills"]]
+                a_ = analyse_clip_entry(r, e, cfg, g)
+                if ovs:
+                    a_ = apply_utility_override(r, e, a_, cfg, g, ovs)
+                ks = [k["t"] for k in a_["kills"]]
             try:
                 mt = os.path.getmtime(r["path"])
             except OSError:
                 continue
             rows.append({"path": r["path"], "name": Path(r["path"]).name, "folder": clip_folder(r["path"], cfg), "mtime": mt,
                          "dur": r.get("dur", 0), "kills": None if ks is None else len(ks), "ks": ks or [],
-                         "used": ud.get(_pkey(r["path"]), ("", ""))[0], "used_label": ud.get(_pkey(r["path"]), ("", ""))[1]})
+                         "used": ud.get(_pkey(r["path"]), ("", ""))[0], "used_label": ud.get(_pkey(r["path"]), ("", ""))[1],
+                         "util": bool(ovs) and clip_override_state(r["path"], ovs)[0] == "on"})
         rows.sort(key=lambda c: -c["mtime"])
         if PERF is not None:
             PERF.stages.append(((_t1 - PERF_T0) * 1000, (time.perf_counter() - _t1) * 1000, "load_clips: per-clip rows (kills lookup, compute_kills, getmtime)", threading.current_thread().name))
@@ -10998,7 +11257,7 @@ class App:
         v = text if col == "#0" else (vals[cols.index(col)] if cols.index(col) < len(vals) else "")
         v = str(v).strip()
         if col == "#0":
-            return (1, 0.0, v.lstrip("\u2610\u2611\u2605 ").lower())
+            return (1, 0.0, v.removesuffix(UTIL_ROW_TAG).lstrip("\u2610\u2611\u2605 ").lower())
         if col == "used" and tree is getattr(self, "ctree", None):       # V6.7.4: the cell shows a title; the order is by date
             d = (getattr(self, "byp", {}).get(iid) or {}).get("used", "")
             return (1, 0.0, f"{d} {v.lower()}") if d else (-1, 0.0, "")
@@ -14116,6 +14375,11 @@ def main():
     scp.set_defaults(fn=cmd_songcheck)
     sp.add_parser("cfgdump", help="print the config file path + contents").set_defaults(fn=cmd_cfgdump)
     sp.add_parser("timeanchor", help="V6.9.7: what the file-name time means (clip START or END) per naming scheme; read-only, writes timeanchor.txt").set_defaults(fn=cmd_timeanchor)
+    pu = sp.add_parser("utilclip", help="V6.9.7: per-clip 'allow utility kills' override (Valorant): utilclip <name fragment | --list> [on|off]; writes only clip_overrides.json")
+    pu.add_argument("target", nargs="?", default="", help="part of the clip file name, or --list")
+    pu.add_argument("state", nargs="?", default="", help="on | off")
+    pu.add_argument("--list", action="store_true", help="the clips that are ON and how many utility rows each has")
+    pu.set_defaults(fn=cmd_utilclip)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")

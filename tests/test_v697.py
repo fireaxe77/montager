@@ -34,7 +34,7 @@ def main():
         for name in ("v697_parta", "v697_partb", "v697_partd"):
             if (Path(__file__).resolve().parent / f"{name}.py").exists():
                 mod = importlib.import_module(name)
-                for fn in getattr(mod, "ORDER", None) or [f for f in ("part_anchor", "part_proof", "part_cap", "part_ledger", "part_commands", "part_guard", "part_real") if hasattr(mod, f)]:
+                for fn in (getattr(mod, "ORDER", None) or ["part_anchor", "part_proof", "part_cap", "part_ledger", "part_commands", "part_guard", "part_real"]):
                     getattr(mod, fn)(tmp)
     finally:
         M.restore_data_dir(old)

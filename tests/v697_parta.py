@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from v697_common import *                                                                        # noqa: F401,F403
-from v697_common import M, T, R, check, section, logged, snapshot, REAL_DATA, ROOT, INCIDENT, build_incident, make_clip, view_events, harness, rec_of, pool_item, BASE_DT
+from v697_common import distinct_names, M, T, R, check, section, logged, snapshot, REAL_DATA, ROOT, INCIDENT, build_incident, make_clip, view_events, harness, rec_of, pool_item, BASE_DT
 
 BASE_REF = os.environ.get("V697_BASE", "76b2859")        # origin/main when v6.9.7 was branched (the V6.9.6 merge)
 STATE = {}
@@ -335,7 +335,7 @@ def part_guard(tmp):
         evview = lambda evs: json.dumps([{k: v for k, v in e.items() if k not in ("rec",)} for e in evs], sort_keys=True, default=str)
         vdir = Path(tmp) / "guard"
         vdir.mkdir()
-        vn = T.names(500, 5)
+        vn = distinct_names(500)
         for game in ("valorant", "cs2"):
             ents = T.gen_entries(100, game)
             nd = sum(view(M, e, game) != view(B, e, game) for e in ents)
@@ -377,3 +377,6 @@ def part_real(tmp):
             print("  skip  real montage_data / the 7 incident clips (VALORANT 2026-10-07 03-4x) not found on this machine - only this check is skipped")
             return
         check(False, "real incident clips found but the real-data regression runner is not implemented for this layout")
+
+
+ORDER = ["part_anchor", "part_proof", "part_cap", "part_ledger", "part_commands", "part_guard", "part_real"]
