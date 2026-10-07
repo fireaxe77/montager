@@ -5,6 +5,10 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V6.9.10 - 2026-10-07
+- CS2 only: a "kill" row that first appears within 10 s of the clip start and whose victim matches a pre-clip row of the same clip is the same row read again and is dropped ("CS2 stale feed row: already on screen at clip start"). Changes 4 of 291 cached CS2 clips (phantom kills at 2.8 / 5.4 s removed); the known-good multikills are unchanged. Valorant, shape filter, fragment merge and kill-cache format untouched. Not fixed: `2026.02.10 - 19.09.46.22` (real kill dated late, separate cause).
+- `docs/CHANGELOG_SIMPLE.md` added (plain-language history). Tests: `tests/test_v6910.py`.
+
 ## V6.9.9 - 2026-10-07
 - Small fix (Valorant weekly / Force new could not render). Detectors, OCR, kill thresholds, utility logic, planner / selection scoring, songmap, effects, theme, sync detector and interpolation untouched.
 - Proven cause: NOT a kill from the previous clip without a stitch. 23.05.17.12 + 31.13 are saved back to back with 0.38 s of footage missing between them; the stitch was built (17.12 first, kills -1.78 / 0.63 / 9.5 / 12.7 s on the group timeline) but `split_parts` put the clip switch in the middle of that gap, so one segment ended past clip 12 and the next started before clip 13 (footage outside both clips). The check at render time refused the whole montage. Fix (`_build_events`): when stitched clips leave footage missing between them, the gap is closed on the group timeline (later clips and their kills move earlier by the gap, logged in the stitch note); the clip switch then falls on a real frame of both clips.
