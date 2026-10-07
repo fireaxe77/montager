@@ -5,6 +5,15 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V7 test (branch v7-songmapv2, NOT merged, APP_VERSION unchanged) - 2026-10-08
+- SONGMAPV2 improvement test. Only `songmap_v2/`, `songmap_compare.py`, `tests/test_v7.py`, docs changed; `montage.py`, SONGMAPV1, detection, planner, placement, render untouched. Default stays Songmap V1.
+  - Tempo: the audio tempo estimate is no longer pulled by the CSV tempo (the CSV is only one more candidate); the other strong comb peaks are candidates too; a refined candidate may never leave 60-200 BPM. V1 trusts the CSV tempo (`bpm0 = csv`), e.g. Silicon XX 115 in V1 while the audio locks at 175.
+  - Events (`events7.py`, `events.py` itself unchanged): linear-amplitude low-band pass for kicks on top of sustained bass, a `sharp` value per hit, a sharp low-band hit is a kick whatever its tail (hardstyle reverse bass no longer sets the phase).
+  - Grid (`grid.py`): lock uses the weighted sharp hits (kicks + snares), a drift tracker (local least squares, +-6 beats) for live drums, tempo segments kept; downbeat evidence uses the mid/high attack per beat (one accented beat or backbeat fit) when kicks cannot tell the bar start.
+  - Gate (`build.py`, `judge.py`): V2 only if confidence >= 0.5, median beat-to-kick <= 24 ms on an independent spectral-flux kick detector, and not worse than V1 (p95 +3 ms, median +1 ms, F1 -0.02). V2 cache key `v7.1`.
+  - Tools: `songmap_v2/bench.py` (independent kick detector), `synth.py` (14-genre generated suite with truth), `planbench.py` (dry planner V1 vs V2 map); `python songmap_compare.py v7bench | v7plan`.
+  - Result: genre suite passes; song-level V2 locks better on several real songs; at plan level V2-auto is NOT clearly better (see docs/SONGMAP_V7.md). Not merged.
+
 ## V6.9.10 - 2026-10-07
 - CS2 only: a "kill" row that first appears within 10 s of the clip start and whose victim matches a pre-clip row of the same clip is the same row read again and is dropped ("CS2 stale feed row: already on screen at clip start"). Changes 4 of 291 cached CS2 clips (phantom kills at 2.8 / 5.4 s removed); the known-good multikills are unchanged. Valorant, shape filter, fragment merge and kill-cache format untouched. Not fixed: `2026.02.10 - 19.09.46.22` (real kill dated late, separate cause).
 - `docs/CHANGELOG_SIMPLE.md` added (plain-language history). Tests: `tests/test_v6910.py`.
