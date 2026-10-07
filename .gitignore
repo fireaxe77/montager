@@ -16,3 +16,4 @@ compare_out/
 interpbench_*/
 ledger.txt
 timeanchor.txt
+cs2_stale_scan.txt
