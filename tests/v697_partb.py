@@ -12,8 +12,7 @@ import time
 from pathlib import Path
 
 from v697_common import *                                                                        # noqa: F401,F403
-from v697_common import distinct_names, M, T, R, check, section, logged, snapshot, REAL_DATA, ROOT, make_clip, view_events, harness, rec_of, pool_item, BASE_DT
-from v697_parta import base_module, led, states, STATE
+from v697_common import mlogged, base_module, led, states, STATE, distinct_names, M, T, R, check, section, logged, snapshot, REAL_DATA, ROOT, make_clip, view_events, harness, rec_of, pool_item, BASE_DT
 
 FPS = M.FPS
 
@@ -42,18 +41,6 @@ def synth_entry(rows, last=480):
     ocr = [[f, f, b, g] for f, (b, g) in sorted(frames.items())]
     ocr.append([last, last, [], []])
     return {"ocr": ocr, "frames": last, "v_off": 0.0, "game": "valorant"}
-
-
-def mlogged(mod, fn, *a, **k):
-    """Like logged() for any module (the base commit's module has its own out())."""
-    lines = []
-    ro, rl = mod.out, mod.LOGONLY
-    mod.out = mod.LOGONLY = lambda *x: lines.append(" ".join(map(str, x)))
-    try:
-        res = fn(*a, **k)
-    finally:
-        mod.out, mod.LOGONLY = ro, rl
-    return res, lines
 
 
 def kill_row(t, victim, icon="gun", **kw):
@@ -351,7 +338,7 @@ def part_frozen(tmp):
         check(out.strip() == "", "git diff --stat: no change in songmap_v2 / songmap_compare.py / fixtures")
 
 
-BASE_REF_B = os.environ.get("V697_BASE", "76b2859")
+from v697_common import BASE_REF as BASE_REF_B
 
 
 def part_cli(tmp):

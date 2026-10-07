@@ -134,3 +134,37 @@ def distinct_names(n, seed=5, maxsim=70):
         if not out_ or process.extractOne(w, out_, scorer=fuzz.ratio)[1] < maxsim:
             out_.append(w)
     return out_
+
+
+# ---- helpers shared by the part files (so that no part file imports another one: a part can be reverted on its own)
+BASE_REF = os.environ.get("V697_BASE", "76b2859")        # origin/main when v6.9.7 was branched (the V6.9.6 merge)
+STATE = {}
+
+
+def base_module(tmp):
+    if "B" not in STATE:
+        STATE["B"] = T.load_baseline(tmp, BASE_REF)
+    return STATE["B"]
+
+
+def led():
+    return getattr(M, "LAST_LEDGER", [None])[0]
+
+
+def states(l):
+    c = {}
+    for r in l.rows:
+        c[r["state"]] = c.get(r["state"], 0) + 1
+    return c
+
+
+def mlogged(mod, fn, *a, **k):
+    """Like logged() for any module (the base commit's module has its own out())."""
+    lines = []
+    ro, rl = mod.out, mod.LOGONLY
+    mod.out = mod.LOGONLY = lambda *x: lines.append(" ".join(map(str, x)))
+    try:
+        res = fn(*a, **k)
+    finally:
+        mod.out, mod.LOGONLY = ro, rl
+    return res, lines

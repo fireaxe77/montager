@@ -7910,7 +7910,7 @@ def detect_dup_chain(path, s0, d):
 def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
     """Returns the plan to build the filter from (the SAME plan object when nothing is interpolated)."""
     if not cfg.get("interpolate_low_fps", True):
-        out("fps: interpolation disabled (interpolate_low_fps = false), no clips probed")
+        out("fps: interpolation off (setting)")                # V6.9.7: also the Settings checkbox (config key interpolate_low_fps); nothing is probed
         return plan
     res = analyse_takes(plan, fx)
     n_takes = len(plan["takes"])
@@ -10339,6 +10339,7 @@ class App:
         cfg["songmap_version"] = next((k for k, lab in SONGMAP_CHOICES_UI.items() if lab == self.set_songmap.get()), SONGMAP_DEFAULT)
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
+        cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
         if self.set_names:
             cfg["player_names"] = {g: norm_names(v.get(), g) for g, v in self.set_names.items()}
@@ -12051,6 +12052,10 @@ class App:
         ttk.Radiobutton(h, text="NVENC p7 cq18 (fast)", variable=self.set_q, value="nvenc").pack(side="left", padx=(0, PX))
         ttk.Radiobutton(h, text="Max quality x264 CRF15", variable=self.set_q, value="max").pack(side="left")
         r[0] += 1
+        self.set_interp = tk.BooleanVar(value=bool(self.cfg.get("interpolate_low_fps", True)))      # V6.9.7: the existing hidden key, now a checkbox
+        label("Low-fps takes")
+        ttk.Checkbutton(holder(), text="Interpolate low-fps takes (slow-mo, duplicated frames, VFR)", variable=self.set_interp).pack(side="left")
+        r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
         r[0] += 1
@@ -12088,7 +12093,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):

@@ -398,7 +398,7 @@ def part_fallbacks(tmp, env):
             newp, lines = logged(M.interp_prepare, plan, dict(cfg, interpolate_low_fps=False), Path(tmp) / "off")
         finally:
             M.probe_fps = real_pf
-        check(newp is plan and any("interpolation disabled (interpolate_low_fps = false)" in l for l in lines) and not (Path(tmp) / "off").exists(), "switch off: nothing probed, nothing interpolated, one log line")
+        check(newp is plan and any("fps: interpolation off (setting)" in l for l in lines) and not (Path(tmp) / "off").exists(), "switch off: nothing probed, nothing interpolated, one log line")
 
 
 def part_sync(tmp):
