@@ -12,7 +12,7 @@ MIN_RANGE = {"loud": 6.0, "low": 6.0, "act": 1.0}      # a flat song's noise is 
 BUMP_RISE = 0.25
 
 
-def bar_table(beats, down, dur, y, sr, low, events):
+def bar_table(beats, down, dur, y, sr, low, events, kick_t=None):
     """Bars between consecutive downbeats: start / end time, beat range and the raw features."""
     nb = len(beats)
     per = float(np.median(np.diff(beats))) if nb > 1 else 0.5
@@ -36,7 +36,13 @@ def bar_table(beats, down, dur, y, sr, low, events):
         rms = max(0.0, float((cs[i1] - cs[i0]) / (i1 - i0)))
         lw = max(0.0, float((cl[min(i1, len(cl) - 1)] - cl[i0]) / (i1 - i0)))
         m = (et >= t0) & (et < t1)
-        bars.append({"beat0": a, "beat1": b, "t0": t0, "t1": t1, "loud": 10 * np.log10(rms + 1e-12), "low": 10 * np.log10(lw + 1e-12),
+        ks_ = 0.0
+        if kick_t is not None and len(kick_t):                       # V7.1: share of this bar's beats that carry a kick (a bar without kicks is a break)
+            bi = np.arange(a, b)
+            lo_ = beats[bi] - 0.5 * per
+            hi_ = beats[bi] + 0.5 * per
+            ks_ = float(np.mean(np.searchsorted(kick_t, hi_) - np.searchsorted(kick_t, lo_) > 0)) if len(bi) else 0.0
+        bars.append({"kick": ks_, "beat0": a, "beat1": b, "t0": t0, "t1": t1, "loud": 10 * np.log10(rms + 1e-12), "low": 10 * np.log10(lw + 1e-12),
                      "act": float(es[m].sum() / (t1 - t0)) if len(es) else 0.0})
     return bars
 
@@ -45,6 +51,70 @@ def _norm(x, rng_min):
     x = np.nan_to_num(np.asarray(x, float), nan=-120.0, posinf=0.0, neginf=-120.0)       # never NaN into the change-point logic
     lo, hi = np.percentile(x, 5), np.percentile(x, 95)
     return np.clip((x - lo) / max(hi - lo, rng_min), 0, 1)
+
+
+def kick_entry(kick_bar, bar, N):
+    """The bar where the kick (re)enters around a loudness-detected drop: the first bar in [bar-1, bar+8] from which >= 4 bars (or the window) carry kicks,
+    when the drop bar itself is kick-less. A drop bar that already has kicks stays."""
+    n = len(kick_bar)
+    if kick_bar[bar] >= 0.6 and float(kick_bar[bar:bar + 4].mean()) >= 0.6:
+        return bar
+    for j in range(max(0, bar - 1), min(n - 3, bar + 9)):
+        if float(kick_bar[j:j + 4].min()) >= 0.35 and kick_bar[j] >= 0.6:
+            return j
+    return bar
+
+
+PLAN_LEN_S = (20.0, 32.0)           # the montage lengths the continuity test covers (the planner fills ~20-30 s windows)
+ANCHOR_LEN_S = 26.0                 # the window length the anchor is computed for
+PRE_FRAC = 0.38                     # the planner puts the main drop ~38 % into its window
+GAP_BARS = 2                        # two bars in a row without kicks inside the window = a kick-less break
+
+
+def window_kicky(kick_bar, bar, bar_s, lens=PLAN_LEN_S):
+    """True when the windows the planner will fill around a drop at `bar` (drop ~38 % in, for each montage length) contain no kick-less break
+    (>= GAP_BARS consecutive bars with almost no kicks) and start / end inside the song."""
+    n = len(kick_bar)
+    for L in lens:
+        nb = max(4, int(round(L / max(bar_s, 0.5))))
+        a = bar - int(round(PRE_FRAC * nb))
+        b = a + nb
+        a, b = max(0, a), min(n, b)
+        if b - a < max(4, nb // 2):
+            return False
+        run = 0
+        for k in range(a, b):
+            run = run + 1 if kick_bar[k] < 0.35 else 0
+            if run >= GAP_BARS:
+                return False
+    return True
+
+
+def span_kicky(kick_bar, a, nb, gap=GAP_BARS):
+    """bars [a, a+nb) carry a continuous kick grid: no GAP_BARS consecutive kick-less bars and at least 60 % of the bars with kicks."""
+    n = len(kick_bar)
+    if a < 0 or a + nb > n:
+        return False
+    w = kick_bar[a:a + nb]
+    run = 0
+    for v in w:
+        run = run + 1 if v < 0.35 else 0
+        if run >= gap:
+            return False
+    return float(np.mean(w >= 0.35)) >= 0.6
+
+
+def relaxed_drop(S, kick_bar, bar_s, N):
+    """Weak drop for songs with no sustained rise: the bar with the biggest local step of the bar score whose planner window is kicky."""
+    n = len(S)
+    best, bk = 0.12, None
+    for i in range(2, n - 4):
+        step = float(S[i:i + 4].mean() - S[max(0, i - 4):i].mean())
+        if step > best and window_kicky(kick_bar, i, bar_s):
+            best, bk = step, i
+    if bk is None:
+        return None
+    return {"bar": bk, "jump": best, "bass_jump": 0.0, "post": float(S[bk:bk + N].mean()), "kicky": True, "strength": float(0.8 * best), "weak": True}
 
 
 def analyse(bars, bar_s):
@@ -97,6 +167,12 @@ def analyse(bars, bar_s):
                 best, bk = step, k
         d["bar"] = bk
     drops.sort(key=lambda d: d["bar"])
+    kick_bar = np.array([b.get("kick", 1.0) for b in bars], float)
+    for d in drops:                                          # V7.1: the drop is where the KICK comes back, not where a vocal / pad gets loud a few bars earlier
+        d["bar"] = kick_entry(kick_bar, d["bar"], N)
+    drops = [d for k, d in enumerate(drops) if all(d["bar"] != e["bar"] for e in drops[:k])]
+    for d in drops:
+        d["kicky"] = window_kicky(kick_bar, d["bar"], bar_s)
 
     def extent(d):
         i = d["bar"]
@@ -104,7 +180,7 @@ def analyse(bars, bar_s):
         j = i + max(2, N // 2)
         while j < n and not (S[j] < 0.75 * level and (j + 1 >= n or S[j + 1] < 0.8 * level)):
             j += 1
-        return i, min(j, n)
+        return i, min(j, n, i + 2 * N)               # V7.1: a uniformly loud song keeps its first drop, labelled for at most 2 x the persistence window
     share = lambda ds: sum(extent(d)[1] - extent(d)[0] for d in ds) / max(1, n)
     while drops and share(drops) > SHARE_CAP:
         drops.remove(min(drops, key=lambda d: d["jump"]))
@@ -150,6 +226,20 @@ def analyse(bars, bar_s):
             break
     out = []
     for d in drops:
-        out.append({"bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"],
+        out.append({"bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"], "kicky": bool(d["kicky"]),
                     "strength": float(d["jump"] + max(d["bass_jump"], 0.0) + d["post"])})
-    return {"S": S, "low_n": low, "drops": out, "labels": labels, "share": share(drops)}
+    if not out:                                              # V7.1: no sustained rise found: the best KICKY rise is offered as a weak drop (never invented from nothing)
+        rel = relaxed_drop(S, kick_bar, bar_s, N)
+        if rel is not None:
+            out.append(rel)
+    anchor = None
+    if out and not any(d["kicky"] for d in out):               # V7.1: every real drop sits behind a kick-less build: anchor the planner's window on the kick entry instead
+        nb = max(4, int(round(ANCHOR_LEN_S / max(bar_s, 0.5))))
+        for d in sorted(out, key=lambda d: -d["strength"]):
+            if span_kicky(kick_bar, d["bar"], nb, GAP_BARS + 1):            # a 2-bar fill inside a drop is normal
+                anchor = d["bar"] + int(round(PRE_FRAC * nb))
+                break
+    if out and anchor is None and not any(d["kicky"] for d in out):      # still nothing kicky: the planner's main drop = the best kicky step of the song (or none)
+        rel = relaxed_drop(S, kick_bar, bar_s, N)
+        anchor = rel["bar"] if rel is not None else -1
+    return {"S": S, "low_n": low, "drops": out, "labels": labels, "share": share(drops), "kick_bar": kick_bar, "anchor": anchor}

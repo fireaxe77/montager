@@ -578,7 +578,10 @@ def v7_bench(argv=None, say=print):
     M = _montage()
     rows = []
     t0 = time.time()
-    for label, p, csv, why in v7_song_list(M, say):
+    from songmap_v2 import planbench as _PB
+    with _PB.data_copy(M):
+        _songs = v7_song_list(M, say)
+    for label, p, csv, why in _songs:
         try:
             rows.append(dict(bench.bench_song(M, p, csv, say=say), why=why))
         except Exception as ex:
@@ -613,12 +616,12 @@ def v7_plan(argv=None, say=print):
     M = _montage()
     out = Path(M.HERE) / "compare_out"
     out.mkdir(exist_ok=True)
-    songs = v7_song_list(M, say)
-    if argv:
-        songs = [x for x in songs if any(f.lower() in x[0].lower() for f in argv)]
     results = []
     t0 = time.time()
-    with PB.data_copy(M):
+    with PB.data_copy(M):                                    # song_pool() writes its caches: the listing runs on the copy too (V7.1)
+        songs = v7_song_list(M, say)
+        if argv:
+            songs = [x for x in songs if any(f.lower() in x[0].lower() for f in argv)]
         sets = PB.take_sets(M)
         for label, p, csv, why in songs:
             say(f"== {label}")
@@ -742,11 +745,60 @@ def v7_report(results, out):
     return text
 
 
+def songmapcheck(frag, say=print):
+    """V7.1: `python montage.py songmapcheck "<song name fragment>"`: one song, V1 vs V2 numbers and three 20 s listening clips in compare_out/ (original, V1 kill
+    clicks, V2 kill clicks; a different tone for the last kill of a multikill). Runs on a COPY of montage_data (the V2 analysis is cached there per file)."""
+    from songmap_v2 import bench, planbench as PB, timebase
+    M = _montage()
+    out = Path(M.HERE) / "compare_out"
+    out.mkdir(exist_ok=True)
+    t0 = time.time()
+    with PB.data_copy(M):
+        files = sorted(Path(M.load_config().get("mp3_dir")).glob("*.mp3"))
+        f = next((p for p in files if frag.lower() in p.name.lower()), None)
+        if f is None:
+            say(f"songmapcheck: no song with '{frag}' in {M.load_config().get('mp3_dir')}")
+            return None
+        pool = {str(x["path"]).replace("\\", "/"): x for x in M.song_pool(M.load_config(), cached_only=True)[0]}
+        ent = pool.get(str(f).replace("\\", "/")) or {}
+        path, csv = str(ent.get("path") or f), ent.get("csv_bpm")
+        y, sr = timebase.decode(path)
+        kicks = bench.strong_kicks(y, sr)
+        v1, v2 = M.get_songmap(path, csv, version="v1"), M.get_songmap(path, csv, version="v2")
+        fmt = lambda x: "-" if x is None else f"{x:.1f}"
+        say(f"{f.stem}  ({len(y) / sr:.0f} s, {len(kicks)} independent kicks)")
+        for nm, m in (("V1", v1), ("V2", v2)):
+            st = bench.beat_stats(m["beats"], kicks)
+            say(f"  {nm}: BPM {m['bpm']:.1f}  kick-to-grid median {fmt(st['median_ms'])} / p95 {fmt(st['p95_ms'])} ms  drops {[round(d['t'], 1) for d in m['drops']]}  main drop beat {m['drop']}")
+        sets = PB.take_sets(M)
+        game, paths = sets["val7"]
+        plans = {}
+        for mode in ("v1", "v2"):
+            plan, _ = PB.run_plan(M, game, paths, path, mode)
+            kt = PB.kill_times(plan)
+            d = [abs(float(bench.nearest([t], kicks)[0])) * 1000 for t, *_ in kt]
+            plans[mode] = (plan, kt)
+            say(f"  {mode.upper()} plan: section {plan['song']['start_t']:.1f}-{plan['song']['start_t'] + plan['duration']:.1f} s, {len(kt)} kills, kill-to-kick median "
+                f"{fmt(float(np.median(d)) if d else None)} ms / p95 {fmt(float(np.percentile(d, 95)) if d else None)} ms")
+        base = safe(f.stem)
+        best = max(((t, n) for t, role, n, _ in plans["v2"][1] if role == "first"), key=lambda x: x[1], default=(plans["v2"][0]["song"]["start_t"] + 5, 1))[0]
+        a, b = clip_bounds(best, len(y) / sr)
+        n = int((b - a) * sr)
+        write_wav(out / f"{base}_check_original.wav", y[int(a * sr):int(a * sr) + n], sr)
+        for mode in ("v1", "v2"):
+            ck = _click_track([(t - a, role) for t, role, _, _ in plans[mode][1]], sr, n)
+            write_wav(out / f"{base}_check_{mode}_clicks.wav", _mix(y[int(a * sr):int(a * sr) + n], ck), sr)
+        say(f"  clips ({a:.0f}-{b:.0f} s) in compare_out/: {base}_check_original.wav, {base}_check_v1_clicks.wav, {base}_check_v2_clicks.wav   [{time.time() - t0:.0f} s]")
+    return True
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "v7bench":
         v7_bench(sys.argv[2:])
     elif cmd == "v7plan":
         v7_plan(sys.argv[2:])
+    elif cmd == "songmapcheck":
+        songmapcheck(" ".join(sys.argv[2:]))
     else:
         print("usage: python songmap_compare.py v7bench | v7plan   (the V6.9.5 tool stays: python montage.py songmapcompare --auto 10)")
