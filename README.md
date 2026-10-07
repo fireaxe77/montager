@@ -5,4 +5,4 @@ V5: song map (beat grid, sections, drops) drives the cut; `python montage.py smo
 
 Desktop shortcut: double-click `Create_Desktop_Shortcut.vbs` once - it creates "Montager" (Desktop + Start menu, own taskbar identity `fireaxe.montager`). Settings are saved on every change to `montage_data\config.json` next to `montage.py`.
 
-Version history: `CHANGELOG.md` (also reachable from Settings > Changelog). Fast GUI / audio-mode checks without rendering: `python test_v557.py`.
+Version history: `CHANGELOG.md` (also reachable from Settings > Changelog). Fast GUI / audio-mode checks without rendering: `python tests/test_v557.py`.
