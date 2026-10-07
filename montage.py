@@ -5422,26 +5422,30 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
             continue
         g = [(a, 0.0)]
         used.add(i)
-        for j in range(i + 1, len(items)):
-            b = items[j]
-            if j in used:
-                continue
-            near = b["ctime"] - a["ctime"] <= 60 + a["rec"].get("dur", 0)
-            off = None
-            for (m, mo) in g:
-                o = _victim_offset(m["kills"], b["kills"], rf) if near else None
-                if o is not None and abs(b["ctime"] - m["ctime"]) <= 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
-                    off = mo + o
-                    break
-                o = _same_kills(m, b, rf, refine)          # V5.42B: same kills = same event, whatever the file times say
-                if o is not None:
-                    off = mo + o
-                    notes.append(f"same kills in two files: {Path(m['rec']['path']).name} = {Path(b['rec']['path']).name} "
-                                 "(one event, never placed twice)")
-                    break
-            if off is not None:
-                g.append((b, off))
-                used.add(j)
+        grew = True
+        while grew:                                        # V6.9.6 (CS2): clips of one base time ('DVR', 'DVR_1', ...) sort in discovery order, so a clip
+            grew = False                                   # scanned before the clip that links it to the group must be tried again
+            for j in range(i + 1, len(items)):
+                b = items[j]
+                if j in used:
+                    continue
+                near = b["ctime"] - a["ctime"] <= 60 + a["rec"].get("dur", 0)
+                off = None
+                for (m, mo) in g:
+                    o = _victim_offset(m["kills"], b["kills"], rf) if near else None
+                    if o is not None and abs(b["ctime"] - m["ctime"]) <= 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
+                        off = mo + o
+                        break
+                    o = _same_kills(m, b, rf, refine)          # V5.42B: same kills = same event, whatever the file times say
+                    if o is not None:
+                        off = mo + o
+                        notes.append(f"same kills in two files: {Path(m['rec']['path']).name} = {Path(b['rec']['path']).name} "
+                                     "(one event, never placed twice)")
+                        break
+                if off is not None:
+                    g.append((b, off))
+                    used.add(j)
+                    grew = game == "cs2"
         groups.append(g)
     evs = []
     for g in groups:
@@ -5543,16 +5547,37 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
         spans.append({"it": it, "shift": o, "start": start, "end": end, "path": it["rec"]["path"]})
     spans.sort(key=lambda s: s["start"])
     stitch_note = ""
+    order_bad = ""
+    if len(spans) > 1 and (spans[0]["it"]["rec"].get("game") == "cs2"):
+        # V6.9.6: the order of a stitched CS2 group is CHRONOLOGICAL BY THE RECORDING TIME in the clip names (the 'pair partner' time index), not
+        # whatever order the victim-matched offsets or the discovery order give. Clips of one base time ('DVR', 'DVR_1', 'DVR_1_1') tie: they keep
+        # the offset order and the frame-match verification below decides between the two possible orders. Unparsable names: the old order.
+        nts = [pair_clip_start(s_["path"]) for s_ in spans]
+        if all(t_ is not None for t_ in nts):
+            spans = [s_ for _, s_ in sorted(zip(range(len(spans)), spans), key=lambda x: (nts[x[0]], x[1]["start"], x[1]["end"]))]
+            nts = sorted(nts)
+            if any(spans[i + 1]["start"] < spans[i]["start"] - 0.5 and nts[i + 1] > nts[i] for i in range(len(spans) - 1)):
+                order_bad = "the recording times in the clip names disagree with the kill offsets (order by name: " + \
+                            " < ".join(Path(s_["path"]).name for s_ in spans) + ")"
     if len(spans) > 1:
         chain = [spans[0]]
         for s_ in spans[1:]:
             if s_["start"] <= chain[-1]["end"] - 0.1 and s_["end"] > chain[-1]["end"]:
                 chain.append(s_)
         spans = chain
-        ok_all = True
-        for i in range(len(spans) - 1):
+        ok_all = not order_bad
+        if order_bad:
+            stitch_note += order_bad + "; "
+        for i in range(len(spans) - 1) if ok_all else ():
             cut = round((max(spans[i]["start"], spans[i + 1]["start"]) + spans[i]["end"]) / 2, 4)
             ok, nshift, why = verify_stitch((spans[i], spans[i + 1]), cut) if verify else (True, spans[i + 1]["shift"], "not checked")
+            if not ok and verify and pair_clip_start(spans[i]["path"]) is not None and pair_clip_start(spans[i]["path"]) == pair_clip_start(spans[i + 1]["path"]):
+                a_, b_ = dict(spans[i + 1]), dict(spans[i])                    # same base time: the frame match decides which one comes first
+                cut2 = round((max(a_["start"], b_["start"]) + a_["end"]) / 2, 4)
+                ok2, nshift2, why2 = verify_stitch((a_, b_), cut2)
+                if ok2:
+                    spans[i], spans[i + 1] = a_, b_
+                    ok, nshift, why, cut = ok2, nshift2, why2 + " (order decided by the frame match)", cut2
             stitch_note += f"cut {i + 1}: {why}; "
             if not ok:
                 ok_all = False
@@ -7785,6 +7810,7 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
                 state[d] = j
                 res["partners"].append((nb[3], rec["path"], gap))
                 lines.append(f"pair partner of {Path(rec['path']).name}: {nm} (gap {gap:.1f} s)")
+    res["partners"].sort(key=lambda x: (pair_clip_start(x[0]["path"]) or 0.0, x[0]["path"]))       # V6.9.6: never in discovery order
     return res
 
 
@@ -7857,7 +7883,7 @@ def pairing_replace_events(res, pool, picked, game, cfg, seed):
         ps = {p for c in mine for p in by_clip.get(c, [])}
         if not ps:
             continue
-        sub = [it for it in pool if _pkey(it["rec"]["path"]) in mine | ps]
+        sub = sorted([it for it in pool if _pkey(it["rec"]["path"]) in mine | ps], key=lambda it: (pair_clip_start(it["rec"]["path"]) or 0.0, it["rec"]["path"]))
         if not any(_pkey(it["rec"]["path"]) in ps for it in sub):
             continue
         evs2, _ = build_events(sub, game, cfg, random.Random(seed))
@@ -7894,6 +7920,101 @@ def cmd_pairscan(args):
     (HERE / "pairscan_cs2.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
     print(f"({n_rows} neighbouring pairs; written to {HERE / 'pairscan_cs2.txt'}; nothing else was changed)")
+
+
+def pair_group(recs, path, store, det, cfg, used):
+    """The fight group of one CS2 clip as the pairing step sees it: the clip, then its neighbours in both directions (gap <= PAIR_MAX_GAP_S, an overlap is
+    a negative gap), up to PAIR_MAX_HOPS per side and PAIR_MAX_EXTRA clips, each with the reason it is in or out. Reads caches only.
+    Returns (members [(start, rec, kills|None, overlap_or_gap_to_previous)], notes)."""
+    idx, _ = pair_time_index(recs)
+    pos = {k: i for i, (_, k, _, _) in enumerate(idx)}
+    key = _pkey(path)
+    if key not in pos:
+        return [], ["the clip is not in the time index (unparsable name, no cached duration or not a cached CS2 clip)"]
+    notes, members, extra = [], [pos[key]], 0
+    for d in (-1, 1):
+        j = pos[key]
+        for _hop in range(PAIR_MAX_HOPS):
+            cur = idx[j]
+            j += d
+            if not 0 <= j < len(idx) or extra >= PAIR_MAX_EXTRA:
+                break
+            nb = idx[j]
+            gap = (nb[0] - cur[2]) if d > 0 else (cur[0] - nb[2])
+            nm = Path(nb[3]["path"]).name
+            ks = pair_player_kills(nb[3], store, det, cfg)
+            if gap > PAIR_MAX_GAP_S:
+                notes.append(f"{nm}: not a partner (gap {gap:.1f} s > {PAIR_MAX_GAP_S:.0f} s)")
+                break
+            if ks is None:
+                notes.append(f"{nm}: not scanned, the planner never uses it")
+                break
+            if nb[1] in used:
+                notes.append(f"{nm}: already used in a montage")
+                break
+            if not ks:
+                notes.append(f"{nm}: no kills of the player")
+                break
+            members.append(j)
+            extra += 1
+    members.sort(key=lambda i: (idx[i][0], idx[i][1]))
+    rows = []
+    for n_, i in enumerate(members):
+        t0, k_, t1, r_ = idx[i]
+        prev = idx[members[n_ - 1]] if n_ else None
+        rows.append((t0, r_, pair_player_kills(r_, store, det, cfg), (t0 - prev[2]) if prev else None))
+    return rows, notes
+
+
+def cmd_grouporder(args):
+    """V6.9.6: python montage.py grouporder cs2 "<clip name>". Read-only: the fight group of that clip (its pair partners), the start time of every clip,
+    the overlap / gap to the previous one and the order the planner will use and why. Writes grouporder.txt next to montage.py, changes nothing."""
+    cfg = load_config()
+    det = Detector("cs2")
+    store = load_kills_cache()
+    clips = load_json(CLIPS_CACHE, {})
+    recs = []
+    for p_ in sorted(set(walk_files(clip_roots(cfg), VIDEO_EXT, MIN_VIDEO, cfg))):
+        try:
+            if tag_game(p_, cfg)[0] != "cs2":
+                continue
+            rec = clips.get(file_key(p_))
+        except OSError:
+            continue
+        if rec and not rec.get("error"):
+            recs.append(dict(rec, path=p_, game="cs2"))
+    q = str(args.clip).lower()
+    hit = [r_ for r_ in recs if Path(r_["path"]).name.lower() == q] or [r_ for r_ in recs if q in Path(r_["path"]).name.lower()]
+    if not hit:
+        lines = [f"grouporder: no cached CS2 clip matches '{args.clip}'"]
+    else:
+        lines = grouporder_lines(recs, hit[0], store, det, cfg, used_dates())
+    text = "\n".join(lines)
+    (HERE / "grouporder.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(written to {HERE / 'grouporder.txt'}; nothing else was changed)")
+
+
+def grouporder_lines(recs, rec, store, det, cfg, used):
+    rows, notes = pair_group(recs, rec["path"], store, det, cfg, used)
+    lines = [f"grouporder cs2: fight group of {Path(rec['path']).name}"]
+    if not rows:
+        return lines + ["  " + n_ for n_ in notes]
+    base = rows[0][0]
+    ties = {}
+    for t0, r_, ks, _ in rows:
+        ties.setdefault(t0, []).append(Path(r_["path"]).name)
+    for n_, (t0, r_, ks, gap) in enumerate(rows, 1):
+        rel = (f"{'overlaps the previous one by %.1f s' % -gap if gap < 0 else 'gap %.1f s after the previous one' % gap}" if gap is not None else "first")
+        lines.append(f"  {n_}. {Path(r_['path']).name}  starts {datetime.datetime.fromtimestamp(t0):%H:%M:%S} (+{t0 - base:.1f} s), {float(r_.get('dur') or 0):.1f} s long, "
+                     f"{len(ks) if ks is not None else '?'} kill(s), {rel}{'  <- the clip asked about' if _pkey(r_['path']) == _pkey(rec['path']) else ''}")
+    lines.append("  order the planner will use: " + " -> ".join(str(i) for i in range(1, len(rows) + 1)) +
+                 "  (chronological by the recording time in the clip names; the gap logic is not used because the clips overlap)")
+    for t0, names in ties.items():
+        if len(names) > 1:
+            lines.append(f"  same base time {datetime.datetime.fromtimestamp(t0):%H:%M:%S}: {', '.join(names)} - their order is decided by the frame-match stitch verification at plan time, never by file-name sort")
+    lines += ["  " + n_ for n_ in notes]
+    return lines
 
 
 def pairscan_rows(cfg, recs, store, det, used, limit=30):
@@ -13347,6 +13468,10 @@ def main():
     pc.add_argument("game", choices=["cs2"])
     pc.add_argument("--limit", type=int, default=30)
     pc.set_defaults(fn=cmd_pairscan)
+    go = sp.add_parser("grouporder", help="V6.9.6: the fight group (pair partners) of a CS2 clip and the order the planner will stitch it in (read-only, writes grouporder.txt)")
+    go.add_argument("game", choices=["cs2"])
+    go.add_argument("clip", help="clip file name (or part of it)")
+    go.set_defaults(fn=cmd_grouporder)
     rh = sp.add_parser("rescanhash", help="V6.8.1: rescan only the clips that have an entry under <hash> and none under the current region")
     rh.add_argument("game", choices=GAMES)
     rh.add_argument("hash")
