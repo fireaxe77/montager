@@ -122,3 +122,15 @@ def harness(mod, game, items, paths, cfg=None, plan_stub=False, song_an=None):
         for k, v in old.items():
             setattr(mod, k, v)
     return plan
+
+
+def distinct_names(n, seed=5, maxsim=70):
+    """n random 9-letter names, no two of them fuzzy-similar (ratio < maxsim): generated kills that must never link by name."""
+    from rapidfuzz import fuzz, process
+    r = random.Random(seed)
+    out_ = []
+    while len(out_) < n:
+        w = "".join(r.choice("abcdefghklmnpqrstuvwxyz") for _ in range(9))
+        if not out_ or process.extractOne(w, out_, scorer=fuzz.ratio)[1] < maxsim:
+            out_.append(w)
+    return out_
