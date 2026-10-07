@@ -11,28 +11,7 @@ import time
 from pathlib import Path
 
 from v697_common import *                                                                        # noqa: F401,F403
-from v697_common import distinct_names, M, T, R, check, section, logged, snapshot, REAL_DATA, ROOT, INCIDENT, build_incident, make_clip, view_events, harness, rec_of, pool_item, BASE_DT
-
-BASE_REF = os.environ.get("V697_BASE", "76b2859")        # origin/main when v6.9.7 was branched (the V6.9.6 merge)
-STATE = {}
-
-
-def base_module(tmp):
-    if "B" not in STATE:
-        STATE["B"] = T.load_baseline(tmp, BASE_REF)
-    return STATE["B"]
-
-
-def led():
-    return M.LAST_LEDGER[0]
-
-
-def states(l):
-    c = {}
-    for r in l.rows:
-        c[r["state"]] = c.get(r["state"], 0) + 1
-    return c
-
+from v697_common import BASE_REF, STATE, base_module, led, states, distinct_names, M, T, R, check, section, logged, snapshot, REAL_DATA, ROOT, INCIDENT, build_incident, make_clip, view_events, harness, rec_of, pool_item, BASE_DT
 
 def part_anchor(tmp):
     with section("A1) clip time anchors: START or END per naming scheme, modified-time cross-check"):
@@ -304,6 +283,7 @@ def part_commands(tmp):
     with section("A5b) python montage.py ledger / timeanchor: read-only"):
         data = Path(tmp) / "cmd_data"
         old = M.use_data_dir(data)
+        keep = {n: ((ROOT / n).read_bytes() if (ROOT / n).exists() else None) for n in ("ledger.txt", "timeanchor.txt")}      # your own generated files stay as they were
         try:
             items, names, pool, paths = STATE["inc"]
             logged(harness, M, "valorant", [dict(i) for i in pool], paths)
@@ -315,14 +295,17 @@ def part_commands(tmp):
             check(ok and "kill ledger: 14 usable" in r.stdout and "MERGED_DUP" in r.stdout and "PLACED" in r.stdout, f"python montage.py ledger reprints the last run's ledger {why}")
             check(snapshot(data) == before, "ledger: the data folder is byte-identical afterwards (no cache, flag or config changed)")
             check((ROOT / "ledger.txt").exists() and "kill ledger: 14 usable" in (ROOT / "ledger.txt").read_text(encoding="utf-8"), "ledger.txt written next to montage.py")
-            (ROOT / "ledger.txt").unlink(missing_ok=True)
             r = R.run([sys.executable, "-W", "ignore", "montage.py", "timeanchor"], text=True, cwd=ROOT, env=env, timeout=120)
             check(r.returncode == 0 and "timeanchor:" in r.stdout and snapshot(data) == before, "timeanchor: runs read-only (data folder byte-identical)")
-            (ROOT / "timeanchor.txt").unlink(missing_ok=True)
             gi = (ROOT / ".gitignore").read_text()
             check("ledger.txt" in gi and "timeanchor.txt" in gi, ".gitignore lists ledger.txt and timeanchor.txt")
         finally:
             M.restore_data_dir(old)
+            for n, b in keep.items():
+                if b is None:
+                    (ROOT / n).unlink(missing_ok=True)
+                else:
+                    (ROOT / n).write_bytes(b)
 
 
 def part_guard(tmp):
