@@ -10,7 +10,7 @@ import time
 import types
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = __import__("_root").find_root(__file__)          # repo root (tests/_root.py); this file lives in tests/
 sys.path.insert(0, str(HERE))
 import montage as M                                                                           # noqa: E402
 
@@ -82,7 +82,7 @@ def main():
         return 1 if FAILS else 0
     print("== V6.7.4 checks (test_v674.py, includes test_v672.py and test_v67.py) ==")
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    r = subprocess.run([sys.executable, str(HERE / "test_v674.py")], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(HERE), env=env)
+    r = subprocess.run([sys.executable, str(HERE / "tests" / "test_v674.py")], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(HERE), env=env)
     fl = [ln for ln in r.stdout.splitlines() if "FAIL" in ln]
     check(r.returncode == 0 and "FAILED" not in r.stdout and ("ALL OK" in r.stdout or "FIXTURES OK" in r.stdout), "test_v674.py still passes" + ("" if r.returncode == 0 else " " + str(fl[:4]) + r.stderr[-300:]))
     print(("\nALL OK" if not FAILS else f"\n{len(FAILS)} FAILED:\n  " + "\n  ".join(FAILS)))

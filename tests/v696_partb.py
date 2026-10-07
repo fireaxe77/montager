@@ -151,6 +151,21 @@ def part_group(tmp):
         M.CLIPS_CACHE.unlink(missing_ok=True)
 
 
+def part_v69():
+    with section("8c) the existing tests/test_v69.py (pairing) still ends with ALL OK"):
+        import subprocess
+        import sys
+        import time
+        from v696_common import ROOT
+        f = ROOT / "tests" / "test_v69.py"
+        f = f if f.exists() else ROOT / "test_v69.py"
+        t0 = time.time()
+        r = subprocess.run([sys.executable, str(f)], capture_output=True, text=True, cwd=str(ROOT), encoding="utf-8", errors="replace")
+        lines = (r.stdout or "").strip().splitlines()
+        check(r.returncode == 0 and lines and lines[-1].strip() == "ALL OK", f"{f.relative_to(ROOT)} ends with '{lines[-1].strip() if lines else r.stderr[-200:]}' ({time.time() - t0:.1f} s)")
+
+
 def run(tmp):
     part_order(tmp)
     part_group(tmp)
+    part_v69()

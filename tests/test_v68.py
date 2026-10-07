@@ -13,7 +13,7 @@ import time
 import types
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = __import__("_root").find_root(__file__)          # repo root (tests/_root.py); this file lives in tests/
 sys.path.insert(0, str(HERE))
 import montage as M                                                                           # noqa: E402
 
@@ -423,7 +423,7 @@ KNOWN = {"test_v557.py": ("changelog popout", "audio mode"), "test_v558.py": ("l
 
 def run_nested(name, timeout=3000):
     env = dict(os.environ, PYTHONIOENCODING="utf-8", V68_NESTED="1")
-    r = subprocess.run([sys.executable, str(HERE / name)], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(HERE), env=env, timeout=timeout)
+    r = subprocess.run([sys.executable, str(HERE / "tests" / name)], capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=str(HERE), env=env, timeout=timeout)
     return r
 
 

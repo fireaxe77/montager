@@ -13,7 +13,7 @@ import tempfile
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = __import__("_root").find_root(__file__)          # repo root (tests/_root.py); this file lives in tests/
 sys.path.insert(0, str(HERE))
 REAL = "MONTAGER_DATA" not in os.environ and any((HERE / "montage_data").glob("kills_v*/*.json"))      # an empty folder (made by an import) is not a real cache
 import montage as M                                                                           # noqa: E402

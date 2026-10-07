@@ -119,8 +119,12 @@ def part_clean(tmp, env):
         import io
         import contextlib
         buf = io.StringIO()
+        ft = M.HERE / "fpscontent.txt"
+        had = ft.exists()
         with contextlib.redirect_stdout(buf):
             M.cmd_fpscontent(ns)
+        if not had and ft.exists():
+            ft.unlink()
         check("cadence 50->60" in buf.getvalue() and "ok" in buf.getvalue(), "fpscontent reports 'cadence 50->60' for the 50 fps source (information only)")
 
 
