@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.7.1"
+APP_VERSION = "V6.9.8"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5596,6 +5596,7 @@ FIGHT_GAP_LONG_CLIP = 30.0              # V6.9.7.1: kills of one clip / group ar
 LONG_CLIP_S = 25.0
 LINK_KILL_TOL_S = 3.0                   # shared-victim kill pairs must agree with the save-time offset within this (else different rounds: not linked)
 STITCH_GAP_S = 0.75                     # a stitched take may join clips that follow each other with at most this much footage missing between them
+CS2_REREAD_S = 10.0                     # V6.9.8 (CS2 only): the same victim read again later in the same clip (a row pushed down by a new row is re-detected) is NOT a new kill
 LINK_DUP_WINDOW_S = 3.0                 # same victim + absolute time within this = ONE kill across linked clips
 
 
@@ -6220,6 +6221,7 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
                 tt = k["t"] + off
                 vk = _alnum(k.get("victim", "").lower())
                 dup = next((u for u in allk if _alnum(u.get("victim", "").lower()) == vk and abs(tt - u["tt"]) <= DUP_WINDOW_S and u["src"] is it
+                            or (game == "cs2" and u["src"] is it and 0 < tt - u["tt"] <= CS2_REREAD_S and cs2_same_victim(u.get("victim"), k.get("victim")))
                             or (u["src"] is not it and abs(tt - u["tt"]) <= LINK_DUP_WINDOW_S and len(vk) >= 2
                                 and fuzz.ratio(_alnum(u.get("victim", "").lower()), vk) >= 80)), None)       # V6.9.7.1: inside a chain: abs time within 3 s
                 if dup is None:
@@ -6231,7 +6233,8 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
                         allk[allk.index(dup)] = dict(k, tt=tt, src=it, off=off)
                         srow, drow = drow, srow
                     if srow and drow and not drow["merged"]:
-                        why_ = f"saved {abs(((it.get('anc') or {}).get('end') or 0) - ((dup['src'].get('anc') or {}).get('end') or 0)):.0f} s apart, same victim, abs time match"                             if dup["src"] is not it else "same clip: existing 1.5 s duplicate rule"
+                        why_ = f"saved {abs(((it.get('anc') or {}).get('end') or 0) - ((dup['src'].get('anc') or {}).get('end') or 0)):.0f} s apart, same victim, abs time match"                             if dup["src"] is not it else ("same clip: existing 1.5 s duplicate rule" if abs(tt - dup["tt"]) <= DUP_WINDOW_S
+                                                          else f"same clip: CS2 victim re-read {abs(tt - dup['tt']):.1f} s later (a row pushed down by a new row), one kill")
                         drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [dup["src"]["rec"]["path"], it["rec"]["path"]], "reason": why_}
                         for r_ in led.rows:                # rows already merged into the replaced one now follow the new survivor
                             if r_["merged"] and r_["merged"]["into"] == drow["id"] and r_ is not srow:
@@ -7338,6 +7341,32 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             "drops_out": [round(d["t"] - bt0, 3) for d in an.get("drops", []) if bt0 <= d["t"] <= bt0 + total_s],
             "beats_n": int(round(total_s / (2 * (U[1] - U[0])))), "headline": head_take["ev"]["path"], "ending": last["ending"],
             "lock": 1.0, "audio_mode": a_mode, "audio_fallback": [], "audio_clip_fallback": audio_state.get("clip_fallback", [])}
+
+
+def plan_duplicate_ranges(plan, tol=0.05):
+    """V6.9.8 check (read-only): every source time range [a, b] a plan's segments cover, per source file (part shift removed; holds of speed 0 have no range);
+    returns one text per range covered twice, inside one take or across takes (overlapping stitched parts, a slow-mo / ending segment re-showing used
+    footage, an untrimmed continuation overlap). An empty list = no footage is shown twice."""
+    rng = []
+    for i, t in enumerate(plan.get("takes", []), 1):
+        srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0}]
+        for sg in t["segs"]:
+            a, b, sp = sg[0], sg[1], sg[2]
+            pi = sg[4] if len(sg) > 4 else 0
+            if not sp or b - a <= 1e-6:
+                continue
+            s_ = srcs[min(pi, len(srcs) - 1)]
+            rng.append((i, _pkey(s_["path"]), a - s_.get("shift", 0.0), b - s_.get("shift", 0.0), sp, Path(s_["path"]).name))
+    bad = []
+    for x in range(len(rng)):
+        for y in range(x + 1, len(rng)):
+            p, q = rng[x], rng[y]
+            if p[1] != q[1]:
+                continue
+            ov = min(p[3], q[3]) - max(p[2], q[2])
+            if ov > tol:
+                bad.append(f"{p[5]}: {ov:.2f} s of source covered twice (take {p[0]} [{p[2]:.2f}-{p[3]:.2f}] x{p[4]:.2f} and take {q[0]} [{q[2]:.2f}-{q[3]:.2f}] x{q[4]:.2f})")
+    return bad
 
 
 def verify_cutlist(plan):
@@ -8526,11 +8555,11 @@ def save_key(rec):
     return a["end"] if a else 0.0
 
 
-def pair_time_index(recs):
+def pair_time_index(recs, game="cs2"):
     """Sorted [(start, pkey, end, rec)] of the CS2 clips with a parsable name and a cached duration, plus the clips skipped."""
     idx, skipped = [], []
     for r in recs:
-        if r.get("game", "cs2") != "cs2" or r.get("error") or not r.get("w"):
+        if r.get("game", "cs2") != game or r.get("error") or not r.get("w"):
             continue
         dur = r.get("dur")
         anc = clip_anchor(r["path"], dur) if dur else None                 # V6.9.7: the name time is START for DVR names, END (save time) for OBS names
@@ -8542,12 +8571,12 @@ def pair_time_index(recs):
     return idx, skipped
 
 
-def pair_player_kills(rec, store, det, cfg):
+def pair_player_kills(rec, store, det, cfg, game="cs2"):
     """None = no cached kill entry (never scanned); else the cached kill times of the player (no decoding, no scan)."""
-    e = store.get(kills_key(rec, "cs2", det))
+    e = store.get(kills_key(rec, game, det))
     if not e or e.get("error"):
         return None
-    return [float(k["t"]) for k in analyse_clip_entry(rec, e, cfg, "cs2")["kills"]]
+    return [float(k["t"]) for k in analyse_clip_entry(rec, e, cfg, game)["kills"]]
 
 
 def pair_is_candidate(ts, dur):
@@ -8558,11 +8587,11 @@ def pair_is_candidate(ts, dur):
     return len(ts) == 1 and (ts[0] <= PAIR_SINGLE_EDGE_S or ts[0] >= dur - PAIR_SINGLE_EDGE_S)
 
 
-def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=None):
+def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=None, game="cs2"):
     """Neighbour lookup for the selected CS2 clips. Returns {"partners": [(partner rec, selected clip path, gap s)], "checked": N,
     "lookups": L, "skip": {...}, "lines": [log lines]}. recs = cached clip records, selected = set of path keys."""
-    kills_fn = kills_fn or (lambda r: pair_player_kills(r, store, det, cfg))
-    idx, bad = pair_time_index(recs)
+    kills_fn = kills_fn or (lambda r: pair_player_kills(r, store, det, cfg, game))
+    idx, bad = pair_time_index(recs, game)
     pos = {k: i for i, (_, k, _, _) in enumerate(idx)}
     res = {"partners": [], "checked": 0, "lookups": 0, "lines": [], "skip": {"not scanned": 0, "used": 0, "no kills": 0, "no match": 0}}
     sk, lines = res["skip"], res["lines"]
@@ -8571,7 +8600,7 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
         if deadline and time.monotonic() > deadline:
             raise TimeoutError("time cap reached")
         if key not in pos:
-            if any(_pkey(r["path"]) == key and r.get("game", "cs2") == "cs2" for r in recs):
+            if any(_pkey(r["path"]) == key and r.get("game", "cs2") == game for r in recs):
                 sk["no match"] += 1                           # unparsable name / no duration: skipped, never guessed
             continue
         i0 = pos[key]
@@ -8581,7 +8610,9 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
         if ts is None:
             sk["not scanned"] += 1
             continue
-        if not pair_is_candidate(ts, t1 - t0):
+        if game == "cs2" and not pair_is_candidate(ts, t1 - t0):      # V6.9.8: Valorant (40 s replay clips) has no edge rule: the save-time neighbours decide
+            continue
+        if not ts:
             continue
         res["lookups"] += 1
         state = {-1: i0, 1: i0}                               # the far end of the chain in each direction
@@ -8636,7 +8667,7 @@ def pair_summary(res):
             "reusable outside the selection)")
 
 
-def pairing_run(cfg, recs, selected_paths, quiet=False):
+def pairing_run(cfg, recs, selected_paths, quiet=False, game="cs2"):
     """The whole neighbour step, guarded: any error / unparsable name / missing cache / more than PAIR_CAP_S = one 'pairing skipped:
     <reason>' line and None (the original selection stays). Runs in a helper thread so a hang cannot hold the plan up."""
     sel = {_pkey(p) for p in selected_paths}
@@ -8648,9 +8679,9 @@ def pairing_run(cfg, recs, selected_paths, quiet=False):
         try:
             if PAIR_TEST_HOOK[0]:
                 PAIR_TEST_HOOK[0]()
-            det = Detector("cs2")
+            det = Detector(game)
             store = load_kills_cache()
-            box["res"] = pair_find(cfg, recs, sel, store, det, used_dates(), deadline=time.monotonic() + PAIR_CAP_S)
+            box["res"] = pair_find(cfg, recs, sel, store, det, used_dates(), deadline=time.monotonic() + PAIR_CAP_S, game=game)
         except BaseException as ex:                          # noqa: BLE001 - nothing may escape the step
             box["err"] = f"{type(ex).__name__}: {ex}"
     log = LOGONLY if quiet else out
@@ -8917,9 +8948,9 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         notes += wk_notes
         for n_ in wk_notes:
             out(n_)
-        if game == "cs2":                                  # V6.9: neighbour clips of the picked CS2 clips (same slot, same count)
+        if game in ("cs2", "valorant"):                    # V6.9 (CS2) / V6.9.8 (both): companion clips of the picked clips (same slot, same count)
             sel_ = set().union(*[pair_event_clips(e) for e in events]) if events else set()
-            pair = pairing_run(cfg, tagged, sel_, quiet=not scan)
+            pair = pairing_run(cfg, tagged, sel_, quiet=not scan, game=game)
             if pair and pair["partners"]:
                 try:
                     events = pairing_replace_events(pair, pool, events, game, cfg, seed)
