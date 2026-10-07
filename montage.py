@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.8.2"
+APP_VERSION = "V6.9.7.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2962,8 +2962,8 @@ def verified_kills(pool_items, cfg):
                 k = dict(k, shot=True, lag=round(k["t"] - shot, 3), shot_t=round(shot, 3))
             if k.get("weak_hl"):
                 it["rej"].append({"t": k["t"], "reason": "no highlight colour (kept - highlight is only a bonus)", "ks": k["ks"], "soft": True})
-            if any(d < k["t"] <= d + lock and not any(d < rv <= k["t"] for rv in it.get("revives", []))
-                   for d in it.get("deaths", [])):                     # a (Clove) revive ends the lock
+            if not k.get("util") and any(d < k["t"] <= d + lock and not any(d < rv <= k["t"] for rv in it.get("revives", []))
+                                         for d in it.get("deaths", [])):                     # a (Clove) revive ends the lock; V6.9.7.1: not for rows the utility override admitted
                 st["death_lock"] += 1
                 it["rej"].append({"t": k["t"], "reason": f"within {lock:.0f}s after my death", "ks": k["ks"]})
                 continue
@@ -3876,6 +3876,8 @@ def game_pool(cfg, game, paths=None):
         pass
     ps = set(paths) if paths is not None else None
     stats = {"tagged": 0, "scanned": 0, "with_kills": 0}
+    ovs = load_clip_overrides() if game == "valorant" else {}          # V6.9.7: per-clip 'allow utility kills' (default OFF: empty = nothing below runs)
+    util_adm = {}
     pool, allrej, cjk = [], [], {}
     cands = []
     for r in scan_clips(cfg):
@@ -3896,6 +3898,8 @@ def game_pool(cfg, game, paths=None):
     for r, e in cands:
         stats["scanned"] += 1
         a = analyse_clip_entry(r, e, cfg, game)
+        if ovs:
+            a = apply_utility_override(r, e, a, cfg, game, ovs, util_adm)
         for k_, v_ in a.get("cjk", {}).items():
             cjk[k_] = cjk.get(k_, 0) + v_
         for j in a["rej"]:
@@ -3903,6 +3907,14 @@ def game_pool(cfg, game, paths=None):
         if a["kills"]:
             pool.append({"rec": r, "kills": a["kills"], "deaths": a["deaths"], "revives": a["revives"], "vis": a["vis"], "rej": []})
     stats["with_kills"] = len(pool)
+    if ovs:
+        seen_ = {_pkey(r["path"]) for r, _ in cands}
+        for k_, e_ in ovs.items():                                     # a moved / renamed clip is reported, never applied to another clip
+            if k_ not in seen_ and (ps is None or k_ in {_pkey(p_) for p_ in ps}) and clip_override_state(k_, ovs)[0] == "missing":
+                util_adm.setdefault("warn", []).append(f"utility override: {clip_override_state(k_, ovs)[1]}")
+        for l_ in utility_override_lines(util_adm):
+            out(l_)
+        stats["util_admitted"] = len(util_adm.get("rows", []))
     if game == "cs2":
         stats["cjk"] = cjk
         out(f"CS2 name '{MY_NAME_CS2}': {sum(cjk.values())} rows recovered that 'fireaxe' alone missed"
@@ -4678,6 +4690,112 @@ def analyse_song(path, csv_bpm=None):
     return an
 
 
+SONGMAP_DEFAULT = "v1"                   # V6.9.5: the default song map; switching the default to SONGMAPV2 is this one line ("v2")
+SONGMAP_CHOICES = {"v1": "Songmap V1", "v2": "Songmap V2"}
+SONGMAP_AUTO = "v2auto"                  # V6.9.5.2: per song, V2 only where its grid is confident and measurably better than V1, else the V1 map
+SONGMAP_CHOICES_UI = dict(SONGMAP_CHOICES, **{SONGMAP_AUTO: "Songmap V2 (auto, V1 fallback)"})     # what the Settings dropdown offers
+SONGMAP_V2_HOOK = [None]                 # tests only: called at the start of a V2 analysis (inject an error / a delay)
+
+
+def songmap_version(cfg=None):
+    v = str((cfg if cfg is not None else load_config()).get("songmap_version") or SONGMAP_DEFAULT).lower()
+    if v in (SONGMAP_AUTO, SONGMAP_CHOICES_UI[SONGMAP_AUTO].lower()):
+        return SONGMAP_AUTO
+    return "v2" if v in ("v2", "songmap v2") else "v1"
+
+
+def _peek_v1_bpm(path, csv_bpm=None):
+    """BPM of the V1 map IF it is already in the V1 cache (read-only: never analyses, never writes), else None."""
+    try:
+        st = os.stat(path)
+        hit = load_json(SONG_CACHE, {}).get(f"{path}|{int(st.st_mtime)}|{st.st_size}|{SONGMAP_V}|{round(float(csv_bpm or 0), 3)}")
+        return float(hit["bpm"]) if hit and hit.get("bpm") else None
+    except Exception:
+        return None
+
+
+class _V2Fail(Exception):
+    """A V2 failure whose message already names the exception type (worker errors, timeouts)."""
+
+
+def _songmap_v2_cached(path, csv_bpm, v1_bpm, name):
+    """The V2 map from its own cache, or built now (cap ANALYSIS_CAP_S). Raises _V2Fail / any exception on a problem."""
+    import songmap_v2
+    cpath = DATA / songmap_v2.CACHE_NAME
+    key = songmap_v2.cache_key(path, csv_bpm, v1_bpm)
+    cache = load_json(cpath, {})
+    hit = cache.get(key)
+    if hit and not hit.get("fallback_marker"):
+        return hit
+    if hit:
+        raise _V2Fail(hit["fallback_marker"] + " (cached: not retried until the V2 algorithm version changes)")
+    box = {}
+    deadline = time.monotonic() + songmap_v2.ANALYSIS_CAP_S
+
+    def work():
+        try:
+            box["m"] = songmap_v2.build_songmap_v2(path, csv_bpm, deadline=deadline, hook=SONGMAP_V2_HOOK[0], v1_bpm=v1_bpm)
+        except BaseException as ex:      # noqa: BLE001 - nothing may escape the worker
+            box["err"] = f"{type(ex).__name__}: {ex}"
+    t0 = time.time()
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(songmap_v2.ANALYSIS_CAP_S)
+    if th.is_alive() or "m" not in box:
+        reason = "timeout (analysis cap %.0f s)" % songmap_v2.ANALYSIS_CAP_S if th.is_alive() or "cap reached" in box.get("err", "") else box.get("err", "no result")
+        if reason.startswith("timeout"):
+            c2 = load_json(cpath, {})
+            c2[key] = {"fallback_marker": reason}
+            save_json(cpath, c2)
+        raise _V2Fail(reason)
+    m = box["m"]
+    c2 = load_json(cpath, {})
+    c2[key] = m
+    save_json(cpath, c2)
+    out(f"songmap v2: {name} {time.time() - t0:.1f} s, bpm={m['bpm']}, grid_conf={m['v2']['grid_confidence']}, "
+        f"{len(m['v2']['events'])} events, {len(m['drops'])} drops")
+    return m
+
+
+def _songmap_auto_pick(path, csv_bpm, v1m, m2, name):
+    """'Songmap V2 (auto, V1 fallback)': V2 only if its grid confidence is >= 0.8, its kick-to-grid p95 <= 40 ms and its median is not worse than
+    V1's; otherwise the V1 map. The decision and its numbers are cached in the V2 cache file (key + '|auto'), one log line per song."""
+    import songmap_v2
+    cpath = DATA / songmap_v2.CACHE_NAME
+    akey = songmap_v2.cache_key(path, csv_bpm, v1m.get("bpm")) + "|auto"
+    cache = load_json(cpath, {})
+    dec = cache.get(akey)
+    if not dec:
+        dec = songmap_v2.build.auto_decision(v1m, m2)
+        c2 = load_json(cpath, {})
+        c2[akey] = dec
+        save_json(cpath, c2)
+    out(f"songmap auto: {name} -> " + songmap_v2.build.auto_line(dec))
+    if dec["choice"] == "v2":
+        return dict(m2, songmap_auto=dec)
+    return dict(v1m, songmap_version="v1-auto", songmap_auto=dec)
+
+
+def get_songmap(path, csv_bpm=None, version=None):
+    """THE routing point for song map requests (V6.9.5): V1 = analyse_song() exactly as before; V2 = the isolated songmap_v2 package with its
+    own cache file; V6.9.5.2 'v2auto' = V2 or V1 per song (see _songmap_auto_pick). Any V2 problem (error, timeout, missing module) logs
+    'songmap v2 fallback: <song> (<reason>)' and returns the V1 map flagged songmap_version = 'v1-fallback', so a montage never fails because of V2."""
+    v = version or songmap_version()
+    if v not in ("v2", SONGMAP_AUTO):
+        return analyse_song(path, csv_bpm)
+    name = Path(path).name
+    v1m = analyse_song(path, csv_bpm) if v == SONGMAP_AUTO else None          # auto always needs the V1 map; plain V2 only peeks at its cache
+    try:
+        m = _songmap_v2_cached(path, csv_bpm, float(v1m["bpm"]) if v1m else _peek_v1_bpm(path, csv_bpm), name)
+        return _songmap_auto_pick(path, csv_bpm, v1m, m, name) if v1m else m
+    except Exception as ex:
+        why = str(ex) if isinstance(ex, _V2Fail) else f"{type(ex).__name__}: {ex}"
+        out(f"songmap v2 fallback: {name} ({why})")
+        m = dict(v1m or analyse_song(path, csv_bpm))
+        m.update(songmap_version="v1-fallback", songmap_fallback_reason=why)
+        return m
+
+
 def analyse_song_v4(path, csv_bpm=None):
     """V4's song analysis (kept for synccompare / the 'v4' placement). Beat grid, downbeats, per-beat energy, section levels, drop. Cached per file. The CSV 'Tempo' is the PRIMARY BPM: librosa only
     refines the beat grid, and is snapped to the CSV tempo when it lands at about 2x or 0.5x (or within 4% on a steady grid)."""
@@ -4931,7 +5049,7 @@ def pick_song(cfg, game, songs, now=None, forced=None):
                 "total": round(rec + sum(fit.values()) - pen, 1), "days": None if d == 999 else d}
     if forced:
         s = next((x for x in songs if x["path"] == forced), None) or {"path": forced, "artist": "", "title": Path(forced).stem, "added": None}
-        an = analyse_song(forced, (next((x for x in songs if x['path'] == forced), {}) or {}).get('csv_bpm'))
+        an = get_songmap(forced, (next((x for x in songs if x['path'] == forced), {}) or {}).get('csv_bpm'))
         return s, an, score(s, an), []
     week = sorted([s for s in songs if s["added"] and (now - s["added"]).days < wd], key=lambda s: s["added"], reverse=True)
     rest = sorted([s for s in songs if s not in week], key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
@@ -4942,7 +5060,7 @@ def pick_song(cfg, game, songs, now=None, forced=None):
                 raise RuntimeError("cancelled")
             progress(i / 15, f"analysing song {i + 1}")
             try:
-                an = analyse_song(s["path"], s.get("csv_bpm"))
+                an = get_songmap(s["path"], s.get("csv_bpm"))
             except Exception as ex:
                 out(f"  skip {Path(s['path']).name}: {ex}")
                 continue
@@ -5320,11 +5438,695 @@ def _same_kills(ia, ib, rf, cache):
     return None
 
 
+# ======================================================================= CLIP TIME ANCHORS + KILL LEDGER (V6.9.7)
+# A clip's file-name time is NOT always its start: OBS replay names ("Replay 2026-09-11 17-00-37.mov", "VALORANT 2026-10-07 03-40.mov",
+# "... 03-40 (2).mov") show the SAVE time = the END of the clip; ShadowPlay / Outplayed "... 22.55.31.02.DVR.mp4" names are start times (V6.9).
+# clip_anchor() gives every clip an absolute [start, end] with the evidence used; the file's modified time (the moment OBS closed the file) is
+# the cross-check. Nothing here changes detection: the anchors only decide which clips MAY be merged (proof rule below) and how the CS2 clip
+# time index orders clips.
+_OBS_NAME = re.compile(r"(20\d\d)-(\d\d)-(\d\d)[ _T](\d\d)-(\d\d)(?:-(\d\d))?(?:\s*\((\d+)\))?\s*\.[A-Za-z0-9]{2,4}$")
+ANCHOR_TOL_S = 6.0                      # the file's modified time may differ from the name time by this much (name seconds, OBS flush)
+
+
+def name_time_info(path):
+    """{t, res ('sec' | 'min'), scheme ('obs' | 'dvr' | 'name'), default ('end' | 'start'), seq} from the file name, or None (unparsable: never guessed)."""
+    name = Path(str(path)).name
+    m = _OBS_NAME.search(name)
+    try:
+        if m:
+            y, mo, d, h, mi, s, n = m.groups()
+            return {"t": datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s or 0)).timestamp(), "res": "sec" if s is not None else "min",
+                    "scheme": "obs", "default": "end", "seq": int(n) if n else 1}
+        m = _FN_TIME.search(name)
+        if m:
+            return {"t": datetime.datetime(*[int(x) for x in m.groups()]).timestamp(), "res": "sec", "scheme": "dvr" if "DVR" in name else "name",
+                    "default": "start", "seq": 1}
+    except ValueError:
+        pass
+    return None
+
+
+def clip_anchor(path, dur=None, mtime=None):
+    """Absolute time range of a clip: {start, end, side ('start' | 'end': what the name time means), verified (modified time agrees), provable
+    (usable as proof evidence), how, scheme, res, name_t, seq} or None (unparsable name / no duration).
+      second-resolution names: the scheme's default (OBS = save time = END, DVR / Outplayed = START) is checked against the modified time:
+        mtime ~ name time -> END, mtime ~ name time + duration -> START (the evidence overrides the default); neither (a copied file) ->
+        the default, marked unverified.
+      minute-only names (OBS without seconds): the name only gives the minute, so the modified time (second precision) IS the save time = END,
+        but only while it lies inside the named minute; a copied / touched file is NOT provable (never guessed).
+    '(2)' suffixes are separate saves: ordering is by the anchored time (modified time), never by the name."""
+    info = name_time_info(path)
+    if not dur or float(dur) <= 0:
+        return None
+    dur = float(dur)
+    if mtime is None:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = None
+    if mtime is not None:                      # V6.9.7.1: the REAL save time is the file's modified time (OBS replay and DVR alike) = the clip END; names are not trusted
+        return {"scheme": (info or {}).get("scheme", "mtime"), "res": (info or {}).get("res", "sec"), "name_t": (info or {}).get("t"), "seq": (info or {}).get("seq", 1),
+                "mtime": mtime, "dur": dur, "start": mtime - dur, "end": mtime, "side": "end", "verified": True, "provable": True,
+                "how": "save time = file modified time = the clip END (start = modified - duration)"}
+    if info is None:
+        return None
+    T = info["t"]
+    res = {"scheme": info["scheme"], "res": info["res"], "name_t": T, "seq": info["seq"], "mtime": mtime, "dur": dur}
+    if info["res"] == "min":
+        if mtime is not None and T - ANCHOR_TOL_S <= mtime < T + 60 + ANCHOR_TOL_S:
+            return dict(res, start=mtime - dur, end=mtime, side="end", verified=True, provable=True,
+                        how="minute-only name: the modified time (second precision) is the save time = the clip END")
+        return dict(res, start=T + 30 - dur, end=T + 30, side="end", verified=False, provable=False,
+                    how="minute-only name and the modified time is not inside that minute: time unknown (never guessed)")
+    ev_end = mtime is not None and abs(mtime - T) <= ANCHOR_TOL_S
+    ev_start = mtime is not None and abs(mtime - (T + dur)) <= ANCHOR_TOL_S
+    if ev_end and not ev_start:
+        side, ver, how = "end", True, "name time = save time (modified time agrees)"
+    elif ev_start and not ev_end:
+        side, ver, how = "start", True, "name time = start (modified time = name time + duration)"
+    elif ev_end and ev_start:
+        side, ver, how = info["default"], True, f"short clip: modified time fits both ends, scheme default ({info['default']})"
+    else:
+        side, ver, how = info["default"], False, f"modified time fits neither end, scheme default ({info['default']}) - unverified"
+    st = T if side == "start" else T - dur
+    return dict(res, start=st, end=st + dur, side=side, verified=ver, provable=True, how=how)
+
+
+def clip_ctime(rec):
+    """Anchored START of a clip (events are ordered by it); the old modified-time fallback for unparsable names."""
+    a = clip_anchor(rec["path"], rec.get("dur"))
+    return a["start"] if a else clip_time(rec["path"])
+
+
+KILL_STATES = ("PLACED", "MERGED_DUP", "RANKED_OUT", "CLIP_UNUSABLE", "OVERRIDE_ADMITTED", "LOST")
+GROUP_MAX_CLIPS = 4                     # the V6.9 fight-size limit (PAIR_MAX_EXTRA + 1)
+DUP_WINDOW_S = 1.5                      # the existing duplicate window (same victim within 1.5 s = one kill)
+PROOF_CAP_S = 5.0                       # the whole proof step of one build_events() call (frame matching included); then 'not proven'
+PROOF_TEST_HOOK = [None]                # tests only: called inside a proof (inject an error / a delay)
+LEDGER_TEST_HOOK = [None]               # tests only: called with (events, ledger) before the loss check (drop an event artificially)
+CUR_LEDGER = [None]                     # the ledger of the build_events() call in progress
+LAST_LEDGER = [None]                    # the ledger of the last top-level build_events() call (make_plan completes it with the plan)
+LEDGER_SUBCALL = [False]                # build_events() called by pairing_replace_events(): partners are never planned alone, no safety net there
+
+
+class KillLedger:
+    """Every usable kill row gets an ID when selection starts and ends in exactly one state: PLACED, MERGED_DUP (survivor + proof), RANKED_OUT,
+    CLIP_UNUSABLE or OVERRIDE_ADMITTED (utility override, part B); a row in none of them is LOST (and the safety net re-queues it once)."""
+
+    def __init__(self, game=None):
+        self.game, self.rows, self.idx, self.events = game, [], {}, {}
+        self.released, self.lines, self.proofs, self.warn, self.splits = [], [], [], [], []
+        self.final_events = []
+
+    @staticmethod
+    def rkey(path, t, victim):
+        return (_pkey(path), round(float(t), 3), _alnum((victim or "").lower()))
+
+    def add_pool(self, items):
+        for it in items:
+            for k in it["kills"]:
+                key = self.rkey(it["rec"]["path"], k["t"], k.get("victim"))
+                if key in self.idx:
+                    continue
+                row = {"id": len(self.rows) + 1, "clip": Path(it["rec"]["path"]).name, "path": it["rec"]["path"], "t": float(k["t"]),
+                       "victim": k.get("victim") or "", "state": None, "info": {}, "tag": "util" if k.get("util") else "", "gone": None,
+                       "unusable": None, "merged": None, "released": False, "k": k, "it": it}
+                self.rows.append(row)
+                self.idx[key] = row
+
+    def row(self, it, k):
+        return self.idx.get(self.rkey(it["rec"]["path"], k["t"], k.get("victim")))
+
+    def row_of_cl(self, kd):
+        return self.row(kd["src"], kd)
+
+    @staticmethod
+    def evkey(ev):
+        return (ev["path"], tuple(ev["times"]))
+
+    def note_event(self, ev, rows):
+        self.events[self.evkey(ev)] = [r["id"] for r in rows if r]
+
+    def reconcile(self, evs):
+        """A duplicate row that an event covers while its survivor is in no event (the survivor's event was rebuilt without it, e.g. after a rejected stitch):
+        the covered row becomes the survivor, so the kill is placed exactly once (never twice, never lost)."""
+        cov = self.covered(evs)
+        for d in self.rows:
+            m = d["merged"]
+            if m and d["id"] in cov and m["into"] not in cov:
+                r = self.rows[m["into"] - 1]
+                r["merged"] = dict(m, into=d["id"], pair=list(reversed(m.get("pair", []))))
+                d["merged"] = None
+
+    def covered(self, evs):
+        got = set()
+        for e in evs:
+            got.update(self.events.get(self.evkey(e), []))
+        return got
+
+    def lost_rows(self, evs):
+        cov = self.covered(evs)
+        return [r for r in self.rows if r["id"] not in cov and not r["merged"] and not r["unusable"]]
+
+    def label(self, r):
+        return f"{r['clip']} @ {ts(r['t'])} -> {r['victim'] or '?'}"
+
+
+FIGHT_GAP_LONG_CLIP = 30.0              # V6.9.7.1: kills of one clip / group are one fight up to this gap when a clip is LONG_CLIP_S or longer
+LONG_CLIP_S = 25.0
+LINK_KILL_TOL_S = 3.0                   # shared-victim kill pairs must agree with the save-time offset within this (else different rounds: not linked)
+STITCH_GAP_S = 0.75                     # a stitched take may join clips that follow each other with at most this much footage missing between them
+LINK_DUP_WINDOW_S = 3.0                 # same victim + absolute time within this = ONE kill across linked clips
+
+
+def save_time_link(a, b):
+    """V6.9.7.1 THE SIMPLE RULE: clips are one fight when they were saved right next to each other. Each clip's range is [modified time - duration, modified
+    time] (clip_anchor); a (saved first) and b link if the ranges overlap or the gap is within the continuation window (PAIR_MAX_GAP_S). Cheap veto: when
+    they share a victim name (OCR-tolerant) and no shared-victim kill pair agrees with the save-time offset within LINK_KILL_TOL_S, they are different rounds
+    with recurring names and do NOT link. The offset (a-time of a moment = b-time + offset) is the median of the agreeing kill pairs when there are any, else
+    the save-time offset. The frame match is advisory only (make_event). Returns ({raw_offset, save_offset, match, pairs, gap}, '') or (None, why)."""
+    from rapidfuzz import fuzz
+    aa, ab = a.get("anc"), b.get("anc")
+    if not aa or not ab:
+        return None, "save time unknown (no modified time / duration)"
+    ov = min(aa["end"], ab["end"]) - max(aa["start"], ab["start"])
+    if ov < -PAIR_MAX_GAP_S:
+        return None, f"saved {-ov:.1f} s apart (gap larger than the {PAIR_MAX_GAP_S:.0f} s continuation window)"
+    off_t = ab["start"] - aa["start"]
+    diffs, shared = [], 0
+    for x in a["kills"]:
+        for y in b["kills"]:
+            va, vb = _alnum((x.get("victim") or "").lower()), _alnum((y.get("victim") or "").lower())
+            if va and vb and fuzz.ratio(va, vb) >= 80:
+                shared += 1
+                if abs((x["t"] - y["t"]) - off_t) <= LINK_KILL_TOL_S:
+                    diffs.append(x["t"] - y["t"])
+    if shared and not diffs:
+        return None, f"shared victim name(s) but the kill times disagree with the save times by more than {LINK_KILL_TOL_S:.0f} s (different rounds)"
+    off = float(statistics.median(diffs)) if diffs else off_t
+    apart = abs(ab["end"] - aa["end"])
+    return {"raw_offset": off, "save_offset": off_t, "pairs": len(diffs), "apart": apart, "gap": -ov,
+            "match": f"saved {apart:.0f} s apart, " + ("overlap %.1f s" % ov if ov >= 0 else "gap %.1f s" % -ov)
+                     + (f", kill-pair offset {off:+.2f} s vs save-time offset {off_t:+.2f} s" if diffs else f", save-time offset {off_t:+.2f} s")}, ""
+
+
+def _proof_gate(budget, fn):
+    """Runs fn() inside the proof budget: a hang / error / timeout is 'not proven' (the caller keeps the events separate)."""
+    if budget["t0"] is None:
+        budget["t0"] = time.monotonic()
+    left = budget["cap"] - (time.monotonic() - budget["t0"])
+    if budget["dead"] or left <= 0:
+        budget["dead"] = True
+        raise TimeoutError(f"proof step over its {budget['cap']:.0f} s cap")
+    box = {}
+
+    def work():
+        try:
+            if PROOF_TEST_HOOK[0]:
+                PROOF_TEST_HOOK[0]()
+            box["r"] = fn()
+        except BaseException as ex:                          # noqa: BLE001
+            box["e"] = ex
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(left)
+    if th.is_alive():
+        budget["dead"] = True
+        raise TimeoutError(f"proof step over its {budget['cap']:.0f} s cap")
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
+
+
+def prove_same_fight(a, b, rf, budget):
+    """PROOF that clip b continues / duplicates clip a (a starts first by its anchored time). Returns ({offset, ...proof}, '') or (None, why).
+    ALL of: (a) the clips' absolute time ranges (corrected anchors) overlap; (b) the overlap is verified with the existing frame match
+    (verify_stitch at the aligned offset, inside the overlap); (c) a same-victim kill pair agrees after applying the offset (the existing
+    1.5 s duplicate window after the frame-verified offset is applied, and the offset itself within the 12 s continuation window of the clip times). Victim name alone, time proximity alone or a chain
+    of such links never links two clips. offset = time in a - time in b of the same moment (the same convention as _victim_offset)."""
+    from rapidfuzz import fuzz
+    aa, ab = a.get("anc"), b.get("anc")
+    if not aa or not ab or not aa["provable"] or not ab["provable"]:
+        return None, "clip time not provable (" + (", ".join(Path(x["rec"]["path"]).name for x, an in ((a, aa), (b, ab)) if not an or not an["provable"])) + ")"
+    ov = min(aa["end"], ab["end"]) - max(aa["start"], ab["start"])
+    if ov < -PAIR_MAX_GAP_S:                                    # (a) the existing continuation window (V6.9): overlapping, or at most PAIR_MAX_GAP_S apart
+        return None, f"time ranges neither overlap nor lie within the {PAIR_MAX_GAP_S:.0f} s continuation window (gap {-ov:.1f} s)"
+    off_abs = ab["start"] - aa["start"]                         # a-time of a moment = b-time + off_abs
+    win = PAIR_MAX_GAP_S                                        # the kill pair's offset must agree with the clip times within that same window
+    cands = []
+    for x in a["kills"]:
+        for y in b["kills"]:
+            va, vb = _alnum((x.get("victim") or "").lower()), _alnum((y.get("victim") or "").lower())
+            if va and vb and fuzz.ratio(va, vb) >= 80:
+                d = abs((x["t"] - y["t"]) - off_abs)
+                if d <= win:
+                    cands.append((d, -fuzz.ratio(va, vb), x, y))
+    if not cands:
+        return None, "no same-victim kill pair whose times agree with the clip times"
+    cands.sort(key=lambda c: (c[0], c[1]))
+    why = "no candidate"
+    for d, _, x, y in cands[:2]:                                # frames decide: a bogus name match from another round never matches
+        o = rf(x) - rf(y)
+        va_, vb_ = a["rec"].get("v_off", 0.0), b["rec"].get("v_off", 0.0)
+        ea, eb = a["rec"].get("dur", 0) - 0.08, o + b["rec"].get("dur", 0) - 0.08
+        lo, hi = max(max(0.05, va_), o + max(0.05, vb_)), min(ea, eb)
+        if hi - lo < 0.1:
+            why = "overlap at the aligned offset is under 0.1 s"
+            continue
+        cut = round((lo + hi) / 2, 4)
+        ok, nshift, vw = _proof_gate(budget, lambda: verify_stitch(({"path": a["rec"]["path"], "shift": 0.0}, {"path": b["rec"]["path"], "shift": o}), cut))
+        if ok:
+            m = re.search(r"difference ([\d.]+)", vw)
+            return {"offset": float(nshift), "raw_offset": float(o), "cut": cut, "victim": x.get("victim") or "", "ax": float(x["t"]), "bx": float(y["t"]),
+                    "agree_s": round(d, 2), "score": float(m.group(1)) if m else None, "match": vw, "overlap_s": round(ov, 1)}, ""
+        why = "frames do not match: " + vw
+    return None, why
+
+
+def _ledger_gone(cl, ev, why):
+    """Rows of cluster cl that the rebuilt event ev does not cover (all of them when ev is None) get the reason they would be lost."""
+    led = CUR_LEDGER[0]
+    if led is None:
+        return
+    cov = set(led.events.get(led.evkey(ev), [])) if ev else set()
+    for kd in cl:
+        r_ = led.row_of_cl(kd)
+        if r_ and r_["id"] not in cov and not r_["gone"]:
+            r_["gone"] = why
+
+
+def ledger_safety_net(led, evs, game, cfg, det, refine, gap):
+    """A4: rows that no event covers (removed by a rejected stitch / a failed group / an earlier stage) are re-queued ONCE as independent events
+    (single clip, never stitched, the same make_event()), so ranking and planning treat them like any other event. A run in which nothing was lost
+    is not touched. Rows still lost after the retry stay LOST and finish with a loud warning (ledger_finalize)."""
+    led.reconcile(evs)
+    lost = led.lost_rows(evs)
+    if not lost:
+        return
+    by_clip = {}
+    for r in lost:
+        by_clip.setdefault(r["path"], []).append(r)
+    made = []
+    for path, rows in by_clip.items():
+        it = rows[0]["it"]
+        rows.sort(key=lambda r: r["t"])
+        revs = sorted(it.get("revives", []))
+        clusters, cur = [], [rows[0]]
+        for r in rows[1:]:                                 # the same fight rule as build_events(): split only on a long gap with no revive in it
+            if r["t"] - cur[-1]["t"] <= fight_gap_for(gap, [it]) or any(cur[-1]["t"] < rv < r["t"] for rv in revs):
+                cur.append(r)
+            else:
+                clusters.append(cur)
+                cur = [r]
+        clusters.append(cur)
+        for cl_rows in clusters:
+            cl = [dict(r["k"], tt=float(r["k"]["t"]), src=it, off=0.0) for r in cl_rows]
+            try:
+                ev = make_event(cl, [(it, 0.0)], det, cfg, refine)
+            except Exception:                              # noqa: BLE001
+                ev = None
+            if ev:
+                evs.append(ev)
+                made.append((ev, cl_rows))
+    for n_, (ev, cl_rows) in enumerate(made, 1):
+        for r in cl_rows:
+            r["released"] = True
+        r0 = cl_rows[0]
+        why = r0["gone"] or "removed between grouping and event building"
+        extra = f" (+{len(cl_rows) - 1} more kill(s) of that fight)" if len(cl_rows) > 1 else ""
+        line = f"safety net: released {len(made)} event(s): {led.label(r0)}{extra} (it would have been lost: {why})"
+        led.lines.append(line)
+        led.released.append(line)
+        out(line)
+
+
+def ledger_finalize(led, picked, planned, plan):
+    """Ends every row in exactly one state (see KillLedger) from the events that were built, picked (weekly / pairing) and planned and the plan itself."""
+    evmap = {}
+    for e in list(led.final_events) + list(picked or []) + list(planned or []):
+        evmap[KillLedger.evkey(e)] = e
+    picked_k = {KillLedger.evkey(e) for e in (picked or [])}
+    planned_k = {KillLedger.evkey(e) for e in (planned or [])}
+    takes = plan.get("takes", [])
+    skipped_names = [x[0] for x in (plan.get("fit") or {}).get("skipped", [])]
+
+    def placed(e):
+        for t in takes:
+            for ts_ in (e["times"], e.get("times_v4") or e["times"]):
+                if t["path"] == e["path"] and len(t.get("kills", [])) == len(ts_) and all(abs(a - b) < 2e-4 for a, b in zip(t["kills"], ts_)):
+                    return True
+        return False
+    order = sorted(evmap, key=lambda k: -(evmap[k].get("score") or 0))
+    rank = {k: i + 1 for i, k in enumerate(order)}
+    row_ev = {}
+    for k, ids in led.events.items():
+        if k in evmap:
+            for i in ids:
+                row_ev.setdefault(i, []).append(k)
+    for r in led.rows:
+        r["state"], r["info"] = None, {}
+        if r["merged"]:
+            r["state"] = "MERGED_DUP"
+            tgt = led.rows[r["merged"]["into"] - 1]
+            pr = r["merged"].get("proof") or {}
+            r["info"] = {"survivor": led.label(tgt), "survivor_id": tgt["id"], "pair": [Path(p).name for p in r["merged"].get("pair", [])],
+                         "offset": round(pr["raw_offset"], 3) if pr else None, "score": pr.get("score") if pr else None, "match": pr.get("match") if pr else "same clip: existing 1.5 s duplicate rule",
+                         "reason": r["merged"].get("reason", "")}
+            continue
+        keys = row_ev.get(r["id"], [])
+        best = None
+        for k in keys:
+            e = evmap[k]
+            nm = Path(e["path"]).name
+            if placed(e):
+                st, inf = ("OVERRIDE_ADMITTED" if r["tag"] == "util" else "PLACED"), {"take": nm}
+            elif k in planned_k and nm in skipped_names:
+                st, inf = "CLIP_UNUSABLE", {"reason": "cannot form a take: " + why_no_take(e)}
+            elif k not in picked_k:
+                st, inf = "RANKED_OUT", {"rank": rank.get(k), "reason": "not picked: already used in a montage / outside this week's pick"}
+            elif k not in planned_k:
+                st, inf = "CLIP_UNUSABLE", {"reason": "cut list repair: its kill row lies outside the take's footage"}
+            else:
+                st, inf = "RANKED_OUT", {"rank": rank.get(k), "reason": "left out by the target / length limit"}
+            pri = {"PLACED": 0, "OVERRIDE_ADMITTED": 0, "CLIP_UNUSABLE": 1, "RANKED_OUT": 2}[st]
+            if best is None or pri < best[0]:
+                best = (pri, st, inf)
+        if best:
+            r["state"], r["info"] = best[1], best[2]
+        elif r["unusable"]:
+            r["state"], r["info"] = "CLIP_UNUSABLE", {"reason": r["unusable"]}
+        else:
+            r["state"], r["info"] = "LOST", {"reason": r["gone"] or "no event covers it"}
+        if r["released"]:
+            r["info"]["released"] = True
+    return led
+
+
+def ledger_summary(led):
+    c = {s: sum(1 for r in led.rows if r["state"] == s) for s in KILL_STATES}
+    ov = c["OVERRIDE_ADMITTED"]
+    rel = sum(1 for r in led.rows if r["released"])
+    line = (f"kill ledger: {len(led.rows)} usable, {c['PLACED'] + ov} placed, {c['MERGED_DUP']} merged as proven duplicates, {c['RANKED_OUT']} ranked out, "
+            f"{c['CLIP_UNUSABLE']} unusable, {c['LOST']} lost, {rel} released by safety net")
+    return line + (f" [{ov} of the placed via utility override]" if ov else "")
+
+
+def ledger_report(led):
+    """The ledger lines of one run: the summary, one line per MERGED_DUP with its proof, one per released event, the loud warning when rows are LOST."""
+    lines = [ledger_summary(led)]
+    for r in led.rows:
+        if r["state"] == "MERGED_DUP":
+            i = r["info"]
+            lines.append(f"  merged duplicate: {led.label(r)} = {i['survivor']} ({i.get('reason') or i['match']}; {' / '.join(i['pair']) or 'same clip'}, offset "
+                         f"{('%+.2f s' % i['offset']) if i['offset'] is not None else 'n/a'})")
+    lines += ["  " + x for x in led.released]
+    lines += ["  " + x for x in led.splits]
+    lost = [r for r in led.rows if r["state"] == "LOST"]
+    if lost:
+        lines.append(f"!!! KILL LEDGER WARNING: {len(lost)} kill row(s) are LOST and could not be recovered by the safety net:")
+        lines += [f"!!!   {led.label(r)} ({r['info'].get('reason')})" for r in lost]
+    return lines
+
+
+def ledger_save(led, plan=None):
+    rows = [{"id": r["id"], "clip": r["clip"], "t": round(r["t"], 3), "victim": r["victim"], "state": r["state"], "info": r["info"], "tag": r["tag"],
+             "released": r["released"]} for r in led.rows]
+    obj = {"saved": time.strftime("%Y-%m-%d %H:%M:%S"), "game": led.game, "summary": ledger_summary(led), "lines": ledger_report(led), "rows": rows,
+           "proofs": led.proofs, "splits": led.splits}
+    save_json(DATA / "ledger_last.json", obj)
+
+
+def cmd_timeanchor(args):
+    """V6.9.7: python montage.py timeanchor. Read-only audit of what the time in a clip's file name means (START or END of the clip) per naming
+    scheme, from the cached clip records (name time, duration) and the file's modified time (the cache key): prints one table, writes timeanchor.txt next to
+    montage.py, changes no cache, flag or config file."""
+    clips = load_json(CLIPS_CACHE, {})
+    sch = {}
+    for key, rec in clips.items():
+        try:
+            path, _size, mt = key.rsplit("|", 2)
+            mt = float(mt)
+        except ValueError:
+            continue
+        info, dur = name_time_info(path), rec.get("dur")
+        label = "unparsable name" if info is None else {"obs": "OBS replay (YYYY-MM-DD HH-MM[-SS])", "dvr": "ShadowPlay / Outplayed DVR (YYYY.MM.DD - HH.MM.SS.cc)",
+                                                        "name": "other name with a time"}[info["scheme"]] + (" [minute-only]" if info["res"] == "min" else "")
+        d = sch.setdefault(label, {"n": 0, "end": 0, "start": 0, "both": 0, "neither": 0, "diffs_end": [], "diffs_start": [], "ex": []})
+        d["n"] += 1
+        if info is None or not dur:
+            continue
+        T, dur = info["t"], float(dur)
+        e_end, e_start = abs(mt - T), abs(mt - (T + dur))
+        d["diffs_end"].append(mt - T)
+        d["diffs_start"].append(mt - (T + dur))
+        ev_end, ev_start = e_end <= ANCHOR_TOL_S + (60 if info["res"] == "min" else 0), e_start <= ANCHOR_TOL_S
+        d["end" if ev_end and not ev_start else "start" if ev_start and not ev_end else "both" if ev_end and ev_start else "neither"] += 1
+        if len(d["ex"]) < 3:
+            d["ex"].append(f"{Path(path).name}: dur {dur:.1f} s, modified {mt - T:+.1f} s from the name time, {mt - T - dur:+.1f} s from name time + duration")
+    lines = ["timeanchor: what the file-name time means per naming scheme (modified time cross-check; END = the name time is the save time)"]
+    for label, d in sorted(sch.items()):
+        med = lambda v: statistics.median(v) if v else 0.0
+        lines.append(f"  {label}: {d['n']} clips; modified time = name time (END): {d['end']}, = name time + duration (START): {d['start']}, both: {d['both']}, neither: {d['neither']}"
+                     f" (median modified - name time {med(d['diffs_end']):+.1f} s, median modified - (name time + duration) {med(d['diffs_start']):+.1f} s)")
+        lines += ["      e.g. " + x for x in d["ex"]]
+    if not sch:
+        lines.append("  no cached clip records: run a scan first")
+    text = "\n".join(lines)
+    (HERE / "timeanchor.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(read-only; written to {HERE / 'timeanchor.txt'}; nothing else was changed)")
+
+
+# ======================================================================= PER-CLIP "ALLOW UTILITY KILLS" OVERRIDE (V6.9.7, Valorant only)
+# The detector rejects a killer-side row with a small / square weapon icon (grenade, molotov, ability) as "utility: ...". The kill cache holds the RAW OCR frames
+# of a clip (not verdicts): every analysis re-derives kills / rejected rows from them, so the rejected utility rows of a clip are available WITHOUT a rescan.
+# An override re-runs the SAME analyse_entry() on that clip's cached frames with exactly one verdict mapped: 'reject: utility' counts as 'kill' (a thread-local
+# switch on the classify_row result; the detector code itself is untouched, every other filter - one-frame blip, gunshot, pre-clip, duplicate, revive, death,
+# assist - still applies to those rows like to any kill). The new rows join the clip's kills and travel through duplicate resolution, grouping, stitching, ranking,
+# planning and the ledger like any kill (tag "util"). Default OFF for every clip; the state lives in montage_data\clip_overrides.json (never in a kill cache).
+UTIL_ROW_TAG = " [U]"                   # Manual clip list: display-only suffix of a clip that has the override ON (verified: nothing parses the row text)
+_UTIL_LOCAL = threading.local()
+_UTIL_LOCK = threading.RLock()
+_OVR_WARNED = [None]
+
+
+def _util_overrides_file():
+    return DATA / "clip_overrides.json"
+
+
+def load_clip_overrides(quiet=False):
+    """{clip key: entry} of the clips that have an override ON. Missing file = all OFF; a corrupt file = all OFF and ONE log line (never a crash)."""
+    p = _util_overrides_file()
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError("not an object")
+        return {k: v for k, v in d.items() if isinstance(v, dict) and v.get("allow_utility_kills")}
+    except Exception as ex:                                # noqa: BLE001
+        if not quiet and _OVR_WARNED[0] != str(p):
+            _OVR_WARNED[0] = str(p)
+            (LOGONLY if QUIET_OVR[0] else out)(f"clip_overrides.json unreadable ({type(ex).__name__}: {ex}): every utility override is OFF")
+        return {}
+
+
+QUIET_OVR = [False]
+
+
+def save_clip_overrides(d):
+    """Atomic (temp file, then replace); entries only for clips that are ON."""
+    save_json(_util_overrides_file(), {k: v for k, v in d.items() if v.get("allow_utility_kills")})
+
+
+def clip_override_state(path, ovs=None):
+    """(state, why): 'on' | 'off' | 'size' (file size differs from the one stored: not applied) | 'missing' (the file is gone: moved / renamed, not applied)."""
+    ovs = load_clip_overrides(quiet=True) if ovs is None else ovs
+    e = ovs.get(_pkey(path))
+    if not e:
+        return "off", ""
+    try:
+        sz = os.path.getsize(path)
+    except OSError:
+        return "missing", f"file not found ({e.get('name', Path(path).name)}): moved or renamed? switch it on again at the new place"
+    if e.get("size") and int(e["size"]) != sz:
+        return "size", f"{e.get('name', Path(path).name)}: size changed since the override was set ({e['size']} -> {sz} bytes): not applied"
+    return "on", ""
+
+
+def set_clip_override(paths, on, ovs=None):
+    """Switches the override for the given clips; writes only clip_overrides.json. Returns the new dict."""
+    cur = dict(load_clip_overrides(quiet=True))
+    for p in paths:
+        k = _pkey(p)
+        if on:
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                sz = 0
+            cur[k] = {"allow_utility_kills": True, "set": datetime.datetime.now().strftime("%Y-%m-%d"), "name": Path(p).name, "size": sz}
+        else:
+            cur.pop(k, None)
+    save_clip_overrides(cur)
+    return cur
+
+
+def utility_kill_rows(entry, cfg, game="valorant", base=None):
+    """The kill-shaped rows the detector rejected with the reason 'utility' in this clip's cached OCR frames: {kills: [...admitted rows...], base: analysis}.
+    The rows come from the one analyse_entry(); only rows whose track is a utility track ('util' icon) and that are not kills without the switch are returned."""
+    base = base or analyse_entry(entry, cfg, game)
+    real = classify_row
+
+    def mapped(r, cfg_=None, lg=0.0, game_=None):
+        v = real(r, cfg_, lg, game_)
+        if not getattr(_UTIL_LOCAL, "on", False):
+            return v
+        return [("kill", "utility kill allowed by override: " + why.split(":", 1)[1].strip()) if (a == "reject" and why.startswith("utility:")) else (a, why) for a, why in v]
+    with _UTIL_LOCK:
+        globals()["classify_row"] = mapped
+        _UTIL_LOCAL.on = True
+        try:
+            a = analyse_entry(entry, cfg, game)
+        finally:
+            _UTIL_LOCAL.on = False
+            globals()["classify_row"] = real
+    have = [(round(k["t"], 3), _alnum((k.get("victim") or "").lower())) for k in base["kills"]]
+    new = [dict(k, util=True) for k in a["kills"] if "] util [" in k.get("row", "") and (round(k["t"], 3), _alnum((k.get("victim") or "").lower())) not in have]
+    return new
+
+
+def apply_utility_override(rec, entry, a, cfg, game, ovs, admitted=None):
+    """a = analyse_clip_entry(...) of the clip. When the clip's override is ON (Valorant), its admitted utility rows join its kills (sorted by time) and leave
+    its rejected list; otherwise a is returned unchanged (default OFF: nothing changes anywhere)."""
+    if game != "valorant" or not ovs or entry is None or entry.get("error"):
+        return a
+    st, why = clip_override_state(rec["path"], ovs)
+    if st != "on":
+        if st != "off" and admitted is not None:
+            admitted.setdefault("warn", []).append(why)
+        return a
+    util = utility_kill_rows(entry, cfg, game, a)
+    if admitted is not None:
+        admitted.setdefault("clips", []).append(Path(rec["path"]).name)
+        for k in util:
+            admitted.setdefault("rows", []).append((Path(rec["path"]).name, k))
+    if not util:
+        return a
+    ts_ = {round(k["t"], 3) for k in util}
+    rej = [j for j in a.get("rej", []) if not (str(j.get("reason", "")).startswith("utility:") and round(j["t"], 3) in ts_)]
+    from rapidfuzz import fuzz
+    deaths, revives = list(a.get("deaths", [])), list(a.get("revives", []))
+    for k in util:                                         # V6.9.7.1: the death / revive-looking row of the SAME victim within 0.5 s is the admitted row's twin (the OCR read the kill row
+        vn = _alnum((k.get("victim") or "").lower())       # twice, e.g. a rank badge 'IV' + 'fireaxe Alexandre'): it is not my death and not a revive of this clip
+        for j in rej:
+            if len(vn) >= 3 and str(j.get("reason", "")).startswith(("death", "revive")) and abs(j["t"] - k["t"]) <= 0.5                     and fuzz.partial_ratio(vn, _alnum(str(j["reason"]).split(":", 1)[-1].lower())) >= 80:
+                deaths = [d for d in deaths if abs(d - j["t"]) > 0.15]
+                revives = [r_ for r_ in revives if abs(r_ - j["t"]) > 0.15]
+                j["reason"] += " [twin of the utility row admitted by the override: ignored for the death window]"
+    return dict(a, kills=sorted(list(a["kills"]) + util, key=lambda k: k["t"]), rej=rej, deaths=deaths, revives=revives)
+
+
+def utility_override_lines(admitted):
+    """B6: one line per run when any override is active (nothing when none is enabled); plus one line per admitted row."""
+    if not admitted or not (admitted.get("clips") or admitted.get("warn")):
+        return []
+    rows = admitted.get("rows", [])
+    lines = list(admitted.get("warn", []))
+    for nm, k in rows:
+        lines.append(f"utility kill allowed by override: {nm} @ {ts(k['t'])} -> {k.get('victim') or '?'}")
+    lines.insert(len(admitted.get("warn", [])), f"utility override: {len(admitted.get('clips', []))} clip(s) enabled, {len(rows)} utility kill(s) admitted"
+                 + (" (" + ", ".join(f"{nm} @ {ts(k['t'])} -> {k.get('victim') or '?'}" for nm, k in rows) + ")" if rows else ""))
+    return lines
+
+
+def cmd_utilclip(args):
+    """V6.9.7: python montage.py utilclip <name fragment | --list> [on|off]. --list prints the clips that are ON and how many utility rows each has (from the kill
+    cache, no scan). With on / off it switches every Valorant clip whose file name contains the fragment; writes only clip_overrides.json."""
+    cfg = load_config()
+    det = Detector("valorant")
+    store = load_kills_cache()
+    clips = load_json(CLIPS_CACHE, {})
+    recs = {}
+    for key, rec in clips.items():
+        try:
+            p = key.rsplit("|", 2)[0]
+        except ValueError:
+            continue
+        if rec and not rec.get("error") and tag_game(p, cfg)[0] == "valorant":
+            recs[_pkey(p)] = dict(rec, path=p, game="valorant")
+
+    def util_count(path):
+        r = recs.get(_pkey(path))
+        e = store.get(kills_key(r, "valorant", det)) if r else None
+        if not e or e.get("error"):
+            return None
+        return len(utility_kill_rows(e, cfg, "valorant"))
+
+    def show():
+        ovs = load_clip_overrides()
+        if not ovs:
+            print("utility override: no clip has it ON (default: OFF for every clip)")
+        for k, e in sorted(ovs.items(), key=lambda kv: kv[1].get("name", "")):
+            path = next((r["path"] for kk, r in recs.items() if kk == k), k)
+            st, why = clip_override_state(path, ovs)
+            n = util_count(path)
+            print(f"  ON  {e.get('name', Path(path).name)}  ({e.get('set', '?')})  utility rows in the cache: {'not scanned yet' if n is None else n}" + ("" if st == "on" else f"  [{why}]"))
+    t = (args.target or "").strip()
+    if not t or t == "--list" or args.list:
+        show()
+        return
+    st = (args.state or "").lower()
+    if st not in ("on", "off"):
+        raise SystemExit("utilclip: say on or off, e.g.  python montage.py utilclip 03-40 on   (or --list)")
+    hits = sorted(p["path"] for p in recs.values() if t.lower() in Path(p["path"]).name.lower())
+    if not hits:
+        raise SystemExit(f"utilclip: no Valorant clip in the clip cache has '{t}' in its name (scan the clips first; CS2 clips have no utility rows)")
+    set_clip_override(hits, st == "on")
+    for p in hits:
+        n = util_count(p)
+        print(f"  {st.upper():3} {Path(p).name}  utility rows in the cache: {'not scanned yet' if n is None else n}")
+    print(f"(written: {_util_overrides_file()}; no scan, no render, nothing else changed)")
+    show()
+
+
+def cmd_ledger(args):
+    """V6.9.7: python montage.py ledger. Read-only: reprints the last run's kill ledger from montage_data\\ledger_last.json (written by the run) or, failing
+    that, from the log; writes ledger.txt next to montage.py; changes no cache, flag or config file."""
+    obj = load_json(DATA / "ledger_last.json", None)
+    if obj and obj.get("rows") is not None:
+        lines = [f"last run's kill ledger ({obj.get('game')}, saved {obj.get('saved')}):"] + obj.get("lines", [])
+        lines.append("")
+        for r in obj["rows"]:
+            inf = r.get("info") or {}
+            det = inf.get("reason") or inf.get("survivor") or inf.get("take") or ""
+            lines.append(f"  #{r['id']:<3} {r['state']:<18} {r['clip']} @ {ts(r['t'])} -> {r['victim'] or '?'}"
+                         + (f"  [rank {inf['rank']}]" if inf.get("rank") else "") + ("  [util]" if r.get("tag") == "util" else "") + ("  [released]" if r.get("released") else "")
+                         + (f"  ({det})" if det else ""))
+    else:
+        lines = []
+        try:
+            for l_ in (LOG_DIR / "montage.log").read_text(encoding="utf-8", errors="replace").splitlines():
+                if "kill ledger:" in l_:
+                    lines = ["(from montage.log; no ledger_last.json) " + l_]
+        except OSError:
+            pass
+        lines = lines or ["no kill ledger saved yet: run a Dry plan first"]
+    text = "\n".join(lines)
+    (HERE / "ledger.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(read-only; written to {HERE / 'ledger.txt'}; nothing else was changed)")
+
+
 FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
 
 
 def fight_gap(cfg, game):
     return max(float(cfg["gap_s"][game]), FIGHT_SPLIT_S.get(game, 0.0))
+
+
+def fight_gap_for(gap, items):
+    """V6.9.7.1: the split gap of a clip / group: unchanged under LONG_CLIP_S; with a clip of LONG_CLIP_S or longer kills stay one fight up to FIGHT_GAP_LONG_CLIP."""
+    return max(gap, FIGHT_GAP_LONG_CLIP) if any(float(it["rec"].get("dur") or 0) >= LONG_CLIP_S for it in items) else gap
 
 
 def build_events(pool, game, cfg, rng, flick_budget=40):
@@ -5339,7 +6141,23 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
     for it in pool:
         ks = list(it["kills"])                             # V5.5: Valorant knife kills are normal kills
         if ks:
-            items.append(dict(it, kills=sorted(ks, key=lambda k: k["t"]), ctime=clip_time(it["rec"]["path"])))
+            items.append(dict(it, kills=sorted(ks, key=lambda k: k["t"]), ctime=clip_ctime(it["rec"]), anc=clip_anchor(it["rec"]["path"], it["rec"].get("dur"))))
+    if LEDGER_SUBCALL[0] and LAST_LEDGER[0] is not None:   # partners (pairing_replace_events): known rows only, nothing new is 'usable' here
+        led = LAST_LEDGER[0]
+    else:
+        led = KillLedger(game)                             # V6.9.7: every usable kill row gets an ID here (see KillLedger)
+        led.add_pool(items)
+    prev_led, CUR_LEDGER[0] = CUR_LEDGER[0], led
+    try:
+        return _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led)
+    finally:
+        CUR_LEDGER[0] = prev_led
+        if not LEDGER_SUBCALL[0]:
+            LAST_LEDGER[0] = led
+
+
+def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
+    from rapidfuzz import fuzz
     # duplicates / continuations
     refine = load_json(REFINE_CACHE, {})
     kref = {}
@@ -5354,59 +6172,90 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
             return refine_kill(it["rec"], det, cfg, k, refine)
         except Exception:
             return k["t"]
-    items.sort(key=lambda i: i["ctime"])
-    groups, used = [], set()
-    for i, a in enumerate(items):
-        if i in used:
-            continue
-        g = [(a, 0.0)]
-        used.add(i)
-        for j in range(i + 1, len(items)):
+    items.sort(key=lambda i: ((i["anc"] or {}).get("end", i["ctime"]), (i["anc"] or {}).get("start", i["ctime"])))     # V6.9.7.1: by SAVE time (stable)
+    links, proofs = set(), {}
+    groups, i = [], 0
+    while i < len(items):                                  # V6.9.7.1: consecutive clips saved right next to each other (time rule, see save_time_link) = one fight
+        g = [(items[i], 0.0)]
+        j = i + 1
+        while j < len(items):
+            m, mo = g[-1]
             b = items[j]
-            if j in used:
-                continue
-            near = b["ctime"] - a["ctime"] <= 60 + a["rec"].get("dur", 0)
-            off = None
-            for (m, mo) in g:
-                o = _victim_offset(m["kills"], b["kills"], rf) if near else None
-                if o is not None and abs(b["ctime"] - m["ctime"]) <= 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
-                    off = mo + o
-                    break
-                o = _same_kills(m, b, rf, refine)          # V5.42B: same kills = same event, whatever the file times say
-                if o is not None:
-                    off = mo + o
-                    notes.append(f"same kills in two files: {Path(m['rec']['path']).name} = {Path(b['rec']['path']).name} "
-                                 "(one event, never placed twice)")
-                    break
-            if off is not None:
-                g.append((b, off))
-                used.add(j)
+            lk, why = save_time_link(m, b)
+            led.proofs.append({"a": Path(m["rec"]["path"]).name, "b": Path(b["rec"]["path"]).name, "proven": bool(lk), "why": why if not lk else "",
+                               **({"offset": round(lk["raw_offset"], 3), "score": None, "match": lk["match"]} if lk else {})})
+            if not lk:
+                break
+            if len(g) >= GROUP_MAX_CLIPS:                  # the V6.9 fight-size limit: a longer chain splits; the boundary duplicate is merged by its pair link
+                dups = {id(kb): (km, lk) for kb in b["kills"] for km in m["kills"]
+                        if fuzz.ratio(_alnum((km.get("victim") or "").lower()), _alnum((kb.get("victim") or "").lower())) >= 80
+                        and abs(km["t"] - (kb["t"] + lk["raw_offset"])) <= LINK_DUP_WINDOW_S}
+                b.setdefault("_dup", {}).update({k_: v_ for k_, v_ in dups.items()})
+                b["_dup_src"] = m
+                led.splits.append(f"fight group limit: {Path(b['rec']['path']).name} is saved next to {Path(m['rec']['path']).name} but the group "
+                                  f"already has {GROUP_MAX_CLIPS} clips - it starts a new group (chain split into adjacent pairs)")
+                break
+            g.append((b, mo + lk["raw_offset"]))
+            links.add((id(m), id(b)))
+            links.add((id(b), id(m)))
+            proofs[(id(m), id(b))] = proofs[(id(b), id(m))] = lk
+            notes.append(f"clips saved next to each other = one fight: {Path(m['rec']['path']).name} / {Path(b['rec']['path']).name} ({lk['match']})")
+            j += 1
         groups.append(g)
+        i = j
     evs = []
     for g in groups:
-        # union of kills on the timeline of the group's first clip (kills of the same victim within 1.5 s are one kill)
+        # union of kills on the timeline of the group's first clip (kills of the same victim within 1.5 s are one kill) - V6.9.7: only kills of
+        # the SAME clip or of a PROVEN adjacent pair (proofs of the group links) are ever merged; no chaining through a third clip
         allk = []
         for it, off in g:
             for k in it["kills"]:
+                if id(k) in it.get("_dup", {}):            # duplicate of a kill in the previous group (chain split): never placed twice
+                    km, pr = it["_dup"][id(k)]
+                    srow, drow = led.row(it["_dup_src"], km), led.row(it, k)
+                    if srow and drow and not drow["merged"]:
+                        drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [it["_dup_src"]["rec"]["path"], it["rec"]["path"]], "split": True,
+                                          "reason": f"saved {pr['apart']:.0f} s apart, same victim, abs time match"}
+                    continue
                 tt = k["t"] + off
-                if not any(abs(tt - u["tt"]) <= 1.5 and _alnum(u.get("victim", "").lower()) == _alnum(k.get("victim", "").lower())
-                           for u in allk):
+                vk = _alnum(k.get("victim", "").lower())
+                dup = next((u for u in allk if _alnum(u.get("victim", "").lower()) == vk and abs(tt - u["tt"]) <= DUP_WINDOW_S and u["src"] is it
+                            or (u["src"] is not it and abs(tt - u["tt"]) <= LINK_DUP_WINDOW_S and len(vk) >= 2
+                                and fuzz.ratio(_alnum(u.get("victim", "").lower()), vk) >= 80)), None)       # V6.9.7.1: inside a chain: abs time within 3 s
+                if dup is None:
                     allk.append(dict(k, tt=tt, src=it, off=off))
+                else:
+                    srow, drow = led.row(dup["src"], dup), led.row(it, k)
+                    pr = proofs.get((id(dup["src"]), id(it)))
+                    if dup["src"] is not it and k.get("ks", 0) > dup.get("ks", 0) + 1e-9:                  # keep the row with the best name confidence
+                        allk[allk.index(dup)] = dict(k, tt=tt, src=it, off=off)
+                        srow, drow = drow, srow
+                    if srow and drow and not drow["merged"]:
+                        why_ = f"saved {abs(((it.get('anc') or {}).get('end') or 0) - ((dup['src'].get('anc') or {}).get('end') or 0)):.0f} s apart, same victim, abs time match"                             if dup["src"] is not it else "same clip: existing 1.5 s duplicate rule"
+                        drow["merged"] = {"into": srow["id"], "proof": pr, "pair": [dup["src"]["rec"]["path"], it["rec"]["path"]], "reason": why_}
+                        for r_ in led.rows:                # rows already merged into the replaced one now follow the new survivor
+                            if r_["merged"] and r_["merged"]["into"] == drow["id"] and r_ is not srow:
+                                r_["merged"]["into"] = srow["id"]
+        if not allk:
+            continue
         if len(g) > 1:
             notes.append("merged continuation/duplicate clips: " + " + ".join(Path(it["rec"]["path"]).name for it, _ in g)
                          + f" ({len(allk)} distinct kills)")
         # events by kill spacing on the group timeline
         allk.sort(key=lambda k: k["tt"])
         revs = sorted(rv + off for it, off in g for rv in it.get("revives", []))
+        gap_g = fight_gap_for(gap, [it for it, _ in g])    # V6.9.7.1: a group with a clip of LONG_CLIP_S or more splits only on FIGHT_GAP_LONG_CLIP
+        if len(g) > 1:                                     # clips saved right next to each other are one fight: the continuation window also bounds the kill gap
+            gap_g = max(gap_g, PAIR_MAX_GAP_S)
         clusters, cur = [], [allk[0]]
         for k in allk[1:]:                                 # one fight = one event: split only on a long gap with no revive in it
-            if k["tt"] - cur[-1]["tt"] <= gap or any(cur[-1]["tt"] < rv < k["tt"] for rv in revs):
+            if k["tt"] - cur[-1]["tt"] <= gap_g or any(cur[-1]["tt"] < rv < k["tt"] for rv in revs):
                 cur.append(k)
             else:
                 clusters.append(cur)
                 cur = [k]
         clusters.append(cur)
-        best_ev = None
+        best_ev, cands = None, []
         for cl in clusters:
             # which clips cover which kills (a clip covers a kill it detected itself)
             cover = {id(it): [k for k in cl if k["src"] is it or any(abs(k["tt"] - (x["t"] + off)) <= 0.3 for x in it["kills"])]
@@ -5420,10 +6269,32 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
                         continue
                     parts.append((it2, off2))
             ev = make_event(cl, parts, det, cfg, refine)
-            if ev and (best_ev is None or ev["score_pre"] > best_ev["score_pre"]):
-                best_ev = ev
+            if ev:
+                cands.append((ev, cl))
+                if best_ev is None or ev["score_pre"] > best_ev["score_pre"]:
+                    best_ev = ev
+            else:
+                for kd in cl:
+                    r_ = led.row_of_cl(kd)
+                    if r_ and not r_["gone"]:
+                        r_["gone"] = "no event could be built for its fight (stitch rejected and no single clip shows it, or it is outside the footage)"
+        for ev, cl in cands:
+            if ev is not best_ev:
+                for kd in cl:
+                    r_ = led.row_of_cl(kd)
+                    if r_ and not r_["gone"] and not r_["unusable"]:
+                        r_["unusable"] = "second fight of the same group: one event per clip / group (existing planner rule)"
         if best_ev:
             evs.append(best_ev)
+    if LEDGER_TEST_HOOK[0]:
+        LEDGER_TEST_HOOK[0](evs, led)
+    if not LEDGER_SUBCALL[0]:
+        try:
+            ledger_safety_net(led, evs, game, cfg, det, refine, gap)
+        except Exception as ex:                            # the safety net never fails a run
+            led.lines.append(f"safety net skipped: {type(ex).__name__}: {ex}")
+    for msg in led.splits:
+        notes.append(msg)
     save_json(REFINE_CACHE, refine)
     singles = [e for e in evs if e["n"] == 1 and not e["hs"]]
     rng.shuffle(singles)
@@ -5436,6 +6307,7 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
         e["score"] = base_score(e) + 2.0 * e["shots"]
         e["plain"] = e["n"] == 1 and not e["hs"] and not e["flick"]
     evs.sort(key=lambda e: -e["score"])
+    led.final_events = list(evs)
     return evs, notes
 
 
@@ -5463,7 +6335,7 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
                 shot = None
         v4t = k.get("shot_t", k["t"] - 0.1) if k.get("shot") else k["t"] - 0.1
         raw.append({"row": row + off - moff, "shot": None if shot is None else shot + off - moff, "v4": v4t + off - moff,
-                    "victim": k.get("victim", ""), "hs": bool(k.get("hs")), "has_shot": bool(k.get("shot"))})
+                    "victim": k.get("victim", ""), "hs": bool(k.get("hs")), "has_shot": bool(k.get("shot")), "k": k})
     lags = [r["row"] - r["shot"] for r in raw if r["shot"] is not None]
     lag = float(statistics.median(lags)) if lags else 0.10
     for r in raw:
@@ -5483,21 +6355,24 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
     spans.sort(key=lambda s: s["start"])
     stitch_note = ""
     if len(spans) > 1:
+        # V6.9.7.1: the clips were linked by their SAVE times and aligned by the kill-pair / save-time offset (build_events); the order is the save order
+        # (spans sorted by the aligned start). The frame match is ADVISORY only: it is logged, never a veto and never moves a clip.
         chain = [spans[0]]
         for s_ in spans[1:]:
-            if s_["start"] <= chain[-1]["end"] - 0.1 and s_["end"] > chain[-1]["end"]:
+            if s_["start"] <= chain[-1]["end"] + STITCH_GAP_S and s_["end"] > chain[-1]["end"]:        # overlapping, or back to back (saved one right after the other)
                 chain.append(s_)
         spans = chain
         ok_all = True
         for i in range(len(spans) - 1):
             cut = round((max(spans[i]["start"], spans[i + 1]["start"]) + spans[i]["end"]) / 2, 4)
-            ok, nshift, why = verify_stitch((spans[i], spans[i + 1]), cut) if verify else (True, spans[i + 1]["shift"], "not checked")
-            stitch_note += f"cut {i + 1}: {why}; "
-            if not ok:
-                ok_all = False
-                break
-            d_ = nshift - spans[i + 1]["shift"]
-            spans[i + 1].update(shift=nshift, start=spans[i + 1]["start"] + d_, end=spans[i + 1]["end"] + d_)
+            if verify:
+                try:
+                    ok, nshift, why = verify_stitch((spans[i], spans[i + 1]), cut)
+                except Exception as ex:                      # noqa: BLE001
+                    ok, why = None, f"not checked ({type(ex).__name__})"
+            else:
+                ok, why = None, "not checked"
+            stitch_note += f"frame check: {why} (advisory); "
         if not ok_all:                                      # fall back to the single clip with the most of these kills
             # V5.43B: the offsets between the clips are WRONG (that is why the stitch failed), so nothing of the joined timeline may
             # be kept: re-plan the event from scratch on the single clip, from the kills THAT clip read, in its own time.
@@ -5512,10 +6387,22 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
                 ev = make_event(own(best), [(best["it"], 0.0)], det, cfg, refine, verify)
                 if ev:
                     ev["stitch_note"] = note
+                _ledger_gone(cl, ev, "its group's stitch was rejected (" + stitch_note.strip().rstrip(";").split(";")[-1].strip() + ") and the event was re-planned on " +
+                             Path(best["path"]).name)
                 return ev
+            _ledger_gone(cl, None, "its group's stitch was rejected and no single clip shows these kills by itself")
             return None
     cover_start, cover_end = spans[0]["start"], spans[-1]["end"]
     keep = [i for i, (t, r) in enumerate(zip(times, rows)) if cover_start + 0.05 <= t and r <= cover_end - 0.05]
+    led = CUR_LEDGER[0]
+    if led is not None:                                     # V6.9.7: a row outside the footage of ONE clip cannot form a take (existing rule); in a stitched span it is only 'gone'
+        for i, r_ in enumerate(raw):
+            if i not in keep:
+                row_ = led.row_of_cl(r_["k"])
+                if row_ and len(spans) == 1:
+                    row_["unusable"] = "kill / killfeed row outside the footage of its clip (needs 0.05 s margin)"
+                elif row_ and not row_["gone"]:
+                    row_["gone"] = "outside the footage of the stitched clips"
     if not keep:
         return None
     times, rows, victims = [times[i] for i in keep], [rows[i] for i in keep], [victims[i] for i in keep]
@@ -5543,6 +6430,8 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
           "stitched": len(spans) > 1, "stitch_note": stitch_note.strip(), "lags": [0.0] * len(times),
           "vis": spans[0]["it"].get("vis", []) if len(spans) == 1 else main.get("vis", [])}
     ev["score_pre"] = base_score(ev)
+    if led is not None:
+        led.note_event(ev, [led.row_of_cl(raw[i]["k"]) for i in keep])
     return ev
 
 
@@ -6724,6 +7613,596 @@ def probe_duration(path):
         return 0.0
 
 
+# ======================================================================= V6.9.3 / V6.9.6: effective-fps interpolation at render time
+# V6.9.6: container fps is the wrong basis (OBS .mov 50, DVR .mp4 60, some CS2 DVR clips are variable frame rate, game footage may be duplicated
+# 30 fps, slow-mo shows every source frame twice). The decision is made per TAKE from the EFFECTIVE on-screen unique frame rate:
+#   effective = min(timestamp fps, content fps (unique frames)) x playback speed, candidate when below 75% of the montage fps for
+#   (a) slow-mo (speed < 1), (b) duplicated content / a low-fps source, (c) VFR gaps (>= 10% of the intervals above 1.5x the median, or a gap above 4 frames).
+# Only the source ranges the takes use (+0.5 s margin) are converted to a temporary file that replaces the clip as that take's input (same timeline:
+# the take's shift moves by the range start). The filter graph is NOT edited (the existing retime consumes the denser segment); everything that is not a
+# candidate produces the byte-identical render command. Any problem uses the original clip. Hidden switch: config.json "interpolate_low_fps" (default true).
+INTERP_FRAC = 0.75                      # candidate: effective fps below this share of the montage fps
+INTERP_MARGIN_S = 0.5
+INTERP_TIMEOUT_X = 4.0                  # a segment taking longer than this x its duration is abandoned
+INTERP_MIN_TIMEOUT_S = 5.0              # (floor for very short segments)
+INTERP_MIN_MEAN_SSIM, INTERP_MIN_FRAME_SSIM = 0.90, 0.75
+INTERP_MCI = "minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:scd=fdiff:mb_size=8:search_param=8"      # conservative: smallest block / search, no vsbmc
+INTERP_BLEND = "framerate=fps=60"                                                          # blend only (scene changes are duplicated)
+INTERP_STATE = {"mci_slow": False}
+INTERP_MAX_FPS = 240.0                  # never interpolate above this rate
+INTERP_MAX_X = 4.0                      # nor above this multiple of the unique source rate
+VFR_SHARE, VFR_GAP_FRAMES = 0.10, 4.0   # VFR candidate: >= 10% of the intervals above 1.5x the median, or any gap above 4 frames
+DUP_MIN_MOTION = 0.6                    # mean abs grey difference (0-255) of the 75th percentile frame step below this = a static scene (not measurable)
+CONTENT_WIN_S, CONTENT_MAX_S = 1.5, 4.0 # content fps window length / ranges longer than this are sampled in three windows
+
+
+def _ratio(s):
+    try:
+        n, _, d = str(s).partition("/")
+        return float(n) / float(d) if d and float(d) else (float(n) if not d else 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def probe_fps(path):
+    """{avg, r, nb, dur, eff, vfr} of the first video stream (ffprobe only). eff = frames / duration when known, else avg_frame_rate."""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration", "-of", "json", str(path)], timeout=60)
+    j = json.loads(r.stdout or b"{}")
+    s = (j.get("streams") or [{}])[0]
+    avg, rr = _ratio(s.get("avg_frame_rate")), _ratio(s.get("r_frame_rate"))
+    try:
+        nb = int(s.get("nb_frames"))
+    except (TypeError, ValueError):
+        nb = 0
+    try:
+        dur = float(s.get("duration") or (j.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        dur = 0.0
+    eff = nb / dur if nb > 1 and dur > 0 else (avg or rr)
+    return {"avg": avg, "r": rr, "nb": nb, "dur": dur, "eff": eff, "vfr": bool(avg and rr and abs(avg - rr) > 0.5)}
+
+
+def _run_timed(cmd, timeout):
+    """(returncode, stderr text, stdout text); returncode None = timeout. Registered in PROCS so Cancel kills it."""
+    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    PROCS.append(pr)
+    try:
+        so, se = pr.communicate(timeout=timeout)
+        return pr.returncode, se.decode(errors="replace"), so.decode(errors="replace")
+    except subprocess.TimeoutExpired:
+        pr.kill()
+        pr.communicate()
+        return None, "timeout", ""
+    finally:
+        if pr in PROCS:
+            PROCS.remove(pr)
+
+
+def interp_vf(method, fps):
+    """The interpolation filter of `method` at output rate `fps` (the 60 fps strings are the V6.9.3 constants, byte for byte)."""
+    base = INTERP_MCI if method == "mci" else INTERP_BLEND
+    return base if abs(fps - OUT_FPS) < 1e-6 else base.replace("fps=60", f"fps={fps:g}", 1)
+
+
+def interp_segment_cmd(src, s0, d, outp, method, fps=OUT_FPS, pre=""):
+    """ffmpeg command for ONE segment [s0, s0+d) of `src`: `pre` (duplicate removal / retime, ends with a comma), then the interpolation to `fps`."""
+    return ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(src), "-map", "0:v:0", "-map", "0:a?",
+            "-vf", f"{pre}tpad=stop_mode=clone:stop_duration={INTERP_MARGIN_S:.2f},{interp_vf(method, fps)},trim=end={d:.4f}", "-vsync", "0",
+            "-c:v", "libx264", "-crf", "10", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", str(outp)]
+
+
+def _ssim_values(a_chain, b_chain, a_in, b_in):
+    cmd = ["ffmpeg", "-hide_banner", "-v", "error"] + a_in + b_in + ["-lavfi", f"[0:v]{a_chain}[a];[1:v]{b_chain}[b];[a][b]ssim,"
+           "metadata=mode=print:key=lavfi.ssim.All:file=-", "-vsync", "0", "-f", "null", "-"]
+    rc, err, so = _run_timed(cmd, 120)
+    vals = [float(x) for x in re.findall(r"lavfi\.ssim\.All=([\d.]+)", so)]
+    return rc, err, vals
+
+
+def interp_duration_ok(dur, d):
+    """V6.9.7.1: a segment's duration may differ by one frame of the MONTAGE target fps (OUT_FPS) plus 2 ms (real failures: 1.491 vs 1.480 s, 2.724 vs 2.708 s)."""
+    return abs(dur - d) <= 1.0 / OUT_FPS + 0.002
+
+
+def interp_validate(src, seg, s0, d, src_fps, out_fps=OUT_FPS):
+    """None when the interpolated segment is sound, else the reason (see the V6.9.3 rules; V6.9.6: at the segment's own output rate)."""
+    seg = Path(seg)
+    if not seg.exists() or seg.stat().st_size < 1000:
+        return "temp file missing"
+    dur = probe_duration(seg)
+    if not interp_duration_ok(dur, d):
+        return f"duration {dur:.3f} s instead of {d:.3f} s"
+    r = run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames,start_time",
+             "-of", "json", str(seg)], timeout=120)
+    try:
+        st = json.loads(r.stdout or b"{}")["streams"][0]
+        n, t0 = int(st["nb_read_frames"]), float(st.get("start_time") or 0)
+    except Exception:
+        return "frame count unreadable"
+    want = int(round((d - t0) * out_fps))
+    if abs(n - want) > 1:                                   # V6.9.7.1: +-1 frame
+        return f"{n} frames instead of {want}"
+    ain, bin_ = ["-ss", "0", "-i", str(seg)], ["-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(src)]
+    small = "scale=480:-2:flags=bilinear,format=yuv420p"
+    rc, err, v60 = _ssim_values(f"{small}", f"{small},fps={out_fps:g}:round=near", ain, bin_)          # every frame vs its nearest source frame
+    err = "\n".join(l for l in err.splitlines() if "non monotonically" not in l).strip()      # (a muxer remark of the null output, not a decode problem)
+    if rc != 0 or err:
+        return "decode error: " + err[:80]
+    if not v60:
+        return "SSIM not measurable"
+    if min(v60) < INTERP_MIN_FRAME_SSIM:
+        return f"a frame differs too much from its nearest source frame (SSIM {min(v60):.2f})"
+    rc, err, vo = _ssim_values(f"{small},fps={src_fps:.4f}:round=near", small, ain, bin_)             # at the source frame times
+    if rc != 0 or not vo:
+        return "SSIM at the source times not measurable"
+    if sum(vo) / len(vo) < INTERP_MIN_MEAN_SSIM:
+        return f"mean SSIM {sum(vo) / len(vo):.2f} against the source frames"
+    return None
+
+
+# ---------------------------------------------------------------- V6.9.6: effective fps measurement (read-only, ffprobe / ffmpeg decode of small ranges)
+def probe_timestamps(path, s0, e):
+    """Packet timestamps (s, sorted) of the first video stream inside [s0, e] (ffprobe only, no decoding)."""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{s0:.3f}%{e:.3f}", "-show_entries", "packet=pts_time",
+             "-of", "csv=p=0", str(path)], timeout=60)
+    ts = []
+    for l_ in (r.stdout or b"").decode(errors="replace").split():
+        try:
+            ts.append(float(l_.strip(",")))
+        except ValueError:
+            pass
+    ts = sorted(t for t in ts if s0 - 1e-3 <= t <= e + 1e-3)
+    return ts
+
+
+def ts_stats(ts):
+    """Timestamp fps and VFR gap statistics from sorted frame times."""
+    import numpy as np
+    if len(ts) < 3:
+        return {"n": len(ts), "ts_fps": 0.0, "median_dt": 0.0, "gap_share": 0.0, "max_gap_frames": 0.0, "vfr": False}
+    d = np.diff(np.asarray(ts))
+    d = d[d > 1e-6]
+    if not len(d):
+        return {"n": len(ts), "ts_fps": 0.0, "median_dt": 0.0, "gap_share": 0.0, "max_gap_frames": 0.0, "vfr": False}
+    med = float(np.median(d))
+    share = float(np.mean(d > 1.5 * med))
+    mg = float(d.max() / med)
+    return {"n": len(ts), "ts_fps": float((len(ts) - 1) / (ts[-1] - ts[0])) if ts[-1] > ts[0] else 0.0, "median_dt": med, "gap_share": share,
+            "max_gap_frames": mg, "vfr": bool(share >= VFR_SHARE or mg > VFR_GAP_FRAMES)}
+
+
+def gray_frames(path, s0, d, w=160, h=90):
+    """Small grey frames of the CENTRAL 60% of the picture (static HUD and black bars are outside it) of [s0, s0+d), every decoded frame, no resampling."""
+    import numpy as np
+    r = run(["ffmpeg", "-v", "error", "-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(path), "-an", "-vf",
+             f"crop=iw*0.6:ih*0.6:iw*0.2:ih*0.2,scale={w}:{h}:flags=area,format=gray", "-vsync", "0", "-f", "rawvideo", "-"], timeout=180)
+    a = np.frombuffer(r.stdout or b"", np.uint8)
+    n = len(a) // (w * h)
+    return a[:n * w * h].reshape(n, h, w).astype(np.float32)
+
+
+def frame_uniqueness(fr):
+    """(unique flags per frame step, motion level). Frame i is unique when it differs from frame i-1 by more than the duplicate threshold."""
+    import numpy as np
+    if len(fr) < 4:
+        return None, 0.0
+    d = np.abs(np.diff(fr, axis=0)).mean(axis=(1, 2))
+    mot = float(np.percentile(d, 75))
+    thr = max(0.25, 0.12 * mot)
+    return d > thr, mot
+
+
+def cadence_of(uniq):
+    """Regular duplicate cadence from the unique flags of the frame steps: (period, phase) when >= 85% of the unique-to-unique distances are equal and
+    the period is 2 or more frames, (1, 0) when nothing is duplicated, else None (irregular). phase = frame index mod period of the first frame of a new picture."""
+    import numpy as np
+    idx = np.where(uniq)[0] + 1                     # frame numbers (step i compares frame i+1 with frame i) that show a new picture
+    if len(idx) < 4:
+        return None
+    g = np.diff(idx)
+    per = int(np.bincount(g).argmax())
+    if np.mean(g == per) < 0.85:
+        return None
+    return per, int(np.bincount(idx % per).argmax())
+
+
+def measure_content(path, s0, e):
+    """Content fps pieces for [s0, e]: unique share of the decoded frames (central region), regular cadence, static scene flag."""
+    wins = [(s0, e - s0)] if e - s0 <= CONTENT_MAX_S else [(s0, CONTENT_WIN_S), ((s0 + e) / 2 - CONTENT_WIN_S / 2, CONTENT_WIN_S), (e - CONTENT_WIN_S, CONTENT_WIN_S)]
+    n = u = 0
+    mots, cads = [], []
+    for w0, wd in wins:
+        fr = gray_frames(path, max(0.0, w0), wd)
+        uq, mot = frame_uniqueness(fr)
+        if uq is None:
+            continue
+        n += len(uq)
+        u += int(uq.sum())
+        mots.append(mot)
+        cads.append(cadence_of(uq))
+    if not n:
+        return {"unique_share": 1.0, "cadence": None, "static": True, "motion": 0.0, "frames": 0}
+    cad = cads[0] if cads and all(c is not None and c[0] == cads[0][0] for c in cads if c is not None) and cads[0] is not None else None
+    return {"unique_share": u / n, "cadence": cad, "static": bool(max(mots) < DUP_MIN_MOTION), "motion": max(mots), "frames": n}
+
+
+def measure_range(path, lo, hi, dur, probe=None):
+    """Everything fpscontent / the render needs about the source range [lo, hi] (+ margin) of one clip: timestamp fps and gaps, content fps, cadence."""
+    s0 = max(0.0, lo - INTERP_MARGIN_S)
+    e = hi + INTERP_MARGIN_S
+    if dur > 0:
+        e = min(e, dur)
+    pr = probe or probe_fps(path)
+    st = ts_stats(probe_timestamps(path, s0, e))
+    ts_fps = st["ts_fps"] or pr["eff"] or pr["avg"]
+    ct = measure_content(path, s0, e)
+    cfps = ts_fps * ct["unique_share"] if not ct["static"] else ts_fps
+    return {"s0": s0, "e": e, "container": pr, "ts": st, "ts_fps": ts_fps, "content": ct, "content_fps": cfps}
+
+
+def classify_range(m, speed):
+    """Reasons (list of 'slow-mo' / 'duplicated frames' / 'vfr gaps' / 'low fps') why a take that shows this range at `speed` is below 75% of the
+    montage fps in EFFECTIVE unique frames per second; [] = fine. speed > 1 (ramps) never counts as slow-mo."""
+    thr = INTERP_FRAC * OUT_FPS
+    why = []
+    base = min(m["ts_fps"], m["content_fps"]) if m["ts_fps"] else 0.0
+    if m["ts"]["vfr"]:
+        why.append("vfr gaps")
+    elif 0 < m["ts_fps"] < thr:
+        why.append("low fps")
+    if m["ts_fps"] >= thr and 0 < m["content_fps"] < thr and not m["content"]["static"]:
+        why.append("duplicated frames")
+    if 0 < speed < 1 and 0 < base * speed < thr:
+        why.append("slow-mo")
+    return why
+
+
+def take_source_ranges(t, srcs, fx=None):
+    """Per source of a take: {"all": (lo, hi), "slow": [(lo, hi, speed)]} in the source's own time, with the SAME range maths the render uses
+    (the no-slow-mo retry window included). Freeze frames (speed 0) are stills and are not measured."""
+    out_ = {}
+    for sg in t["segs"]:
+        a, b, sp, n = sg[:4]
+        if fx is not None and "slow" not in fx and sp in (0.5, 0.0):
+            b, sp = a + n / OUT_FPS, 1.0
+        si = sg[4] if len(sg) > 4 and sg[4] < len(srcs) else 0
+        sa = a - srcs[si]["shift"]
+        need = max((b - a) if sp > 0 else 1.0 / OUT_FPS, n / OUT_FPS) + 0.3
+        rg = out_.setdefault(si, {"all": None, "slow": []})
+        lo, hi = rg["all"] or (sa, sa + need)
+        rg["all"] = (min(lo, sa), max(hi, sa + need))
+        if 0 < sp < 1:
+            rg["slow"].append((sa, sa + max((b - a), n / OUT_FPS * sp) + 0.3, sp))
+    return out_
+
+
+def analyse_takes(plan, fx=None, workers=4):
+    """Measure every (take, source) of a plan. Returns [{"take": i, "si": si, "path", "range", "m", "speed", "why", ...}] (read-only)."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = []
+    probes = {}
+    for ti, t in enumerate(plan["takes"]):
+        srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0}]
+        for si, rg in take_source_ranges(t, srcs, fx).items():
+            if rg["all"] is None:
+                continue
+            jobs.append((ti, si, srcs[si], rg))
+
+    def one(job):
+        ti, si, src, rg = job
+        pth = src["path"]
+        try:
+            if pth not in probes:
+                probes[pth] = probe_fps(pth)
+            pr = probes[pth]
+            lo, hi = rg["all"]
+            m = measure_range(pth, lo, hi, pr["dur"], pr)
+            spd = min([s_[2] for s_ in rg["slow"]], default=1.0)
+            return {"take": ti, "si": si, "path": pth, "range": (lo, hi), "slow": rg["slow"], "m": m, "speed": spd, "why": classify_range(m, spd)}
+        except Exception as ex:
+            return {"take": ti, "si": si, "path": pth, "range": rg["all"], "slow": rg["slow"], "m": None, "speed": 1.0, "why": [], "error": f"{type(ex).__name__}: {ex}"}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        return list(ex.map(one, jobs))
+
+
+def detect_dup_chain(path, s0, d):
+    """The duplicate-removal prefix for the segment [s0, s0+d) of `path`, measured on the SAME extraction the segment is cut from, plus the unique
+    rate: (prefix filter, unique fps, how). Regular cadence: select by the detected phase and re-time to the exact original times; irregular: mpdecimate."""
+    fr = gray_frames(path, s0, min(d, 3.0))
+    uq, mot = frame_uniqueness(fr)
+    if uq is None or mot < DUP_MIN_MOTION:
+        return "", 0.0, "none"
+    pr = probe_fps(path)
+    f = pr["eff"] or pr["avg"] or float(OUT_FPS)
+    cad = cadence_of(uq)
+    if cad is not None and cad[0] >= 2:
+        per, ph = cad
+        return (f"select='eq(mod(n\\,{per})\\,{ph})',setpts=(N*{per}+{ph})/({f:.5f}*TB),", f / per, f"cadence {per} phase {ph}")
+    if cad is not None and cad[0] == 1:
+        return "", f, "none"
+    share = float(uq.mean())
+    return f"mpdecimate,setpts=N/({f * share:.5f}*TB),", f * share, "mpdecimate"
+
+
+def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
+    """Returns the plan to build the filter from (the SAME plan object when nothing is interpolated)."""
+    if not cfg.get("interpolate_low_fps", True):
+        out("fps: interpolation off (setting)")                # V6.9.7: also the Settings checkbox (config key interpolate_low_fps); nothing is probed
+        return plan
+    res = analyse_takes(plan, fx)
+    n_takes = len(plan["takes"])
+    bad_ = [r_ for r_ in res if r_.get("error")]
+    cand = [r_ for r_ in res if r_["why"]]
+    cnt = {k: sum(1 for r_ in cand if k in r_["why"]) for k in ("slow-mo", "duplicated frames", "vfr gaps", "low fps")}
+    reasons = f"slow-mo {cnt['slow-mo']}, duplicated {cnt['duplicated frames']}, vfr {cnt['vfr gaps']}" + (f", low-fps {cnt['low fps']}" if cnt["low fps"] else "")
+    if not cand:
+        out(f"fps: {n_takes} takes probed, 0 low-effective-fps" + (f" ({len(bad_)} unreadable)" if bad_ else ""))
+        return plan
+    done, fell = 0, 0
+    new_takes = list(plan["takes"])
+    INTERP_STATE["mci_slow"] = False
+    idx = 0
+    by_take = {}
+    for r_ in cand:
+        by_take.setdefault(r_["take"], []).append(r_)
+    for ti in sorted(by_take):
+        t = plan["takes"][ti]
+        srcs = [dict(s) for s in (t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"], "audio": t["audio"],
+                                                       "a_stream": 0, "gain_db": -6.0}])]
+        changed = False
+        for r_ in by_take[ti]:
+            if CANCEL.is_set():
+                raise RuntimeError("cancelled")
+            si, m = r_["si"], r_["m"]
+            nm = Path(srcs[si]["path"]).name
+            whole = any(k in r_["why"] for k in ("vfr gaps", "low fps", "duplicated frames"))
+            lo, hi = r_["range"] if whole else (min(x[0] for x in r_["slow"]), max(x[1] for x in r_["slow"]))
+            pr = m["container"]
+            s0 = max(0.0, lo - INTERP_MARGIN_S)
+            e = hi + INTERP_MARGIN_S
+            if pr["dur"] > 0:
+                e = min(e, pr["dur"])
+            d = e - s0
+            sp = r_["speed"]
+            urate = min(m["ts_fps"], m["content_fps"]) or m["ts_fps"] or float(OUT_FPS)
+            out(f"effective fps: {nm} {lo:.2f}-{hi:.2f} s container {pr['eff']:.0f}, content {m['content_fps']:.0f}, speed {sp:.2f} -> "
+                f"{min(m['ts_fps'], m['content_fps']) * sp:.0f} effective -> interpolating ({' + '.join(r_['why'])})")
+            if d < 0.2:
+                continue
+            pre, how = "", ""
+            try:
+                if "duplicated frames" in r_["why"]:
+                    pre, urate, how = detect_dup_chain(srcs[si]["path"], s0, d)
+                    urate = urate or float(OUT_FPS) / 2
+            except Exception as ex:
+                out(f"interpolation skipped: {nm} (duplicate detection failed: {type(ex).__name__}: {ex})")
+                fell += 1
+                continue
+            target = float(OUT_FPS)
+            if sp < 1:
+                target = max(float(OUT_FPS), min(INTERP_MAX_FPS, OUT_FPS / sp, INTERP_MAX_X * max(urate, 1.0)))
+                target = float(round(target))
+            seg = Path(tmpdir) / f"seg{idx}.mov"
+            idx += 1
+            why = None
+            t_start = time.time()
+            method = "blend" if INTERP_STATE["mci_slow"] else "mci"
+            for method in ((method,) if method == "blend" else ("mci", "blend")):
+                Path(tmpdir).mkdir(parents=True, exist_ok=True)
+                t_start = time.time()
+                rc, err, _ = _run_timed(interp_segment_cmd(srcs[si]["path"], s0, d, seg, method, target, pre) if (target != OUT_FPS or pre)
+                                        else interp_segment_cmd(srcs[si]["path"], s0, d, seg, method), max(INTERP_MIN_TIMEOUT_S, INTERP_TIMEOUT_X * d))
+                if rc is None and method == "mci":
+                    INTERP_STATE["mci_slow"] = True
+                    out(f"interpolation: motion method needs more than {INTERP_TIMEOUT_X:.0f}x real time on this PC - blend is used instead")
+                    continue
+                why = "timeout (more than %gx the segment)" % INTERP_TIMEOUT_X if rc is None else (None if rc == 0 else "ffmpeg error: " + err.strip()[-120:])
+                break
+            if CANCEL.is_set():
+                raise RuntimeError("cancelled")
+            if why is None:
+                why = interp_validate(srcs[si]["path"], seg, s0, d, pr["eff"] or pr["avg"] or float(OUT_FPS), target)
+            if why:
+                fell += 1
+                out(f"interpolation skipped: {nm} ({why})")
+                try:
+                    seg.unlink()
+                except OSError:
+                    pass
+                continue
+            out(f"interpolated {nm} {s0:.2f}-{e:.2f} s {urate:.0f} -> {target:g} fps method={method}{' (' + how + ' removed first)' if pre else ''} "
+                f"in {time.time() - t_start:.1f} s")
+            srcs[si].update(path=str(seg), shift=round(srcs[si]["shift"] + s0, 6))
+            done += 1
+            changed = True
+        if changed:
+            new_takes[ti] = dict(t, srcs=srcs)
+    out(f"fps: {n_takes} takes probed, {len(cand)} low-effective-fps ({reasons}), {done} interpolated, {fell} fell back")
+    return dict(plan, takes=new_takes) if done else plan
+
+
+def cmd_fpscheck(args):
+    """V6.9.3: python montage.py fpscheck [game] [--limit N] [--all]. Read-only: the real frame rate (ffprobe) of the clips of the newest saved dry plan
+    (montage_data\\plans), or with --all of every cached clip; how many would be interpolation candidates in a montage of OUT_FPS. Writes fpscheck.txt
+    next to montage.py, never a cache."""
+    game = getattr(args, "game", None)
+    if getattr(args, "all", False):
+        clips = load_json(CLIPS_CACHE, {})
+        paths = sorted(r["path"] for r in clips.values() if isinstance(r, dict) and r.get("path") and os.path.exists(r["path"]) and not r.get("error"))
+        if game:
+            cfg = load_config()
+            paths = [p_ for p_ in paths if tag_game(p_, cfg)[0] == game]
+        what = f"all cached clips{' of ' + game if game else ''}"
+    else:
+        plans = sorted((DATA / "plans").glob("*.dry.json"), key=lambda p_: p_.stat().st_mtime) if (DATA / "plans").is_dir() else []
+        plans = [p_ for p_ in plans if not game or load_json(p_, {}).get("game") == game]
+        if not plans:
+            print("fpscheck: no saved dry plan found - run a Dry plan first, or use --all")
+            return
+        pl = load_json(plans[-1], {})
+        paths = []
+        for t in pl.get("takes", []):
+            for s_ in (t.get("srcs") or [{"path": t.get("path")}]):
+                if s_.get("path") and s_["path"] not in paths and os.path.exists(s_["path"]):
+                    paths.append(s_["path"])
+        what = f"the clips of the newest dry plan ({plans[-1].name})"
+    lim = int(getattr(args, "limit", 0) or 0)
+    if lim:
+        paths = paths[:lim]
+    lines, n_cand = [], 0
+    for p_ in paths:
+        try:
+            i = probe_fps(p_)
+        except Exception as ex:
+            lines.append(f"{p_}  unreadable ({ex})")
+            continue
+        cand = 0 < i["eff"] < INTERP_FRAC * OUT_FPS
+        n_cand += cand
+        lines.append(f"{Path(p_).name}  {i['eff']:.2f} fps (avg {i['avg']:.2f}, r {i['r']:.2f}, frames {i['nb']}{', variable' if i['vfr'] else ''})"
+                     + ("  -> interpolation candidate" if cand else ""))
+    head = f"fpscheck: {len(paths)} clips from {what}; {n_cand} would be interpolation candidates in a {OUT_FPS} fps montage (below {INTERP_FRAC * OUT_FPS:.0f} fps)"
+    text = "\n".join([head] + lines)
+    (HERE / "fpscheck.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(written to {HERE / 'fpscheck.txt'}; nothing else was changed)")
+
+
+def _fmt_range(m):
+    return f"{m['s0']:.1f}-{m['e']:.1f} s"
+
+
+def fpscontent_line(name, rng_txt, m, speed, why, extra=""):
+    """One report line of fpscontent for a take / clip range."""
+    pr, st, ct = m["container"], m["ts"], m["content"]
+    cad = ("static scene (not measurable)" if ct["static"] else
+           (f"cadence period {ct['cadence'][0]} phase {ct['cadence'][1]}" if ct["cadence"] and ct["cadence"][0] >= 2 else
+            ("no duplicates" if ct["unique_share"] > 0.97 else "irregular duplicates")))
+    eff = min(m["ts_fps"], m["content_fps"]) * speed
+    info = ""
+    if not why and 40 <= m["ts_fps"] < 0.9 * OUT_FPS and abs(m["ts_fps"] - 50) <= 2.5:
+        info = f" | info: cadence {m['ts_fps']:.0f}->{OUT_FPS} (every 5th frame shown twice, no action)"
+    return (f"{name} {rng_txt}: container avg {pr['avg']:.1f} / r {pr['r']:.1f}, timestamps {m['ts_fps']:.1f} fps, "
+            f"gaps {st['gap_share']:.0%} above 1.5x median (largest {st['max_gap_frames']:.1f} frames), content {m['content_fps']:.1f} fps ({cad}), "
+            f"speed {speed:.2f} -> effective {eff:.1f} fps -> " + ("ok" if not why else "LOW-EFFECTIVE-FPS: " + " + ".join(why)) + info + extra)
+
+
+def cmd_fpscontent(args):
+    """V6.9.6: python montage.py fpscontent [<montage.mp4> | <clip names...> | --all] [--limit N]. Read-only: the EFFECTIVE on-screen fps of every take of a
+    montage (its .plan.json), of the named clips or (--all) of 2 s windows of the cached clips: timestamp fps, VFR gaps, content fps (unique frames),
+    playback speed, verdict. Writes fpscontent.txt next to montage.py, never a cache / flag / config."""
+    tg = list(getattr(args, "target", None) or [])
+    lines, counts, n = [], {"slow-mo": 0, "duplicated frames": 0, "vfr gaps": 0, "low fps": 0}, 0
+    lim = int(getattr(args, "limit", 0) or 0)
+    pj = None
+    if len(tg) == 1 and tg[0].lower().endswith(".mp4") and Path(tg[0]).exists() and not getattr(args, "all", False):
+        f = Path(tg[0])
+        pj = next((q for q in (f.parent / "logs" / (f.stem + ".plan.json"), f.with_suffix(".plan.json")) if q.exists()), None)
+        if not pj and not _FN_TIME.search(f.name):                # a montage file (no recording time in its name): its newest plan
+            cands = sorted(list(f.parent.glob("*.plan.json")) + list((f.parent / "logs").glob("*.plan.json")), key=lambda p_: p_.stat().st_mtime)
+            pj = cands[-1] if cands else None
+    if pj:
+        plan = load_json(pj, {})
+        head = f"fpscontent: takes of {f.name} (plan {pj.name}, {len(plan.get('takes', []))} takes, montage {OUT_FPS} fps)"
+        for r_ in analyse_takes(plan):
+            if lim and n >= lim:
+                break
+            n += 1
+            nm = Path(r_["path"]).name
+            if r_.get("error"):
+                lines.append(f"take {r_['take'] + 1}: {nm} unreadable ({r_['error']})")
+                continue
+            sp_all = [sg[2] for sg in plan["takes"][r_["take"]]["segs"] if sg[2] > 0]
+            spd = r_["speed"] if r_["speed"] < 1 else (max(sp_all) if sp_all else 1.0)
+            why = r_["why"]
+            for k in why:
+                counts[k] += 1
+            lines.append("take %d: " % (r_["take"] + 1) + fpscontent_line(nm, _fmt_range(r_["m"]), r_["m"], r_["speed"] if r_["speed"] < 1 else 1.0, why,
+                                                                         f" | plan speed {spd:.2f}{' (slow-mo)' if r_['speed'] < 1 else ' (ramp)' if spd > 1.01 else ''}"))
+    else:
+        clips = load_json(CLIPS_CACHE, {})
+        allp = sorted(r["path"] for r in clips.values() if isinstance(r, dict) and r.get("path") and os.path.exists(r["path"]) and not r.get("error"))
+        if getattr(args, "all", False) or not tg:
+            paths = allp
+            if not getattr(args, "all", False):
+                print("fpscontent: give a montage .mp4, clip names or --all")
+                return
+        else:
+            paths = []
+            for t_ in tg:
+                paths += [q for q in ([t_] if os.path.exists(t_) else allp) if os.path.exists(q) and (q == t_ or t_.lower() in Path(q).name.lower())]
+        paths = list(dict.fromkeys(paths))[:lim or (40 if getattr(args, "all", False) else 1000)]
+        head = f"fpscontent: {len(paths)} clip(s), 2 s window in the middle of each (montage {OUT_FPS} fps)"
+        for q in paths:
+            try:
+                pr = probe_fps(q)
+                mid = max(0.0, pr["dur"] / 2 - 1.0)
+                m = measure_range(q, mid + INTERP_MARGIN_S, mid + 2.0 - INTERP_MARGIN_S, pr["dur"], pr)
+                why = classify_range(m, 1.0)
+            except Exception as ex:
+                lines.append(f"{Path(q).name} unreadable ({ex})")
+                continue
+            n += 1
+            for k in why:
+                counts[k] += 1
+            lines.append(fpscontent_line(Path(q).name, _fmt_range(m), m, 1.0, why))
+    summ = (f"summary: {n} measured, takes per reason: slow-mo {counts['slow-mo']}, duplicated frames {counts['duplicated frames']}, "
+            f"vfr gaps {counts['vfr gaps']}, low fps {counts['low fps']}")
+    text = "\n".join([head] + lines + [summ])
+    (HERE / "fpscontent.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(written to {HERE / 'fpscontent.txt'}; nothing else was changed)")
+
+
+def cmd_interpbench(args):
+    """V6.9.6: python montage.py interpbench [clip]. Seconds of ffmpeg time per source second for the motion (mci) and the blend interpolation on a 5 s
+    sample, and the verdict the render will reach on THIS PC. Writes nothing into montage_data (a temp folder that is deleted)."""
+    import tempfile
+    q = getattr(args, "clip", None)
+    cands = []
+    if q and os.path.exists(q):
+        cands = [q]
+    else:
+        clips = load_json(CLIPS_CACHE, {})
+        allp = sorted(r["path"] for r in clips.values() if isinstance(r, dict) and r.get("path") and os.path.exists(r["path"]) and not r.get("error"))
+        if q:
+            allp = [p_ for p_ in allp if q.lower() in Path(p_).name.lower()]
+        cands = allp
+    if not cands:
+        print("interpbench: no clip found (give a path or a name fragment)")
+        return
+    pick = cands[0]
+    for p_ in cands[:12]:                                   # the first clip that would be a candidate, else the first clip
+        try:
+            pr = probe_fps(p_)
+            if classify_range(measure_range(p_, 0.0, 2.0, pr["dur"], pr), 1.0):
+                pick = p_
+                break
+        except Exception:
+            continue
+    pr = probe_fps(pick)
+    s0 = max(0.0, min(pr["dur"] - 5.0, pr["dur"] / 3)) if pr["dur"] > 5.5 else 0.0
+    d = min(5.0, pr["dur"] - s0) if pr["dur"] else 5.0
+    res = {}
+    with tempfile.TemporaryDirectory(prefix="interpbench_") as td:
+        for method in ("mci", "blend"):
+            t0 = time.time()
+            rc, err, _ = _run_timed(interp_segment_cmd(pick, s0, d, Path(td) / f"{method}.mov", method), 600)
+            res[method] = (time.time() - t0) / d if rc == 0 else None
+    fmt = lambda v: "failed" if v is None else f"{v:.1f} s per source second"
+    ok = res["mci"] is not None and res["mci"] <= INTERP_TIMEOUT_X
+    print(f"interpbench: {Path(pick).name} ({pr['eff']:.1f} fps), {d:.1f} s sample from {s0:.1f} s")
+    print(f"  motion (mci):  {fmt(res['mci'])}")
+    print(f"  blend:         {fmt(res['blend'])}")
+    print(f"  verdict: " + ("mci ok (a segment finishes within the %gx real-time limit)" % INTERP_TIMEOUT_X if ok else
+                            "too slow, blend will be used (mci needs more than %gx real time on this PC)" % INTERP_TIMEOUT_X))
+    print("(nothing was written into montage_data)")
+
+
+def render_tmpdir(outfile):
+    return Path(outfile).with_name(Path(outfile).stem + ".interp")
+
+
 def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, effects=True):
     """Encode with all effects; if ffmpeg fails, retry without the failing effect, then without all effects. NVENC -> x264.
     The finished file must last exactly as long as the plan (else it is reported as a failure, never silently kept)."""
@@ -6743,8 +8222,24 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     elog = LOG_DIR / "last_render_stderr.txt"
     gp = LOG_DIR / "last_filter.txt"
     fx, failed = (set(FX_ALL) if effects else {"slow"}), []
+    itmp = render_tmpdir(outfile)
+    try:                                                   # V6.9.3: low-fps clips are interpolated first (only the ranges the plan uses)
+        pr_ = interp_prepare(p, cfg, itmp, fx)
+    except Exception as ex:
+        if CANCEL.is_set():
+            shutil.rmtree(itmp, ignore_errors=True)
+            raise RuntimeError("cancelled")
+        out(f"interpolation skipped: {type(ex).__name__}: {ex}")
+        pr_ = p
+    try:
+        return _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nvenc, tmp, elog, gp, fx, failed, D)
+    finally:
+        shutil.rmtree(itmp, ignore_errors=True)
+
+
+def _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nvenc, tmp, elog, gp, fx, failed, D):
     while True:
-        inputs, graph = build_filter(p, cfg, preview, fx)
+        inputs, graph = build_filter(pr_, cfg, preview, fx)
         gp.write_text(graph, encoding="utf-8")
         txt = ""
         for use_nv in ((nvenc, False) if nvenc else (False,)):
@@ -6989,7 +8484,7 @@ def weekly_song_fit(song, an, sinfo, runners):
         return song, an, sinfo, runners
     for s_, sc_ in runners:
         try:
-            a2 = analyse_song(s_["path"], s_.get("csv_bpm"))
+            a2 = get_songmap(s_["path"], s_.get("csv_bpm"))
         except Exception:
             continue
         if sec(a2) >= WEEKLY_MIN_S:
@@ -6998,6 +8493,381 @@ def weekly_song_fit(song, an, sinfo, runners):
             return s_, a2, sc_, [r for r in runners if r[0] is not s_]
     out(f"song {song.get('title') or Path(song['path']).stem} has only {sec(an):.0f} s (< {WEEKLY_MIN_S:.0f} s) and no ranked song is longer")
     return song, an, sinfo, runners
+
+
+# ======================================================================= V6.9: CS2 neighbour-clip pairing
+# A fight recorded as a multikill can be split over 2-3 consecutive clips. After the selection and before the planner, the neighbours
+# (by recording time) of a selected CS2 clip that shows a kill at its edge are added to the candidate pool as "pair partners". The
+# planner's existing continuation / duplicate merge and frame-match stitch verification decide whether they are joined; a partner is
+# never planned alone. Nothing here reads or decodes a clip: only file names, the cached clip records and the cached kill entries.
+PAIR_EDGE_S = 3.0                       # a kill this close to either end of the clip makes it a candidate for a larger fight
+PAIR_SINGLE_EDGE_S = 4.0                # a 1k clip: its single kill this close to either end
+PAIR_MAX_GAP_S = 12.0                   # build_events() tests continuations inline (not reusable on a pair outside the selection)
+PAIR_MAX_HOPS, PAIR_MAX_EXTRA = 2, 3    # per direction / per selected clip
+PAIR_CAP_S = 2.0                        # hard cap for the whole step
+PAIR_TEST_HOOK = [None]                 # tests only: called at the start of the step (inject an error / a delay)
+
+
+def pair_clip_start(path):
+    """Recording start from the file name ('Counter-strike 2 2025.02.08 - 19.48.57.15.DVR.mp4', 'Replay 2026-06-08 23-36-22.mov'; the
+    '_1' / '_1_1' variants share the base time), or None. Never guessed: no mtime fallback."""
+    m = _FN_TIME.search(Path(str(path)).name)
+    if not m:
+        return None
+    try:
+        return datetime.datetime(*[int(x) for x in m.groups()]).timestamp()
+    except ValueError:
+        return None
+
+
+def save_key(rec):
+    """V6.9.7.1: the save time (modified time = clip END) of a clip record; 0.0 when unknown."""
+    a = clip_anchor(rec["path"], rec.get("dur"))
+    return a["end"] if a else 0.0
+
+
+def pair_time_index(recs):
+    """Sorted [(start, pkey, end, rec)] of the CS2 clips with a parsable name and a cached duration, plus the clips skipped."""
+    idx, skipped = [], []
+    for r in recs:
+        if r.get("game", "cs2") != "cs2" or r.get("error") or not r.get("w"):
+            continue
+        dur = r.get("dur")
+        anc = clip_anchor(r["path"], dur) if dur else None                 # V6.9.7: the name time is START for DVR names, END (save time) for OBS names
+        if anc is None or not anc["provable"]:
+            skipped.append(r["path"])
+            continue
+        idx.append((anc["start"], _pkey(r["path"]), anc["end"], r))
+    idx.sort(key=lambda x: (x[0], x[1]))
+    return idx, skipped
+
+
+def pair_player_kills(rec, store, det, cfg):
+    """None = no cached kill entry (never scanned); else the cached kill times of the player (no decoding, no scan)."""
+    e = store.get(kills_key(rec, "cs2", det))
+    if not e or e.get("error"):
+        return None
+    return [float(k["t"]) for k in analyse_clip_entry(rec, e, cfg, "cs2")["kills"]]
+
+
+def pair_is_candidate(ts, dur):
+    if not ts:
+        return False
+    if any(t <= PAIR_EDGE_S or t >= dur - PAIR_EDGE_S for t in ts):
+        return True
+    return len(ts) == 1 and (ts[0] <= PAIR_SINGLE_EDGE_S or ts[0] >= dur - PAIR_SINGLE_EDGE_S)
+
+
+def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=None):
+    """Neighbour lookup for the selected CS2 clips. Returns {"partners": [(partner rec, selected clip path, gap s)], "checked": N,
+    "lookups": L, "skip": {...}, "lines": [log lines]}. recs = cached clip records, selected = set of path keys."""
+    kills_fn = kills_fn or (lambda r: pair_player_kills(r, store, det, cfg))
+    idx, bad = pair_time_index(recs)
+    pos = {k: i for i, (_, k, _, _) in enumerate(idx)}
+    res = {"partners": [], "checked": 0, "lookups": 0, "lines": [], "skip": {"not scanned": 0, "used": 0, "no kills": 0, "no match": 0}}
+    sk, lines = res["skip"], res["lines"]
+    added = set()
+    for key in sorted(selected):
+        if deadline and time.monotonic() > deadline:
+            raise TimeoutError("time cap reached")
+        if key not in pos:
+            if any(_pkey(r["path"]) == key and r.get("game", "cs2") == "cs2" for r in recs):
+                sk["no match"] += 1                           # unparsable name / no duration: skipped, never guessed
+            continue
+        i0 = pos[key]
+        t0, _, t1, rec = idx[i0]
+        res["checked"] += 1
+        ts = kills_fn(rec)
+        if ts is None:
+            sk["not scanned"] += 1
+            continue
+        if not pair_is_candidate(ts, t1 - t0):
+            continue
+        res["lookups"] += 1
+        state = {-1: i0, 1: i0}                               # the far end of the chain in each direction
+        alive = {-1: True, 1: True}
+        n_extra = 0
+        for _hop in range(PAIR_MAX_HOPS):
+            for d in (-1, 1):
+                if not alive[d] or n_extra >= PAIR_MAX_EXTRA:
+                    continue
+                cur = idx[state[d]]
+                j = state[d] + d
+                if not 0 <= j < len(idx):                         # no clip on that side at all
+                    alive[d] = False
+                    continue
+                nb = idx[j]
+                gap = (nb[0] - cur[2]) if d > 0 else (cur[0] - nb[2])
+                nm = Path(nb[3]["path"]).name
+                if gap > PAIR_MAX_GAP_S or nb[1] in selected or nb[1] in added:
+                    alive[d] = False
+                    sk["no match"] += 1
+                    continue
+                nk = kills_fn(nb[3])
+                if nk is None:
+                    alive[d] = False
+                    sk["not scanned"] += 1
+                    lines.append(f"neighbour not scanned: {nm}")
+                    continue
+                if nb[1] in used:
+                    alive[d] = False
+                    sk["used"] += 1
+                    lines.append(f"neighbour already used: {nm}")
+                    continue
+                if not nk:
+                    alive[d] = False
+                    sk["no kills"] += 1
+                    lines.append(f"neighbour has no kills of the player: {nm}")
+                    continue
+                added.add(nb[1])
+                n_extra += 1
+                state[d] = j
+                res["partners"].append((nb[3], rec["path"], gap))
+                lines.append(f"pair partner of {Path(rec['path']).name}: {nm} (gap {gap:.1f} s)")
+    res["partners"].sort(key=lambda x: (save_key(x[0]), x[0]["path"]))       # V6.9.6: never in discovery order; V6.9.7.1: by save time
+    return res
+
+
+def pair_summary(res):
+    s = res["skip"]
+    return (f"pairing: checked {res['checked']} clips, {len(res['partners'])} partner(s) added, {sum(s.values())} skipped "
+            f"({s['not scanned']} not scanned / {s['used']} used / {s['no kills']} no kills / {s['no match']} no match; "
+            f"neighbour window: gap <= {PAIR_MAX_GAP_S:.0f} s - the planner's continuation test is inline in build_events and not "
+            "reusable outside the selection)")
+
+
+def pairing_run(cfg, recs, selected_paths, quiet=False):
+    """The whole neighbour step, guarded: any error / unparsable name / missing cache / more than PAIR_CAP_S = one 'pairing skipped:
+    <reason>' line and None (the original selection stays). Runs in a helper thread so a hang cannot hold the plan up."""
+    sel = {_pkey(p) for p in selected_paths}
+    if not sel:
+        return None
+    box = {}
+
+    def work():
+        try:
+            if PAIR_TEST_HOOK[0]:
+                PAIR_TEST_HOOK[0]()
+            det = Detector("cs2")
+            store = load_kills_cache()
+            box["res"] = pair_find(cfg, recs, sel, store, det, used_dates(), deadline=time.monotonic() + PAIR_CAP_S)
+        except BaseException as ex:                          # noqa: BLE001 - nothing may escape the step
+            box["err"] = f"{type(ex).__name__}: {ex}"
+    log = LOGONLY if quiet else out
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(PAIR_CAP_S)
+    if th.is_alive():
+        log(f"pairing skipped: timeout (more than {PAIR_CAP_S:.0f} s)")
+        return None
+    if "err" in box or "res" not in box:
+        log(f"pairing skipped: {box.get('err', 'no result')}")
+        return None
+    res = box["res"]
+    log(pair_summary(res))
+    for l_ in res["lines"]:
+        log(l_)
+    return res
+
+
+def pairing_result_line(res, plan):
+    """After the planner: how many partners were stitched into a take, how many were rejected / left out."""
+    if not res or not res["partners"]:
+        return None
+    in_takes = {_pkey(x["path"]) for t in plan["takes"] for x in t.get("srcs", [])} | {_pkey(t["path"]) for t in plan["takes"]}
+    ok = [p for p, _, _ in res["partners"] if _pkey(p["path"]) in in_takes]
+    return f"pairing result: {len(ok)} pair(s) stitched, {len(res['partners']) - len(ok)} rejected"
+
+
+def pair_event_clips(e):
+    return {_pkey(p) for p in _ev_paths(e)} | {_pkey(x["path"]) for x in e.get("parts", []) if x.get("path")}
+
+
+def pairing_replace_events(res, pool, picked, game, cfg, seed):
+    """Weekly / Auto pick: each picked event whose clip has partners is re-built from its clips + partners with the SAME build_events();
+    the merged / stitched event replaces the single one in its slot (the pick's length and count are not recomputed). If the planner's
+    stitch is rejected build_events() falls back to the single clip: the pick stays as it was."""
+    by_clip = {}
+    for p, of, _ in res["partners"]:
+        by_clip.setdefault(_pkey(of), []).append(_pkey(p["path"]))
+    from rapidfuzz import fuzz
+    out_ev = list(picked)
+    for i, e in enumerate(picked):
+        mine = pair_event_clips(e)
+        ps = {p for c in mine for p in by_clip.get(c, [])}
+        if not ps:
+            continue
+        sub = sorted([it for it in pool if _pkey(it["rec"]["path"]) in mine | ps], key=lambda it: (save_key(it["rec"]), it["rec"]["path"]))
+        if not any(_pkey(it["rec"]["path"]) in ps for it in sub):
+            continue
+        LEDGER_SUBCALL[0] = True
+        try:
+            evs2, _ = build_events(sub, game, cfg, random.Random(seed))
+        finally:
+            LEDGER_SUBCALL[0] = False
+        # accepted: an event that uses a partner clip, was not a fallback after a rejected stitch, shows MORE kills than the single
+        # event and still contains all of its kills (so it is that fight, not a separate event of the partner clip)
+        have = lambda x: [_alnum((v or "").lower()) for v in x["victims"]]
+        merged = [x for x in evs2 if {_pkey(q["path"]) for q in x.get("parts", [])} & ps
+                  and "stitch rejected" not in x.get("stitch_note", "") and x["n"] > e["n"]
+                  and all(any(fuzz.ratio(v, u) >= 80 for u in have(x)) for v in have(e) if v)]
+        if merged:
+            out_ev[i] = max(merged, key=lambda x: x["n"])
+    return out_ev
+
+
+def cmd_pairscan(args):
+    """V6.9: python montage.py pairscan cs2 [--limit N]. Read-only: candidate pairs among ALL cached CS2 clips from the time index and the
+    cached kill entries (no scan, no decoding, no cache or flag written; only pairscan_cs2.txt next to montage.py)."""
+    cfg = load_config()
+    det = Detector("cs2")
+    store = load_kills_cache()
+    clips = load_json(CLIPS_CACHE, {})
+    recs = []
+    for p in sorted(set(walk_files(clip_roots(cfg), VIDEO_EXT, MIN_VIDEO, cfg))):
+        try:
+            if tag_game(p, cfg)[0] != "cs2":
+                continue
+            rec = clips.get(file_key(p))
+        except OSError:
+            continue
+        if rec and not rec.get("error"):
+            recs.append(dict(rec, path=p, game="cs2"))
+    lines, n_rows = pairscan_rows(cfg, recs, store, det, used_dates(), int(getattr(args, "limit", 0) or 30))
+    text = "\n".join(lines)
+    (HERE / "pairscan_cs2.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"({n_rows} neighbouring pairs; written to {HERE / 'pairscan_cs2.txt'}; nothing else was changed)")
+
+
+def pair_group(recs, path, store, det, cfg, used):
+    """The fight group of one CS2 clip as the pairing step sees it: the clip, then its neighbours in both directions (gap <= PAIR_MAX_GAP_S, an overlap is
+    a negative gap), up to PAIR_MAX_HOPS per side and PAIR_MAX_EXTRA clips, each with the reason it is in or out. Reads caches only.
+    Returns (members [(start, rec, kills|None, overlap_or_gap_to_previous)], notes)."""
+    idx, _ = pair_time_index(recs)
+    pos = {k: i for i, (_, k, _, _) in enumerate(idx)}
+    key = _pkey(path)
+    if key not in pos:
+        return [], ["the clip is not in the time index (unparsable name, no cached duration or not a cached CS2 clip)"]
+    notes, members, extra = [], [pos[key]], 0
+    for d in (-1, 1):
+        j = pos[key]
+        for _hop in range(PAIR_MAX_HOPS):
+            cur = idx[j]
+            j += d
+            if not 0 <= j < len(idx) or extra >= PAIR_MAX_EXTRA:
+                break
+            nb = idx[j]
+            gap = (nb[0] - cur[2]) if d > 0 else (cur[0] - nb[2])
+            nm = Path(nb[3]["path"]).name
+            ks = pair_player_kills(nb[3], store, det, cfg)
+            if gap > PAIR_MAX_GAP_S:
+                notes.append(f"{nm}: not a partner (gap {gap:.1f} s > {PAIR_MAX_GAP_S:.0f} s)")
+                break
+            if ks is None:
+                notes.append(f"{nm}: not scanned, the planner never uses it")
+                break
+            if nb[1] in used:
+                notes.append(f"{nm}: already used in a montage")
+                break
+            if not ks:
+                notes.append(f"{nm}: no kills of the player")
+                break
+            members.append(j)
+            extra += 1
+    members.sort(key=lambda i: (idx[i][0], idx[i][1]))
+    rows = []
+    for n_, i in enumerate(members):
+        t0, k_, t1, r_ = idx[i]
+        prev = idx[members[n_ - 1]] if n_ else None
+        rows.append((t0, r_, pair_player_kills(r_, store, det, cfg), (t0 - prev[2]) if prev else None))
+    return rows, notes
+
+
+def cmd_grouporder(args):
+    """V6.9.6: python montage.py grouporder cs2 "<clip name>". Read-only: the fight group of that clip (its pair partners), the start time of every clip,
+    the overlap / gap to the previous one and the order the planner will use and why. Writes grouporder.txt next to montage.py, changes nothing."""
+    cfg = load_config()
+    det = Detector("cs2")
+    store = load_kills_cache()
+    clips = load_json(CLIPS_CACHE, {})
+    recs = []
+    for p_ in sorted(set(walk_files(clip_roots(cfg), VIDEO_EXT, MIN_VIDEO, cfg))):
+        try:
+            if tag_game(p_, cfg)[0] != "cs2":
+                continue
+            rec = clips.get(file_key(p_))
+        except OSError:
+            continue
+        if rec and not rec.get("error"):
+            recs.append(dict(rec, path=p_, game="cs2"))
+    q = str(args.clip).lower()
+    hit = [r_ for r_ in recs if Path(r_["path"]).name.lower() == q] or [r_ for r_ in recs if q in Path(r_["path"]).name.lower()]
+    if not hit:
+        lines = [f"grouporder: no cached CS2 clip matches '{args.clip}'"]
+    else:
+        lines = grouporder_lines(recs, hit[0], store, det, cfg, used_dates())
+    text = "\n".join(lines)
+    (HERE / "grouporder.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(written to {HERE / 'grouporder.txt'}; nothing else was changed)")
+
+
+def grouporder_lines(recs, rec, store, det, cfg, used):
+    rows, notes = pair_group(recs, rec["path"], store, det, cfg, used)
+    lines = [f"grouporder cs2: fight group of {Path(rec['path']).name}"]
+    if not rows:
+        return lines + ["  " + n_ for n_ in notes]
+    base = rows[0][0]
+    ties = {}
+    for t0, r_, ks, _ in rows:
+        ties.setdefault(t0, []).append(Path(r_["path"]).name)
+    for n_, (t0, r_, ks, gap) in enumerate(rows, 1):
+        rel = (f"{'overlaps the previous one by %.1f s' % -gap if gap < 0 else 'gap %.1f s after the previous one' % gap}" if gap is not None else "first")
+        lines.append(f"  {n_}. {Path(r_['path']).name}  starts {datetime.datetime.fromtimestamp(t0):%H:%M:%S} (+{t0 - base:.1f} s), {float(r_.get('dur') or 0):.1f} s long, "
+                     f"{len(ks) if ks is not None else '?'} kill(s), {rel}{'  <- the clip asked about' if _pkey(r_['path']) == _pkey(rec['path']) else ''}")
+    lines.append("  order the planner will use: " + " -> ".join(str(i) for i in range(1, len(rows) + 1)) +
+                 "  (chronological by the recording time in the clip names; the gap logic is not used because the clips overlap)")
+    for t0, names in ties.items():
+        if len(names) > 1:
+            lines.append(f"  same base time {datetime.datetime.fromtimestamp(t0):%H:%M:%S}: {', '.join(names)} - their order is decided by the frame-match stitch verification at plan time, never by file-name sort")
+    lines += ["  " + n_ for n_ in notes]
+    return lines
+
+
+def pairscan_rows(cfg, recs, store, det, used, limit=30):
+    idx, bad = pair_time_index(recs)
+    kc = {}
+
+    def kills(r):
+        if r["path"] not in kc:
+            kc[r["path"]] = pair_player_kills(r, store, det, cfg)
+        return kc[r["path"]]
+    rows = []
+    for a, b in zip(idx, idx[1:]):
+        gap = b[0] - a[2]
+        if gap > PAIR_MAX_GAP_S:
+            continue
+        ka, kb = kills(a[3]), kills(b[3])
+        why = []
+        if ka is None or kb is None:
+            why.append("not scanned: " + ", ".join(Path(r["path"]).name for r, k in ((a[3], ka), (b[3], kb)) if k is None))
+        else:
+            if not ka or not kb:
+                why.append("no kills of the player in " + ("both" if not ka and not kb else "the first" if not ka else "the second"))
+            if not (pair_is_candidate(ka, a[2] - a[0]) or pair_is_candidate(kb, b[2] - b[0])):
+                why.append("no kill within the edge window of either clip")
+        used_b = [Path(r["path"]).name for _, k, _, r in (a, b) if k in used]
+        if used_b:
+            why.append("already used: " + ", ".join(used_b))
+        rows.append((len(ka or []) + len(kb or []), a, b, gap, ka, kb, why))
+    rows.sort(key=lambda r: (-r[0], r[1][0]))
+    lines = [f"pairscan cs2: {len(idx)} clips in the time index ({len(bad)} with an unparsable name skipped), "
+             f"{len(rows)} neighbouring pairs (gap <= {PAIR_MAX_GAP_S:.0f} s); top {min(limit, len(rows))} by combined kills"]
+    for tot, a, b, gap, ka, kb, why in rows[:limit]:
+        lines.append(f"{Path(a[3]['path']).name}  +  {Path(b[3]['path']).name}  gap {gap:.1f} s  kills {len(ka) if ka is not None else '?'} + "
+                     f"{len(kb) if kb is not None else '?'}  -> " + ("qualifies" if not why else "no: " + "; ".join(why)))
+    return lines, len(rows)
 
 
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True):
@@ -7015,7 +8885,13 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         out(f"auto: {len(paths)} uncached clips to scan this run (last {cfg['auto_recent_days']} days + up to {cfg['auto_old_per_run']} older)")
     if paths and scan:
         run_scan(cfg, [game], paths)
-    pool, st = game_pool(cfg, game, set(paths) if manual else None)
+    pair = None
+    pool_paths = set(paths) if manual else None
+    if game == "cs2" and manual and paths:                 # V6.9: neighbour clips of the ticked clips join the candidate pool
+        pair = pairing_run(cfg, tagged, paths, quiet=not scan)
+        if pair and pair["partners"]:
+            pool_paths |= {p_["path"] for p_, _, _ in pair["partners"]}
+    pool, st = game_pool(cfg, game, pool_paths)
     au = st["audio"]
     out(f"{game}: {st['tagged']} clips in included folders, {st['scanned']} scanned, {st['with_kills']} with detected kills; "
         f"{au['raw']} kills found, {au['no_shot']} without a heard gunshot (kept, audio is only a bonus), {au['death_lock']} dropped after my death, {au['kept']} usable")
@@ -7024,7 +8900,15 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
                            f"({au['raw']} found, {au['death_lock']} dropped after my death; rejected rows are listed above with their reasons). "
                            "Run Troubleshoot > Self-test detection to see the scores, or scan more clips.")
     seed = int(seed) if seed else random.randrange(1, 10 ** 6)
-    events, notes = build_events(pool, game, cfg, random.Random(seed))
+    if pair and pair["partners"]:                          # V6.9: the ticked clips are planned exactly as before; a partner only joins one of
+        sel_ = {_pkey(p_) for p_ in paths}                 # their events when the planner's own merge + stitch accepts it (never its own take)
+        events, notes = build_events([it for it in pool if _pkey(it["rec"]["path"]) in sel_], game, cfg, random.Random(seed))
+        try:
+            events = pairing_replace_events(pair, pool, events, game, cfg, seed)
+        except Exception as ex:
+            out(f"pairing skipped: {type(ex).__name__}: {ex}")
+    else:
+        events, notes = build_events(pool, game, cfg, random.Random(seed))
     if not events:
         raise RuntimeError("no usable kill events (utility kills are excluded)")
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
@@ -7033,6 +8917,14 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         notes += wk_notes
         for n_ in wk_notes:
             out(n_)
+        if game == "cs2":                                  # V6.9: neighbour clips of the picked CS2 clips (same slot, same count)
+            sel_ = set().union(*[pair_event_clips(e) for e in events]) if events else set()
+            pair = pairing_run(cfg, tagged, sel_, quiet=not scan)
+            if pair and pair["partners"]:
+                try:
+                    events = pairing_replace_events(pair, pool, events, game, cfg, seed)
+                except Exception as ex:
+                    out(f"pairing skipped: {type(ex).__name__}: {ex}")
     songs, unmatched, csvname = song_pool(cfg)
     song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path)
     if not manual and not song_path:
@@ -7071,6 +8963,20 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     plan["notes"] = list(plan["notes"]) + fixes
     for f_ in fixes:
         out(f_)
+    if pair:
+        pr_ = pairing_result_line(pair, plan)
+        if pr_:
+            (out if scan else LOGONLY)(pr_)
+    try:                                                   # V6.9.7: the kill ledger of this run (never fails or changes a run)
+        led_ = LAST_LEDGER[0]
+        if led_ is not None and led_.rows:
+            ledger_finalize(led_, events, pool_ev, plan)
+            for l_ in ledger_report(led_):
+                out(l_)
+            if scan:
+                ledger_save(led_, plan)
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"kill ledger skipped: {type(ex).__name__}: {ex}")
     if plan["duration"] > plan["song"]["section_s"] + 1e-3:              # never render past the end of the music
         raise RuntimeError(f"plan is {plan['duration']:.1f} s but the song only has {plan['song']['section_s']:.1f} s from "
                            f"{ts(plan['song']['start_t'])} - not rendered")
@@ -7971,7 +9877,7 @@ class SongMapView:
 
         def work():
             try:
-                an = analyse_song(path, csv_bpm)
+                an = get_songmap(path, csv_bpm)
                 self.app.q.put(("call", lambda: self.show(an)))
             except Exception as ex:
                 msg = f"song map failed: {ex}"
@@ -7980,6 +9886,7 @@ class SongMapView:
 
     def show(self, an):
         self.an = an
+        self.win.title(f"Song map ({SONGMAP_CHOICES.get(str(an.get('songmap_version', 'v1'))[:2], 'Songmap V1')}) - {Path(self.path).name}" if getattr(self, "path", None) else self.win.title())
         drops = ", ".join(f"{ts(d['t'])} ({d['strength']:.2f})" for d in an.get("drops", [])) or "none"
         self.info.set(f"BPM {an['bpm']} ({an.get('bpm_src')}, librosa {an.get('bpm_librosa')}, agree {an.get('librosa_agree_ms')} ms)   "
                       f"beats {len(an['beats'])}   rhythm {an.get('rhythm')}   loudness {an.get('lufs')} LUFS   drops: {drops}   "
@@ -8453,8 +10360,10 @@ class App:
                 pass                                               # half-typed number: keep the old value
         cfg["length_s"] = "optimal" if self.set_opt.get() else max(LEN_MIN_S, min(LEN_MAX_S, int(self.set_len.get())))
         cfg["style"], cfg["placement"] = self.set_style.get(), self.set_place.get()
+        cfg["songmap_version"] = next((k for k, lab in SONGMAP_CHOICES_UI.items() if lab == self.set_songmap.get()), SONGMAP_DEFAULT)
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
+        cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
         if self.set_names:
             cfg["player_names"] = {g: norm_names(v.get(), g) for g, v in self.set_names.items()}
@@ -8947,6 +10856,8 @@ class App:
         self.make_sortable(self.ctree, self.apply_filter, {"#0": "Clip", "date": "Date", "len": "Length", "kills": "Kills",
                                                            "used": "Used"})
         self.ctree.bind("<Button-1>", self.on_tree_click)
+        self.ctree.bind("<Button-3>", self.on_tree_context)          # V6.9.7: right-click menu (Valorant): Allow utility kills (this clip)
+        self.ctree.bind("<Button-2>", self.on_tree_context)
         self.ctree.bind("<Double-1>", self.on_tree_double)
         s2 = ttk.LabelFrame(mid, text="Step 2: choose the song (newest added first)", padding=4)
         mid.add(s1, minsize=int(180 * UI_SCALE[0]), stretch="always", padx=2, pady=2)
@@ -9173,9 +11084,66 @@ class App:
             self.update_status()
         return "break"
 
+    def util_targets(self, iid):
+        """V6.9.7: (targets, is_on_for_the_first) for the right-click menu, or None (hidden: not a Valorant list). The ticked rows are the selection when the clicked row
+        is ticked (the toggle follows the FIRST of them in list order), else only the clicked row."""
+        if self.m_game.get() != "valorant" or iid not in self.byp:
+            return None
+        vis = list(self.ctree.get_children())
+        targets = [x for x in vis if x in self.ticked] if iid in self.ticked else [iid]
+        return targets, bool(self.byp[targets[0]].get("util"))
+
+    def toggle_util(self, targets, new_state):
+        """Switches the override of the given clips (writes only clip_overrides.json). Never changes ticks, used flags or selection, never scans or renders."""
+        try:
+            set_clip_override(targets, new_state)
+        except Exception as ex:                             # noqa: BLE001
+            out(f"utility override not saved: {ex}")
+            return
+        cfg, det = load_config(), Detector("valorant")
+        clips, store, ovs = load_json(CLIPS_CACHE, {}), load_kills_cache(), load_clip_overrides(quiet=True)
+        for iid in targets:
+            c = self.byp.get(iid)
+            if not c:
+                continue
+            c["util"] = bool(new_state)
+            try:                                            # the kill count follows from the CACHED rows (no scan)
+                r = clips.get(file_key(iid))
+                e = store.get(kills_key(dict(r, path=iid, game="valorant"), "valorant", det)) if r else None
+                if e and not e.get("error"):
+                    a_ = analyse_clip_entry(dict(r, path=iid, game="valorant"), e, cfg, "valorant")
+                    a_ = apply_utility_override(dict(r, path=iid), e, a_, cfg, "valorant", ovs)
+                    c["ks"], c["kills"] = [k["t"] for k in a_["kills"]], len(a_["kills"])
+            except Exception as ex:                         # noqa: BLE001
+                LOGONLY(f"utility override: kill count not refreshed for {c.get('name')}: {ex}")
+            if self.ctree.exists(iid):
+                self.ctree.item(iid, text=self.row_text(iid))
+                self.ctree.set(iid, "kills", "not scanned" if c["kills"] is None else str(c["kills"]))
+        getattr(self, "_fill_sig", {}).pop(self.ctree, None)
+        out(f"utility kills {'allowed' if new_state else 'not allowed'} for {len(targets)} clip(s): " + ", ".join(self.byp[x]["name"] for x in targets[:5] if x in self.byp)
+            + (" ..." if len(targets) > 5 else ""))
+
+    def on_tree_context(self, e):
+        if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
+            return None
+        iid = self.ctree.identify_row(e.y)
+        info = self.util_targets(iid) if iid else None
+        if info is None:
+            return "break"                                  # CS2 (no utility rows) / empty space: no menu
+        targets, cur = info
+        m = tk.Menu(self.root, tearoff=0)
+        var = tk.BooleanVar(value=cur)
+        m.add_checkbutton(label="Allow utility kills (this clip)" if len(targets) == 1 else f"Allow utility kills ({len(targets)} selected clips)",
+                          variable=var, command=lambda: self.toggle_util(targets, not cur))
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+        return "break"
+
     def row_text(self, iid):
         c = self.byp.get(iid)
-        return ("\u2611 " if iid in self.ticked else "\u2610 ") + (c["name"] if c else Path(iid).name)
+        return ("\u2611 " if iid in self.ticked else "\u2610 ") + (c["name"] if c else Path(iid).name) + (UTIL_ROW_TAG if c and c.get("util") else "")
 
     def tick(self, how):
         vis = list(self.ctree.get_children())
@@ -9219,6 +11187,7 @@ class App:
         with pstage("load_clips: used_dates"):
             ud = used_info()                                       # V5.55 / V6.7.4: (date, montage title) of the montage each clip was used in
         rows = []
+        ovs = load_clip_overrides() if g == "valorant" else {}      # V6.9.7: clips with 'allow utility kills' ON (default: none)
         with pstage("load_clips: scan_clips (total)"):
             scanned = scan_clips(load_config())
         _t1 = time.perf_counter()
@@ -9228,14 +11197,18 @@ class App:
             e = kc.get(kills_key(r, g, det)) if det else None
             ks = None
             if e and not e.get("error"):
-                ks = [k["t"] for k in analyse_clip_entry(r, e, cfg, g)["kills"]]
+                a_ = analyse_clip_entry(r, e, cfg, g)
+                if ovs:
+                    a_ = apply_utility_override(r, e, a_, cfg, g, ovs)
+                ks = [k["t"] for k in a_["kills"]]
             try:
                 mt = os.path.getmtime(r["path"])
             except OSError:
                 continue
             rows.append({"path": r["path"], "name": Path(r["path"]).name, "folder": clip_folder(r["path"], cfg), "mtime": mt,
                          "dur": r.get("dur", 0), "kills": None if ks is None else len(ks), "ks": ks or [],
-                         "used": ud.get(_pkey(r["path"]), ("", ""))[0], "used_label": ud.get(_pkey(r["path"]), ("", ""))[1]})
+                         "used": ud.get(_pkey(r["path"]), ("", ""))[0], "used_label": ud.get(_pkey(r["path"]), ("", ""))[1],
+                         "util": bool(ovs) and clip_override_state(r["path"], ovs)[0] == "on"})
         rows.sort(key=lambda c: -c["mtime"])
         if PERF is not None:
             PERF.stages.append(((_t1 - PERF_T0) * 1000, (time.perf_counter() - _t1) * 1000, "load_clips: per-clip rows (kills lookup, compute_kills, getmtime)", threading.current_thread().name))
@@ -9309,7 +11282,7 @@ class App:
         v = text if col == "#0" else (vals[cols.index(col)] if cols.index(col) < len(vals) else "")
         v = str(v).strip()
         if col == "#0":
-            return (1, 0.0, v.lstrip("\u2610\u2611\u2605 ").lower())
+            return (1, 0.0, v.removesuffix(UTIL_ROW_TAG).lstrip("\u2610\u2611\u2605 ").lower())
         if col == "used" and tree is getattr(self, "ctree", None):       # V6.7.4: the cell shows a title; the order is by date
             d = (getattr(self, "byp", {}).get(iid) or {}).get("used", "")
             return (1, 0.0, f"{d} {v.lower()}") if d else (-1, 0.0, "")
@@ -9561,7 +11534,7 @@ class App:
                 an = None
                 if song:
                     try:
-                        an = analyse_song(song["path"], song.get("csv_bpm"))
+                        an = get_songmap(song["path"], song.get("csv_bpm"))
                     except Exception as ex:
                         out(f"Random pick: song map unavailable ({ex}), sizing for a plain 120 BPM song")
                 paths, fit = random_pick(cands, an, style)
@@ -10087,6 +12060,10 @@ class App:
         label("Kill placement (see synccompare)")
         ttk.Combobox(holder(), textvariable=self.set_place, values=["v5", "v4"], width=10, state="readonly").pack(side="left")
         r[0] += 1
+        self.set_songmap = tk.StringVar(value=SONGMAP_CHOICES_UI[songmap_version(self.cfg)])
+        label("Songmap version")
+        ttk.Combobox(holder(), textvariable=self.set_songmap, values=list(SONGMAP_CHOICES_UI.values()), width=28, state="readonly").pack(side="left")
+        r[0] += 1
         am = self.cfg.get("audio_mode", "auto")
         self.set_audio = tk.StringVar(value=AUDIO_MODES.get(am, AUDIO_MODES["auto"]))
         label("Audio mode")
@@ -10098,6 +12075,10 @@ class App:
         h = holder()
         ttk.Radiobutton(h, text="NVENC p7 cq18 (fast)", variable=self.set_q, value="nvenc").pack(side="left", padx=(0, PX))
         ttk.Radiobutton(h, text="Max quality x264 CRF15", variable=self.set_q, value="max").pack(side="left")
+        r[0] += 1
+        self.set_interp = tk.BooleanVar(value=bool(self.cfg.get("interpolate_low_fps", True)))      # V6.9.7: the existing hidden key, now a checkbox
+        label("Low-fps takes")
+        ttk.Checkbutton(holder(), text="Interpolate low-fps takes (slow-mo, duplicated frames, VFR)", variable=self.set_interp).pack(side="left")
         r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
@@ -10136,7 +12117,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
@@ -10695,7 +12676,7 @@ def measure_render(outfile, plan, cfg, refine=True):
         return res
     seen, seen_clean = timed(kills_all), timed(kills_clean)
     off = music_offset(outfile, plan["song"]["path"], plan["song"]["start_t"]) or 0.0
-    an = analyse_song(plan["song"]["path"], plan["song"].get("bpm") if plan.get("placement") != "v4" else None)
+    an = get_songmap(plan["song"]["path"], plan["song"].get("bpm") if plan.get("placement") != "v4" else None)
     beats = np.array(an["beats"]) - plan["song"]["start_t"] + off
     strong = local_onsets(plan["song"]["path"]) - plan["song"]["start_t"] + off   # strong hits for THEIR part of the song
     rows = []
@@ -12361,6 +14342,35 @@ def main():
     rw.add_argument("--all", action="store_true", help="one table of every cached CS2 clip, sorted by the largest difference (rowdebug_cs2.txt)")
     rw.add_argument("--rebuild", action="store_true", help="rebuild the sidecar(s) first")
     rw.set_defaults(fn=cmd_rowdebug)
+    fc = sp.add_parser("fpscheck", help="V6.9.3: frame rate of the clips of the newest dry plan (or --all cached clips) and how many would be interpolated (read-only)")
+    fc.add_argument("game", nargs="?", choices=GAMES)
+    fc.add_argument("--limit", type=int, default=0)
+    fc.add_argument("--all", action="store_true")
+    fc.set_defaults(fn=cmd_fpscheck)
+    fcc = sp.add_parser("fpscontent", help="V6.9.6: EFFECTIVE on-screen fps per take (timestamps, VFR gaps, duplicated frames, slow-mo); read-only, writes fpscontent.txt")
+    fcc.add_argument("target", nargs="*", help="a montage .mp4 (uses its .plan.json), or clip names")
+    fcc.add_argument("--all", action="store_true")
+    fcc.add_argument("--limit", type=int, default=0)
+    fcc.set_defaults(fn=cmd_fpscontent)
+    ib = sp.add_parser("interpbench", help="V6.9.6: seconds per source second of the mci / blend interpolation on this PC (5 s sample, writes nothing)")
+    ib.add_argument("clip", nargs="?")
+    ib.set_defaults(fn=cmd_interpbench)
+    sm = sp.add_parser("songmapcompare", help="V6.9.5: find the songs where SONGMAP V1 and V2 disagree most and write listening material (compare_out/)")
+    sm.add_argument("target", nargs="?", help="a song file or a list.txt (default: choose songs automatically)")
+    sm.add_argument("--auto", type=int, nargs="?", const=10, default=None, help="pick the N most suspicious songs (default 10)")
+    sm.add_argument("--songs-dir", help="analyse this folder instead of the playlist / songs folder")
+    sm.add_argument("--seed", type=int, help="seed of the random sample of the songs folder (printed on every run, reusable)")
+    sm.add_argument("--song", action="append", help="analyse the songs whose file name contains this text (repeatable)")
+    sm.add_argument("--out", help="output folder (default compare_out next to montage.py)")
+    sm.set_defaults(fn=lambda a: __import__("songmap_compare").main(a))
+    pc = sp.add_parser("pairscan", help="V6.9: candidate neighbour clip pairs among all cached CS2 clips (read-only, writes pairscan_cs2.txt)")
+    pc.add_argument("game", choices=["cs2"])
+    pc.add_argument("--limit", type=int, default=30)
+    pc.set_defaults(fn=cmd_pairscan)
+    go = sp.add_parser("grouporder", help="V6.9.6: the fight group (pair partners) of a CS2 clip and the order the planner will stitch it in (read-only, writes grouporder.txt)")
+    go.add_argument("game", choices=["cs2"])
+    go.add_argument("clip", help="clip file name (or part of it)")
+    go.set_defaults(fn=cmd_grouporder)
     rh = sp.add_parser("rescanhash", help="V6.8.1: rescan only the clips that have an entry under <hash> and none under the current region")
     rh.add_argument("game", choices=GAMES)
     rh.add_argument("hash")
@@ -12393,6 +14403,13 @@ def main():
     scp.add_argument("paths", nargs="*")
     scp.set_defaults(fn=cmd_songcheck)
     sp.add_parser("cfgdump", help="print the config file path + contents").set_defaults(fn=cmd_cfgdump)
+    sp.add_parser("timeanchor", help="V6.9.7: what the file-name time means (clip START or END) per naming scheme; read-only, writes timeanchor.txt").set_defaults(fn=cmd_timeanchor)
+    pu = sp.add_parser("utilclip", help="V6.9.7: per-clip 'allow utility kills' override (Valorant): utilclip <name fragment | --list> [on|off]; writes only clip_overrides.json")
+    pu.add_argument("target", nargs="?", default="", help="part of the clip file name, or --list")
+    pu.add_argument("state", nargs="?", default="", help="on | off")
+    pu.add_argument("--list", action="store_true", help="the clips that are ON and how many utility rows each has")
+    pu.set_defaults(fn=cmd_utilclip)
+    sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
     st_.add_argument("--no-gui", action="store_true")
