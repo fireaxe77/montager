@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.5.1"
+APP_VERSION = "V6.9.5.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4680,66 +4680,106 @@ def analyse_song(path, csv_bpm=None):
 
 SONGMAP_DEFAULT = "v1"                   # V6.9.5: the default song map; switching the default to SONGMAPV2 is this one line ("v2")
 SONGMAP_CHOICES = {"v1": "Songmap V1", "v2": "Songmap V2"}
+SONGMAP_AUTO = "v2auto"                  # V6.9.5.2: per song, V2 only where its grid is confident and measurably better than V1, else the V1 map
+SONGMAP_CHOICES_UI = dict(SONGMAP_CHOICES, **{SONGMAP_AUTO: "Songmap V2 (auto, V1 fallback)"})     # what the Settings dropdown offers
 SONGMAP_V2_HOOK = [None]                 # tests only: called at the start of a V2 analysis (inject an error / a delay)
 
 
 def songmap_version(cfg=None):
     v = str((cfg if cfg is not None else load_config()).get("songmap_version") or SONGMAP_DEFAULT).lower()
+    if v in (SONGMAP_AUTO, SONGMAP_CHOICES_UI[SONGMAP_AUTO].lower()):
+        return SONGMAP_AUTO
     return "v2" if v in ("v2", "songmap v2") else "v1"
+
+
+def _peek_v1_bpm(path, csv_bpm=None):
+    """BPM of the V1 map IF it is already in the V1 cache (read-only: never analyses, never writes), else None."""
+    try:
+        st = os.stat(path)
+        hit = load_json(SONG_CACHE, {}).get(f"{path}|{int(st.st_mtime)}|{st.st_size}|{SONGMAP_V}|{round(float(csv_bpm or 0), 3)}")
+        return float(hit["bpm"]) if hit and hit.get("bpm") else None
+    except Exception:
+        return None
 
 
 class _V2Fail(Exception):
     """A V2 failure whose message already names the exception type (worker errors, timeouts)."""
 
 
+def _songmap_v2_cached(path, csv_bpm, v1_bpm, name):
+    """The V2 map from its own cache, or built now (cap ANALYSIS_CAP_S). Raises _V2Fail / any exception on a problem."""
+    import songmap_v2
+    cpath = DATA / songmap_v2.CACHE_NAME
+    key = songmap_v2.cache_key(path, csv_bpm, v1_bpm)
+    cache = load_json(cpath, {})
+    hit = cache.get(key)
+    if hit and not hit.get("fallback_marker"):
+        return hit
+    if hit:
+        raise _V2Fail(hit["fallback_marker"] + " (cached: not retried until the V2 algorithm version changes)")
+    box = {}
+    deadline = time.monotonic() + songmap_v2.ANALYSIS_CAP_S
+
+    def work():
+        try:
+            box["m"] = songmap_v2.build_songmap_v2(path, csv_bpm, deadline=deadline, hook=SONGMAP_V2_HOOK[0], v1_bpm=v1_bpm)
+        except BaseException as ex:      # noqa: BLE001 - nothing may escape the worker
+            box["err"] = f"{type(ex).__name__}: {ex}"
+    t0 = time.time()
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(songmap_v2.ANALYSIS_CAP_S)
+    if th.is_alive() or "m" not in box:
+        reason = "timeout (analysis cap %.0f s)" % songmap_v2.ANALYSIS_CAP_S if th.is_alive() or "cap reached" in box.get("err", "") else box.get("err", "no result")
+        if reason.startswith("timeout"):
+            c2 = load_json(cpath, {})
+            c2[key] = {"fallback_marker": reason}
+            save_json(cpath, c2)
+        raise _V2Fail(reason)
+    m = box["m"]
+    c2 = load_json(cpath, {})
+    c2[key] = m
+    save_json(cpath, c2)
+    out(f"songmap v2: {name} {time.time() - t0:.1f} s, bpm={m['bpm']}, grid_conf={m['v2']['grid_confidence']}, "
+        f"{len(m['v2']['events'])} events, {len(m['drops'])} drops")
+    return m
+
+
+def _songmap_auto_pick(path, csv_bpm, v1m, m2, name):
+    """'Songmap V2 (auto, V1 fallback)': V2 only if its grid confidence is >= 0.8, its kick-to-grid p95 <= 40 ms and its median is not worse than
+    V1's; otherwise the V1 map. The decision and its numbers are cached in the V2 cache file (key + '|auto'), one log line per song."""
+    import songmap_v2
+    cpath = DATA / songmap_v2.CACHE_NAME
+    akey = songmap_v2.cache_key(path, csv_bpm, v1m.get("bpm")) + "|auto"
+    cache = load_json(cpath, {})
+    dec = cache.get(akey)
+    if not dec:
+        dec = songmap_v2.build.auto_decision(v1m, m2)
+        c2 = load_json(cpath, {})
+        c2[akey] = dec
+        save_json(cpath, c2)
+    out(f"songmap auto: {name} -> " + songmap_v2.build.auto_line(dec))
+    if dec["choice"] == "v2":
+        return dict(m2, songmap_auto=dec)
+    return dict(v1m, songmap_version="v1-auto", songmap_auto=dec)
+
+
 def get_songmap(path, csv_bpm=None, version=None):
     """THE routing point for song map requests (V6.9.5): V1 = analyse_song() exactly as before; V2 = the isolated songmap_v2 package with its
-    own cache file. Any V2 problem (error, timeout, missing module) logs 'songmap v2 fallback: <song> (<reason>)' and returns the V1 map
-    flagged songmap_version = 'v1-fallback', so a montage never fails because of V2."""
+    own cache file; V6.9.5.2 'v2auto' = V2 or V1 per song (see _songmap_auto_pick). Any V2 problem (error, timeout, missing module) logs
+    'songmap v2 fallback: <song> (<reason>)' and returns the V1 map flagged songmap_version = 'v1-fallback', so a montage never fails because of V2."""
     v = version or songmap_version()
-    if v != "v2":
+    if v not in ("v2", SONGMAP_AUTO):
         return analyse_song(path, csv_bpm)
     name = Path(path).name
+    v1m = analyse_song(path, csv_bpm) if v == SONGMAP_AUTO else None          # auto always needs the V1 map; plain V2 only peeks at its cache
     try:
-        import songmap_v2
-        cpath = DATA / songmap_v2.CACHE_NAME
-        key = songmap_v2.cache_key(path, csv_bpm)
-        cache = load_json(cpath, {})
-        hit = cache.get(key)
-        if hit and not hit.get("fallback_marker"):
-            return hit
-        if hit:
-            raise _V2Fail(hit["fallback_marker"] + " (cached: not retried until the V2 algorithm version changes)")
-        box = {}
-        deadline = time.monotonic() + songmap_v2.ANALYSIS_CAP_S
-
-        def work():
-            try:
-                box["m"] = songmap_v2.build_songmap_v2(path, csv_bpm, deadline=deadline, hook=SONGMAP_V2_HOOK[0])
-            except BaseException as ex:      # noqa: BLE001 - nothing may escape the worker
-                box["err"] = f"{type(ex).__name__}: {ex}"
-        t0 = time.time()
-        th = threading.Thread(target=work, daemon=True)
-        th.start()
-        th.join(songmap_v2.ANALYSIS_CAP_S)
-        if th.is_alive() or "m" not in box:
-            reason = "timeout (analysis cap %.0f s)" % songmap_v2.ANALYSIS_CAP_S if th.is_alive() or "cap reached" in box.get("err", "") else box.get("err", "no result")
-            if reason.startswith("timeout"):
-                c2 = load_json(cpath, {})
-                c2[key] = {"fallback_marker": reason}
-                save_json(cpath, c2)
-            raise _V2Fail(reason)
-        m = box["m"]
-        c2 = load_json(cpath, {})
-        c2[key] = m
-        save_json(cpath, c2)
-        out(f"songmap v2: {name} {time.time() - t0:.1f} s, bpm={m['bpm']}, grid_conf={m['v2']['grid_confidence']}, "
-            f"{len(m['v2']['events'])} events, {len(m['drops'])} drops")
-        return m
+        m = _songmap_v2_cached(path, csv_bpm, float(v1m["bpm"]) if v1m else _peek_v1_bpm(path, csv_bpm), name)
+        return _songmap_auto_pick(path, csv_bpm, v1m, m, name) if v1m else m
     except Exception as ex:
         why = str(ex) if isinstance(ex, _V2Fail) else f"{type(ex).__name__}: {ex}"
         out(f"songmap v2 fallback: {name} ({why})")
-        m = dict(analyse_song(path, csv_bpm))
+        m = dict(v1m or analyse_song(path, csv_bpm))
         m.update(songmap_version="v1-fallback", songmap_fallback_reason=why)
         return m
 
@@ -9078,7 +9118,7 @@ class App:
                 pass                                               # half-typed number: keep the old value
         cfg["length_s"] = "optimal" if self.set_opt.get() else max(LEN_MIN_S, min(LEN_MAX_S, int(self.set_len.get())))
         cfg["style"], cfg["placement"] = self.set_style.get(), self.set_place.get()
-        cfg["songmap_version"] = next((k for k, lab in SONGMAP_CHOICES.items() if lab == self.set_songmap.get()), SONGMAP_DEFAULT)
+        cfg["songmap_version"] = next((k for k, lab in SONGMAP_CHOICES_UI.items() if lab == self.set_songmap.get()), SONGMAP_DEFAULT)
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
@@ -10713,9 +10753,9 @@ class App:
         label("Kill placement (see synccompare)")
         ttk.Combobox(holder(), textvariable=self.set_place, values=["v5", "v4"], width=10, state="readonly").pack(side="left")
         r[0] += 1
-        self.set_songmap = tk.StringVar(value=SONGMAP_CHOICES[songmap_version(self.cfg)])
+        self.set_songmap = tk.StringVar(value=SONGMAP_CHOICES_UI[songmap_version(self.cfg)])
         label("Songmap version")
-        ttk.Combobox(holder(), textvariable=self.set_songmap, values=list(SONGMAP_CHOICES.values()), width=12, state="readonly").pack(side="left")
+        ttk.Combobox(holder(), textvariable=self.set_songmap, values=list(SONGMAP_CHOICES_UI.values()), width=28, state="readonly").pack(side="left")
         r[0] += 1
         am = self.cfg.get("audio_mode", "auto")
         self.set_audio = tk.StringVar(value=AUDIO_MODES.get(am, AUDIO_MODES["auto"]))

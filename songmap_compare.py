@@ -41,7 +41,8 @@ def analyse_pair(M, path, csv_bpm=None):
     except Exception as ex:
         errors["v1"] = f"{type(ex).__name__}: {ex}"
     try:
-        v2 = songmap_v2.build_songmap_v2(str(path), csv_bpm, deadline=time.monotonic() + max(120.0, songmap_v2.ANALYSIS_CAP_S * 2))
+        v2 = songmap_v2.build_songmap_v2(str(path), csv_bpm, deadline=time.monotonic() + max(120.0, songmap_v2.ANALYSIS_CAP_S * 2),
+                                         v1_bpm=v1["bpm"] if v1 is not None else None)
     except Exception as ex:
         errors["v2"] = f"{type(ex).__name__}: {ex}"
     y, sr = timebase.decode(str(path))
@@ -139,7 +140,12 @@ def compare(v1, v2, name):
     why = (f"kick-to-grid offset V1 median {o1['median_ms']} / p95 {p1} ms, V2 median {o2['median_ms']} / p95 {p2} ms; "
            f"drops V1 {[round(t, 1) for t in t1]} ({len(t1)}), V2 {[round(t, 1) for t in t2]} ({len(t2)}); V1 drops V2 rejected {[round(t, 1) for t in short_rejected]}; "
            f"drop share V1 {s1:.0%} / V2 {s2:.0%}; drop sanity problems V1 {san1} / V2 {san2}")
-    return {"song": name, "bpm": v2["bpm"], "beats": len(v2["beats"]), "grid_confidence": v2["v2"]["grid_confidence"],
+    from songmap_v2 import build as _b
+    auto = _b.auto_decision(v1, v2)
+    lock = v2["v2"].get("lock", {})
+    return {"auto": auto, "auto_would_pick": auto["choice"].upper(), "auto_reason": _b.auto_line(auto), "confidence_parts": v2["v2"].get("confidence_parts"),
+            "chosen_tempo": lock.get("chosen_bpm"), "tempo_candidates": lock.get("candidates"),
+            "song": name, "bpm": v2["bpm"], "beats": len(v2["beats"]), "grid_confidence": v2["v2"]["grid_confidence"],
             "downbeat_confidence": v2["v2"]["downbeat_confidence"], "drops_v1": [round(t, 2) for t in t1], "drops_v2": [round(t, 2) for t in t2],
             "rejected_v1_drops": [round(t, 2) for t in short_rejected], "unmatched_v1": [round(t, 2) for t in unmatched1],
             "unmatched_v2": [round(t, 2) for t in unmatched2], "events_on_grid_v1": on_grid_share(v1), "events_on_grid_v2": on_grid_share(v2),
@@ -406,7 +412,8 @@ def write_reports(out_dir, state, notes):
     summary = {"analysed": len(state["results"]), "skipped": len(state["errors"]), "written": len(top), "seed": state.get("seed"),
                "pool": state.get("pool_size"), "png": state.get("png", False)}
     (out_dir / "report.json").write_text(json.dumps({"summary": summary, "notes": notes, "songs": top, "errors": state["errors"],
-                                                     "all_scores": [{"song": r["song"], "score": r["disagreement_score"], "verdict": r["verdict"]} for r in state["results"]]},
+                                                     "all_scores": [{"song": r["song"], "score": r["disagreement_score"], "verdict": r["verdict"], "auto_would_pick": r["auto_would_pick"],
+                                                                    "bpm_v1": r["bpm_v1"], "bpm_v2": r["bpm"], "grid_confidence": r["grid_confidence"]} for r in state["results"]]},
                                                     indent=1), encoding="utf-8")
     L = ["# SONGMAP V1 vs V2 - listening report", "",
          f"{summary['analysed']} songs analysed, {summary['skipped']} with problems, the {len(top)} with the largest disagreement are written below "
@@ -416,7 +423,7 @@ def write_reports(out_dir, state, notes):
     L += ["", "## Listen to these first", ""]
     for i, r in enumerate(top[:5], 1):
         f = r["files"]
-        L.append(f"{i}. **{r['song']}** (score {r['disagreement_score']}, {r['verdict']})")
+        L.append(f"{i}. **{r['song']}** (score {r['disagreement_score']}, {r['verdict']}, auto would pick {r['auto_reason']})")
         L.append(f"   - around the first drop ({f['firstdrop']['center_s']} s): `{f['firstdrop']['files'][0]}`, `{f['firstdrop']['files'][1]}`, `{f['firstdrop']['files'][2]}`")
         L.append(f"   - most suspicious region ({f['suspect']['center_s']} s): `{f['suspect']['files'][0]}`, `{f['suspect']['files'][1]}`, `{f['suspect']['files'][2]}`")
     L += ["", "Listen to the original, then the V1 clicks, then the V2 clicks: the clicks should sit exactly on the kicks / the beat. "
@@ -428,7 +435,10 @@ def write_reports(out_dir, state, notes):
               f"- numbers: {r['verdict_why']}",
               f"- disagreement score {r['disagreement_score']}; BPM {r['bpm']} (V1 {r['bpm_v1']}); {r['beats']} beats; grid confidence {r['grid_confidence']}, downbeat confidence {r['downbeat_confidence']}",
               f"- kick-to-grid offset: V1 median {o1['median_ms']} ms, p95 {o1['p95_ms']} ms  |  V2 median {o2['median_ms']} ms, p95 {o2['p95_ms']} ms",
-              f"- events on grid: V1 {r['events_on_grid_v1']}  |  V2 {r['events_on_grid_v2']}"]
+              f"- events on grid: V1 {r['events_on_grid_v1']}  |  V2 {r['events_on_grid_v2']}",
+              f"- **auto would pick: {r['auto_reason']}**",
+              f"- grid confidence components: {r['confidence_parts']}; chosen tempo {r['chosen_tempo']} BPM; tempo candidates (in -> fitted, kick on grid, hits on grid, beat hit rate, score): "
+              + "; ".join(f"{c['bpm_in']} {c['src']} -> {c['bpm']}, {c['kick_frac']}, {c['hit_frac']}, {c['coverage']}, {c['score']}" for c in (r.get("tempo_candidates") or []))]
         if len(r.get("paths", [])) > 1:
             L.append("- also found as (same title + artist): " + "; ".join(f"`{p}`" for p in r["paths"][1:]))
         f = r["files"]
@@ -439,9 +449,17 @@ def write_reports(out_dir, state, notes):
         for e in state["errors"]:
             L.append(f"- **{e['song']}**: {e['error']}" + (f"  (V1 result: BPM {e['v1']['bpm']}, drops {e['v1']['drops']})" if e.get("v1") else ""))
         L.append("")
+    if state["results"]:
+        na = sum(1 for r in state["results"] if r["auto_would_pick"] == "V2")
+        L += ["## All analysed songs", "", f"auto would pick V2 for {na} of {len(state['results'])} songs.", "",
+              "| song | V1 BPM | V2 BPM | grid conf | V1 kick median ms | V2 kick median ms | V2 p95 ms | auto would pick |", "|---|---|---|---|---|---|---|---|"]
+        for r in sorted(state["results"], key=lambda r: -r["disagreement_score"]):
+            L.append(f"| {r['song']} | {r['bpm_v1']} | {r['bpm']} | {r['grid_confidence']} | {r['kick_offset_v1']['median_ms']} | {r['kick_offset_v2']['median_ms']} | "
+                     f"{r['kick_offset_v2']['p95_ms']} | {r['auto_reason']} |")
+        L.append("")
     others = [r for r in state["results"] if r not in top]
     if others:
-        L += ["## Other analysed songs (not written)", ""] + [f"- {r['song']}: score {r['disagreement_score']}, {r['verdict']}" for r in sorted(others, key=lambda r: -r["disagreement_score"])] + [""]
+        L += ["## Other analysed songs (not written)", ""] + [f"- {r['song']}: score {r['disagreement_score']}, {r['verdict']}, auto would pick {r['auto_would_pick']}" for r in sorted(others, key=lambda r: -r["disagreement_score"])] + [""]
     (out_dir / "report.md").write_text("\n".join(L), encoding="utf-8")
     return "\n".join(L)
 
