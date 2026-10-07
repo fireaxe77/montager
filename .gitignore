@@ -20,3 +20,4 @@ cs2_stale_scan.txt
 
 # accidental data backups (kept on disk, never committed)
 montage_data_backup*/
+good.mp4
