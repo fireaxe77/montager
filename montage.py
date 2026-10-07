@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.8.1"
+APP_VERSION = "V6.9.9"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2974,7 +2974,8 @@ def verified_kills(pool_items, cfg):
 
 
 def ts(t):
-    return f"{int(t // 60)}:{t % 60:04.1f}"
+    sg, t = ("-", -t) if t < 0 else ("", t)                # V6.9.9: -1.8 s showed as -1:58.2
+    return f"{sg}{int(t // 60)}:{t % 60:04.1f}"
 
 
 def kills_key(rec, game, det):
@@ -6310,7 +6311,8 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
         e["score"] = base_score(e) + 2.0 * e["shots"]
         e["plain"] = e["n"] == 1 and not e["hs"] and not e["flick"]
     evs.sort(key=lambda e: -e["score"])
-    led.final_events = list(evs)
+    if not LEDGER_SUBCALL[0]:                              # V6.9.9: a pairing sub-call (companions) must not replace the main run's event list: its rows would all end LOST
+        led.final_events = list(evs)
     return evs, notes
 
 
@@ -6410,6 +6412,14 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
         return None
     times, rows, victims = [times[i] for i in keep], [rows[i] for i in keep], [victims[i] for i in keep]
     v4times = sorted(r["v4"] for i, r in enumerate(raw) if i in keep)
+    gaps = [(spans[i + 1]["start"], spans[i + 1]["start"] - spans[i]["end"]) for i in range(len(spans) - 1) if spans[i + 1]["start"] > spans[i]["end"]]
+    if gaps:                                               # V6.9.9: clips saved back to back leave footage missing between them; the planner's cut would fall in that gap
+        cum = lambda t: sum(g_ for b_, g_ in gaps if t >= b_ - 1e-9)       # (footage outside both clips). Close the gap: later clips move earlier on the group timeline, with their kills
+        times, rows = [round(t - cum(t), 4) for t in times], [round(t - cum(t), 4) for t in rows]
+        v4times = [round(t - cum(t), 4) for t in v4times]
+        spans = [dict(s_, shift=s_["shift"] - cum(s_["start"]), start=s_["start"] - cum(s_["start"]), end=s_["end"] - cum(s_["start"])) for s_ in spans]
+        cover_start, cover_end = spans[0]["start"], spans[-1]["end"]
+        stitch_note += f"{sum(g_ for _, g_ in gaps):.2f} s of missing footage between the clips closed; "
     deaths = []
     for s_ in spans:
         deaths += [d + s_["shift"] for d in s_["it"].get("deaths", [])]
@@ -7367,6 +7377,11 @@ def plan_duplicate_ranges(plan, tol=0.05):
             if ov > tol:
                 bad.append(f"{p[5]}: {ov:.2f} s of source covered twice (take {p[0]} [{p[2]:.2f}-{p[3]:.2f}] x{p[4]:.2f} and take {q[0]} [{q[2]:.2f}-{q[3]:.2f}] x{q[4]:.2f})")
     return bad
+
+
+def _TAKE_SKIP_OK(msg):
+    """V6.9.9: per-take cut-list problems that a re-plan without that take repairs (footage outside its clip, speed / tail / minimum rules); never the whole-plan frame sums."""
+    return any(k in msg for k in ("outside its clip", "is not inside the take", "is under the minimum", "speed ", "tail ", "only ", "used twice"))
 
 
 def verify_cutlist(plan):
@@ -8994,7 +9009,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         n2 = list(notes)
         plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
                             placement=placement, manual=manual)
-        bad = [b_ for b_ in verify_cutlist(plan) if "kill row" in b_]
+        bad = [b_ for b_ in verify_cutlist(plan) if re.match(r"take \d+:", b_) and ("kill row" in b_ or _TAKE_SKIP_OK(b_))]   # V6.9.9: any per-take problem drops / re-plans only that take
         idx = {int(m.group(1)) for b_ in bad for m in [re.match(r"take (\d+):", b_)] if m}
         why_b = {plan["takes"][i - 1]["path"]: b_.split(":", 1)[1].strip() for b_ in bad for m in [re.match(r"take (\d+):", b_)]
                  if m and 0 < (i := int(m.group(1))) <= len(plan["takes"])}
@@ -9002,16 +9017,17 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         if not gone:
             break
         if manual:                                         # V5.42B: first extend the take's window (no jump-cuts over its fight)
-            ext = {p_ for p_ in gone if p_ not in extended}
+            ext = {p_ for p_ in gone if p_ not in extended and "kill row" in why_b.get(p_, "")}
             if ext:
                 extended |= ext
                 fixes += [f"cut list repair: {Path(p_).name} - {why_b.get(p_, 'kill row outside its footage')}; take window "
                           "extended (its whole fight shown, no jump-cut), re-planned" for p_ in ext]
                 pool_ev = [dict(e, _no_cuts=True) if e["path"] in ext else e for e in pool_ev]
                 continue
-        fixes += [f"cut list repair: dropped {Path(p_).name} ({why_b.get(p_, 'kill row outside its footage')}"
-                  f"{' even with its take window extended' if p_ in extended else ''}), re-planned with the next best events"
-                  for p_ in gone]
+        fixes += [(f"cut list repair: dropped {Path(p_).name} ({why_b.get(p_, 'kill row outside its footage')}"
+                   f"{' even with its take window extended' if p_ in extended else ''}), re-planned with the next best events")
+                  if "kill row" in why_b.get(p_, "kill row") else
+                  f"take skipped: {Path(p_).name} ({why_b.get(p_)}), re-planned without it" for p_ in gone]
         pool_ev = [e for e in pool_ev if e["path"] not in gone]
     plan["notes"] = list(plan["notes"]) + fixes
     for f_ in fixes:
