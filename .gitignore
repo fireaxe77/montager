@@ -8,6 +8,9 @@ rowdebug_cs2.txt
 regiontest_cs2.txt
 pairscan_cs2.txt
 fpscheck.txt
+fpscontent.txt
+grouporder.txt
 *.part.mp4
 *.interp/
 compare_out/
+interpbench_*/
