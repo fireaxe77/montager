@@ -13,7 +13,7 @@ import time
 import types
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = __import__("_root").find_root(__file__)          # repo root (tests/_root.py); this file lives in tests/
 sys.path.insert(0, str(HERE))
 import montage as M                                                                           # noqa: E402
 import cv2                                                                                    # noqa: E402

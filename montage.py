@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V6.9.5.2"
+APP_VERSION = "V6.9.6"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5467,26 +5467,30 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
             continue
         g = [(a, 0.0)]
         used.add(i)
-        for j in range(i + 1, len(items)):
-            b = items[j]
-            if j in used:
-                continue
-            near = b["ctime"] - a["ctime"] <= 60 + a["rec"].get("dur", 0)
-            off = None
-            for (m, mo) in g:
-                o = _victim_offset(m["kills"], b["kills"], rf) if near else None
-                if o is not None and abs(b["ctime"] - m["ctime"]) <= 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
-                    off = mo + o
-                    break
-                o = _same_kills(m, b, rf, refine)          # V5.42B: same kills = same event, whatever the file times say
-                if o is not None:
-                    off = mo + o
-                    notes.append(f"same kills in two files: {Path(m['rec']['path']).name} = {Path(b['rec']['path']).name} "
-                                 "(one event, never placed twice)")
-                    break
-            if off is not None:
-                g.append((b, off))
-                used.add(j)
+        grew = True
+        while grew:                                        # V6.9.6 (CS2): clips of one base time ('DVR', 'DVR_1', ...) sort in discovery order, so a clip
+            grew = False                                   # scanned before the clip that links it to the group must be tried again
+            for j in range(i + 1, len(items)):
+                b = items[j]
+                if j in used:
+                    continue
+                near = b["ctime"] - a["ctime"] <= 60 + a["rec"].get("dur", 0)
+                off = None
+                for (m, mo) in g:
+                    o = _victim_offset(m["kills"], b["kills"], rf) if near else None
+                    if o is not None and abs(b["ctime"] - m["ctime"]) <= 60 + max(m["rec"].get("dur", 0), b["rec"].get("dur", 0)):
+                        off = mo + o
+                        break
+                    o = _same_kills(m, b, rf, refine)          # V5.42B: same kills = same event, whatever the file times say
+                    if o is not None:
+                        off = mo + o
+                        notes.append(f"same kills in two files: {Path(m['rec']['path']).name} = {Path(b['rec']['path']).name} "
+                                     "(one event, never placed twice)")
+                        break
+                if off is not None:
+                    g.append((b, off))
+                    used.add(j)
+                    grew = game == "cs2"
         groups.append(g)
     evs = []
     for g in groups:
@@ -5588,16 +5592,37 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
         spans.append({"it": it, "shift": o, "start": start, "end": end, "path": it["rec"]["path"]})
     spans.sort(key=lambda s: s["start"])
     stitch_note = ""
+    order_bad = ""
+    if len(spans) > 1 and (spans[0]["it"]["rec"].get("game") == "cs2"):
+        # V6.9.6: the order of a stitched CS2 group is CHRONOLOGICAL BY THE RECORDING TIME in the clip names (the 'pair partner' time index), not
+        # whatever order the victim-matched offsets or the discovery order give. Clips of one base time ('DVR', 'DVR_1', 'DVR_1_1') tie: they keep
+        # the offset order and the frame-match verification below decides between the two possible orders. Unparsable names: the old order.
+        nts = [pair_clip_start(s_["path"]) for s_ in spans]
+        if all(t_ is not None for t_ in nts):
+            spans = [s_ for _, s_ in sorted(zip(range(len(spans)), spans), key=lambda x: (nts[x[0]], x[1]["start"], x[1]["end"]))]
+            nts = sorted(nts)
+            if any(spans[i + 1]["start"] < spans[i]["start"] - 0.5 and nts[i + 1] > nts[i] for i in range(len(spans) - 1)):
+                order_bad = "the recording times in the clip names disagree with the kill offsets (order by name: " + \
+                            " < ".join(Path(s_["path"]).name for s_ in spans) + ")"
     if len(spans) > 1:
         chain = [spans[0]]
         for s_ in spans[1:]:
             if s_["start"] <= chain[-1]["end"] - 0.1 and s_["end"] > chain[-1]["end"]:
                 chain.append(s_)
         spans = chain
-        ok_all = True
-        for i in range(len(spans) - 1):
+        ok_all = not order_bad
+        if order_bad:
+            stitch_note += order_bad + "; "
+        for i in range(len(spans) - 1) if ok_all else ():
             cut = round((max(spans[i]["start"], spans[i + 1]["start"]) + spans[i]["end"]) / 2, 4)
             ok, nshift, why = verify_stitch((spans[i], spans[i + 1]), cut) if verify else (True, spans[i + 1]["shift"], "not checked")
+            if not ok and verify and pair_clip_start(spans[i]["path"]) is not None and pair_clip_start(spans[i]["path"]) == pair_clip_start(spans[i + 1]["path"]):
+                a_, b_ = dict(spans[i + 1]), dict(spans[i])                    # same base time: the frame match decides which one comes first
+                cut2 = round((max(a_["start"], b_["start"]) + a_["end"]) / 2, 4)
+                ok2, nshift2, why2 = verify_stitch((a_, b_), cut2)
+                if ok2:
+                    spans[i], spans[i + 1] = a_, b_
+                    ok, nshift, why, cut = ok2, nshift2, why2 + " (order decided by the frame match)", cut2
             stitch_note += f"cut {i + 1}: {why}; "
             if not ok:
                 ok_all = False
@@ -6830,13 +6855,14 @@ def probe_duration(path):
         return 0.0
 
 
-# ======================================================================= V6.9.3: low-fps interpolation at render time
-# A clip recorded at about 30 fps sticks out in a 60 fps montage. Pre-step of the render input preparation only: for the clips that are in
-# the final plan (never any other clip) the real frame rate is read with ffprobe; a clip below 75% of the montage fps gets ONLY the source
-# ranges its takes use (+0.5 s margin each side) interpolated to a temporary file, and that file replaces the clip as the take's input
-# (same timeline: the take's shift moves by the range start). Everything else is untouched: a 60 fps plan produces the byte-identical
-# render command. Any problem uses the original clip; the render never fails because of interpolation. Hidden switch: config.json
-# "interpolate_low_fps" (default true).
+# ======================================================================= V6.9.3 / V6.9.6: effective-fps interpolation at render time
+# V6.9.6: container fps is the wrong basis (OBS .mov 50, DVR .mp4 60, some CS2 DVR clips are variable frame rate, game footage may be duplicated
+# 30 fps, slow-mo shows every source frame twice). The decision is made per TAKE from the EFFECTIVE on-screen unique frame rate:
+#   effective = min(timestamp fps, content fps (unique frames)) x playback speed, candidate when below 75% of the montage fps for
+#   (a) slow-mo (speed < 1), (b) duplicated content / a low-fps source, (c) VFR gaps (>= 10% of the intervals above 1.5x the median, or a gap above 4 frames).
+# Only the source ranges the takes use (+0.5 s margin) are converted to a temporary file that replaces the clip as that take's input (same timeline:
+# the take's shift moves by the range start). The filter graph is NOT edited (the existing retime consumes the denser segment); everything that is not a
+# candidate produces the byte-identical render command. Any problem uses the original clip. Hidden switch: config.json "interpolate_low_fps" (default true).
 INTERP_FRAC = 0.75                      # candidate: effective fps below this share of the montage fps
 INTERP_MARGIN_S = 0.5
 INTERP_TIMEOUT_X = 4.0                  # a segment taking longer than this x its duration is abandoned
@@ -6845,6 +6871,11 @@ INTERP_MIN_MEAN_SSIM, INTERP_MIN_FRAME_SSIM = 0.90, 0.75
 INTERP_MCI = "minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:scd=fdiff:mb_size=8:search_param=8"      # conservative: smallest block / search, no vsbmc
 INTERP_BLEND = "framerate=fps=60"                                                          # blend only (scene changes are duplicated)
 INTERP_STATE = {"mci_slow": False}
+INTERP_MAX_FPS = 240.0                  # never interpolate above this rate
+INTERP_MAX_X = 4.0                      # nor above this multiple of the unique source rate
+VFR_SHARE, VFR_GAP_FRAMES = 0.10, 4.0   # VFR candidate: >= 10% of the intervals above 1.5x the median, or any gap above 4 frames
+DUP_MIN_MOTION = 0.6                    # mean abs grey difference (0-255) of the 75th percentile frame step below this = a static scene (not measurable)
+CONTENT_WIN_S, CONTENT_MAX_S = 1.5, 4.0 # content fps window length / ranges longer than this are sampled in three windows
 
 
 def _ratio(s):
@@ -6890,10 +6921,16 @@ def _run_timed(cmd, timeout):
             PROCS.remove(pr)
 
 
-def interp_segment_cmd(src, s0, d, outp, method):
-    filt = INTERP_MCI if method == "mci" else INTERP_BLEND
+def interp_vf(method, fps):
+    """The interpolation filter of `method` at output rate `fps` (the 60 fps strings are the V6.9.3 constants, byte for byte)."""
+    base = INTERP_MCI if method == "mci" else INTERP_BLEND
+    return base if abs(fps - OUT_FPS) < 1e-6 else base.replace("fps=60", f"fps={fps:g}", 1)
+
+
+def interp_segment_cmd(src, s0, d, outp, method, fps=OUT_FPS, pre=""):
+    """ffmpeg command for ONE segment [s0, s0+d) of `src`: `pre` (duplicate removal / retime, ends with a comma), then the interpolation to `fps`."""
     return ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(src), "-map", "0:v:0", "-map", "0:a?",
-            "-vf", f"tpad=stop_mode=clone:stop_duration={INTERP_MARGIN_S:.2f},{filt},trim=end={d:.4f}", "-vsync", "0",
+            "-vf", f"{pre}tpad=stop_mode=clone:stop_duration={INTERP_MARGIN_S:.2f},{interp_vf(method, fps)},trim=end={d:.4f}", "-vsync", "0",
             "-c:v", "libx264", "-crf", "10", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "pcm_s16le", str(outp)]
 
 
@@ -6905,13 +6942,13 @@ def _ssim_values(a_chain, b_chain, a_in, b_in):
     return rc, err, vals
 
 
-def interp_validate(src, seg, s0, d, src_fps):
-    """None when the interpolated segment is sound, else the reason (see the V6.9.3 rules)."""
+def interp_validate(src, seg, s0, d, src_fps, out_fps=OUT_FPS):
+    """None when the interpolated segment is sound, else the reason (see the V6.9.3 rules; V6.9.6: at the segment's own output rate)."""
     seg = Path(seg)
     if not seg.exists() or seg.stat().st_size < 1000:
         return "temp file missing"
     dur = probe_duration(seg)
-    if abs(dur - d) > 1.0 / OUT_FPS + 0.002:
+    if abs(dur - d) > 1.0 / out_fps + 0.002:
         return f"duration {dur:.3f} s instead of {d:.3f} s"
     r = run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries", "stream=nb_read_frames,start_time",
              "-of", "json", str(seg)], timeout=120)
@@ -6920,12 +6957,12 @@ def interp_validate(src, seg, s0, d, src_fps):
         n, t0 = int(st["nb_read_frames"]), float(st.get("start_time") or 0)
     except Exception:
         return "frame count unreadable"
-    want = int(round((d - t0) * OUT_FPS))
+    want = int(round((d - t0) * out_fps))
     if abs(n - want) > (0 if t0 < 0.001 else 1):
         return f"{n} frames instead of {want}"
     ain, bin_ = ["-ss", "0", "-i", str(seg)], ["-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(src)]
     small = "scale=480:-2:flags=bilinear,format=yuv420p"
-    rc, err, v60 = _ssim_values(f"{small}", f"{small},fps={OUT_FPS}:round=near", ain, bin_)          # every frame vs its nearest source frame
+    rc, err, v60 = _ssim_values(f"{small}", f"{small},fps={out_fps:g}:round=near", ain, bin_)          # every frame vs its nearest source frame
     err = "\n".join(l for l in err.splitlines() if "non monotonically" not in l).strip()      # (a muxer remark of the null output, not a decode problem)
     if rc != 0 or err:
         return "decode error: " + err[:80]
@@ -6941,56 +6978,248 @@ def interp_validate(src, seg, s0, d, src_fps):
     return None
 
 
+# ---------------------------------------------------------------- V6.9.6: effective fps measurement (read-only, ffprobe / ffmpeg decode of small ranges)
+def probe_timestamps(path, s0, e):
+    """Packet timestamps (s, sorted) of the first video stream inside [s0, e] (ffprobe only, no decoding)."""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{s0:.3f}%{e:.3f}", "-show_entries", "packet=pts_time",
+             "-of", "csv=p=0", str(path)], timeout=60)
+    ts = []
+    for l_ in (r.stdout or b"").decode(errors="replace").split():
+        try:
+            ts.append(float(l_.strip(",")))
+        except ValueError:
+            pass
+    ts = sorted(t for t in ts if s0 - 1e-3 <= t <= e + 1e-3)
+    return ts
+
+
+def ts_stats(ts):
+    """Timestamp fps and VFR gap statistics from sorted frame times."""
+    import numpy as np
+    if len(ts) < 3:
+        return {"n": len(ts), "ts_fps": 0.0, "median_dt": 0.0, "gap_share": 0.0, "max_gap_frames": 0.0, "vfr": False}
+    d = np.diff(np.asarray(ts))
+    d = d[d > 1e-6]
+    if not len(d):
+        return {"n": len(ts), "ts_fps": 0.0, "median_dt": 0.0, "gap_share": 0.0, "max_gap_frames": 0.0, "vfr": False}
+    med = float(np.median(d))
+    share = float(np.mean(d > 1.5 * med))
+    mg = float(d.max() / med)
+    return {"n": len(ts), "ts_fps": float((len(ts) - 1) / (ts[-1] - ts[0])) if ts[-1] > ts[0] else 0.0, "median_dt": med, "gap_share": share,
+            "max_gap_frames": mg, "vfr": bool(share >= VFR_SHARE or mg > VFR_GAP_FRAMES)}
+
+
+def gray_frames(path, s0, d, w=160, h=90):
+    """Small grey frames of the CENTRAL 60% of the picture (static HUD and black bars are outside it) of [s0, s0+d), every decoded frame, no resampling."""
+    import numpy as np
+    r = run(["ffmpeg", "-v", "error", "-ss", f"{s0:.4f}", "-t", f"{d:.4f}", "-i", str(path), "-an", "-vf",
+             f"crop=iw*0.6:ih*0.6:iw*0.2:ih*0.2,scale={w}:{h}:flags=area,format=gray", "-vsync", "0", "-f", "rawvideo", "-"], timeout=180)
+    a = np.frombuffer(r.stdout or b"", np.uint8)
+    n = len(a) // (w * h)
+    return a[:n * w * h].reshape(n, h, w).astype(np.float32)
+
+
+def frame_uniqueness(fr):
+    """(unique flags per frame step, motion level). Frame i is unique when it differs from frame i-1 by more than the duplicate threshold."""
+    import numpy as np
+    if len(fr) < 4:
+        return None, 0.0
+    d = np.abs(np.diff(fr, axis=0)).mean(axis=(1, 2))
+    mot = float(np.percentile(d, 75))
+    thr = max(0.25, 0.12 * mot)
+    return d > thr, mot
+
+
+def cadence_of(uniq):
+    """Regular duplicate cadence from the unique flags of the frame steps: (period, phase) when >= 85% of the unique-to-unique distances are equal and
+    the period is 2 or more frames, (1, 0) when nothing is duplicated, else None (irregular). phase = frame index mod period of the first frame of a new picture."""
+    import numpy as np
+    idx = np.where(uniq)[0] + 1                     # frame numbers (step i compares frame i+1 with frame i) that show a new picture
+    if len(idx) < 4:
+        return None
+    g = np.diff(idx)
+    per = int(np.bincount(g).argmax())
+    if np.mean(g == per) < 0.85:
+        return None
+    return per, int(np.bincount(idx % per).argmax())
+
+
+def measure_content(path, s0, e):
+    """Content fps pieces for [s0, e]: unique share of the decoded frames (central region), regular cadence, static scene flag."""
+    wins = [(s0, e - s0)] if e - s0 <= CONTENT_MAX_S else [(s0, CONTENT_WIN_S), ((s0 + e) / 2 - CONTENT_WIN_S / 2, CONTENT_WIN_S), (e - CONTENT_WIN_S, CONTENT_WIN_S)]
+    n = u = 0
+    mots, cads = [], []
+    for w0, wd in wins:
+        fr = gray_frames(path, max(0.0, w0), wd)
+        uq, mot = frame_uniqueness(fr)
+        if uq is None:
+            continue
+        n += len(uq)
+        u += int(uq.sum())
+        mots.append(mot)
+        cads.append(cadence_of(uq))
+    if not n:
+        return {"unique_share": 1.0, "cadence": None, "static": True, "motion": 0.0, "frames": 0}
+    cad = cads[0] if cads and all(c is not None and c[0] == cads[0][0] for c in cads if c is not None) and cads[0] is not None else None
+    return {"unique_share": u / n, "cadence": cad, "static": bool(max(mots) < DUP_MIN_MOTION), "motion": max(mots), "frames": n}
+
+
+def measure_range(path, lo, hi, dur, probe=None):
+    """Everything fpscontent / the render needs about the source range [lo, hi] (+ margin) of one clip: timestamp fps and gaps, content fps, cadence."""
+    s0 = max(0.0, lo - INTERP_MARGIN_S)
+    e = hi + INTERP_MARGIN_S
+    if dur > 0:
+        e = min(e, dur)
+    pr = probe or probe_fps(path)
+    st = ts_stats(probe_timestamps(path, s0, e))
+    ts_fps = st["ts_fps"] or pr["eff"] or pr["avg"]
+    ct = measure_content(path, s0, e)
+    cfps = ts_fps * ct["unique_share"] if not ct["static"] else ts_fps
+    return {"s0": s0, "e": e, "container": pr, "ts": st, "ts_fps": ts_fps, "content": ct, "content_fps": cfps}
+
+
+def classify_range(m, speed):
+    """Reasons (list of 'slow-mo' / 'duplicated frames' / 'vfr gaps' / 'low fps') why a take that shows this range at `speed` is below 75% of the
+    montage fps in EFFECTIVE unique frames per second; [] = fine. speed > 1 (ramps) never counts as slow-mo."""
+    thr = INTERP_FRAC * OUT_FPS
+    why = []
+    base = min(m["ts_fps"], m["content_fps"]) if m["ts_fps"] else 0.0
+    if m["ts"]["vfr"]:
+        why.append("vfr gaps")
+    elif 0 < m["ts_fps"] < thr:
+        why.append("low fps")
+    if m["ts_fps"] >= thr and 0 < m["content_fps"] < thr and not m["content"]["static"]:
+        why.append("duplicated frames")
+    if 0 < speed < 1 and 0 < base * speed < thr:
+        why.append("slow-mo")
+    return why
+
+
+def take_source_ranges(t, srcs, fx=None):
+    """Per source of a take: {"all": (lo, hi), "slow": [(lo, hi, speed)]} in the source's own time, with the SAME range maths the render uses
+    (the no-slow-mo retry window included). Freeze frames (speed 0) are stills and are not measured."""
+    out_ = {}
+    for sg in t["segs"]:
+        a, b, sp, n = sg[:4]
+        if fx is not None and "slow" not in fx and sp in (0.5, 0.0):
+            b, sp = a + n / OUT_FPS, 1.0
+        si = sg[4] if len(sg) > 4 and sg[4] < len(srcs) else 0
+        sa = a - srcs[si]["shift"]
+        need = max((b - a) if sp > 0 else 1.0 / OUT_FPS, n / OUT_FPS) + 0.3
+        rg = out_.setdefault(si, {"all": None, "slow": []})
+        lo, hi = rg["all"] or (sa, sa + need)
+        rg["all"] = (min(lo, sa), max(hi, sa + need))
+        if 0 < sp < 1:
+            rg["slow"].append((sa, sa + max((b - a), n / OUT_FPS * sp) + 0.3, sp))
+    return out_
+
+
+def analyse_takes(plan, fx=None, workers=4):
+    """Measure every (take, source) of a plan. Returns [{"take": i, "si": si, "path", "range", "m", "speed", "why", ...}] (read-only)."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = []
+    probes = {}
+    for ti, t in enumerate(plan["takes"]):
+        srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0}]
+        for si, rg in take_source_ranges(t, srcs, fx).items():
+            if rg["all"] is None:
+                continue
+            jobs.append((ti, si, srcs[si], rg))
+
+    def one(job):
+        ti, si, src, rg = job
+        pth = src["path"]
+        try:
+            if pth not in probes:
+                probes[pth] = probe_fps(pth)
+            pr = probes[pth]
+            lo, hi = rg["all"]
+            m = measure_range(pth, lo, hi, pr["dur"], pr)
+            spd = min([s_[2] for s_ in rg["slow"]], default=1.0)
+            return {"take": ti, "si": si, "path": pth, "range": (lo, hi), "slow": rg["slow"], "m": m, "speed": spd, "why": classify_range(m, spd)}
+        except Exception as ex:
+            return {"take": ti, "si": si, "path": pth, "range": rg["all"], "slow": rg["slow"], "m": None, "speed": 1.0, "why": [], "error": f"{type(ex).__name__}: {ex}"}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        return list(ex.map(one, jobs))
+
+
+def detect_dup_chain(path, s0, d):
+    """The duplicate-removal prefix for the segment [s0, s0+d) of `path`, measured on the SAME extraction the segment is cut from, plus the unique
+    rate: (prefix filter, unique fps, how). Regular cadence: select by the detected phase and re-time to the exact original times; irregular: mpdecimate."""
+    fr = gray_frames(path, s0, min(d, 3.0))
+    uq, mot = frame_uniqueness(fr)
+    if uq is None or mot < DUP_MIN_MOTION:
+        return "", 0.0, "none"
+    pr = probe_fps(path)
+    f = pr["eff"] or pr["avg"] or float(OUT_FPS)
+    cad = cadence_of(uq)
+    if cad is not None and cad[0] >= 2:
+        per, ph = cad
+        return (f"select='eq(mod(n\\,{per})\\,{ph})',setpts=(N*{per}+{ph})/({f:.5f}*TB),", f / per, f"cadence {per} phase {ph}")
+    if cad is not None and cad[0] == 1:
+        return "", f, "none"
+    share = float(uq.mean())
+    return f"mpdecimate,setpts=N/({f * share:.5f}*TB),", f * share, "mpdecimate"
+
+
 def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
-    """Returns (plan to build the filter from, number of temp files). The same plan object when nothing is interpolated."""
+    """Returns the plan to build the filter from (the SAME plan object when nothing is interpolated)."""
     if not cfg.get("interpolate_low_fps", True):
         out("fps: interpolation disabled (interpolate_low_fps = false), no clips probed")
         return plan
-    paths = []
-    for t in plan["takes"]:
-        for s in (t.get("srcs") or [{"path": t["path"]}]):
-            if s["path"] not in paths:
-                paths.append(s["path"])
-    info, fails = {}, 0
-    for p_ in paths:
-        try:
-            info[p_] = probe_fps(p_)
-        except Exception:
-            fails += 1
-    cand = {p_ for p_, i in info.items() if 0 < i["eff"] < INTERP_FRAC * OUT_FPS}
+    res = analyse_takes(plan, fx)
+    n_takes = len(plan["takes"])
+    bad_ = [r_ for r_ in res if r_.get("error")]
+    cand = [r_ for r_ in res if r_["why"]]
+    cnt = {k: sum(1 for r_ in cand if k in r_["why"]) for k in ("slow-mo", "duplicated frames", "vfr gaps", "low fps")}
+    reasons = f"slow-mo {cnt['slow-mo']}, duplicated {cnt['duplicated frames']}, vfr {cnt['vfr gaps']}" + (f", low-fps {cnt['low fps']}" if cnt["low fps"] else "")
     if not cand:
-        out(f"fps: {len(paths)} clips probed, 0 low-fps" + (f" ({fails} unreadable)" if fails else ""))
+        out(f"fps: {n_takes} takes probed, 0 low-effective-fps" + (f" ({len(bad_)} unreadable)" if bad_ else ""))
         return plan
     done, fell = 0, 0
-    names = ", ".join(f"{Path(p_).name} {info[p_]['eff']:.0f} fps" for p_ in paths if p_ in cand)
-    new_takes, idx = [], 0
+    new_takes = list(plan["takes"])
     INTERP_STATE["mci_slow"] = False
-    for t in plan["takes"]:
+    idx = 0
+    by_take = {}
+    for r_ in cand:
+        by_take.setdefault(r_["take"], []).append(r_)
+    for ti in sorted(by_take):
+        t = plan["takes"][ti]
         srcs = [dict(s) for s in (t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"], "audio": t["audio"],
-                                                      "a_stream": 0, "gain_db": -6.0}])]
-        rng = {}
-        for sg in t["segs"]:
-            a, b, sp, n = sg[:4]
-            si = sg[4] if len(sg) > 4 and sg[4] < len(srcs) else 0
-            if srcs[si]["path"] not in cand:
-                continue
-            sa = a - srcs[si]["shift"]
-            need = max((b - a) if sp > 0 else 1.0 / OUT_FPS, n / OUT_FPS) + 0.3          # also what the no-slow-mo retry would read
-            lo, hi = rng.get(si, (sa, sa + need))
-            rng[si] = (min(lo, sa), max(hi, sa + need))
+                                                       "a_stream": 0, "gain_db": -6.0}])]
         changed = False
-        for si, (lo, hi) in rng.items():
+        for r_ in by_take[ti]:
             if CANCEL.is_set():
                 raise RuntimeError("cancelled")
-            i = info[srcs[si]["path"]]
+            si, m = r_["si"], r_["m"]
+            nm = Path(srcs[si]["path"]).name
+            whole = any(k in r_["why"] for k in ("vfr gaps", "low fps", "duplicated frames"))
+            lo, hi = r_["range"] if whole else (min(x[0] for x in r_["slow"]), max(x[1] for x in r_["slow"]))
+            pr = m["container"]
             s0 = max(0.0, lo - INTERP_MARGIN_S)
             e = hi + INTERP_MARGIN_S
-            if i["dur"] > 0:
-                e = min(e, i["dur"])
+            if pr["dur"] > 0:
+                e = min(e, pr["dur"])
             d = e - s0
-            nm = Path(srcs[si]["path"]).name
+            sp = r_["speed"]
+            urate = min(m["ts_fps"], m["content_fps"]) or m["ts_fps"] or float(OUT_FPS)
+            out(f"effective fps: {nm} {lo:.2f}-{hi:.2f} s container {pr['eff']:.0f}, content {m['content_fps']:.0f}, speed {sp:.2f} -> "
+                f"{min(m['ts_fps'], m['content_fps']) * sp:.0f} effective -> interpolating ({' + '.join(r_['why'])})")
             if d < 0.2:
                 continue
+            pre, how = "", ""
+            try:
+                if "duplicated frames" in r_["why"]:
+                    pre, urate, how = detect_dup_chain(srcs[si]["path"], s0, d)
+                    urate = urate or float(OUT_FPS) / 2
+            except Exception as ex:
+                out(f"interpolation skipped: {nm} (duplicate detection failed: {type(ex).__name__}: {ex})")
+                fell += 1
+                continue
+            target = float(OUT_FPS)
+            if sp < 1:
+                target = max(float(OUT_FPS), min(INTERP_MAX_FPS, OUT_FPS / sp, INTERP_MAX_X * max(urate, 1.0)))
+                target = float(round(target))
             seg = Path(tmpdir) / f"seg{idx}.mov"
             idx += 1
             why = None
@@ -6999,7 +7228,8 @@ def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
             for method in ((method,) if method == "blend" else ("mci", "blend")):
                 Path(tmpdir).mkdir(parents=True, exist_ok=True)
                 t_start = time.time()
-                rc, err, _ = _run_timed(interp_segment_cmd(srcs[si]["path"], s0, d, seg, method), max(INTERP_MIN_TIMEOUT_S, INTERP_TIMEOUT_X * d))
+                rc, err, _ = _run_timed(interp_segment_cmd(srcs[si]["path"], s0, d, seg, method, target, pre) if (target != OUT_FPS or pre)
+                                        else interp_segment_cmd(srcs[si]["path"], s0, d, seg, method), max(INTERP_MIN_TIMEOUT_S, INTERP_TIMEOUT_X * d))
                 if rc is None and method == "mci":
                     INTERP_STATE["mci_slow"] = True
                     out(f"interpolation: motion method needs more than {INTERP_TIMEOUT_X:.0f}x real time on this PC - blend is used instead")
@@ -7009,7 +7239,7 @@ def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
             if CANCEL.is_set():
                 raise RuntimeError("cancelled")
             if why is None:
-                why = interp_validate(srcs[si]["path"], seg, s0, d, i["eff"])
+                why = interp_validate(srcs[si]["path"], seg, s0, d, pr["eff"] or pr["avg"] or float(OUT_FPS), target)
             if why:
                 fell += 1
                 out(f"interpolation skipped: {nm} ({why})")
@@ -7018,12 +7248,14 @@ def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
                 except OSError:
                     pass
                 continue
-            out(f"interpolated {nm} {s0:.2f}-{e:.2f} s {i['eff']:.0f} -> {OUT_FPS} fps method={method} in {time.time() - t_start:.1f} s")
+            out(f"interpolated {nm} {s0:.2f}-{e:.2f} s {urate:.0f} -> {target:g} fps method={method}{' (' + how + ' removed first)' if pre else ''} "
+                f"in {time.time() - t_start:.1f} s")
             srcs[si].update(path=str(seg), shift=round(srcs[si]["shift"] + s0, 6))
             done += 1
             changed = True
-        new_takes.append(dict(t, srcs=srcs) if changed else t)
-    out(f"fps: {len(paths)} clips probed, {len(cand)} low-fps candidate(s) ({names}), {done} interpolated, {fell} fell back")
+        if changed:
+            new_takes[ti] = dict(t, srcs=srcs)
+    out(f"fps: {n_takes} takes probed, {len(cand)} low-effective-fps ({reasons}), {done} interpolated, {fell} fell back")
     return dict(plan, takes=new_takes) if done else plan
 
 
@@ -7071,6 +7303,137 @@ def cmd_fpscheck(args):
     (HERE / "fpscheck.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
     print(f"(written to {HERE / 'fpscheck.txt'}; nothing else was changed)")
+
+
+def _fmt_range(m):
+    return f"{m['s0']:.1f}-{m['e']:.1f} s"
+
+
+def fpscontent_line(name, rng_txt, m, speed, why, extra=""):
+    """One report line of fpscontent for a take / clip range."""
+    pr, st, ct = m["container"], m["ts"], m["content"]
+    cad = ("static scene (not measurable)" if ct["static"] else
+           (f"cadence period {ct['cadence'][0]} phase {ct['cadence'][1]}" if ct["cadence"] and ct["cadence"][0] >= 2 else
+            ("no duplicates" if ct["unique_share"] > 0.97 else "irregular duplicates")))
+    eff = min(m["ts_fps"], m["content_fps"]) * speed
+    info = ""
+    if not why and 40 <= m["ts_fps"] < 0.9 * OUT_FPS and abs(m["ts_fps"] - 50) <= 2.5:
+        info = f" | info: cadence {m['ts_fps']:.0f}->{OUT_FPS} (every 5th frame shown twice, no action)"
+    return (f"{name} {rng_txt}: container avg {pr['avg']:.1f} / r {pr['r']:.1f}, timestamps {m['ts_fps']:.1f} fps, "
+            f"gaps {st['gap_share']:.0%} above 1.5x median (largest {st['max_gap_frames']:.1f} frames), content {m['content_fps']:.1f} fps ({cad}), "
+            f"speed {speed:.2f} -> effective {eff:.1f} fps -> " + ("ok" if not why else "LOW-EFFECTIVE-FPS: " + " + ".join(why)) + info + extra)
+
+
+def cmd_fpscontent(args):
+    """V6.9.6: python montage.py fpscontent [<montage.mp4> | <clip names...> | --all] [--limit N]. Read-only: the EFFECTIVE on-screen fps of every take of a
+    montage (its .plan.json), of the named clips or (--all) of 2 s windows of the cached clips: timestamp fps, VFR gaps, content fps (unique frames),
+    playback speed, verdict. Writes fpscontent.txt next to montage.py, never a cache / flag / config."""
+    tg = list(getattr(args, "target", None) or [])
+    lines, counts, n = [], {"slow-mo": 0, "duplicated frames": 0, "vfr gaps": 0, "low fps": 0}, 0
+    lim = int(getattr(args, "limit", 0) or 0)
+    pj = None
+    if len(tg) == 1 and tg[0].lower().endswith(".mp4") and Path(tg[0]).exists() and not getattr(args, "all", False):
+        f = Path(tg[0])
+        pj = next((q for q in (f.parent / "logs" / (f.stem + ".plan.json"), f.with_suffix(".plan.json")) if q.exists()), None)
+        if not pj and not _FN_TIME.search(f.name):                # a montage file (no recording time in its name): its newest plan
+            cands = sorted(list(f.parent.glob("*.plan.json")) + list((f.parent / "logs").glob("*.plan.json")), key=lambda p_: p_.stat().st_mtime)
+            pj = cands[-1] if cands else None
+    if pj:
+        plan = load_json(pj, {})
+        head = f"fpscontent: takes of {f.name} (plan {pj.name}, {len(plan.get('takes', []))} takes, montage {OUT_FPS} fps)"
+        for r_ in analyse_takes(plan):
+            if lim and n >= lim:
+                break
+            n += 1
+            nm = Path(r_["path"]).name
+            if r_.get("error"):
+                lines.append(f"take {r_['take'] + 1}: {nm} unreadable ({r_['error']})")
+                continue
+            sp_all = [sg[2] for sg in plan["takes"][r_["take"]]["segs"] if sg[2] > 0]
+            spd = r_["speed"] if r_["speed"] < 1 else (max(sp_all) if sp_all else 1.0)
+            why = r_["why"]
+            for k in why:
+                counts[k] += 1
+            lines.append("take %d: " % (r_["take"] + 1) + fpscontent_line(nm, _fmt_range(r_["m"]), r_["m"], r_["speed"] if r_["speed"] < 1 else 1.0, why,
+                                                                         f" | plan speed {spd:.2f}{' (slow-mo)' if r_['speed'] < 1 else ' (ramp)' if spd > 1.01 else ''}"))
+    else:
+        clips = load_json(CLIPS_CACHE, {})
+        allp = sorted(r["path"] for r in clips.values() if isinstance(r, dict) and r.get("path") and os.path.exists(r["path"]) and not r.get("error"))
+        if getattr(args, "all", False) or not tg:
+            paths = allp
+            if not getattr(args, "all", False):
+                print("fpscontent: give a montage .mp4, clip names or --all")
+                return
+        else:
+            paths = []
+            for t_ in tg:
+                paths += [q for q in ([t_] if os.path.exists(t_) else allp) if os.path.exists(q) and (q == t_ or t_.lower() in Path(q).name.lower())]
+        paths = list(dict.fromkeys(paths))[:lim or (40 if getattr(args, "all", False) else 1000)]
+        head = f"fpscontent: {len(paths)} clip(s), 2 s window in the middle of each (montage {OUT_FPS} fps)"
+        for q in paths:
+            try:
+                pr = probe_fps(q)
+                mid = max(0.0, pr["dur"] / 2 - 1.0)
+                m = measure_range(q, mid + INTERP_MARGIN_S, mid + 2.0 - INTERP_MARGIN_S, pr["dur"], pr)
+                why = classify_range(m, 1.0)
+            except Exception as ex:
+                lines.append(f"{Path(q).name} unreadable ({ex})")
+                continue
+            n += 1
+            for k in why:
+                counts[k] += 1
+            lines.append(fpscontent_line(Path(q).name, _fmt_range(m), m, 1.0, why))
+    summ = (f"summary: {n} measured, takes per reason: slow-mo {counts['slow-mo']}, duplicated frames {counts['duplicated frames']}, "
+            f"vfr gaps {counts['vfr gaps']}, low fps {counts['low fps']}")
+    text = "\n".join([head] + lines + [summ])
+    (HERE / "fpscontent.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(written to {HERE / 'fpscontent.txt'}; nothing else was changed)")
+
+
+def cmd_interpbench(args):
+    """V6.9.6: python montage.py interpbench [clip]. Seconds of ffmpeg time per source second for the motion (mci) and the blend interpolation on a 5 s
+    sample, and the verdict the render will reach on THIS PC. Writes nothing into montage_data (a temp folder that is deleted)."""
+    import tempfile
+    q = getattr(args, "clip", None)
+    cands = []
+    if q and os.path.exists(q):
+        cands = [q]
+    else:
+        clips = load_json(CLIPS_CACHE, {})
+        allp = sorted(r["path"] for r in clips.values() if isinstance(r, dict) and r.get("path") and os.path.exists(r["path"]) and not r.get("error"))
+        if q:
+            allp = [p_ for p_ in allp if q.lower() in Path(p_).name.lower()]
+        cands = allp
+    if not cands:
+        print("interpbench: no clip found (give a path or a name fragment)")
+        return
+    pick = cands[0]
+    for p_ in cands[:12]:                                   # the first clip that would be a candidate, else the first clip
+        try:
+            pr = probe_fps(p_)
+            if classify_range(measure_range(p_, 0.0, 2.0, pr["dur"], pr), 1.0):
+                pick = p_
+                break
+        except Exception:
+            continue
+    pr = probe_fps(pick)
+    s0 = max(0.0, min(pr["dur"] - 5.0, pr["dur"] / 3)) if pr["dur"] > 5.5 else 0.0
+    d = min(5.0, pr["dur"] - s0) if pr["dur"] else 5.0
+    res = {}
+    with tempfile.TemporaryDirectory(prefix="interpbench_") as td:
+        for method in ("mci", "blend"):
+            t0 = time.time()
+            rc, err, _ = _run_timed(interp_segment_cmd(pick, s0, d, Path(td) / f"{method}.mov", method), 600)
+            res[method] = (time.time() - t0) / d if rc == 0 else None
+    fmt = lambda v: "failed" if v is None else f"{v:.1f} s per source second"
+    ok = res["mci"] is not None and res["mci"] <= INTERP_TIMEOUT_X
+    print(f"interpbench: {Path(pick).name} ({pr['eff']:.1f} fps), {d:.1f} s sample from {s0:.1f} s")
+    print(f"  motion (mci):  {fmt(res['mci'])}")
+    print(f"  blend:         {fmt(res['blend'])}")
+    print(f"  verdict: " + ("mci ok (a segment finishes within the %gx real-time limit)" % INTERP_TIMEOUT_X if ok else
+                            "too slow, blend will be used (mci needs more than %gx real time on this PC)" % INTERP_TIMEOUT_X))
+    print("(nothing was written into montage_data)")
 
 
 def render_tmpdir(outfile):
@@ -7492,6 +7855,7 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
                 state[d] = j
                 res["partners"].append((nb[3], rec["path"], gap))
                 lines.append(f"pair partner of {Path(rec['path']).name}: {nm} (gap {gap:.1f} s)")
+    res["partners"].sort(key=lambda x: (pair_clip_start(x[0]["path"]) or 0.0, x[0]["path"]))       # V6.9.6: never in discovery order
     return res
 
 
@@ -7564,7 +7928,7 @@ def pairing_replace_events(res, pool, picked, game, cfg, seed):
         ps = {p for c in mine for p in by_clip.get(c, [])}
         if not ps:
             continue
-        sub = [it for it in pool if _pkey(it["rec"]["path"]) in mine | ps]
+        sub = sorted([it for it in pool if _pkey(it["rec"]["path"]) in mine | ps], key=lambda it: (pair_clip_start(it["rec"]["path"]) or 0.0, it["rec"]["path"]))
         if not any(_pkey(it["rec"]["path"]) in ps for it in sub):
             continue
         evs2, _ = build_events(sub, game, cfg, random.Random(seed))
@@ -7601,6 +7965,101 @@ def cmd_pairscan(args):
     (HERE / "pairscan_cs2.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
     print(f"({n_rows} neighbouring pairs; written to {HERE / 'pairscan_cs2.txt'}; nothing else was changed)")
+
+
+def pair_group(recs, path, store, det, cfg, used):
+    """The fight group of one CS2 clip as the pairing step sees it: the clip, then its neighbours in both directions (gap <= PAIR_MAX_GAP_S, an overlap is
+    a negative gap), up to PAIR_MAX_HOPS per side and PAIR_MAX_EXTRA clips, each with the reason it is in or out. Reads caches only.
+    Returns (members [(start, rec, kills|None, overlap_or_gap_to_previous)], notes)."""
+    idx, _ = pair_time_index(recs)
+    pos = {k: i for i, (_, k, _, _) in enumerate(idx)}
+    key = _pkey(path)
+    if key not in pos:
+        return [], ["the clip is not in the time index (unparsable name, no cached duration or not a cached CS2 clip)"]
+    notes, members, extra = [], [pos[key]], 0
+    for d in (-1, 1):
+        j = pos[key]
+        for _hop in range(PAIR_MAX_HOPS):
+            cur = idx[j]
+            j += d
+            if not 0 <= j < len(idx) or extra >= PAIR_MAX_EXTRA:
+                break
+            nb = idx[j]
+            gap = (nb[0] - cur[2]) if d > 0 else (cur[0] - nb[2])
+            nm = Path(nb[3]["path"]).name
+            ks = pair_player_kills(nb[3], store, det, cfg)
+            if gap > PAIR_MAX_GAP_S:
+                notes.append(f"{nm}: not a partner (gap {gap:.1f} s > {PAIR_MAX_GAP_S:.0f} s)")
+                break
+            if ks is None:
+                notes.append(f"{nm}: not scanned, the planner never uses it")
+                break
+            if nb[1] in used:
+                notes.append(f"{nm}: already used in a montage")
+                break
+            if not ks:
+                notes.append(f"{nm}: no kills of the player")
+                break
+            members.append(j)
+            extra += 1
+    members.sort(key=lambda i: (idx[i][0], idx[i][1]))
+    rows = []
+    for n_, i in enumerate(members):
+        t0, k_, t1, r_ = idx[i]
+        prev = idx[members[n_ - 1]] if n_ else None
+        rows.append((t0, r_, pair_player_kills(r_, store, det, cfg), (t0 - prev[2]) if prev else None))
+    return rows, notes
+
+
+def cmd_grouporder(args):
+    """V6.9.6: python montage.py grouporder cs2 "<clip name>". Read-only: the fight group of that clip (its pair partners), the start time of every clip,
+    the overlap / gap to the previous one and the order the planner will use and why. Writes grouporder.txt next to montage.py, changes nothing."""
+    cfg = load_config()
+    det = Detector("cs2")
+    store = load_kills_cache()
+    clips = load_json(CLIPS_CACHE, {})
+    recs = []
+    for p_ in sorted(set(walk_files(clip_roots(cfg), VIDEO_EXT, MIN_VIDEO, cfg))):
+        try:
+            if tag_game(p_, cfg)[0] != "cs2":
+                continue
+            rec = clips.get(file_key(p_))
+        except OSError:
+            continue
+        if rec and not rec.get("error"):
+            recs.append(dict(rec, path=p_, game="cs2"))
+    q = str(args.clip).lower()
+    hit = [r_ for r_ in recs if Path(r_["path"]).name.lower() == q] or [r_ for r_ in recs if q in Path(r_["path"]).name.lower()]
+    if not hit:
+        lines = [f"grouporder: no cached CS2 clip matches '{args.clip}'"]
+    else:
+        lines = grouporder_lines(recs, hit[0], store, det, cfg, used_dates())
+    text = "\n".join(lines)
+    (HERE / "grouporder.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(written to {HERE / 'grouporder.txt'}; nothing else was changed)")
+
+
+def grouporder_lines(recs, rec, store, det, cfg, used):
+    rows, notes = pair_group(recs, rec["path"], store, det, cfg, used)
+    lines = [f"grouporder cs2: fight group of {Path(rec['path']).name}"]
+    if not rows:
+        return lines + ["  " + n_ for n_ in notes]
+    base = rows[0][0]
+    ties = {}
+    for t0, r_, ks, _ in rows:
+        ties.setdefault(t0, []).append(Path(r_["path"]).name)
+    for n_, (t0, r_, ks, gap) in enumerate(rows, 1):
+        rel = (f"{'overlaps the previous one by %.1f s' % -gap if gap < 0 else 'gap %.1f s after the previous one' % gap}" if gap is not None else "first")
+        lines.append(f"  {n_}. {Path(r_['path']).name}  starts {datetime.datetime.fromtimestamp(t0):%H:%M:%S} (+{t0 - base:.1f} s), {float(r_.get('dur') or 0):.1f} s long, "
+                     f"{len(ks) if ks is not None else '?'} kill(s), {rel}{'  <- the clip asked about' if _pkey(r_['path']) == _pkey(rec['path']) else ''}")
+    lines.append("  order the planner will use: " + " -> ".join(str(i) for i in range(1, len(rows) + 1)) +
+                 "  (chronological by the recording time in the clip names; the gap logic is not used because the clips overlap)")
+    for t0, names in ties.items():
+        if len(names) > 1:
+            lines.append(f"  same base time {datetime.datetime.fromtimestamp(t0):%H:%M:%S}: {', '.join(names)} - their order is decided by the frame-match stitch verification at plan time, never by file-name sort")
+    lines += ["  " + n_ for n_ in notes]
+    return lines
 
 
 def pairscan_rows(cfg, recs, store, det, used, limit=30):
@@ -13036,6 +13495,14 @@ def main():
     fc.add_argument("--limit", type=int, default=0)
     fc.add_argument("--all", action="store_true")
     fc.set_defaults(fn=cmd_fpscheck)
+    fcc = sp.add_parser("fpscontent", help="V6.9.6: EFFECTIVE on-screen fps per take (timestamps, VFR gaps, duplicated frames, slow-mo); read-only, writes fpscontent.txt")
+    fcc.add_argument("target", nargs="*", help="a montage .mp4 (uses its .plan.json), or clip names")
+    fcc.add_argument("--all", action="store_true")
+    fcc.add_argument("--limit", type=int, default=0)
+    fcc.set_defaults(fn=cmd_fpscontent)
+    ib = sp.add_parser("interpbench", help="V6.9.6: seconds per source second of the mci / blend interpolation on this PC (5 s sample, writes nothing)")
+    ib.add_argument("clip", nargs="?")
+    ib.set_defaults(fn=cmd_interpbench)
     sm = sp.add_parser("songmapcompare", help="V6.9.5: find the songs where SONGMAP V1 and V2 disagree most and write listening material (compare_out/)")
     sm.add_argument("target", nargs="?", help="a song file or a list.txt (default: choose songs automatically)")
     sm.add_argument("--auto", type=int, nargs="?", const=10, default=None, help="pick the N most suspicious songs (default 10)")
@@ -13048,6 +13515,10 @@ def main():
     pc.add_argument("game", choices=["cs2"])
     pc.add_argument("--limit", type=int, default=30)
     pc.set_defaults(fn=cmd_pairscan)
+    go = sp.add_parser("grouporder", help="V6.9.6: the fight group (pair partners) of a CS2 clip and the order the planner will stitch it in (read-only, writes grouporder.txt)")
+    go.add_argument("game", choices=["cs2"])
+    go.add_argument("clip", help="clip file name (or part of it)")
+    go.set_defaults(fn=cmd_grouporder)
     rh = sp.add_parser("rescanhash", help="V6.8.1: rescan only the clips that have an entry under <hash> and none under the current region")
     rh.add_argument("game", choices=GAMES)
     rh.add_argument("hash")
