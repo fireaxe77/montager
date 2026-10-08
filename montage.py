@@ -4706,7 +4706,7 @@ def analyse_song(path, csv_bpm=None):
     return an
 
 
-SONGMAP_DEFAULT = "v1"                   # V6.9.5: the default song map; switching the default to SONGMAPV2 is this one line ("v2")
+SONGMAP_DEFAULT = "v2"                   # V6.9.5: the default song map; switching the default to SONGMAPV2 is this one line ("v2")
 SONGMAP_CHOICES = {"v1": "Songmap V1", "v2": "Songmap V2"}
 SONGMAP_AUTO = "v2auto"                  # V6.9.5.2: per song, V2 only where its grid is confident and measurably better than V1, else the V1 map
 SONGMAP_CHOICES_UI = dict(SONGMAP_CHOICES)     # V7.1: the Settings dropdown offers only Songmap V1 and Songmap V2 (a stored "v2auto" still works internally)
