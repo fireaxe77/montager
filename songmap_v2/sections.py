@@ -10,6 +10,12 @@ DROP_HOLD = 0.8                     # share of the persistence window that must 
 SHARE_CAP = 0.45                    # at most this share of the song may be labelled drop
 MIN_RANGE = {"loud": 6.0, "low": 6.0, "act": 1.0}      # a flat song's noise is never stretched to a full 0-1 range
 BUMP_RISE = 0.25
+EARLY_S = 48.0                      # V7.4: drops this early may come back after a SHORT break / build (no long build-up needed) ...
+EARLY_M = 6                         # ... if the new level is sustained for this many bars (a short bump is not a drop)
+EARLY_STEP = 0.3                    # immediate step: the new level minus the bar before
+EARLY_DIP = 0.4                     # break type: new level minus the quietest bar of the 3 before
+EARLY_LOW = 0.2                     # independent evidence: low-band step, or kick density step (EARLY_KICK), or a low-band break
+EARLY_KICK = 0.4
 
 
 def bar_table(beats, down, dur, y, sr, low, events, kick_t=None):
@@ -118,6 +124,42 @@ def relaxed_drop(S, kick_bar, bar_s, N):
     return {"bar": bk, "jump": best, "bass_jump": 0.0, "post": float(S[bk:bk + N].mean()), "kicky": True, "strength": float(0.8 * best), "weak": True}
 
 
+def early_candidates(bars, S, low, kick_bar, level_min):
+    """V7.4: drops in the first EARLY_S seconds without the long build-up the normal rule wants. The kick / bass comes back after a short break or build:
+    the bar score steps up (by EARLY_STEP vs the bar before, and either EARLY_DIP above the quietest of the 3 bars before or DROP_JUMP above the 4 before),
+    stays up for EARLY_M bars (80 % of them above the half-way level) and independent evidence agrees: low-band energy step, kick-density step or a low-band break."""
+    n = len(S)
+    M = EARLY_M
+    res = []
+    for i in range(3, n - M + 1):
+        if bars[i]["t0"] > EARLY_S:
+            break
+        win = S[i:i + M]
+        post = float(win.mean())
+        if post < level_min or post - float(S[i - 1]) < EARLY_STEP:
+            continue
+        pre = S[max(0, i - 4):i]
+        base_dip = float(S[max(0, i - 3):i].min())
+        jump = post - float(pre.mean())
+        if not (post - base_dip >= EARLY_DIP or jump >= DROP_JUMP):
+            continue
+        base = float(pre.mean()) if jump >= DROP_JUMP else base_dip
+        if float(np.mean(win >= base + 0.5 * (post - base))) < DROP_HOLD:
+            continue
+        lw = float(low[i:i + M].mean())
+        lstep = lw - float(low[max(0, i - 4):i].mean())
+        kstep = float(kick_bar[i:i + M].mean()) - float(kick_bar[max(0, i - 4):i].mean())
+        lbreak = float(low[max(0, i - 3):i].min()) <= 0.35 * lw
+        if not (lstep >= EARLY_LOW or kstep >= EARLY_KICK or lbreak):
+            continue
+        res.append({"bar": i, "jump": max(jump, post - base_dip), "post": post, "bass_jump": lstep, "early": True})
+    keep = []
+    for c in sorted(res, key=lambda c: -(c["jump"] + c["post"])):       # one per neighbourhood: the strongest step
+        if all(abs(c["bar"] - k["bar"]) > 3 for k in keep):
+            keep.append(c)
+    return keep
+
+
 def analyse(bars, bar_s):
     """Returns {"S","drops","labels","share"}; drops = [{"bar","t","strength","jump","bass_jump"}] (V1 field names)."""
     n = len(bars)
@@ -187,6 +229,19 @@ def analyse(bars, bar_s):
     share = lambda ds: sum(extent(d)[1] - extent(d)[0] for d in ds) / max(1, n)
     while drops and share(drops) > SHARE_CAP:
         drops.remove(min(drops, key=lambda d: d["jump"]))
+    for c in early_candidates(bars, S, low, kick_bar, level_min):             # V7.4: added AFTER the cap, so no earlier drop is ever removed by them
+        ok = True
+        for d in drops:
+            dist = abs(c["bar"] - d["bar"])
+            if dist >= max(16, N):
+                continue
+            if dist == 0 or dist < 3 or not (dist >= 8 or c["post"] >= d["post"] + 0.12):
+                ok = False
+                break
+        if ok:
+            c["kicky"] = window_kicky(kick_bar, c["bar"], bar_s) and fits(c["bar"])
+            drops.append(c)
+    drops.sort(key=lambda d: d["bar"])
     labels = ["verse"] * n
     for d in drops:
         a, b = extent(d)
@@ -229,7 +284,7 @@ def analyse(bars, bar_s):
             break
     out = []
     for d in drops:
-        out.append({"bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"], "kicky": bool(d["kicky"]),
+        out.append({"early": bool(d.get("early")), "bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"], "kicky": bool(d["kicky"]),
                     "strength": float(d["jump"] + max(d["bass_jump"], 0.0) + d["post"])})
     anchor = None
     if out and not any(d["kicky"] for d in out):               # V7.1: every real drop sits behind a kick-less build: anchor the planner's window on the kick entry instead
