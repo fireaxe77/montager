@@ -66,6 +66,7 @@ def kick_entry(kick_bar, bar, N):
 
 
 PLAN_LEN_S = (20.0, 32.0)           # the montage lengths the continuity test covers (the planner fills ~20-30 s windows)
+HEAD_S, TAIL_S = 17.0, 30.0         # seconds of song needed before / after the main drop so that the planner can fill its longest window (V7.2 takes parity)
 ANCHOR_LEN_S = 26.0                 # the window length the anchor is computed for
 PRE_FRAC = 0.38                     # the planner puts the main drop ~38 % into its window
 GAP_BARS = 2                        # two bars in a row without kicks inside the window = a kick-less break
@@ -171,8 +172,10 @@ def analyse(bars, bar_s):
     for d in drops:                                          # V7.1: the drop is where the KICK comes back, not where a vocal / pad gets loud a few bars earlier
         d["bar"] = kick_entry(kick_bar, d["bar"], N)
     drops = [d for k, d in enumerate(drops) if all(d["bar"] != e["bar"] for e in drops[:k])]
+    t_end = float(bars[-1]["t1"])
+    fits = lambda bar: bars[bar]["t0"] >= HEAD_S and t_end - bars[bar]["t0"] >= TAIL_S      # V7.2: room for the longest montage before and after the main drop
     for d in drops:
-        d["kicky"] = window_kicky(kick_bar, d["bar"], bar_s)
+        d["kicky"] = window_kicky(kick_bar, d["bar"], bar_s) and fits(d["bar"])
 
     def extent(d):
         i = d["bar"]
@@ -228,18 +231,14 @@ def analyse(bars, bar_s):
     for d in drops:
         out.append({"bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"], "kicky": bool(d["kicky"]),
                     "strength": float(d["jump"] + max(d["bass_jump"], 0.0) + d["post"])})
-    if not out:                                              # V7.1: no sustained rise found: the best KICKY rise is offered as a weak drop (never invented from nothing)
-        rel = relaxed_drop(S, kick_bar, bar_s, N)
-        if rel is not None:
-            out.append(rel)
     anchor = None
     if out and not any(d["kicky"] for d in out):               # V7.1: every real drop sits behind a kick-less build: anchor the planner's window on the kick entry instead
         nb = max(4, int(round(ANCHOR_LEN_S / max(bar_s, 0.5))))
         for d in sorted(out, key=lambda d: -d["strength"]):
-            if span_kicky(kick_bar, d["bar"], nb, GAP_BARS + 1):            # a 2-bar fill inside a drop is normal
+            if span_kicky(kick_bar, d["bar"], nb, GAP_BARS + 1) and fits(d["bar"]):            # a 2-bar fill inside a drop is normal
                 anchor = d["bar"] + int(round(PRE_FRAC * nb))
                 break
     if out and anchor is None and not any(d["kicky"] for d in out):      # still nothing kicky: the planner's main drop = the best kicky step of the song (or none)
         rel = relaxed_drop(S, kick_bar, bar_s, N)
-        anchor = rel["bar"] if rel is not None else -1
+        anchor = rel["bar"] if rel is not None and fits(rel["bar"]) else -1
     return {"S": S, "low_n": low, "drops": out, "labels": labels, "share": share(drops), "kick_bar": kick_bar, "anchor": anchor}

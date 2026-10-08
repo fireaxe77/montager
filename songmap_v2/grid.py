@@ -19,7 +19,7 @@ SEG_SLOPE_TOL = 0.015                     # tempo change smaller than 1.5 % is n
 BEAT_WIN_FRAC = 0.22                      # beat search window (fraction of the period) while tracking
 CSV_NEAR = 0.04
 RATIO_PEN = 0.10                          # V7.1: score penalty of a tempo that exists only as a 3:2 / 2:3 relation of another candidate
-TIE_MARGIN = 0.06                         # V7.1: score gap within which the V1 / CSV tempo is preferred
+TIE_MARGIN = 0.09                         # V7.1: score gap within which the V1 / CSV tempo is preferred
 
 
 def band_signals(y, sr):

@@ -25,7 +25,8 @@ def data_copy(M, tmp=None):
     """montage_data copied to a temp folder (logs / plans / theme_cache left out) and every data path of montage.py pointed at it."""
     tmp = Path(tmp or tempfile.mkdtemp(prefix="v7data_"))
     dst = tmp / "data"
-    shutil.copytree(M.DATA, dst, ignore=shutil.ignore_patterns("logs", "plans", "theme_cache"))
+    src = Path(os.environ.get("V7_DATA_SRC") or M.DATA)        # V7.1: a frozen snapshot of montage_data (the real data keeps changing while the Montager app runs)
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns("logs", "plans", "theme_cache"))
     M.save_json(dst / "clip_overrides.json", {})
     old = M.use_data_dir(dst)
     env_old = os.environ.get("MONTAGER_DATA")
