@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.5.1.1 - 2026-10-08: Kill timing on, editable drops, shorter outro
+- CS2 kills are now timed from the moment their row appears on screen.
+- In the Song map you can drag a drop line to the real drop, add or remove drops, and press Reset to go back to the automatic map.
+- The final fade to black is much shorter, so the last kill stays clearly visible.
+- The first clip gets a small zoom punch on the first beat and the last frame is held briefly before the fade.
+
 ## V7.5.1 - 2026-10-08: CS2 kill timing groundwork
 - The code that dates a CS2 kill from the moment its row appears is stricter now, but it stays switched off for now.
 - Nothing in your montages changes.
