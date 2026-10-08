@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.4.8"
+APP_VERSION = "V7.4.9"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2671,6 +2671,53 @@ def border_analysis(sc, cfg, deaths=None):
             "dm": len(kills) > 6 or rep}
 
 
+CS2_NAMEKEEP_ON = [True]
+CS2_NAMEKEEP_KS = 0.75               # V7.4.9: the name read of the victim row must be this stable ...
+CS2_NAMEKEEP_HITS = 2                # ... over at least this many reads
+_NAMEKEEP_LOGGED = set()
+
+
+def cs2_name_kills_kept(a, b, sc, clip=""):
+    """V7.4.9 (CS2 only): when the border list has FEWER kills than the name-based list, name-based kills the border list lacks are kept if (a) the victim name
+    read is stable (ks >= CS2_NAMEKEEP_KS over >= CS2_NAMEKEEP_HITS reads, a real name), (b) the name list itself passed its pre-clip / stale / utility / death-window /
+    duplicate rules (it is in a['kills']), it is not in the clip's first 1.6 s (nor in the first CS2_STALE_S s of a clip with a pre-clip row) and the border analysis did not see and classify a row there, (c) it is
+    not within 1.0 s of a kept kill, and (d) the sidecar holds a settled outlined row-shaped track starting there (a third row the row-spacing filter dropped).
+    Never removes or re-times a border kill. Returns the kept name kills."""
+    if not CS2_NAMEKEEP_ON[0] or len(b["kills"]) >= len(a["kills"]):
+        return []
+    off, fps, n = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS)), int(sc.get("frames", 0))
+    _, blobs = border_shape_filter(sc.get("tracks", []), n)
+    shaped = []
+    for t in blobs:
+        r = t.get("best_rect") or {}
+        if not r:
+            continue
+        h, w = r["y1"] - r["y0"], r["x1"] - r["x0"]
+        if BORDER_H[0] <= h <= BORDER_H[1] and w >= BORDER_ASPECT * h and t["hits"] >= 3:
+            shaped.append(round(t["first"] / fps + off, 3))
+    seen_rows = [d["t"] for d in b.get("rows", [])] + [r["t"] for r in b.get("rej", [])]
+    kept = []
+    for nk in sorted(a["kills"], key=lambda k: k["t"]):
+        t = nk["t"]
+        if len(b["kills"]) + len(kept) >= len(a["kills"]):
+            break
+        if any(abs(t - k["t"]) < 1.0 for k in b["kills"] + kept):
+            continue
+        if len(_alnum(nk.get("victim") or "")) < 3 or nk.get("ks", 0.0) < CS2_NAMEKEEP_KS or nk.get("hits", 0) < CS2_NAMEKEEP_HITS:
+            continue
+        pre_rows = [r for r in b.get("rej", []) if str(r.get("reason", "")).startswith(("pre-clip", "CS2 stale"))]
+        if t < BORDER_PRE_S + 1.0 + off or (t < CS2_STALE_S + off and pre_rows) or any(abs(t - x) < 1.0 for x in seen_rows):
+            continue
+        if not any(abs(t - x) <= 0.6 for x in shaped):
+            continue
+        kept.append(dict(nk, name_kept=True))
+        key = (clip, round(t, 1))
+        if key not in _NAMEKEEP_LOGGED:
+            _NAMEKEEP_LOGGED.add(key)
+            LOGONLY(f"CS2 name kill kept (border list missed it): {clip} @ {t:.1f} -> {nk.get('victim')}")
+    return kept
+
+
 def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
     """analyse_entry() plus the CS2 red-border list: when the clip's sidecar exists (or `build` creates it), the border-based list replaces the
     name-based one (deaths stay the name-based ones); otherwise - and for every other game - this IS analyse_entry(). A clip whose sidecar holds
@@ -2694,6 +2741,14 @@ def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
         a["border_note"] = "no red-outlined row found in this clip: the name-based list is kept"
         return a
     b["old"] = a
+    if (game or entry.get("game")) == "cs2":                 # V7.4.9: CS2 only; never removes or re-times a border kill
+        try:
+            add = cs2_name_kills_kept(a, b, sc, Path(rec.get("path", "")).name)
+        except Exception:
+            add = []
+        if add:
+            b["kills"] = sorted(b["kills"] + add, key=lambda k: k["t"])
+            b["name_kept"] = [k["t"] for k in add]
     return b
 
 

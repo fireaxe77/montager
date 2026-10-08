@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.4.9 - 2026-10-08: CS2 multikills no longer lose a kill
+- A CS2 multikill that showed only two of its three kills now shows all three.
+- Valorant and every other clip stay exactly as they were.
+
 ## V7.4.8 - 2026-10-08: Later drops found after quiet breaks
 - A song that quiets down and comes back at full strength later on now gets that second drop marked.
 - Drops that were already found stay exactly where they were.
