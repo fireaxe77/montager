@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.5.1 - 2026-10-08: CS2 kill timing groundwork
+- The code that dates a CS2 kill from the moment its row appears is stricter now, but it stays switched off for now.
+- Nothing in your montages changes.
+
 ## V7.5 - 2026-10-08: Headline kill lands on the kick
 - When a drop falls between two beats, the headline kill now lands on the kick instead of a beat 0.3 s early.
 - All other clips and songs stay exactly as they were.
