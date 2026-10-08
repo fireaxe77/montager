@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.4.9"
+APP_VERSION = "V7.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2718,6 +2718,117 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
     return kept
 
 
+CS2_DATING_ON = [False]              # V7.5: OFF - impact scan: 60 kills move in 528 clips, a confirmed-good clip (2026.02.12 - 19.24.00.20) moves 3 kills that could not be confirmed on frames; test / scan switch
+CS2_DATING_MAX_S = 2.0               # never more than this far before the cached time
+CS2_DATING_MIN_MOVE = 0.1            # smaller moves are noise and are ignored
+CS2_DATING_MEMO = {}                 # (sidecar key, track id) -> first visible frame or None
+_DATING_LOGGED = set()
+
+
+def _dating_file():
+    return DATA / "cs2_dating_v1.json"
+
+
+def _dating_memo_load():
+    if not CS2_DATING_MEMO.get("_loaded_" + str(DATA)):
+        try:
+            for k, v in json.loads(_dating_file().read_text(encoding="utf-8")).items():
+                CS2_DATING_MEMO[tuple(k.split("#", 1))] = v
+        except Exception:
+            pass
+        CS2_DATING_MEMO["_loaded_" + str(DATA)] = True
+
+
+def _dating_memo_save():
+    try:
+        d = {f"{k[0]}#{k[1]}": v for k, v in CS2_DATING_MEMO.items() if isinstance(k, tuple)}
+        tmp = _dating_file().with_suffix(".tmp")
+        tmp.write_text(json.dumps(d), encoding="utf-8")
+        os.replace(tmp, _dating_file())
+    except Exception:
+        pass
+
+
+def cs2_row_first_frame(rec, det, cfg, sc, tr):
+    """V7.5 (CS2 only): the first sidecar frame (BORDER_FPS grid) at which the SAME row's outline is already in the colour mask, walking back from the frame where
+    the outline lines first paired into a rectangle (tr['first']): same position, mask count >= 30 % of the row's settled count, and the same row appearance
+    (border_desc >= 0.75), continuous, at most CS2_DATING_MAX_S back. A small window of the clip is decoded once per row (memoised in montage_data\cs2_dating_v1.json);
+    the kill cache and the sidecar are not touched. Returns the frame number (<= tr['first']) or None."""
+    import numpy as np
+    fps = float(sc.get("fps", BORDER_FPS))
+    f1 = int(tr["first"])
+    key = (str(sc.get("key", "")), str(tr["id"]))
+    _dating_memo_load()
+    if key in CS2_DATING_MEMO:
+        return CS2_DATING_MEMO[key]
+    res = None
+    try:
+        fs = max(0, f1 - int(round(CS2_DATING_MAX_S * fps)) - 1)
+        n = f1 - fs + 8
+        y0 = int(tr["slots"][0][1])
+        rc = {"x0": int(tr["x0"]), "x1": int(tr["x1"]), "y0": y0, "y1": y0 + int(tr["y1"] - tr["y0"])}
+        cmd = ["ffmpeg", "-v", "error", "-ss", f"{fs / fps:.4f}", "-i", rec["path"], "-an", "-sn", "-vf", f"fps={fps}," + region_filter(rec, det, cfg),
+               "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+        nb = det.dw * det.dh * 3
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
+        raw = p.stdout
+        frames = [np.frombuffer(raw[i * nb:(i + 1) * nb], np.uint8).reshape(det.dh, det.dw, 3) for i in range(len(raw) // nb)]
+        j1 = f1 - fs
+        if len(frames) > j1 + 4:
+            ya, yb, xa, xb = max(0, rc["y0"] - 3), rc["y1"] + 4, max(0, rc["x0"] - 3), rc["x1"] + 4
+            cnt = [int(border_dm(fr)[0][ya:yb, xa:xb].sum()) for fr in frames]
+            ref = float(np.median(cnt[j1:j1 + 6]))
+            dref = border_desc(frames[j1 + 2], rc)
+            if ref >= 30 and dref is not None:
+                j, gap = j1, False
+                while j - 1 >= 0:
+                    d = border_desc(frames[j - 1], rc) if cnt[j - 1] >= 0.3 * ref else None
+                    if d is None or float(np.dot(dref, d)) < 0.75:
+                        gap = True                             # the outline was NOT there before: a real first appearance
+                        break
+                    j -= 1
+                if gap and j < j1:                             # no gap inside the window (row on screen at the clip start / an earlier row in this slot): not moved
+                    res = fs + j
+                    for t2 in sc.get("tracks", []):            # another tracked row that stood in this slot before: it was that row's outline, not ours (similar rows of one multikill look alike)
+                        if t2["id"] != tr["id"] and t2["first"] < f1 and any(abs(sl[1] - y0) <= 8 for sl in t2["slots"]) and t2["last"] >= res:
+                            res = max(res, t2["last"] + 1) if t2["last"] < f1 else f1
+                    if res >= f1:
+                        res = None
+    except Exception:
+        res = None
+    CS2_DATING_MEMO[key] = res
+    _dating_memo_save()
+    return res
+
+
+def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
+    """V7.5 (CS2 only): border-list kill times become the time the row first APPEARS (outline in the colour mask) instead of the first frame where the outline
+    lines paired into a rectangle. Never earlier than CS2_DATING_MAX_S before the cached time, the clip start, or the previous kept kill + 0.3 s; moves under
+    CS2_DATING_MIN_MOVE are ignored. Mutates b['kills'] times (k['t_cached'] keeps the old one)."""
+    if not CS2_DATING_ON[0]:
+        return
+    off, fps = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS))
+    by_id = {t["id"]: t for t in sc.get("tracks", [])}
+    prev = None
+    for k in sorted(b["kills"], key=lambda k: k["t"]):
+        tr = by_id.get(k.get("track")) if k.get("border") else None
+        if tr is not None and tr.get("slots"):
+            f = cs2_row_first_frame(rec, Detector("cs2"), cfg, sc, tr)
+            if f is not None:
+                nt = round(f / fps + off, 3)
+                lo = max(0.0, k["t"] - CS2_DATING_MAX_S, (prev + 0.3) if prev is not None else 0.0)
+                nt = max(nt, lo)
+                if k["t"] - nt >= CS2_DATING_MIN_MOVE:
+                    kk = (clip, round(k["t"], 2))
+                    if kk not in _DATING_LOGGED:
+                        _DATING_LOGGED.add(kk)
+                        LOGONLY(f"CS2 kill time moved earlier: {clip} {k['t']:.2f} -> {nt:.2f}")
+                    k["t_cached"] = k["t"]
+                    k["t"] = nt
+        prev = k["t"]
+    b["kills"].sort(key=lambda k: k["t"])
+
+
 def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
     """analyse_entry() plus the CS2 red-border list: when the clip's sidecar exists (or `build` creates it), the border-based list replaces the
     name-based one (deaths stay the name-based ones); otherwise - and for every other game - this IS analyse_entry(). A clip whose sidecar holds
@@ -2749,6 +2860,10 @@ def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
         if add:
             b["kills"] = sorted(b["kills"] + add, key=lambda k: k["t"])
             b["name_kept"] = [k["t"] for k in add]
+        try:                                                 # V7.5: CS2 only; kill time = the row's first visible frame
+            cs2_kill_times_earlier(rec, Detector("cs2"), cfg, sc, b, Path(rec.get("path", "")).name)
+        except Exception:
+            pass
     return b
 
 
@@ -6914,6 +7029,99 @@ def song_drop_labels(song_path):
         return None
 
 
+HEAD_KICK_ON = [True]                 # V7.5: test switch (headline finisher on the kick when the map drop is off the beat grid)
+HEAD_KICK_OFFGRID = 0.15              # beats: the map drop is farther than this from every grid beat
+HEAD_KICK_WIN = 0.15                  # s: an independent kick lies within this of the map drop
+_KICK_MEMO = {}
+
+
+def song_kicks(song_path):
+    """V7.5: independent kick / bass onsets (35-130 Hz band flux of the decoded song, not the song map's own lists). Memoised per file in this process."""
+    import numpy as np
+    import librosa
+    key = file_key(song_path)
+    if key not in _KICK_MEMO:
+        y, sr = decode_mono(song_path)
+        hop = 256
+        Sx = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
+        fr = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        env = librosa.onset.onset_strength(S=librosa.amplitude_to_db(Sx[(fr >= 35) & (fr <= 130)], ref=np.max), sr=sr, hop_length=hop)
+        pk = librosa.util.peak_pick(env, pre_max=4, post_max=4, pre_avg=12, post_avg=12, delta=np.percentile(env, 75) * 0.6, wait=int(0.2 * sr / hop))
+        _KICK_MEMO[key] = [float(x) for x in librosa.frames_to_time(pk, sr=sr, hop_length=hop)]
+    return _KICK_MEMO[key]
+
+
+def head_kick_time(song_path, bt, drop_b, drops):
+    """V7.5: the song time of the kick to anchor the headline finisher on, or None (= today's behaviour: the grid beat). Only when the active map drop is farther than
+    HEAD_KICK_OFFGRID beat from every grid beat AND an independent kick lies within HEAD_KICK_WIN s of the map drop."""
+    if not HEAD_KICK_ON[0] or not song_path:
+        return None
+    dt = next((float(d["t"]) for d in drops if int(d["beat"]) == int(drop_b) and d.get("t") is not None), None)
+    if dt is None:
+        return None
+    import numpy as np
+    beat = float(np.median(np.diff(bt[max(0, drop_b - 8):drop_b + 9])))
+    if float(np.min(np.abs(np.asarray(bt) - dt))) <= HEAD_KICK_OFFGRID * beat:
+        return None
+    try:
+        ks = [k for k in song_kicks(song_path) if abs(k - dt) <= HEAD_KICK_WIN]
+    except Exception:
+        return None
+    return round(min(ks, key=lambda k: abs(k - dt)), 3) if ks else None
+
+
+def headline_on_kick(plan, kick_t, notes):
+    """V7.5: move the headline finisher from its grid beat onto the kick (off-grid) without touching any other take. The headline's own segments are re-cut: the
+    segment holding the finisher starts earlier / later by m frames and the LAST segment (the tail) gives / takes the same m frames, so the take keeps its length
+    and out_start; kills / rows / slow_at from the finisher on move by m frames. Returns True when applied; leaves the plan as it is when the footage does not allow it."""
+    ht = next((t for t in plan["takes"] if t.get("role") == "headline"), None)
+    if ht is None or not ht.get("kills_out") or len(ht["segs"]) < 2:
+        return False
+    fps = round(plan["total_frames"] / plan["duration"])
+    s0 = float(plan["song"]["start_t"])
+    kidx = len(ht["kills"]) - 1 if (plan.get("drop_anchor") or {}).get("anchor") == "last" else 0
+    cur = s0 + ht["out_start"] + ht["kills_out"][kidx]
+    m = int(round((kick_t - cur) * fps))
+    if m == 0 or abs(m) > fps:
+        return False
+    segs = [list(sg) for sg in ht["segs"]]
+
+    def seg_of(ks):
+        c = [i for i, sg in enumerate(segs) if sg[0] - 0.02 <= ks <= sg[1] + 0.02]
+        return c[-1] if c else None
+    si = seg_of(ht["kills"][kidx])
+    if si is None or si >= len(segs) - 1:
+        return False
+    a, z = segs[si], segs[-1]
+    if a[3] + m < 12 or z[3] - m < int(0.5 * fps):
+        return False
+    a_new0 = a[0] - m * a[2] / fps
+    z_new1 = z[1] - m * z[2] / fps
+    prev = segs[si - 1] if si > 0 else None
+    if prev is not None and prev[4] == a[4] and a_new0 < prev[1]:
+        return False
+    if z[4] >= 0 and z[4] < len(ht["srcs"]) and z_new1 > float(ht["srcs"][z[4]].get("dur") or 1e9):
+        return False
+    a[0], a[3] = round(a_new0, 6), a[3] + m
+    z[1], z[3] = round(z_new1, 6), z[3] - m
+    sh = m / fps
+    for j, ks in enumerate(ht["kills"]):
+        sj = seg_of(ks)
+        if sj is not None and sj >= si:
+            ht["kills_out"][j] = round(ht["kills_out"][j] + sh, 5)
+            ht["rows_out"][j] = round(ht["rows_out"][j] + sh, 5)
+    if ht.get("slow_at") is not None and ht["slow_at"] >= ht["kills_out"][kidx] - sh - 0.01:
+        ht["slow_at"] = round(ht["slow_at"] + sh, 4)
+    ht["segs"] = segs
+    plan["song"]["drop_t"] = round(kick_t - s0, 3)
+    if plan.get("drop_anchor"):
+        plan["drop_anchor"]["drop_t"] = round(kick_t, 3)
+        plan["drop_anchor"]["kick"] = True
+    notes.append(f"headline anchored on kick: {kick_t:.3f}")
+    LOGONLY(f"headline anchored on kick: {kick_t:.3f}")
+    return True
+
+
 def optimal_fit(clips, an, style, song_path=None):
     """V5.42B OPTIMAL - THE length rule, ONE shared function (Manual now; the weekly Auto mode can reuse it unchanged):
     (clips, song map, style) -> {"length", "start_beat", "end_beat", "drop_beat", "clips", "left", "max", "why"}.
@@ -6998,7 +7206,8 @@ def optimal_fit(clips, an, style, song_path=None):
            + (f"; {len(left)} weakest didn't fit: " + ", ".join(Path(e["path"]).name for e, _ in left) if left else "")
            + f". Song section {ts(bt[S])}-{ts(bt[E])} ends on {end_kind}; drop at {ts(bt[drop_b])} ({dwhy}, {fr(drop_b):.0%} in)")
     return {"length": round(L, 2), "start_beat": int(S), "end_beat": int(E), "drop_beat": int(drop_b), "clips": chosen,
-            "left": left, "max": mx, "why": why, "drop_why": dwhy, "second": [round(float(bt[int(d["beat"])]), 1) for d in second]}
+            "left": left, "max": mx, "why": why, "drop_why": dwhy, "second": [round(float(bt[int(d["beat"])]), 1) for d in second],
+            "head_kick_t": head_kick_time(song_path, bt, int(drop_b), drops)}
 
 
 def why_no_take(ev):
@@ -7361,6 +7570,11 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         plan["drop_anchor"] = {"drop_t": round(float(U[drop]), 3), "source": (fit or {}).get("drop_why") or "nearest 8-bar downbeat to the map drop (planner fallback)",
                                "n": head_take["ev"]["n"], "anchor": "last" if head_take.get("anchor") == "last" else "first",
                                "kill": (head_take["ev"]["n"] if head_take.get("anchor") == "last" else 1)}
+        if fit and fit.get("head_kick_t"):                 # V7.5: the finisher sits on the kick when the map drop is off the beat grid
+            try:
+                headline_on_kick(plan, float(fit["head_kick_t"]), plan["notes"])
+            except Exception as ex_:
+                LOGONLY(f"headline kick anchor skipped: {ex_}")
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
