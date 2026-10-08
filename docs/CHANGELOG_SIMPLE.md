@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.5 - 2026-10-08: Headline kill lands on the kick
+- When a drop falls between two beats, the headline kill now lands on the kick instead of a beat 0.3 s early.
+- All other clips and songs stay exactly as they were.
+
 ## V7.4.9 - 2026-10-08: CS2 multikills no longer lose a kill
 - A CS2 multikill that showed only two of its three kills now shows all three.
 - Valorant and every other clip stay exactly as they were.
