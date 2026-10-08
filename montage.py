@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.5.1.1"
+APP_VERSION = "V7.5.1.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2719,16 +2719,16 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
 
 
 CS2_DATING_ON = [True]               # V7.5.1.1: ON (V7.5.1 shipped it OFF); test / scan switch
-CS2_DATING_DENY = [("Counter-strike 2 2026.02.12 - 19.24.00.20.DVR.mp4", 6.97), ("Counter-strike 2 2026.02.12 - 19.24.00.20.DVR.mp4", 14.8),
-                   ("Counter-strike 2 2026.02.10 - 19.09.46.22.DVR.mp4", 7.47)]      # V7.5.1.1: known bad moves keep the cached time
+CS2_GATE_S = [0.15]                # V7.5.1.2: the frames before a proposed first appearance (this many seconds, at least 3 frames) must show no row
 CS2_DATING_MAX_S = 2.0               # never more than this far before the cached time
 CS2_DATING_MIN_MOVE = 0.1            # smaller moves are noise and are ignored
 CS2_DATING_MEMO = {}                 # (sidecar key, track id) -> first visible frame or None
 _DATING_LOGGED = set()
+CS2_GATE_REJECT = -1                 # cs2_dating_walk / cs2_row_first_frame: a move was proposed but its first appearance is not proven
 
 
 def _dating_file():
-    return DATA / "cs2_dating_v5.json"
+    return DATA / "cs2_dating_v6.json"
 
 
 def _dating_memo_load():
@@ -2815,7 +2815,22 @@ def cs2_dating_walk(frames, rc, j1, fps, others=()):
             gap = True
             break
         j -= 1
-    return j if (gap and j < j1) else None
+    if not (gap and j < j1):
+        return None
+    ext = 0                                                            # V7.5.1.2: the row's text can show a few frames before its outline does (still the same row, no outline yet)
+    while j - 1 >= 0 and ext < int(0.2 * fps) and corr(j - 1)[0] >= 0.6 and not other_row_at(j - 1, corr(j - 1)[1]):
+        j -= 1
+        ext += 1
+    ng = max(3, int(math.ceil(CS2_GATE_S[0] * fps - 1e-9)))          # V7.5.1.2 gate: the first appearance must be PROVEN by empty frames before it
+    if j - ng < 0:
+        return CS2_GATE_REJECT
+    yb0, yb1 = max(0, rc["y0"] - 40), min(dh, rc["y1"] + 40)
+    for q in range(j - ng, j):
+        c, _y = corr(q)
+        oc = int(border_dm(frames[q])[0][yb0:yb1, xa:xb].sum())
+        if c >= 0.6 or oc >= 0.3 * ref:
+            return CS2_GATE_REJECT                                     # the row (or an outline in its slot) is still there before the proposed time
+    return j
 
 
 def cs2_row_first_frame(rec, det, cfg, sc, tr):
@@ -2824,7 +2839,7 @@ def cs2_row_first_frame(rec, det, cfg, sc, tr):
     (at most 0.5 s) is accepted when the outline is in the colour mask at the tracked x-extent and y, the patch still correlates >= 0.3 and the previous frame of the walk
     was accepted. The walk stops at the first frame that fails, or where a different row sits in the tracked spot (correlation < 0.6 outside the fade stretch). At most
     CS2_DATING_MAX_S back; a row that is still there at the start of the decoded window (or of the clip) is not moved. A small window of the clip is decoded once per
-    row (memoised in montage_data\cs2_dating_v5.json); the kill cache and the sidecar are not touched. Returns the frame number (<= tr['first']) or None."""
+    row (memoised in montage_data\cs2_dating_v6.json); the kill cache and the sidecar are not touched. Returns the frame number (<= tr['first']) or None."""
     import cv2
     import numpy as np
     fps = float(sc.get("fps", BORDER_FPS))
@@ -2848,7 +2863,9 @@ def cs2_row_first_frame(rec, det, cfg, sc, tr):
         if len(frames) > j1 + 4:
             oth = [(t2["first"] - fs, t2["last"] - fs, [(sl[0] - fs, sl[1]) for sl in t2["slots"]]) for t2 in sc.get("tracks", []) if t2["id"] != tr["id"]]
             j = cs2_dating_walk(frames, rc, j1, fps, oth)
-            if j is not None:
+            if j == CS2_GATE_REJECT:
+                res = CS2_GATE_REJECT
+            elif j is not None:
                 res = fs + j
                 for t2 in sc.get("tracks", []):                # another tracked row that stood in this slot before: it was that row's outline, not ours
                     if t2["id"] != tr["id"] and t2["first"] < f1 and any(abs(sl[1] - y0) <= 8 for sl in t2["slots"]) and t2["last"] >= res:
@@ -2871,35 +2888,39 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
     off, fps = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS))
     by_id = {t["id"]: t for t in sc.get("tracks", [])}
     orig = [(k, k["t"]) for k in b["kills"]]
-    prev = None
+    prev, proposed, failed = None, 0, 0
     for k in sorted(b["kills"], key=lambda k: k["t"]):
         tr = by_id.get(k.get("track")) if k.get("border") else None
         if tr is not None and tr.get("slots"):
-            if any(clip == dn and abs(k["t"] - dt) <= 0.05 for dn, dt in CS2_DATING_DENY):
-                kk = (clip, round(k["t"], 2), "deny")
+            f = cs2_row_first_frame(rec, Detector("cs2"), cfg, sc, tr)
+            if f == CS2_GATE_REJECT:
+                proposed += 1
+                failed += 1
+                kk = (clip, round(k["t"], 2), "kept")
                 if kk not in _DATING_LOGGED:
                     _DATING_LOGGED.add(kk)
-                    LOGONLY(f"CS2 kill time kept (known bad move): {clip} {k['t']:.2f}")
-                prev = k["t"]
-                continue
-            f = cs2_row_first_frame(rec, Detector("cs2"), cfg, sc, tr)
-            if f is not None:
+                    LOGONLY(f"CS2 kill time kept (no proven first appearance): {clip} {k['t']:.2f}")
+            elif f is not None:
                 nt = round(f / fps + off, 3)
                 lo = max(0.0, k["t"] - CS2_DATING_MAX_S, (prev + 0.3) if prev is not None else 0.0)
                 nt = max(nt, lo)
                 if k["t"] - nt >= CS2_DATING_MIN_MOVE:
-                    kk = (clip, round(k["t"], 2))
-                    if kk not in _DATING_LOGGED:
-                        _DATING_LOGGED.add(kk)
-                        LOGONLY(f"CS2 kill time moved earlier: {clip} {k['t']:.2f} -> {nt:.2f}")
+                    proposed += 1
                     k["t_cached"] = k["t"]
                     k["t"] = nt
         prev = k["t"]
     ordered = [k for k, _ in sorted(orig, key=lambda x: x[1])]
-    if [id(k) for k in sorted(b["kills"], key=lambda k: k["t"])] != [id(k) for k in ordered]:      # order changed: the whole clip keeps its cached times
+    if failed * 2 > proposed or [id(k) for k in sorted(b["kills"], key=lambda k: k["t"])] != [id(k) for k in ordered]:      # more than half failed the gate / order changed: the whole clip keeps its cached times
         for k, t in orig:
             k["t"] = t
             k.pop("t_cached", None)
+    else:
+        for k, t in orig:
+            if "t_cached" in k:
+                kk = (clip, round(t, 2))
+                if kk not in _DATING_LOGGED:
+                    _DATING_LOGGED.add(kk)
+                    LOGONLY(f"CS2 kill time moved earlier: {clip} {t:.2f} -> {k['t']:.2f}")
     b["kills"].sort(key=lambda k: k["t"])
 
 
@@ -7211,6 +7232,116 @@ def headline_on_kick(plan, kick_t, notes):
     return True
 
 
+DROP_ANCHOR_ON = [True]              # V7.5.1.2: test switch (every drop in the montage gets a kill impact on its exact time, CS2 only)
+DROP_ANCHOR_TOL = 0.03               # s: anchored when the kill is within this of the drop
+DROP_ANCHOR_MAX = 1.0                # s: a kill farther than this from the drop is not a candidate
+DROP_GRID_MIN = 0.03                 # s: a drop closer than this to a grid beat keeps the beat time
+
+
+def shift_take_kill(plan, ht, kidx, target, fps, s0):
+    """V7.5.1.2: move kill `kidx` of take `ht` onto song time `target` by re-cutting the take's OWN segments (lever a): the take keeps its length, out_start and every other take.
+    Segment holding the kill (not the last one): it starts m frames earlier / later and the last segment gives / takes the same frames. Otherwise the segment's source window
+    slides by m frames. Returns (True, error_s) or (False, reason). Never lets a kill leave the take, run past the clip or reach the death, or re-show footage of the segment before."""
+    cur = s0 + ht["out_start"] + ht["kills_out"][kidx]
+    m = int(round((target - cur) * fps))
+    if m == 0:
+        return True, abs(target - cur)
+    if abs(m) > int(DROP_ANCHOR_MAX * fps):
+        return False, "shift larger than 1 s"
+    segs = [list(sg) for sg in ht["segs"]]
+    srcs = ht.get("srcs") or []
+    nf = ht["nf"]
+    sh_of = lambda sg: float(srcs[sg[4]].get("shift", 0.0)) if len(sg) > 4 and 0 <= sg[4] < len(srcs) else 0.0
+    dur_of = lambda sg: float(srcs[sg[4]].get("dur") or 1e9) if len(sg) > 4 and 0 <= sg[4] < len(srcs) else 1e9
+    first, last = segs[0], segs[-1]
+    if len(segs) == 1:                                       # one segment: its source window slides, the take keeps its length
+        d = m * first[2] / fps
+        n0, n1 = first[0] - d, first[1] - d
+        if n0 - sh_of(first) < 0:
+            return False, "footage would start before the clip start"
+        if n1 > dur_of(first):
+            return False, "footage runs past the clip end"
+        if m < 0 and ht.get("death_after") is not None and n1 > float(ht["death_after"]) - 0.05:
+            return False, "footage would reach the death"
+        first[0], first[1] = round(n0, 6), round(n1, 6)
+    else:                                                    # the take's first segment starts m frames earlier (later), the last one gives (takes) the same frames
+        if first[3] + m < 12 or last[3] - m < int(0.5 * fps):
+            return False, "take would get shorter than its minimum"
+        f0 = first[0] - m * first[2] / fps
+        l1 = last[1] - m * last[2] / fps
+        if f0 - sh_of(first) < 0:
+            return False, "footage would start before the clip start"
+        if l1 > dur_of(last):
+            return False, "footage runs past the clip end"
+        if m < 0 and ht.get("death_after") is not None and l1 > float(ht["death_after"]) - 0.05:
+            return False, "footage would reach the death"
+        first[0], first[3] = round(f0, 6), first[3] + m
+        last[1], last[3] = round(l1, 6), last[3] - m
+    sh = m / fps
+    new_k = [round(x + sh, 5) for x in ht["kills_out"]]
+    if not all(-0.01 <= x < nf / fps - 0.15 for x in new_k):
+        return False, "a kill would leave the take"
+    ht["kills_out"] = new_k
+    ht["rows_out"] = [round(x + sh, 5) for x in ht["rows_out"]]
+    ht["pulses"] = [round(p + sh, 4) for p in ht.get("pulses", [])]
+    if ht.get("slow_at") is not None:
+        ht["slow_at"] = round(ht["slow_at"] + sh, 4)
+    ht["segs"] = segs
+    return True, abs(target - (s0 + ht["out_start"] + ht["kills_out"][kidx]))
+
+
+def anchor_all_drops(plan, drops, kick_for, game, notes):
+    """V7.5.1.2 (CS2 only): every drop [(time, strength)] of the song that lies inside the montage gets a kill impact on its exact time (kick time when an independent kick lies
+    within HEAD_KICK_WIN, else the drop time; a drop within DROP_GRID_MIN of a grid beat keeps the beat). Lever a only (re-cut inside the take); one anchor per take, headline
+    first. A drop nothing can serve logs 'drop <t> not anchorable: <reason>' and keeps today's placement. Returns the log lines."""
+    if game != "cs2" or not DROP_ANCHOR_ON[0] or not drops:
+        return []
+    fps = round(plan["total_frames"] / plan["duration"])
+    s0, D = float(plan["song"]["start_t"]), plan["duration"]
+    used, lines = set(), []
+    hd = plan["song"].get("drop_t")
+    hdrop = s0 + hd if hd is not None else None
+    order = sorted(drops, key=lambda d: (0 if (hdrop is not None and abs(d[0] - hdrop) < 1.0) else 1, -d[1], d[0]))
+    for t_d, _st in order:
+        if not (s0 + 0.5 < t_d < s0 + D - 1.0):
+            continue
+        tgt = kick_for(t_d) or t_d
+        best = None
+        cands = []
+        for ti, tk in enumerate(plan["takes"]):
+            if tk.get("ending") or tk.get("util") or ti in used or not tk.get("kills_out"):
+                continue
+            for kj, ko in enumerate(tk["kills_out"]):
+                e = (s0 + tk["out_start"] + ko) - tgt
+                if abs(e) <= DROP_ANCHOR_MAX:
+                    cands.append((abs(e) + (0.0 if tk.get("role") == "headline" else 0.001), ti, kj))
+        why = "no kill within 1 s of the drop"
+        for _e, ti, kj in sorted(cands):
+            import copy
+            tk = copy.deepcopy(plan["takes"][ti])
+            ok, r = shift_take_kill(plan, tk, kj, tgt, fps, s0)
+            if ok and r <= DROP_ANCHOR_TOL:
+                one = lambda t_: [b_ for b_ in verify_cutlist({"takes": [dict(t_, f0=0)], "total_frames": t_["nf"]})]
+                new_bad = [b_ for b_ in one(tk) if b_ not in one(plan["takes"][ti])]
+                if new_bad:                                  # the shifted take must pass the same cut-list rules as before (else the planner would drop it and re-plan)
+                    why = "the shifted take breaks a cut-list rule (" + new_bad[0].split(":", 1)[-1].strip()[:60] + ")"
+                    continue
+                plan["takes"][ti] = tk
+                best = (ti, kj, r)
+                break
+            why = r if not ok else f"error {r * 1000:.0f} ms after the shift"
+        if best is None:
+            lines.append(f"drop {t_d:.3f} not anchorable: {why}")
+        else:
+            ti, kj, r = best
+            used.add(ti)
+            lines.append(f"drop {t_d:.3f} anchored: take {ti + 1} kill at {s0 + plan['takes'][ti]['out_start'] + plan['takes'][ti]['kills_out'][kj]:.3f} error {r * 1000:.0f} ms via a")
+    for ln in lines:
+        notes.append(ln)
+        LOGONLY(ln)
+    return lines
+
+
 def optimal_fit(clips, an, style, song_path=None):
     """V5.42B OPTIMAL - THE length rule, ONE shared function (Manual now; the weekly Auto mode can reuse it unchanged):
     (clips, song map, style) -> {"length", "start_beat", "end_beat", "drop_beat", "clips", "left", "max", "why"}.
@@ -7664,6 +7795,23 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                 headline_on_kick(plan, float(fit["head_kick_t"]), plan["notes"])
             except Exception as ex_:
                 LOGONLY(f"headline kick anchor skipped: {ex_}")
+    if game == "cs2" and DROP_ANCHOR_ON[0]:                # V7.5.1.2: every drop in the montage, labelled or auto-detected
+        try:
+            lab_ = song_drop_labels(song["path"])
+            dl_ = [(float(t_), 2.0) for t_ in lab_] if lab_ else [(float(d_["t"]), float(d_.get("strength", 1.0))) for d_ in (an.get("drops") or []) if d_.get("t") is not None]
+
+            def kick_for_(td):
+                gi = int(np.argmin(np.abs(np.asarray(bt) - td)))
+                if abs(float(bt[gi]) - td) <= DROP_GRID_MIN:
+                    return float(bt[gi])
+                try:
+                    ks_ = [k_ for k_ in song_kicks(song["path"]) if abs(k_ - td) <= HEAD_KICK_WIN]
+                except Exception:
+                    ks_ = []
+                return round(min(ks_, key=lambda k_: abs(k_ - td)), 3) if ks_ else None
+            anchor_all_drops(plan, dl_, kick_for_, game, plan["notes"])
+        except Exception as ex_:
+            LOGONLY(f"drop anchoring skipped: {ex_}")
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
@@ -8035,26 +8183,24 @@ def _sum_expr(terms):
     return "+".join(terms) if terms else "0"
 
 
-OUTRO_FADE_LEN = 0.8        # V7.5.1.1: video fade-out length (the music fade keeps fade_out_start .. end)
-OUTRO_AFTER_KILL = 0.5      # the video fade never starts earlier than this after the last kill
-OUTRO_HOLD = 0.4            # last frame held this long before the video fade (ending takes of 1.5 s or more)
+OUTRO_FADE_LEN = 0.5        # V7.5.1.2: video fade-out = the last 0.5 s of the final take (music fade keeps fade_out_start .. end); no freeze / hold
+OUTRO_SHORT_TAIL = 0.8      # tail after the last kill shorter than this: shorter fade
+OUTRO_MIN_FADE = 0.3
 INTRO_PUNCH = (0.06, 0.25)  # first take: zoom amount on the first beat, settling time
 
 
 def outro_fade(plan):
-    """V7.5.1.1: (video fade start, video fade length, hold start in take-timeline s or None). Video only: the music fade and the take length are untouched."""
+    """V7.5.1.2: (video fade start, video fade length). Video only: the music fade and the take length are untouched; never starts before the last kill, no freeze."""
     takes = plan["takes"]
     D = plan["duration"]
     if not takes:
-        return max(0.0, D - 2.0), 2.0, None
+        return max(0.0, D - 2.0), 2.0
     last = takes[-1]
     ko = last["out_start"] + (last["kills_out"][-1] if last.get("kills_out") else 0.0)
-    vfo = min(max(D - OUTRO_FADE_LEN, ko + OUTRO_AFTER_KILL), D - 0.3)
-    vlen = max(0.3, D - vfo)
-    hold = None
-    if last.get("ending") and not last.get("util") and last["nf"] >= 90 and vfo - OUTRO_HOLD >= ko + OUTRO_AFTER_KILL:
-        hold = vfo - OUTRO_HOLD - last["out_start"]
-    return vfo, vlen, hold
+    tail = D - ko
+    vlen = OUTRO_FADE_LEN if tail >= OUTRO_SHORT_TAIL else max(OUTRO_MIN_FADE, tail - 0.3)
+    vlen = min(vlen, max(OUTRO_MIN_FADE, tail))
+    return round(D - vlen, 4), round(vlen, 4)
 
 
 def build_filter(plan, cfg, preview, fx=FX_ALL):
@@ -8139,20 +8285,14 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             chains.append(f"[{base}m]format=yuv420p[{base}m2]")
             chains.append(f"[{base}m2][{base}e]overlay=0:0:eof_action=pass:enable='{en_}'[{base}o]")
             lab = f"[{base}o]"
-        hold_t = outro_fade(plan)[2] if ti == len(takes) - 1 else None
-        if hold_t is not None:                                                             # V7.5.1.1: outro hold on the last frame, then the short fade
-            hf = int(round(hold_t * OUT_FPS))
-            LOGONLY(f"outro hold: {OUTRO_HOLD} s from take second {hold_t:.2f}")
-            chains.append(lab + f"format=yuv420p,trim=end_frame={hf},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={(nf - hf) / OUT_FPS + 0.1:.4f},"
-                          f"trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
-        else:
-            chains.append(lab + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
+        chains.append(lab + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
         vl.append(f"[{base}v][{base}a]")
     D = plan["duration"]
     fo = float(plan["song"].get("fade_out_start", max(0.0, D - 2.0)))
     fo = min(fo, D - 0.3)
     chains.append("".join(vl) + f"concat=n={len(takes)}:v=1:a=1[vc][gc]")
-    vfo, vlen, _h = outro_fade(plan)
+    vfo, vlen = outro_fade(plan)
+    LOGONLY(f"outro fade: video fades from {vfo:.2f}s over {vlen:.2f}s (music from {fo:.2f}s)")
     chains.append(f"[vc]{'scale=1280:720:flags=bicubic,' if preview else ''}fade=t=in:st=0:d={FADE_IN},"
                   f"fade=t=out:st={vfo:.3f}:d={vlen:.3f},format=yuv420p[vout]")
     sidx = len([x for x in inputs if x == "-i"])

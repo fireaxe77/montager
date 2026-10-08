@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.5.1.2 - 2026-10-08: Drops land on the beat
+- CS2 montages now put a kill on every drop in the song where the clips allow it, without needing hand labels.
+- Kill timing only moves a kill earlier when the kill row clearly appears on screen at that moment.
+- The final fade to black is much shorter and nothing is frozen at the end.
+
 ## V7.5.1.1 - 2026-10-08: Kill timing on, editable drops, shorter outro
 - CS2 kills are now timed from the moment their row appears on screen.
 - In the Song map you can drag a drop line to the real drop, add or remove drops, and press Reset to go back to the automatic map.
