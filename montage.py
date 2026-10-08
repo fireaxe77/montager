@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.4"
+APP_VERSION = "V7.4.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -14738,6 +14738,22 @@ def dropcheck_report(plan, plan_name, true_arg=None, cfg=None):
             if v == used and (miss or stray):
                 map_wrong = True
     L.append(f"  map used by the app (Settings): {used.upper()}")
+    # V7.4.5: one line per drop of the used map: map time, the refined label time of this song (tests/data/drop_labels_refined.json), error, confidence
+    try:
+        rf = load_json(HERE / "tests" / "data" / "drop_labels_refined.json", {}).get("songs", {})
+        ttl = (sg.get("title") or "").lower()
+        lab_ = next((v for k_, v in rf.items() if k_.lower() in ttl or k_.lower() in Path(path).stem.lower()), None)
+        mm = maps.get(used) or {}
+        for dd_ in mm.get("drops", []):
+            tm = float(dd_["t"])
+            ln = f"  drop {_mmss(tm)}: confidence {dd_['conf']:.2f}" if dd_.get("conf") is not None else f"  drop {_mmss(tm)}: confidence n/a (older map)"
+            if lab_:
+                r_ = min(lab_, key=lambda r: abs(r["t"] - tm))
+                if abs(r_["t"] - tm) <= 3.0:
+                    ln += f"; refined label {_mmss(r_['t'])}; error {(tm - r_['t']) * 1000:+.0f} ms"
+            L.append(ln)
+    except Exception as ex:
+        L.append(f"  (per-drop confidence lines skipped: {type(ex).__name__})")
     # ---- L2 PLANNER
     L.append("")
     L.append("L2 PLANNER")

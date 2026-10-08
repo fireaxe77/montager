@@ -1,0 +1,275 @@
+{
+ "held_out_songs": [
+  "Ouch",
+  "Tattoo",
+  "Self Aware",
+  "If I Lose Myself"
+ ],
+ "songs": {
+  "Burn": [
+   {
+    "typed": 38.0,
+    "t": 38.09,
+    "shift": 0.09,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 26.1,
+    "hard": false
+   },
+   {
+    "typed": 101.0,
+    "t": 101.14,
+    "shift": 0.14,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 34.3,
+    "hard": false
+   }
+  ],
+  "Ouch": [
+   {
+    "typed": 26.0,
+    "t": 25.12,
+    "shift": -0.88,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 52.6,
+    "hard": false
+   },
+   {
+    "typed": 90.0,
+    "t": 89.17,
+    "shift": -0.83,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 25.3,
+    "hard": false
+   }
+  ],
+  "Reverse Psychology": [
+   {
+    "typed": 44.0,
+    "t": 43.96,
+    "shift": -0.04,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 20.3,
+    "hard": false
+   },
+   {
+    "typed": 156.0,
+    "t": 156.79,
+    "shift": 0.79,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 24.7,
+    "hard": false
+   }
+  ],
+  "All The Things She Said": [
+   {
+    "typed": 39.0,
+    "t": 38.21,
+    "shift": -0.79,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 6.4,
+    "hard": true
+   },
+   {
+    "typed": 83.0,
+    "t": 82.13,
+    "shift": -0.87,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 9.8,
+    "hard": false
+   }
+  ],
+  "Tattoo": [
+   {
+    "typed": 39.0,
+    "t": 38.98,
+    "shift": -0.02,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 17.3,
+    "hard": false
+   },
+   {
+    "typed": 131.0,
+    "t": 130.76,
+    "shift": -0.24,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 7.8,
+    "hard": false
+   }
+  ],
+  "Rave Dream": [
+   {
+    "typed": 30.0,
+    "t": 30.0,
+    "shift": 0.0,
+    "status": "unrefined",
+    "tol": 1.0,
+    "step_db": 0.8,
+    "hard": true
+   },
+   {
+    "typed": 54.0,
+    "t": 54.36,
+    "shift": 0.36,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 15.5,
+    "hard": false
+   },
+   {
+    "typed": 129.0,
+    "t": 128.33,
+    "shift": -0.67,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 15.8,
+    "hard": false
+   }
+  ],
+  "If I Lose Myself": [
+   {
+    "typed": 68.0,
+    "t": 68.57,
+    "shift": 0.57,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 32.4,
+    "hard": false
+   },
+   {
+    "typed": 160.0,
+    "t": 160.14,
+    "shift": 0.14,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 34.5,
+    "hard": false
+   }
+  ],
+  "For Your Entertainment": [
+   {
+    "typed": 42.0,
+    "t": 41.62,
+    "shift": -0.38,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 39.8,
+    "hard": false
+   },
+   {
+    "typed": 109.0,
+    "t": 109.27,
+    "shift": 0.27,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 34.9,
+    "hard": false
+   },
+   {
+    "typed": 169.0,
+    "t": 169.0,
+    "shift": 0.0,
+    "status": "unrefined",
+    "tol": 1.0,
+    "step_db": 3.0,
+    "hard": false
+   }
+  ],
+  "Self Aware": [
+   {
+    "typed": 24.0,
+    "t": 24.24,
+    "shift": 0.24,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 15.6,
+    "hard": false
+   },
+   {
+    "typed": 85.0,
+    "t": 85.31,
+    "shift": 0.31,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 35.8,
+    "hard": false
+   },
+   {
+    "typed": 122.0,
+    "t": 121.29,
+    "shift": -0.71,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 33.8,
+    "hard": false
+   }
+  ],
+  "Les": [
+   {
+    "typed": 36.0,
+    "t": 35.72,
+    "shift": -0.28,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 8.1,
+    "hard": false
+   },
+   {
+    "typed": 93.0,
+    "t": 93.3,
+    "shift": 0.3,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 6.6,
+    "hard": true
+   }
+  ],
+  "Beautiful Now": [
+   {
+    "typed": 56.8,
+    "t": 56.8,
+    "shift": 0.0,
+    "status": "anchor",
+    "tol": 0.25,
+    "hard": false
+   }
+  ],
+  "pretty afternoon": [
+   {
+    "typed": 34.0,
+    "t": 34.6,
+    "shift": 0.6,
+    "status": "anchor",
+    "tol": 0.25,
+    "hard": false
+   },
+   {
+    "typed": 92.0,
+    "t": 92.58,
+    "shift": 0.58,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 35.6,
+    "hard": true
+   },
+   {
+    "typed": 135.0,
+    "t": 135.13,
+    "shift": 0.13,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 8.6,
+    "hard": false
+   }
+  ]
+ }
+}

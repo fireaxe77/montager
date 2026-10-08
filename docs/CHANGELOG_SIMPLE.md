@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.4.5 - 2026-10-08: Drops found within a fraction of a second
+- Drops now land on the moment the bass really comes back, usually within about a quarter of a second.
+- Gentle, slow songs get their drops found too.
+- Every detected drop now has a confidence score, shown in the drop check tool.
+
 ## V7.4 - 2026-10-08: Drops found earlier and on the beat
 - Drops in the first minute of a song are found now, and drops sit on the beat where the bass comes back.
 - The montage's main drop is now always a real drop of the song, and you can save your own drop times with "dropsave".
