@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.5.1"
+APP_VERSION = "V7.5.1.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2718,7 +2718,9 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
     return kept
 
 
-CS2_DATING_ON = [False]              # V7.5.1: set True only after the impact checks pass; test / scan switch
+CS2_DATING_ON = [True]               # V7.5.1.1: ON (V7.5.1 shipped it OFF); test / scan switch
+CS2_DATING_DENY = [("Counter-strike 2 2026.02.12 - 19.24.00.20.DVR.mp4", 6.97), ("Counter-strike 2 2026.02.12 - 19.24.00.20.DVR.mp4", 14.8),
+                   ("Counter-strike 2 2026.02.10 - 19.09.46.22.DVR.mp4", 7.47)]      # V7.5.1.1: known bad moves keep the cached time
 CS2_DATING_MAX_S = 2.0               # never more than this far before the cached time
 CS2_DATING_MIN_MOVE = 0.1            # smaller moves are noise and are ignored
 CS2_DATING_MEMO = {}                 # (sidecar key, track id) -> first visible frame or None
@@ -2873,6 +2875,13 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
     for k in sorted(b["kills"], key=lambda k: k["t"]):
         tr = by_id.get(k.get("track")) if k.get("border") else None
         if tr is not None and tr.get("slots"):
+            if any(clip == dn and abs(k["t"] - dt) <= 0.05 for dn, dt in CS2_DATING_DENY):
+                kk = (clip, round(k["t"], 2), "deny")
+                if kk not in _DATING_LOGGED:
+                    _DATING_LOGGED.add(kk)
+                    LOGONLY(f"CS2 kill time kept (known bad move): {clip} {k['t']:.2f}")
+                prev = k["t"]
+                continue
             f = cs2_row_first_frame(rec, Detector("cs2"), cfg, sc, tr)
             if f is not None:
                 nt = round(f / fps + off, 3)
@@ -7094,6 +7103,21 @@ def song_drop_labels(song_path):
         return None
 
 
+def song_drops_write(song_path, times, title="", artist=""):
+    """V7.5.1.1: save (times) or delete (times empty / None) the hand drop labels of ONE song in montage_data\song_drops.json (atomic; other songs stay)."""
+    f = DATA / "song_drops.json"
+    cur = load_json(f, {})
+    nm = Path(song_path).name
+    if times:
+        cur[nm] = {"title": title, "artist": artist, "drops": sorted(round(float(t), 2) for t in times)}
+    else:
+        cur.pop(nm, None)
+    DATA.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(f) + ".tmp")
+    tmp.write_text(json.dumps(cur, indent=1, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, f)
+
+
 HEAD_KICK_ON = [True]                 # V7.5: test switch (headline finisher on the kick when the map drop is off the beat grid)
 HEAD_KICK_OFFGRID = 0.15              # beats: the map drop is farther than this from every grid beat
 HEAD_KICK_WIN = 0.15                  # s: an independent kick lies within this of the map drop
@@ -7939,7 +7963,8 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     L.append(f"SONG     {sg['artist']} - {sg['title']}   [{Path(sg['path']).name}]   BPM {sg['bpm']}   placement {plan['placement']}")
     L.append(f"TIMELINE song starts at {ts(sg['start_t'])} (music + video fade in {sg['fade_in']} s); {plan['duration']:.1f}s at 60 fps "
              f"({plan['total_frames']} frames); best multikill on the drop at {sg['drop_t']}s; "
-             f"{'slow-mo ending, fades from ' + format(sg['fade_out_start'], '.2f') + 's' if plan['ending'] else 'fade-out over the last 2 s'}")
+             f"{'slow-mo ending, music fades from ' + format(sg['fade_out_start'], '.2f') + 's' if plan['ending'] else 'music fade-out over the last 2 s'}; "
+             f"video fades from {outro_fade(plan)[0]:.2f}s over {outro_fade(plan)[1]:.2f}s")
     if score_info:
         fp = score_info["fit_parts"]
         L.append(f"SONG SCORE total {score_info['total']} = recency {score_info['recency']} (added {score_info['days']} days ago)"
@@ -8010,6 +8035,28 @@ def _sum_expr(terms):
     return "+".join(terms) if terms else "0"
 
 
+OUTRO_FADE_LEN = 0.8        # V7.5.1.1: video fade-out length (the music fade keeps fade_out_start .. end)
+OUTRO_AFTER_KILL = 0.5      # the video fade never starts earlier than this after the last kill
+OUTRO_HOLD = 0.4            # last frame held this long before the video fade (ending takes of 1.5 s or more)
+INTRO_PUNCH = (0.06, 0.25)  # first take: zoom amount on the first beat, settling time
+
+
+def outro_fade(plan):
+    """V7.5.1.1: (video fade start, video fade length, hold start in take-timeline s or None). Video only: the music fade and the take length are untouched."""
+    takes = plan["takes"]
+    D = plan["duration"]
+    if not takes:
+        return max(0.0, D - 2.0), 2.0, None
+    last = takes[-1]
+    ko = last["out_start"] + (last["kills_out"][-1] if last.get("kills_out") else 0.0)
+    vfo = min(max(D - OUTRO_FADE_LEN, ko + OUTRO_AFTER_KILL), D - 0.3)
+    vlen = max(0.3, D - vfo)
+    hold = None
+    if last.get("ending") and not last.get("util") and last["nf"] >= 90 and vfo - OUTRO_HOLD >= ko + OUTRO_AFTER_KILL:
+        hold = vfo - OUTRO_HOLD - last["out_start"]
+    return vfo, vlen, hold
+
+
 def build_filter(plan, cfg, preview, fx=FX_ALL):
     """ONE filter graph (V4 engine). Effects sit on each take's own output timeline: centred V4 zoom punches on kills (overlaid
     only inside the punch), ramps before kills, V4 slow-mo (frame blending only inside slow-mo segments). V5.2: no flashes, no
@@ -8078,6 +8125,10 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             for p in t.get("pulses", []):                                                  # V4 punch: centred, peak on the kill, 0.45 s decay
                 zt.append(f"between({tt},{p:.4f},{p + 0.45:.4f})*{t['amp']:.3f}*exp(-9*({tt}-{p:.4f}))")
                 wins.append((p, p + 0.45))
+            if ti == 0 and not t.get("util") and t["nf"] >= 90:                              # V7.5.1.1: intro punch on the first beat of the music
+                zt.append(f"between({tt},0,{INTRO_PUNCH[1]})*{INTRO_PUNCH[0]:.3f}*exp(-9*{tt})")
+                wins.append((0.0, INTRO_PUNCH[1]))
+                LOGONLY("intro punch: first take")
         lab = f"[{base}c]"
         if zt:
             en_ = "+".join(f"between(t,{a_:.4f},{b_:.4f})" for a_, b_ in wins)
@@ -8088,14 +8139,22 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             chains.append(f"[{base}m]format=yuv420p[{base}m2]")
             chains.append(f"[{base}m2][{base}e]overlay=0:0:eof_action=pass:enable='{en_}'[{base}o]")
             lab = f"[{base}o]"
-        chains.append(lab + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
+        hold_t = outro_fade(plan)[2] if ti == len(takes) - 1 else None
+        if hold_t is not None:                                                             # V7.5.1.1: outro hold on the last frame, then the short fade
+            hf = int(round(hold_t * OUT_FPS))
+            LOGONLY(f"outro hold: {OUTRO_HOLD} s from take second {hold_t:.2f}")
+            chains.append(lab + f"format=yuv420p,trim=end_frame={hf},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={(nf - hf) / OUT_FPS + 0.1:.4f},"
+                          f"trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
+        else:
+            chains.append(lab + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
         vl.append(f"[{base}v][{base}a]")
     D = plan["duration"]
     fo = float(plan["song"].get("fade_out_start", max(0.0, D - 2.0)))
     fo = min(fo, D - 0.3)
     chains.append("".join(vl) + f"concat=n={len(takes)}:v=1:a=1[vc][gc]")
+    vfo, vlen, _h = outro_fade(plan)
     chains.append(f"[vc]{'scale=1280:720:flags=bicubic,' if preview else ''}fade=t=in:st=0:d={FADE_IN},"
-                  f"fade=t=out:st={fo:.3f}:d={max(0.3, D - fo):.3f},format=yuv420p[vout]")
+                  f"fade=t=out:st={vfo:.3f}:d={vlen:.3f},format=yuv420p[vout]")
     sidx = len([x for x in inputs if x == "-i"])
     inputs += ["-i", plan["song"]["path"]]
     head = 10 ** (-2.0 / 20)                               # 2 dB headroom on BOTH music and game (same balance), so the
@@ -10494,6 +10553,7 @@ class SongMapView:
     """Songs tab > Song map: waveform, energy curve, beat + downbeat ticks, coloured sections, drops and accents."""
     def __init__(self, app, path, csv_bpm=None):
         self.app, self.path, self.an, self.zoom = app, path, None, 1
+        self.drops, self.hand, self._drag, self._csv_bpm = [], False, None, csv_bpm
         self.win = app.reg(tk.Toplevel(app.root), "window")
         self.win.title(f"Song map - {Path(path).name}")
         self.win.configure(bg=app.pal["bg"])
@@ -10506,6 +10566,7 @@ class SongMapView:
         cb.pack(side="right")
         cb.bind("<<ComboboxSelected>>", lambda e: self.draw())
         ttk.Label(top, text="Zoom").pack(side="right", padx=4)
+        ttk.Button(top, text="Reset", command=self.reset_hand).pack(side="right", padx=8)
         fr = ttk.Frame(self.win)
         fr.pack(fill="both", expand=True, padx=6, pady=4)
         self.cv = app.reg(tk.Canvas(fr, width=1300, height=int(360 * UI_SCALE[0]), bg="#ececec",
@@ -10520,6 +10581,12 @@ class SongMapView:
             app.reg(tk.Label(leg, text=f"  {k}  ", bg=SECTION_COLORS[k], fg="#111"), "fixed").pack(side="left", padx=2)
         ttk.Label(leg, text="   red line = drop   | tall tick = downbeat   | dot = accent (filled = bass hit)   | line = energy").pack(side="left")
         self.cv.bind("<Configure>", lambda e: self.draw())
+        self.cv.bind("<ButtonPress-1>", self._press)
+        self.cv.bind("<B1-Motion>", self._motion)
+        self.cv.bind("<ButtonRelease-1>", self._release)
+        self.cv.bind("<Double-Button-1>", self._add)
+        self.cv.bind("<Button-3>", self._remove)
+        ttk.Label(leg, text="   |  drag a red line = move the drop (saved as a hand label)  | double-click = add  | right-click a line = remove").pack(side="left")
 
         def work():
             try:
@@ -10530,13 +10597,106 @@ class SongMapView:
                 self.app.q.put(("call", lambda: self.info.set(msg)))
         threading.Thread(target=work, daemon=True).start()
 
+    @staticmethod
+    def _fmt(t):
+        return f"{int(t // 60)}:{t % 60:05.2f}"
+
+    def _load_drops(self):
+        lab = song_drop_labels(self.path)
+        self.hand = bool(lab)
+        self.drops = list(lab) if lab else [float(d["t"]) for d in (self.an or {}).get("drops", [])]
+
+    def _t_at(self, ev):
+        x = self.cv.canvasx(ev.x)
+        return max(0.0, min(self._dur, round((x - 2) / self._W * self._dur, 2)))
+
+    def _hit(self, ev, px=7):
+        x, best = self.cv.canvasx(ev.x), None
+        for i, t in enumerate(self.drops):
+            d = abs(2 + t / self._dur * self._W - x)
+            if d <= px and (best is None or d < best[0]):
+                best = (d, i)
+        return None if best is None else best[1]
+
+    def _save_hand(self):
+        try:
+            song_drops_write(self.path, self.drops, (self.an or {}).get("title", "") or "", (self.an or {}).get("artist", "") or "")
+            self.hand = bool(self.drops)
+        except Exception as ex:
+            self.info.set(f"could not save the drop labels: {ex}")
+            return
+        self.show_info()
+
+    def _press(self, ev):
+        if self.an and self._dl:
+            i = self._hit(ev)
+            self._drag = i
+
+    def _motion(self, ev):
+        if self._drag is None or not self.an:
+            return
+        t = self._t_at(ev)
+        self.drops[self._drag] = t
+        x = 2 + t / self._dur * self._W
+        ln, tx = self._dl[self._drag]
+        self.cv.coords(ln, x, self._top, x, self._bot)
+        self.cv.coords(tx, x + 3, self.cv.coords(tx)[1])
+        self.cv.itemconfigure(tx, text=f"DROP {self._fmt(t)}")
+
+    def _release(self, ev):
+        if self._drag is not None:
+            self._drag = None
+            self.drops.sort()
+            self._save_hand()
+            self.draw()
+
+    def _add(self, ev):
+        if not self.an or self._hit(ev) is not None:
+            return
+        self.drops = sorted(self.drops + [self._t_at(ev)])
+        self._drag = None
+        self._save_hand()
+        self.draw()
+
+    def _remove(self, ev):
+        if not self.an:
+            return
+        i = self._hit(ev, px=10)
+        if i is not None:
+            del self.drops[i]
+            self._save_hand()
+            self.draw()
+
+    def reset_hand(self):
+        """Deletes this song's hand labels and goes back to the newest automatic map."""
+        try:
+            song_drops_write(self.path, None)
+        except Exception as ex:
+            self.info.set(f"could not reset: {ex}")
+            return
+        self.info.set("reloading the automatic map ...")
+
+        def work():
+            try:
+                an = get_songmap(self.path, self._csv_bpm)
+                self.app.q.put(("call", lambda: self.show(an)))
+            except Exception as ex:
+                msg = f"song map failed: {ex}"
+                self.app.q.put(("call", lambda: self.info.set(msg)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_info(self):
+        an = self.an
+        drops = ", ".join(self._fmt(t) for t in self.drops) or "none"
+        self.info.set(f"BPM {an['bpm']} ({an.get('bpm_src')}, librosa {an.get('bpm_librosa')}, agree {an.get('librosa_agree_ms')} ms)   "
+                      f"beats {len(an['beats'])}   rhythm {an.get('rhythm')}   loudness {an.get('lufs')} LUFS   drops: {drops}"
+                      f"{' (hand-edited)' if self.hand else ''}   sections: {' > '.join(s['label'] for s in an.get('sections', []))}")
+
     def show(self, an):
         self.an = an
+        self._load_drops()
         self.win.title(f"Song map ({SONGMAP_CHOICES.get(str(an.get('songmap_version', 'v1'))[:2], 'Songmap V1')}) - {Path(self.path).name}" if getattr(self, "path", None) else self.win.title())
-        drops = ", ".join(f"{ts(d['t'])} ({d['strength']:.2f})" for d in an.get("drops", [])) or "none"
-        self.info.set(f"BPM {an['bpm']} ({an.get('bpm_src')}, librosa {an.get('bpm_librosa')}, agree {an.get('librosa_agree_ms')} ms)   "
-                      f"beats {len(an['beats'])}   rhythm {an.get('rhythm')}   loudness {an.get('lufs')} LUFS   drops: {drops}   "
-                      f"sections: {' > '.join(s['label'] for s in an.get('sections', []))}")
+        self.show_info()
         self.draw()
 
     def draw(self):
@@ -10581,9 +10741,12 @@ class SongMapView:
         for t, s_, bass in an.get("accents", [])[:800]:
             r = 2 + min(4, s_ / 4)
             cv.create_oval(X(t) - r, top + 20 - r, X(t) + r, top + 20 + r, outline="#222", fill="#222" if bass else "")
-        for d in an.get("drops", []):
-            cv.create_line(X(d["t"]), top, X(d["t"]), H - 18, fill="#d00000", width=3)
-            cv.create_text(X(d["t"]) + 3, H - 34, text=f"DROP {ts(d['t'])}", anchor="w", fill="#d00000", font=("Segoe UI", F(9), "bold"))
+        self._W, self._dur, self._top, self._bot = W, dur, top, H - 18
+        self._dl = []                                                 # [canvas line id, text id] per drop (V7.5.1.1: draggable)
+        for t in self.drops:
+            ln = cv.create_line(X(t), top, X(t), H - 18, fill="#d00000", width=3, tags=("drop",))
+            tx = cv.create_text(X(t) + 3, H - 34, text=f"DROP {self._fmt(t)}", anchor="w", fill="#d00000", font=("Segoe UI", F(9), "bold"), tags=("drop",))
+            self._dl.append([ln, tx])
         for s in range(0, int(dur) + 1, 10 if z == 1 else 5):
             cv.create_text(X(s), H - 2, text=ts(s)[:-2], anchor="s", font=("Segoe UI", F(8)), fill="#444")
 
