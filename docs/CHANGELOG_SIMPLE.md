@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.3 - 2026-10-08: Drop kills with real impact
+- The last kill of a multikill now lands on the drop (the first kill for a double kill), so the payoff hits the beat.
+- CS2 "Force new" now fills the montage up to the 60 second minimum, like Valorant.
+- Kills added by the utility override get no slow-motion and never end a montage.
+- New "dropcheck" tool: shows whether a missed drop is the song map, the planner or the kill timing.
+
 ## V7.2 - 2026-10-08: Song map V2 is the default
 - Kills now land closer to the beat.
 - Drops are found where the kick comes back, so a montage starts on a steady beat instead of a quiet build-up.

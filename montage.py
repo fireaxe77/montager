@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.2"
+APP_VERSION = "V7.3"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6458,6 +6458,8 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
           "stitched": len(spans) > 1, "stitch_note": stitch_note.strip(), "lags": [0.0] * len(times),
           "vis": spans[0]["it"].get("vis", []) if len(spans) == 1 else main.get("vis", [])}
     ev["score_pre"] = base_score(ev)
+    if any(raw[i]["k"].get("util") for i in keep):          # V7.3: a kill admitted by the per-clip utility override (OVERRIDE_ADMITTED)
+        ev["util"] = True
     if led is not None:
         led.note_event(ev, [led.row_of_cl(raw[i]["k"]) for i in keep])
     return ev
@@ -6588,11 +6590,12 @@ def gap_allowance(an, rname, t_song):
     return GAP_ALLOW[1] + (GAP_ALLOW[2] - GAP_ALLOW[1]) * c
 
 
-def dead_air_cuts(ev, U, kb):
+def dead_air_cuts(ev, U, kb, t0=None, lead_override=None):
     """V5.41: jump-cuts over over-long empty time inside a multikill (first kill on song time U[kb]). A gap longer than its
     allowance (gap_allowance) is cut ON a beat 0.4 s+ after the kill, landing about 1 s before the next kill (on a beat when
     that lands within 0.85-1.15 s); kills stay 1.0x and every kill is shown. Returns (cuts, output span), cuts =
-    [(output s from the first kill, source time the footage resumes at)]. No over-long gap: ([], the plain span)."""
+    [(output s from the first kill, source time the footage resumes at)]. No over-long gap: ([], the plain span).
+    V7.3: t0 = the first kill's song time when it is not on tick kb (last-kill anchor); lead_override = (cut index, lead s) for that cut's run-in."""
     times = ev["times"]
     span = times[-1] - times[0]
     allow = ev.get("_allow")
@@ -6600,7 +6603,7 @@ def dead_air_cuts(ev, U, kb):
         return [], span
     import bisect
     cuts, o = [], 0.0                                      # o = output time of kill i, from the first kill
-    T0, nt = float(U[kb]), len(U)
+    T0, nt = float(U[kb]) if t0 is None else float(t0), len(U)
     rows = ev.get("rows") or times
     for i, (a, b) in enumerate(zip(times, times[1:])):
         g = b - a
@@ -6619,21 +6622,75 @@ def dead_air_cuts(ev, U, kb):
         nxt = [float(U[j]) - float(U[cj]) for j in range(cj + 1, min(nt, cj + 6)) if 0.85 <= U[j] - U[cj] <= 1.15]
         if nxt:
             lead = min(nxt, key=lambda x: abs(x - 1.0))
+        if lead_override is not None and lead_override[0] == len(cuts):
+            lead = min(float(lead_override[1]), g - (float(U[cj]) - (T0 + o)) - 0.05)
         cuts.append((dc, b - lead))
         o = dc + lead
     return cuts, (o if cuts else span)
 
 
-def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True):
+def last_anchor_solve(ev, U, kb):
+    """V7.3: the LAST kill of the event on tick kb (the drop). Returns (t0, cuts, ospan) with t0 = the song time of the first kill and
+    t0 + ospan == U[kb] exactly (jump-cuts over dead air included: the run-in of the last cut absorbs the difference, 0.7-1.25 s), or None.
+    Cached on the event copy (the planner works on copies)."""
+    cache = ev.setdefault("_lastsolve", {})
+    if kb in cache:
+        return cache[kb]
+    target = float(U[kb])
+    span = ev["times"][-1] - ev["times"][0]
+    res = None
+    cuts, osp = dead_air_cuts(ev, U, kb, t0=target - span)
+    if not cuts:
+        res = (target - span, [], span)
+    else:
+        td = float(U[1] - U[0])
+        base = target - osp
+        for _ in range(3):                                 # the cut structure settles after the first shift
+            c2, o2 = dead_air_cuts(ev, U, kb, t0=base)
+            if not c2:
+                break
+            if abs(base - (target - o2)) < 1e-9:
+                break
+            base = target - o2
+        for m in (0, 1, -1, 2, -2, 3, -3, 4, -4):
+            t0 = base + m * td
+            c2, o2 = dead_air_cuts(ev, U, kb, t0=t0)
+            if not c2:
+                continue
+            nxt = [t for t in ev["times"] if t > c2[-1][1]]
+            if not nxt:
+                continue
+            lead = nxt[0] - c2[-1][1]
+            want = lead + (target - (t0 + o2))
+            if not (0.7 <= want <= 1.25):
+                continue
+            c3, o3 = dead_air_cuts(ev, U, kb, t0=t0, lead_override=(len(c2) - 1, want))
+            if len(c3) == len(c2) and abs(t0 + o3 - target) < 1e-6:
+                res = (t0, c3, o3)
+                break
+    cache[kb] = res
+    return res
+
+
+def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first"):
     """One continuous take (ticks = beats + half-beats; kb = the beat tick where the first kill lands): run-up from tick c,
     1.0x from 1.0 s before the first kill through the last, speed-ups only before that, tail 0.2-0.5 s to the end tick
     (never into my death), slow-mo starts ON the last kill. ending=True: slow-mo from the final kill for the 2-3 s fade."""
-    lead_t = float(U[kb] - U[c])
+    t0_last = None
+    if anchor == "last":                                   # V7.3: kb is the tick of the LAST kill; the first kill sits an output span earlier
+        sol = last_anchor_solve(ev, U, kb)
+        if sol is None:
+            return None
+        t0_last, cuts, span = sol
+        lead_t = t0_last - float(U[c])
+    else:
+        lead_t = float(U[kb] - U[c])
     if lead_t < LEAD_MIN - 1e-6 or lead_t > ev["pre"] + 1e-6:
         return None
     first, last = ev["times"][0], ev["times"][-1]
-    span = last - first
-    cuts, span = dead_air_cuts(ev, U, kb)
+    if anchor != "last":
+        span = last - first
+        cuts, span = dead_air_cuts(ev, U, kb)
     r = 1.0
     if ramp > 1.0 and lead_t >= 1.6:
         app = lead_t - 1.0
@@ -6667,7 +6724,7 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True):
     if end - c < 2 * MIN_TAKE_BEATS or D < MIN_TAKE_S:
         return None
     return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "ramp": r, "slow": slow, "ending": False, "dur": D,
-            **({"cuts": cuts, "ospan": span} if cuts else {})}
+            **({"cuts": cuts, "ospan": span} if cuts else {}), **({"anchor": "last", "kt": t0_last, "ospan": span} if anchor == "last" else {})}
 
 
 def row_tail_window(ev, slow, win, post, ext=True):
@@ -6690,40 +6747,54 @@ def row_tail_window(ev, slow, win, post, ext=True):
     return (lo, max(win[1], lo + ROW_SLACK))
 
 
-def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, ending=False, c_only=None, ext_only=None):
+def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, ending=False, c_only=None, ext_only=None, anchor="first"):
     """V4 placement on ticks: the first kill on a beat (downbeat preferred), run-up of the recipe's 1-4 beats (more only to keep
     earlier killfeed rows off the first frame), end tick 0.2-0.5 s after the last kill. V5.43: the kill-row tail may only extend
-    the END (ext_only=False: the V5.42 window; True: the extended window) - the start / run-up is never moved later for it."""
+    the END (ext_only=False: the V5.42 window; True: the extended window) - the start / run-up is never moved later for it.
+    V7.3: anchor="last" puts the LAST kill on tick kb (the headline finisher on the drop), see last_anchor_solve()."""
+    import numpy as np
     nt = len(U) - 1
     first = ev["times"][0]
     span = ev["times"][-1] - first
     lo, hi = rp.get("lead", (1, 2))
-    if kb is not None:
+    lead_of = lambda q: float(U[q[1]] - U[q[0]])
+    if anchor == "last" and kb is not None:                # V7.3: kb = the tick of the LAST kill; the run-up is measured to the first kill
+        sol = last_anchor_solve(ev, U, kb)
+        if sol is None:
+            return None
+        t0_last, _, span_o = sol
+        td = float(U[1] - U[0])
+        lead_of = lambda q: t0_last - float(U[q[0]])
+        ci = int(np.searchsorted(U, t0_last - LEAD_MIN + 1e-9, side="right")) - 1
+        pairs = [(cc_, kb, max(1, int(round((t0_last - float(U[cc_])) / td)))) for cc_ in range(ci, max(-1, ci - 16), -1)]
+        if c_only is not None:
+            pairs = [q for q in pairs if q[0] == c_only]
+    elif kb is not None:
         pairs = [(kb - k, kb, k) for k in range(1, min(kb, 16) + 1)]
     else:
         pairs = [(c, c + k, k) for k in range(1, 17) if c + k < nt and (c + k) % 2 == 0]
-    if c_only is not None:
+    if c_only is not None and anchor != "last":
         pairs = [(c_only, kb, kb - c_only)] if kb is not None and kb > c_only else []
-    pairs = [q for q in pairs if LEAD_MIN - 1e-6 <= U[q[1]] - U[q[0]] <= ev["pre"] + 1e-6]
+    pairs = [q for q in pairs if LEAD_MIN - 1e-6 <= lead_of(q) <= ev["pre"] + 1e-6]
     if ramp > 1.0:
-        pairs = [q for q in pairs if U[q[1]] - U[q[0]] >= 1.6]
+        pairs = [q for q in pairs if lead_of(q) >= 1.6]
     pref = lambda q: (0 if 2 * lo <= q[2] <= 2 * hi else 1, abs(q[2] - (lo + hi)), q[1] // 2 not in down, q[0] % 2)
-    good = sorted([q for q in pairs if vis_ok(ev, first - (U[q[1]] - U[q[0]]))], key=pref)
-    bad = sorted([q for q in pairs if q not in good], key=lambda q: -(U[q[1]] - U[q[0]]))[:2]
+    good = sorted([q for q in pairs if vis_ok(ev, first - lead_of(q))], key=pref)
+    bad = sorted([q for q in pairs if q not in good], key=lambda q: -lead_of(q))[:2]
     for ext, (cc, kk, _) in [(x, q) for x in ((True,) if ending else (False, True) if ext_only is None else (ext_only,)) for q in good + bad]:
         if ending:
             g = geom(ev, U, cc, kk, None, ramp, True, ending=True)
             if g:
                 return g
             continue
-        last_out = U[kk] + dead_air_cuts(ev, U, kk)[1]
+        last_out = U[kk] if anchor == "last" else U[kk] + dead_air_cuts(ev, U, kk)[1]
         hi = max(TAIL[1], 2 * max(0.0, max(ev.get("rows") or ev["times"]) - ev["times"][-1]) + ROW_TAIL + ROW_SLACK)
         ends = [end] if end is not None else \
             sorted([j for j in range(kk + 1, min(nt + 1, kk + 40 + int(span / max(1e-3, float(U[1] - U[0]))) + 1))   # long fights too
                     if TAIL[0] - 0.12 <= U[j] - last_out <= hi + 0.01],
                    key=lambda j: (j % 2, abs(U[j] - last_out - 0.32)))
         for j in ends:
-            g = geom(ev, U, cc, kk, j, ramp, slow, ext=ext)
+            g = geom(ev, U, cc, kk, j, ramp, slow, ext=ext, anchor=anchor)
             if g:
                 return g
     return None
@@ -6742,6 +6813,8 @@ def optimal_length(events, bd, notes):
     notes.append(f"auto target {L:.0f} s from {used}")
     return L
 
+
+HEADLINE_RULES_V73 = True               # V7.3: headline anchor (finisher on the drop) + single-kill tie-break; False = the V7.2 planner (tests compare against it)
 
 OPT_RANGE = (80.0, 150.0)               # V5.42B Optimal: 80 s minimum (when the material allows), 150 s maximum, never past the song
 
@@ -6831,7 +6904,7 @@ def optimal_fit(clips, an, style):
            + (f"; {len(left)} weakest didn't fit: " + ", ".join(Path(e["path"]).name for e, _ in left) if left else "")
            + f". Song section {ts(bt[S])}-{ts(bt[E])} ends on {end_kind}; drop at {ts(bt[drop_b])} ({dwhy}, {fr(drop_b):.0%} in)")
     return {"length": round(L, 2), "start_beat": int(S), "end_beat": int(E), "drop_beat": int(drop_b), "clips": chosen,
-            "left": left, "max": mx, "why": why}
+            "left": left, "max": mx, "why": why, "drop_why": dwhy}
 
 
 def why_no_take(ev):
@@ -6924,13 +6997,24 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         usable = [e for e in usable if any(e is c_ for c_ in fit["clips"])]
         notes.append(fit["why"])
     head_cands = [e for e in usable if e["path"] not in heads] or usable
+    k_top = sum(1 for e in head_cands if e["score"] == head_cands[0]["score"])
+    if HEADLINE_RULES_V73 and head_cands[0]["n"] == 1 and k_top > 1 and all(e["n"] == 1 for e in head_cands[:k_top]):
+        # V7.3: a single-kill headline among equal scores: flick first, then headshot, then the rest (the order stays otherwise)
+        head_cands = sorted(head_cands[:k_top], key=lambda e: (not e.get("flick"), not (e.get("hs") or 0) > 0)) + head_cands[k_top:]
     head = head_cands[0]
     rest = [e for e in usable if e is not head]
-    ending = next((e for e in sorted(rest, key=lambda e: -e["score"]) if e["post"] >= 0.5), None)
+    ending = next((e for e in sorted(rest, key=lambda e: -e["score"]) if e["post"] >= 0.5 and not e.get("util")), None)
+    if ending is None:                                     # V7.3: a utility take never ends the montage - unless every candidate is one (base behaviour, logged)
+        ending = next((e for e in sorted(rest, key=lambda e: -e["score"]) if e["post"] >= 0.5), None)
+        if ending is not None and ending.get("util") and len(rest) >= 2:
+            notes.append(f"utility take: every event that could end the montage contains one - base behaviour kept: {nm(ending)}")
     if ending is not None and len(rest) >= 2:
         rest.remove(ending)
     else:
         ending = None
+    for e in usable:
+        if e.get("util") and e is not ending:
+            notes.append(f"utility take: no slow-mo / not ending: {nm(e)}")
     total = nat(head) + sum(nat(e) for e in rest) + (nat(ending) + 6 if ending else 0)
     cut_len = [e for e, _ in fit["left"]] if fit else []      # V5.42B: still tried in front below before being listed
     while total > cap_t and rest:                          # length-driven only: drop the lowest-ranked
@@ -6960,9 +7044,19 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                 return t
         return None
     head_take = None
+    drop_note = ""
     for e in head_cands[:10]:
-        head_take = (place(e, U, down, rp, kb=drop, slow=True) if rp["slow_max"] > 0 else None) or place(e, U, down, rp, kb=drop)
+        slow_ok = rp["slow_max"] > 0 and not e.get("util")      # V7.3: a utility take gets no slow-mo
+        head_take = (place(e, U, down, rp, kb=drop, slow=True) if slow_ok else None) or place(e, U, down, rp, kb=drop)
         if head_take:
+            if e["n"] >= 3 and HEADLINE_RULES_V73:         # V7.3: the FINISHER (last kill) lands on the drop when a valid run-up fits before it, else the first kill
+                up = next((u for u in (place(e, U, down, rp, kb=drop, slow=sl, anchor="last") for sl in ((True, False) if head_take["slow"] else (False,))) if u), None)
+                if up:
+                    head_take = up
+                else:
+                    why_k = ("the drop is too early in the song for the finisher's run-up" if drop - 2 * (e["span"] / max(1e-3, bd)) < 4
+                             else "no valid run-up / tail window for the finisher on this drop")
+                    drop_note = f"drop anchor: kept (first kill: {why_k})"
             if e is not head:
                 rest = [x for x in rest if x is not e] + ([head] if head not in rest and head is not ending else [])
                 head = e
@@ -6979,6 +7073,10 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         pre.append(e)
         acc += nat(e)
     post = [e for e in sorted(rest, key=lambda e: -e["score"] * jit[id(e)]) if e not in pre]
+    if ending is None and len(post) > 1 and post[-1].get("util"):     # V7.3: a utility take is never the last take of the montage (if another event can be)
+        j_ = max((i_ for i_, x_ in enumerate(post) if not x_.get("util")), default=None)
+        if j_ is not None:
+            post[-1], post[j_] = post[j_], post[-1]
     pre.sort(key=lambda e: (e["n"], e["score"] * jit[id(e)]))
 
     def run_pre(order, s):
@@ -7005,7 +7103,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             pre_takes = res
             break
         if g < 0 or g <= 8:                                # let the headline's run-up meet the build-up exactly
-            ht = place(head, U, down, rp, c=None, kb=drop, slow=head_take["slow"], c_only=c_end)
+            ht = place(head, U, down, rp, c=None, kb=drop, slow=head_take["slow"], c_only=c_end, anchor=head_take.get("anchor", "first"))
             if ht:
                 head_take, c_h = ht, ht["c"]
                 pre_takes = res
@@ -7029,7 +7127,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     t0 = takes[0]
     if t0["c"] % 2 or (t0["c"] // 2) not in down:
         for cc in sorted([2 * d for d in down if 0 < t0["c"] - 2 * d <= 8], reverse=True):
-            g = geom(t0["ev"], U, cc, t0["kb"], t0["end"], t0["ramp"], t0["slow"])
+            g = geom(t0["ev"], U, cc, t0["kb"], t0["end"], t0["ramp"], t0["slow"], anchor=t0.get("anchor", "first"))
             if g:
                 takes[0] = g
                 if t0 is head_take:
@@ -7104,7 +7202,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             t0 = takes[0]
             for sh in ((1, 2, 3) if fit and not got and not t0.get("ending") else ()):
                 # V5.42B repair: shift the neighbouring take's window (a slightly longer run-up) so this clip's tail can land
-                g0 = geom(t0["ev"], U, t0["c"] - sh, t0["kb"], t0["end"], t0["ramp"], t0["slow"])
+                g0 = geom(t0["ev"], U, t0["c"] - sh, t0["kb"], t0["end"], t0["ramp"], t0["slow"], anchor=t0.get("anchor", "first"))
                 if not g0:
                     continue
                 for xp in (False, True):
@@ -7140,9 +7238,9 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             if manual:                                     # V5.42B repair: a longer run-up (the take before ends earlier)
                 fixed = None
                 for sh in range(1, 9):
-                    g = geom(t["ev"], U, t["c"] - sh, t["kb"], t["end"], t["ramp"], t["slow"])
+                    g = geom(t["ev"], U, t["c"] - sh, t["kb"], t["end"], t["ramp"], t["slow"], anchor=t.get("anchor", "first"))
                     gp = geom(takes[i - 1]["ev"], U, takes[i - 1]["c"], takes[i - 1]["kb"], t["c"] - sh, takes[i - 1]["ramp"],
-                              takes[i - 1]["slow"]) if i > 0 else True
+                              takes[i - 1]["slow"], anchor=takes[i - 1].get("anchor", "first")) if i > 0 else True
                     if g and gp and (i == 0 or not takes[i - 1].get("ending")):
                         fixed = (g, gp)
                         break
@@ -7159,7 +7257,13 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             takes.remove(t)
             notes.append(f"removed a take shorter than the minimum: {nm(t['ev'])}" +
                          (" (no longer run-up fits its footage or the take before)" if manual else ""))
+    if drop_note:
+        notes.append(drop_note)
     plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock)
+    if HEADLINE_RULES_V73:                                 # which kill sits on which drop (read by `montage.py dropcheck`)
+        plan["drop_anchor"] = {"drop_t": round(float(U[drop]), 3), "source": (fit or {}).get("drop_why") or "nearest 8-bar downbeat to the map drop (planner fallback)",
+                               "n": head_take["ev"]["n"], "anchor": "last" if head_take.get("anchor") == "last" else "first",
+                               "kill": (head_take["ev"]["n"] if head_take.get("anchor") == "last" else 1)}
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
@@ -7279,6 +7383,8 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         ev = tk["ev"]
         kb = tk["kb"]
         f_c, f_k = fr(U[tk["c"]]), fr(U[kb])
+        if tk.get("anchor") == "last":                     # V7.3: kb is the LAST kill (the drop); the first kill sits its output span earlier
+            f_k -= int(round(tk.get("ospan", ev["times"][-1] - ev["times"][0]) * OUT_FPS))
         if tk.get("ending"):
             osp = tk.get("ospan", ev["span"])
             last_k = f_k + int(round(osp * OUT_FPS))
@@ -7307,9 +7413,10 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         strong = (kb // 2) in down or en[min(kb // 2, len(en) - 1)] >= 0.6
         frq = lambda x: round(x * OUT_FPS) / OUT_FPS
         pulses = []
+        last_anc = tk.get("anchor") == "last"
         if role == "headline" or (strong and rng.random() < rp["zoom_p"]):                   # V4 zoom punch frequency
-            pulses.append(frq(ko[0]))
-        for k2 in ko[1:]:
+            pulses.append(frq(ko[-1] if last_anc else ko[0]))             # V7.3: the zoom punches the kill that lands on the drop
+        for k2 in (ko[:-1] if last_anc else ko[1:]):
             j = int(np.argmin(np.abs(bt - (U[tk["c"]] + k2))))
             if abs(bt[j] - (U[tk["c"]] + k2)) < 0.06 and (j in down or en[min(j, len(en) - 1)] >= 0.6) and len(pulses) < 3 \
                     and rng.random() < rp["zoom_p"] * 0.6:
@@ -7345,7 +7452,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           "hs": ev["hs"], "ramp": round(tk["ramp"], 2), "slow": tk["slow"], "ending": bool(tk.get("ending")),
                           "snapped": 0, "stitched": ev.get("stitched", False), "stitch_note": ev.get("stitch_note", ""),
                           "death_after": ev.get("death_after"), "lag": ev.get("lag", 0.1), "level": int(lv[min(kb // 2, len(lv) - 1)]),
-                          **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {})})
+                          **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {}), **({"util": True} if ev.get("util") else {})})
     a_mode = audio_state.get("mode") or cfg.get("audio_mode", "auto")
     total_f = out_takes[-1]["f0"] + out_takes[-1]["nf"]
     total_s = total_f / OUT_FPS
@@ -8536,6 +8643,34 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None):
     return pick, notes
 
 
+def weekly_more(events, pick, style, game, need_s):
+    """V7.3 (CS2 weekly / Force new): the planner could not place all of weekly_pick()'s events and the plan is under the 60 s minimum, so the pick is
+    extended with the SAME priority as weekly_pick(): unused events first (best multikills, then singles), then previously used ones (oldest use
+    first, best first) - never a clip of the game's previous montage, never a clip twice - until their estimate covers need_s. Returns (events, reused)."""
+    used = used_dates()
+    rn = style if style in RECIPES else "hype"
+    est = lambda lst: sum(take_estimate(e, 0.47, rn) for e in lst)
+    in_pick = {id(e) for e in pick}
+    taken = set().union(*[_ev_paths(e) for e in pick]) if pick else set()
+    last = hist_list(USED_CLIPS, game)[-1:] if game else []
+    prev = {_pkey(c) for h in last for c in h.get("clips", [])}
+    fresh = sorted([e for e in events if id(e) not in in_pick and _pkey(e["path"]) not in used], key=lambda e: (bool(e.get("plain")), -e["score"]))
+    old = sorted([e for e in events if id(e) not in in_pick and _pkey(e["path"]) in used and not any(_pkey(q) in prev for q in _ev_paths(e))],
+                 key=lambda e: (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"]))
+    add, reused = [], []
+    for e in fresh + old:
+        if est(add) >= need_s:
+            break
+        ps = _ev_paths(e)
+        if ps & taken:
+            continue
+        add.append(e)
+        taken |= ps
+        if _pkey(e["path"]) in used:
+            reused.append(e)
+    return add, reused
+
+
 def weekly_song_fit(song, an, sinfo, runners):
     """V6.5.1 (weekly / Auto): a chosen song whose section is under the 60 s minimum is replaced by the next best-ranked song that can."""
     sec = lambda a: float(a.get("dur") or 0) - float((a.get("beats") or [0])[0])
@@ -8994,20 +9129,26 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         events, notes = build_events(pool, game, cfg, random.Random(seed))
     if not events:
         raise RuntimeError("no usable kill events (utility kills are excluded)")
+    all_events = list(events)
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
         events, wk_notes = weekly_pick(events, cfg, cfg.get("length_s", "optimal") if target is None else target,
                                        cfg.get("style", "auto") if style is None else style, game=game)
         notes += wk_notes
         for n_ in wk_notes:
             out(n_)
-        if game in ("cs2", "valorant"):                    # V6.9 (CS2) / V6.9.8 (both): companion clips of the picked clips (same slot, same count)
-            sel_ = set().union(*[pair_event_clips(e) for e in events]) if events else set()
-            pair = pairing_run(cfg, tagged, sel_, quiet=not scan, game=game, allow_used=True)
-            if pair and pair["partners"]:
+    picked = list(events)
+
+    def companions(evs, pair_):
+        if not manual and game in ("cs2", "valorant"):     # V6.9 (CS2) / V6.9.8 (both): companion clips of the picked clips (same slot, same count)
+            sel_ = set().union(*[pair_event_clips(e) for e in evs]) if evs else set()
+            pair_ = pairing_run(cfg, tagged, sel_, quiet=not scan, game=game, allow_used=True)
+            if pair_ and pair_["partners"]:
                 try:
-                    events = pairing_replace_events(pair, pool, events, game, cfg, seed)
+                    evs = pairing_replace_events(pair_, pool, evs, game, cfg, seed)
                 except Exception as ex:
                     out(f"pairing skipped: {type(ex).__name__}: {ex}")
+        return evs, pair_
+    events, pair = companions(events, pair)
     songs, unmatched, csvname = song_pool(cfg)
     song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path)
     if not manual and not song_path:
@@ -9019,31 +9160,55 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         target = cfg.get("length_s", "optimal")
     if style is None:
         style = cfg.get("style", "auto")
-    pool_ev, fixes, extended = list(events), [], set()
-    for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
-        n2 = list(notes)
-        plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
-                            placement=placement, manual=manual)
-        bad = [b_ for b_ in verify_cutlist(plan) if re.match(r"take \d+:", b_) and ("kill row" in b_ or _TAKE_SKIP_OK(b_))]   # V6.9.9: any per-take problem drops / re-plans only that take
-        idx = {int(m.group(1)) for b_ in bad for m in [re.match(r"take (\d+):", b_)] if m}
-        why_b = {plan["takes"][i - 1]["path"]: b_.split(":", 1)[1].strip() for b_ in bad for m in [re.match(r"take (\d+):", b_)]
-                 if m and 0 < (i := int(m.group(1))) <= len(plan["takes"])}
-        gone = {plan["takes"][i - 1]["path"] for i in idx if 0 < i <= len(plan["takes"])}
-        if not gone:
+    def plan_loop(events):
+        pool_ev, fixes, extended = list(events), [], set()
+        for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
+            n2 = list(notes)
+            plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
+                                placement=placement, manual=manual)
+            bad = [b_ for b_ in verify_cutlist(plan) if re.match(r"take \d+:", b_) and ("kill row" in b_ or _TAKE_SKIP_OK(b_))]   # V6.9.9: any per-take problem drops / re-plans only that take
+            idx = {int(m.group(1)) for b_ in bad for m in [re.match(r"take (\d+):", b_)] if m}
+            why_b = {plan["takes"][i - 1]["path"]: b_.split(":", 1)[1].strip() for b_ in bad for m in [re.match(r"take (\d+):", b_)]
+                     if m and 0 < (i := int(m.group(1))) <= len(plan["takes"])}
+            gone = {plan["takes"][i - 1]["path"] for i in idx if 0 < i <= len(plan["takes"])}
+            if not gone:
+                break
+            if manual:                                         # V5.42B: first extend the take's window (no jump-cuts over its fight)
+                ext = {p_ for p_ in gone if p_ not in extended and "kill row" in why_b.get(p_, "")}
+                if ext:
+                    extended |= ext
+                    fixes += [f"cut list repair: {Path(p_).name} - {why_b.get(p_, 'kill row outside its footage')}; take window "
+                              "extended (its whole fight shown, no jump-cut), re-planned" for p_ in ext]
+                    pool_ev = [dict(e, _no_cuts=True) if e["path"] in ext else e for e in pool_ev]
+                    continue
+            fixes += [(f"cut list repair: dropped {Path(p_).name} ({why_b.get(p_, 'kill row outside its footage')}"
+                       f"{' even with its take window extended' if p_ in extended else ''}), re-planned with the next best events")
+                      if "kill row" in why_b.get(p_, "kill row") else
+                      f"take skipped: {Path(p_).name} ({why_b.get(p_)}), re-planned without it" for p_ in gone]
+            pool_ev = [e for e in pool_ev if e["path"] not in gone]
+        return plan, pool_ev, fixes
+    plan, pool_ev, fixes = plan_loop(events)
+    rounds = 0
+    while not manual and game == "cs2" and plan["duration"] < WEEKLY_MIN_S - 0.5 and rounds < 6:
+        # V7.3: CS2 reaches the 60 s weekly minimum with the SAME mechanism as Valorant (weekly_pick: unused first, then previously used clips)
+        # - weekly_pick() only counts estimated seconds, and the planner may not be able to place every event (no run-up / tail fits the song's beats)
+        add, reused_ = weekly_more(all_events, picked, style, game, max(8.0, (WEEKLY_MIN_S - plan["duration"]) * 1.5))
+        if not add:
             break
-        if manual:                                         # V5.42B: first extend the take's window (no jump-cuts over its fight)
-            ext = {p_ for p_ in gone if p_ not in extended and "kill row" in why_b.get(p_, "")}
-            if ext:
-                extended |= ext
-                fixes += [f"cut list repair: {Path(p_).name} - {why_b.get(p_, 'kill row outside its footage')}; take window "
-                          "extended (its whole fight shown, no jump-cut), re-planned" for p_ in ext]
-                pool_ev = [dict(e, _no_cuts=True) if e["path"] in ext else e for e in pool_ev]
-                continue
-        fixes += [(f"cut list repair: dropped {Path(p_).name} ({why_b.get(p_, 'kill row outside its footage')}"
-                   f"{' even with its take window extended' if p_ in extended else ''}), re-planned with the next best events")
-                  if "kill row" in why_b.get(p_, "kill row") else
-                  f"take skipped: {Path(p_).name} ({why_b.get(p_)}), re-planned without it" for p_ in gone]
-        pool_ev = [e for e in pool_ev if e["path"] not in gone]
+        rounds += 1
+        picked = picked + add
+        notes.append(f"weekly pick: the planner placed only {plan['duration']:.0f} s - {len(add) - len(reused_)} more unused event(s) added (best multikills first, then singles)")
+        out(notes[-1])
+        if reused_:
+            notes.append(f"reused {len(reused_)} previously used clip(s) to reach the {WEEKLY_MIN_S:.0f} s minimum")
+            out(notes[-1])
+        events, pair = companions(list(picked), pair)
+        plan, pool_ev, fixes = plan_loop(events)
+    if not manual and game == "cs2" and plan["duration"] < WEEKLY_MIN_S - 0.5:
+        msg = (f"the whole library only gives ~{plan['duration']:.0f} s of placeable cs2 events - below the {WEEKLY_MIN_S:.0f} s minimum, so this is all "
+               "there is; nothing is padded")
+        plan["notes"] = list(plan["notes"]) + [msg]
+        out(msg)
     plan["notes"] = list(plan["notes"]) + fixes
     for f_ in fixes:
         out(f_)
@@ -14305,6 +14470,353 @@ def gui_main(start_tab=0):
     App(start_tab).root.mainloop()
 
 
+# ======================================================================= V7.3: dropcheck
+DROPCHECK_KILL_DELAY_MS = 40.0          # a median killfeed-row-minus-gunshot above this is a real edit delay
+DROPCHECK_NEAR_BEATS = 1.0              # a drop within this many beats (and at least DROPCHECK_NEAR_S) of another counts as the same drop
+DROPCHECK_NEAR_S = 1.0                  # a typed drop time (m:ss) is only this precise
+
+
+def _mmss(t):
+    if t is None:
+        return "-"
+    t = float(t)
+    return f"{'-' if t < 0 else ''}{int(abs(t) // 60)}:{abs(t) % 60:04.1f}"
+
+
+def _dc_parse_drops(txt):
+    """'0:34,1:32,2:15' (m:ss, comma separated) -> [34.0, 92.0, 135.0]"""
+    res = []
+    for part in str(txt).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            m_, s_ = part.rsplit(":", 1)
+            res.append(float(m_) * 60.0 + float(s_))
+        else:
+            res.append(float(part))
+    return sorted(res)
+
+
+def _dc_plan_files(cfg, game=None):
+    """Saved plans, newest first: montage_data\\plans\\*.dry.json and the plans next to rendered montages (<output>\\<Game>\\logs\\*.plan.json)."""
+    files = []
+    for g in ([game] if game else list(GAME_DIR)):
+        if (DATA / "plans").is_dir():
+            files += list((DATA / "plans").glob(f"{GAME_DIR[g]}_*.dry.json"))
+        lg = Path(cfg["output_root"]) / GAME_DIR[g] / "logs"
+        if lg.is_dir():
+            files += list(lg.glob("*.plan.json"))
+    return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)
+
+
+def _dc_resolve_plan(target, cfg, game=None):
+    if target:
+        p = Path(target)
+        if p.suffix.lower() == ".json":
+            return p
+        for cand in (p.parent / "logs" / (p.stem + ".plan.json"), p.parent / (p.stem + ".plan.json")):
+            if cand.exists():
+                return cand
+        raise RuntimeError(f"no saved plan for {p.name} (looked for logs\\{p.stem}.plan.json next to the video)")
+    fs = _dc_plan_files(cfg, game)
+    if not fs:
+        raise RuntimeError("no saved plan found (montage_data\\plans or the output folder's logs)")
+    return fs[0]
+
+
+def _dc_peek_maps(path, plan_bpm):
+    """V1 and V2 song maps of the song, READ-ONLY: from the cache files (any CSV tempo; the one whose BPM is closest to the plan's), else built in memory
+    and never saved. Returns {"v1": map or None, "v2": map or None, "how": {...}}."""
+    st = os.stat(path)
+    res, how = {"v1": None, "v2": None}, {}
+    c1 = load_json(SONG_CACHE, {})
+    pre = f"{path}|{int(st.st_mtime)}|{st.st_size}|{SONGMAP_V}|"
+    hits = [k for k in c1 if k.startswith(pre)]
+    if hits:
+        k = min(hits, key=lambda k: abs(float(c1[k].get("bpm") or 0) - float(plan_bpm or 0)))
+        res["v1"], how["v1"] = c1[k], "cache"
+    else:
+        try:
+            res["v1"], how["v1"] = build_song_map(path, None), "built in memory (not cached)"
+        except Exception as ex:
+            how["v1"] = f"failed: {type(ex).__name__}: {ex}"
+    c2 = load_json(DATA / "song_cache_v2.json", {})
+    sig = f"{st.st_size}-{int(st.st_mtime)}-"
+    hits = [k for k, v in c2.items() if isinstance(v, dict) and not v.get("fallback_marker") and len(k.split("|")) > 2 and k.split("|")[2].startswith(sig)]
+    if hits:
+        k = min(hits, key=lambda k: abs(float(c2[k].get("bpm") or 0) - float(plan_bpm or 0)))
+        res["v2"], how["v2"] = c2[k], "cache"
+    else:
+        try:
+            import songmap_v2
+            res["v2"], how["v2"] = songmap_v2.build_songmap_v2(path, None), "built in memory (not cached)"
+        except Exception as ex:
+            how["v2"] = f"failed: {type(ex).__name__}: {ex}"
+    res["how"] = how
+    return res
+
+
+def _dc_map_drops(m):
+    """([(t, strength)] of a map's drop list, the main drop's time)."""
+    if not m:
+        return [], None
+    bt = m.get("beats") or []
+    main = m.get("drop")
+    main_t = float(bt[main]) if main is not None and 0 <= int(main) < len(bt) else None
+    return [(float(d["t"]), float(d.get("strength", 0))) for d in m.get("drops", [])], main_t
+
+
+def _dc_independent_drops(path, bpm):
+    """INDEPENDENT of both song maps: the sustained loudness rise of about 8 bars (mean level of the next ~8 bars minus the previous ~8 bars, dB) that
+    coincides with the kick returning (low-band attacks per second after vs before), on the render-timebase audio (decode_mono: same origin as the
+    render). Returns [{"t", "rise_db", "kick_after", "kick_before", "conf"}] by time, drops at least 16 s apart."""
+    import numpy as np
+    from scipy.signal import butter, sosfiltfilt, find_peaks
+    y, sr = decode_mono(path, 22050)
+    y = np.asarray(y, np.float64)
+    hop = 0.5
+    n = int(hop * sr)
+    m_ = len(y) // n
+    lv = 10 * np.log10((y[:m_ * n].reshape(m_, n) ** 2).mean(1) + 1e-10)
+    win = float(np.clip(32 * 60.0 / max(60.0, float(bpm or 128.0)), 8.0, 20.0))        # 8 bars of 4 beats
+    k = max(4, int(round(win / hop)))
+    low = sosfiltfilt(butter(4, 150, "low", fs=sr, output="sos"), y)
+    env = np.convolve(np.abs(low), np.ones(int(0.008 * sr)) / int(0.008 * sr), mode="same")
+    d = np.gradient(np.sqrt(env + 1e-9))
+    d[d < 0] = 0
+    ref = float(np.percentile(d[d > 0], 90)) if np.any(d > 0) else 0.0
+    pk, _ = find_peaks(d, height=max(0.18 * ref, 1e-9), distance=int(0.10 * sr), prominence=0.12 * ref)
+    kt = pk / sr
+    cands = []
+    for i in range(k, len(lv) - k):
+        rise = float(lv[i:i + k].mean() - lv[i - k:i].mean())
+        if rise < 1.5:
+            continue
+        t = i * hop
+        after = float(np.sum((kt >= t) & (kt < t + 10.0))) / 10.0
+        before = float(np.sum((kt >= t - 10.0) & (kt < t))) / 10.0
+        if after < 0.8 or before > 0.65 * after:
+            continue
+        cands.append((rise * (1.0 - before / max(after, 1e-9)), t, rise, after, before))
+    cands.sort(reverse=True)
+    res = []
+    for sc, t, rise, after, before in cands:
+        if rise < 3.0 or any(abs(t - r["t"]) < 16.0 for r in res):
+            continue
+        if res and sc < 0.35 * cands[0][0]:
+            break
+        first = kt[(kt >= t - 2.0) & (kt <= t + 4.0)]
+        res.append({"t": round(float(first[0]) if len(first) else t, 2), "rise_db": round(rise, 1), "kick_after": round(after, 2),
+                    "kick_before": round(before, 2), "conf": round(float(np.clip(sc / 8.0, 0.0, 1.0)), 2), "kind": "loudness rise + kick returns"})
+    if res:
+        return sorted(res, key=lambda r: r["t"])
+    # no drop with a returning kick (a song whose kick never leaves): the sharpest sustained loudness steps, weaker evidence, marked as such
+    rr = np.array([lv[i:i + k].mean() - lv[i - k:i].mean() if k <= i < len(lv) - k else -99.0 for i in range(len(lv))])
+    st = np.array([lv[i:i + 4].mean() - lv[i - 4:i].mean() if 4 <= i < len(lv) - 4 else -99.0 for i in range(len(lv))])
+    pks, _ = find_peaks(rr, height=1.5, distance=int(16.0 / hop))
+    steps = []
+    for i in pks:
+        lo_, hi_ = max(4, i - 12), min(len(lv) - 5, i + 12)
+        j = lo_ + int(np.argmax(st[lo_:hi_]))
+        steps.append((float(st[j]), j * hop, float(rr[i])))
+    if not steps:
+        return []
+    top = max(x[0] for x in steps)
+    return sorted([{"t": round(t, 2), "rise_db": round(r_, 1), "kick_after": 0.0, "kick_before": 0.0, "conf": round(min(1.0, sp / 8.0) * 0.5, 2),
+                    "kind": f"loudness step +{sp:.1f} dB / 2 s only (no returning kick: weaker evidence)"}
+                   for sp, t, r_ in steps if sp >= max(3.0, 0.5 * top)], key=lambda r: r["t"])
+
+
+def _dc_planner_drop(plan):
+    """(song time of the drop the planner used, the map field or planner step that produced it) - from the plan's drop_anchor (V7.3 plans) or the
+    'drop at M:SS.s (why, N% in)' plan note of older plans."""
+    da = plan.get("drop_anchor") or {}
+    src_map = {"the song's main drop": "map field 'drop' (the map's main drop)",
+               "the strongest drop inside the section": "map field 'drops' (the strongest drop inside the chosen section)",
+               "no drop fits inside this section - a downbeat ~38% in": "planner's own search (a downbeat ~38% into the section; no map drop fits)",
+               "nearest 8-bar downbeat to the map drop (planner fallback)": "planner fallback (the downbeat nearest to the map's main drop)"}
+    if da.get("drop_t") is not None:
+        return float(da["drop_t"]), src_map.get(da.get("source"), da.get("source") or "unknown")
+    for n_ in plan.get("notes", []):
+        m = re.search(r"drop at (\d+):(\d+(?:\.\d+)?) \((.+?), \d+% in\)", n_)
+        if m:
+            return int(m.group(1)) * 60 + float(m.group(2)), src_map.get(m.group(3), m.group(3)) + " [from the plan note, 0.1 s resolution]"
+    hl = next((t for t in plan["takes"] if t.get("role") == "headline"), None)
+    if hl is not None:
+        return float(plan["song"]["start_t"]) + float(hl["out_start"]) + float(hl["kills_out"][0]), "unknown (the plan has no drop note; the headline's first kill)"
+    return None, "unknown"
+
+
+def _dc_kill_delays(plan, take_filter=None):
+    """killfeed row time minus gunshot onset (ms) per planned kill, in the SOURCE clip's game audio (gun_onsets, the existing detector).
+    Returns (delays_ms, n_without_gunshot, n_kills)."""
+    clips = load_json(CLIPS_CACHE, {})
+    cache = load_json(ONSET_CACHE, {})
+    delays, nogun, total = [], 0, 0
+    for tk in plan["takes"]:
+        if take_filter is not None and not take_filter(tk):
+            continue
+        rows = tk.get("rows") or tk["kills"]
+        for i, kt in enumerate(tk["kills"]):
+            row = rows[i] if i < len(rows) else kt
+            total += 1
+            pi = 0
+            for sg in tk["segs"]:
+                if sg[0] - 1e-3 <= row <= sg[1] + 1e-3 and sg[2] > 0:
+                    pi = sg[4] if len(sg) > 4 else 0
+                    break
+            src = tk["srcs"][min(pi, len(tk["srcs"]) - 1)]
+            try:
+                rec = dict(clips[file_key(src["path"])], path=src["path"], game=plan["game"])
+                ons = gun_onsets(rec, cache)
+            except Exception:
+                ons = None
+            if not ons:
+                nogun += 1
+                continue
+            rc = row - src.get("shift", 0.0)
+            cand = [o[0] for o in ons if rc - 0.6 <= o[0] <= rc + 0.05]
+            if not cand:
+                nogun += 1
+                continue
+            delays.append((rc - max(cand)) * 1000.0)
+    return delays, nogun, total
+
+
+def _dc_stats(v):
+    import numpy as np
+    if not v:
+        return "n/a"
+    a = np.asarray(v, float)
+    return f"median {np.median(a):.0f} ms, spread {np.percentile(a, 25):.0f}..{np.percentile(a, 75):.0f} ms (IQR), min {a.min():.0f} max {a.max():.0f}, n={len(a)}"
+
+
+def dropcheck_report(plan, plan_name, true_arg=None, cfg=None):
+    """The three layers and the verdict as a list of lines (read-only: no cache, plan or config file is written)."""
+    import numpy as np
+    cfg = cfg or load_config()
+    L = []
+    sg = plan["song"]
+    path = sg["path"]
+    bpm = float(sg.get("bpm") or 0)
+    beat = 60.0 / bpm if bpm else 0.5
+    L.append(f"dropcheck: {plan_name}  [{plan['game']}]  song: {sg.get('artist', '')} - {sg.get('title', '')}  ({Path(path).name}, {bpm:.1f} BPM)")
+    verdicts = []
+    # ---- L1 MAP
+    L.append("")
+    L.append("L1 MAP")
+    maps = {"v1": None, "v2": None, "how": {}}
+    true_src = "--drops"
+    true = _dc_parse_drops(true_arg) if true_arg else []
+    if not os.path.exists(path):
+        L.append(f"  song file not found: {path} - the map layer is skipped")
+    else:
+        maps = _dc_peek_maps(path, bpm)
+        for v in ("v1", "v2"):
+            L.append(f"  {v.upper()} map: {maps['how'].get(v)}")
+        if not true_arg:
+            true_src = "independent detector, render-timebase audio"
+            ind = _dc_independent_drops(path, bpm)
+            true = [r["t"] for r in ind]
+            for r in ind:
+                L.append(f"    independent drop {_mmss(r['t'])}: {r['kind']}; 8-bar rise +{r['rise_db']} dB, confidence {r['conf']}")
+    L.append(f"  true drops ({true_src}): " + (", ".join(_mmss(t) for t in true) or "none found"))
+    used = "v2" if songmap_version(cfg) != "v1" else "v1"
+    near = lambda t, lst: min(lst, key=lambda x: abs(x - t)) if lst else None
+    tol = max(DROPCHECK_NEAR_BEATS * beat, DROPCHECK_NEAR_S)
+    map_wrong = False
+    mains = {}
+    for v in ("v1", "v2"):
+        drops, main_t = _dc_map_drops(maps.get(v))
+        mains[v] = main_t
+        L.append(f"  {v.upper()} drops: " + (", ".join(f"{_mmss(t)}{'*' if main_t is not None and abs(t - main_t) < 1e-6 else ''}" for t, _ in drops) or "none") + "   (* = main drop)")
+        for t, _ in drops:
+            tn = near(t, true)
+            if tn is not None:
+                L.append(f"      map {_mmss(t)} -> nearest true drop {_mmss(tn)}: {t - tn:+.1f} s = {(t - tn) / beat:+.1f} beats")
+        if true:
+            miss = [t for t in true if not drops or min(abs(t - d) for d, _ in drops) > tol]
+            stray = [t for t, _ in drops if min(abs(t - x) for x in true) > tol]
+            L.append(f"      true drops with no {v.upper()} drop within {tol:.1f} s: " + (", ".join(_mmss(t) for t in miss) if miss else "none")
+                     + f";  {v.upper()} drops that are not a true drop: " + (", ".join(_mmss(t) for t in stray) if stray else "none"))
+            if v == used and (miss or stray):
+                map_wrong = True
+    L.append(f"  map used by the app (Settings): {used.upper()}")
+    # ---- L2 PLANNER
+    L.append("")
+    L.append("L2 PLANNER")
+    hl = next((t for t in plan["takes"] if t.get("role") == "headline"), None)
+    pdrop, psrc = _dc_planner_drop(plan)
+    start_t = float(sg["start_t"])
+    L.append(f"  song starts at {_mmss(start_t)} (the section the planner chose, {sg.get('section_s', 0):.0f} s of music available)")
+    L.append(f"  drop used by the planner: {_mmss(pdrop)}   <- produced by: {psrc}")
+    diff_map = False
+    if pdrop is not None and mains.get(used) is not None:
+        dd = pdrop - mains[used]
+        L.append(f"  planner drop vs the {used.upper()} map's main drop {_mmss(mains[used])}: {dd:+.1f} s = {dd / beat:+.1f} beats")
+        listed = [t for t, _ in _dc_map_drops(maps.get(used))[0]]
+        if listed:
+            dl = min(listed, key=lambda t: abs(t - pdrop))
+            L.append(f"  planner drop vs the nearest drop in the {used.upper()} drop list {_mmss(dl)}: {pdrop - dl:+.1f} s = {(pdrop - dl) / beat:+.1f} beats")
+        diff_map = abs(dd) > tol or (bool(listed) and min(abs(t - pdrop) for t in listed) > tol)
+    if hl is None:
+        L.append("  no headline take in this plan")
+    else:
+        ks = [start_t + float(hl["out_start"]) + float(k) for k in hl["kills_out"]]
+        n = len(ks)
+        idx = min(range(n), key=lambda i: abs(ks[i] - pdrop)) if pdrop is not None else 0
+        kind = "only kill" if n == 1 else "first" if idx == 0 else "last" if idx == n - 1 else "middle"
+        L.append(f"  headline take {Path(hl['path']).name}: {n} kill(s) at song time " + ", ".join(_mmss(k) for k in ks))
+        L.append(f"  kill placed on the drop: #{idx + 1} of {n} = {kind} at {_mmss(ks[idx])}" + (f" ({(ks[idx] - pdrop) * 1000:+.0f} ms from the planner's drop)" if pdrop is not None else ""))
+        tn = near(ks[idx], true)
+        if tn is not None:
+            L.append(f"  distance of that kill to the nearest true drop {_mmss(tn)}: {ks[idx] - tn:+.2f} s = {(ks[idx] - tn) / beat:+.1f} beats")
+        if plan.get("drop_anchor"):
+            L.append(f"  anchor rule (V7.3): the {plan['drop_anchor'].get('anchor')} kill of {plan['drop_anchor'].get('n')}")
+        if kind == "middle":
+            verdicts.append("anchor kill is a middle kill")
+    # ---- L3 KILL DELAY
+    L.append("")
+    L.append("L3 KILL DELAY (killfeed row time minus gunshot onset in the source clip's game audio)")
+    d_h, med_h = [], None
+    if hl is not None:
+        d_h, ng_h, nk_h = _dc_kill_delays(plan, lambda tk: tk is hl)
+        L.append(f"  headline take kills: {_dc_stats(d_h)}; {ng_h} of {nk_h} kills had no gunshot")
+        for i, dv in enumerate(d_h, 1):
+            L.append(f"      kill delay #{i}: {dv:+.0f} ms")
+        med_h = float(np.median(d_h)) if d_h else None
+    d_a, ng_a, nk_a = _dc_kill_delays(plan)
+    L.append(f"  all kills of the plan: {_dc_stats(d_a)}; {ng_a} of {nk_a} kills had no gunshot")
+    med_all = float(np.median(d_a)) if d_a else None
+    worst = max([x for x in (med_h, med_all) if x is not None], default=None)
+    if worst is not None and worst > DROPCHECK_KILL_DELAY_MS:
+        verdicts.append(f"kill delay {worst:.0f} ms")
+    # ---- VERDICT
+    if diff_map:
+        verdicts.insert(0, "planner chose a different drop than the map")
+    if map_wrong:
+        verdicts.insert(0, "map wrong")
+    L.append("")
+    L.append("VERDICT: " + ("; ".join(verdicts) if verdicts else "all fine"))
+    return L
+
+
+def cmd_dropcheck(args):
+    """V7.3: python montage.py dropcheck [<montage.mp4 | plan.json>] [--drops 0:34,1:32,2:15] [--game valorant|cs2]. Read-only: prints the three layers (map,
+    planner, kill delay) and a verdict, writes only dropcheck.txt next to montage.py."""
+    cfg = load_config()
+    pf = _dc_resolve_plan(args.target, cfg, getattr(args, "game", None))
+    plan = load_json(pf, None)
+    if not plan or "takes" not in plan:
+        raise RuntimeError(f"{pf} is not a plan")
+    lines = dropcheck_report(plan, pf.name, args.drops, cfg)
+    text = "\n".join(lines)
+    (HERE / "dropcheck.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(read-only; written to {HERE / 'dropcheck.txt'}; nothing else was changed)")
+
+
 def cmd_auto(args):
     mode = "dry" if (args.dry or args.plan_only) else "preview" if args.preview else "render"
     for g in ([args.game] if args.game else list(GAMES)):
@@ -14506,6 +15018,11 @@ def main():
     pu.add_argument("state", nargs="?", default="", help="on | off")
     pu.add_argument("--list", action="store_true", help="the clips that are ON and how many utility rows each has")
     pu.set_defaults(fn=cmd_utilclip)
+    dc = sp.add_parser("dropcheck", help="V7.3: the three layers behind a drop-sync complaint (song map, planner, kill delay) + a verdict; read-only, writes dropcheck.txt")
+    dc.add_argument("target", nargs="?", help="a montage .mp4 (its saved plan) or a plan .json; default: the newest saved plan")
+    dc.add_argument("--drops", help="the true drops, e.g. 0:34,1:32,2:15 (default: an independent detector)")
+    dc.add_argument("--game", choices=GAMES, help="newest plan of this game")
+    dc.set_defaults(fn=cmd_dropcheck)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
