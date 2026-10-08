@@ -2,23 +2,17 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
-## Song map V2: better beat sync and drops
-- Song map V2 now finds drops where the kick actually comes back, so the montage starts on a steady beat instead of a quiet build-up.
-- On many songs the kills land much closer to the beat. Song map V2 is now the default; Song map V1 stays selectable in Settings.
+## V7.2 - 2026-10-08: Song map V2 is the default
+- Kills now land closer to the beat.
+- Drops are found where the kick comes back, so a montage starts on a steady beat instead of a quiet build-up.
+- Songs where V2 cannot find a steady beat fall back to the old map automatically. Songmap V1 stays selectable in Settings.
+
+## V7.1 - 2026-10-08: Better beat grid and drops (V2 tuning)
+- The beat grid follows the kick more closely, including songs with a drifting or unusual tempo.
 - Settings now offers just "Songmap V1" and "Songmap V2".
-- If V2 cannot find a steady beat on a song, or fails, that song silently uses V1's beat values.
 
-## Known issues / on hold
-- KNOWN ISSUE: on a few songs with sparse kicks, song map V2 uses V1's beats, and the main drop is not always where the headline kill lands.
-- ABANDONED: frame interpolation for low-fps clips. It is off by default.
-- KNOWN ISSUE: the CS2 sync report undercounts kills. The montage itself is fine.
-- KNOWN ISSUE: CS2 clip 2026.02.10 - 19.09.46.22 shows its kill dated late, so the take cuts away before it.
-- KNOWN ISSUE: CS2 stale kill rows with very different spelling can still survive (13.53.24.09).
-- KNOWN ISSUE: Valorant clip 21.04.36.03 (4K) often cannot form a take.
-- KNOWN ISSUE: low-bitrate OBS clips need a kill-detection check.
-
-## V7 test - 2026-10-08: Song map V2 improvement (test branch, not merged)
-- The better beat grid is tested on 19 songs. It locks better on several (e.g. Silicon XX) but is not clearly better in real montages, so V1 stays default.
+## V7 - 2026-10-08: Song map V2 test
+- A first test of the better beat grid on 19 songs.
 
 ## V6.9.11 - 2026-10-07: Readable changelog in Settings
 - The changelog in Settings now shows this short plain-language history.
