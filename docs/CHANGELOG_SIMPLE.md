@@ -6,7 +6,7 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - Song map V2 now finds drops where the kick actually comes back, so the montage starts on a steady beat instead of a quiet build-up.
 - On many songs the kills land much closer to the beat; a few songs are still better with Song map V1, so V1 stays the default.
 - Settings now offers just "Songmap V1" and "Songmap V2".
-- If V2 ever fails on a song, that song silently uses V1.
+- If V2 cannot find a steady beat on a song, or fails, that song silently uses V1's beat values.
 
 ## Known issues / on hold
 - ON HOLD: making song map V2 the default. V1 stays the default until V2 is never worse on any song.

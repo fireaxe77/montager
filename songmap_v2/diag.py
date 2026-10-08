@@ -37,6 +37,19 @@ def kick_continuity(kicks, t0, t1, gap=2.0):
     return {"longest_gap_s": round(float(np.max(np.diff(pts))), 1), "windows_with_kick": round(float(np.mean([np.any((k >= a) & (k < a + 1)) for a in np.arange(t0, t1 - 1, 1.0)])) if t1 - t0 > 1 else 0, 2)}
 
 
+def compact(r):
+    """One status line per song: BPMs and ratio, confidence, and per map the windows (val7 / singles), longest kick gap in the window, the V2-grid and V1-grid
+    phase against the independent kicks (median offset ms / beats, share of kicks within 25 ms)."""
+    L = [f"{r['song'][:28]:28} V1 {r['v1_bpm']:.1f} V2 {r['v2_bpm']:.1f} ratio {r['v2_bpm'] / r['v1_bpm']:.2f} conf {r['v2_conf']:.2f} | median V1 {r['modes']['v1']['median']} V2 {r['modes']['v2']['median']}"]
+    for mode in ("v1", "v2"):
+        for st in r["modes"][mode]["sets"]:
+            if st.get("set") == "val7" and "start" in st:
+                ph = st["phase_v2" if mode == "v2" else "phase_v1"] or {}
+                L.append(f"    {mode} val7 window {st['start']}-{st['end']} s, longest kick gap {st['cont']['longest_gap_s']} s, own grid: off {ph.get('median_off_ms')} ms "
+                         f"({ph.get('off_beats')} beat), kicks/quarter-beat {ph.get('quarters')}, kill errors {st['d_ms']}")
+    return chr(10).join(L)
+
+
 def main(frags):
     import montage as M
     from songmap_v2 import bench, planbench as PB, timebase
@@ -74,7 +87,7 @@ def main(frags):
                 r["modes"][mode] = {"median": round(float(np.median(allk)), 1) if allk else None, "sets": rows}
             r["secs"] = round(time.time() - t0)
             res.append(r)
-            print(json.dumps(r, indent=1, default=float))
+            print(compact(r), flush=True)
     out = HERE / "compare_out"
     out.mkdir(exist_ok=True)
     (out / "diag_step0.json").write_text(json.dumps(res, indent=1, default=float), encoding="utf-8")

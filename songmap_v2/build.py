@@ -5,7 +5,7 @@ import time
 
 import numpy as np
 
-from . import ALGO_V, ANALYSIS_CAP_S, CACHE_NS, adapter, events, events7, grid, judge, sections, timebase
+from . import ALGO_V, ANALYSIS_CAP_S, CACHE_NS, adapter, events, events7, grid, judge, safety, sections, timebase
 
 
 def file_signature(path):
@@ -27,7 +27,7 @@ def _code_sig():
     """Short hash of the analysis sources: any edit of the V2 algorithm invalidates ONLY the V2 cache (V7.1)."""
     h = hashlib.sha1()
     here = os.path.dirname(os.path.abspath(__file__))
-    for n in ("grid", "events", "events7", "sections", "adapter", "build", "timebase", "judge"):
+    for n in ("grid", "events", "events7", "sections", "adapter", "build", "timebase", "judge", "safety"):
         try:
             with open(os.path.join(here, n + ".py"), "rb") as f:
                 h.update(f.read())
@@ -181,4 +181,11 @@ def build_songmap_v2(path, csv_bpm=None, deadline=None, hook=None, v1_bpm=None):
               "pre_intro_beats": int(np.argmax(G["observed"])) if len(G["observed"]) else 0,
               "analysis_s": round(time.time() - t0, 2)}
     m = adapter.to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras)
+    chk("adapter")
+    try:
+        m = safety.apply(m, path, csv_bpm, jk, dur)           # V7.2: V2 never invents beats it cannot lock better than V1 does
+    except Cap:
+        raise
+    except Exception:
+        pass
     return m

@@ -144,7 +144,8 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
     ev_extra = []
     for e in EV[:EXTRA_EVENTS_CAP]:
         ev_extra.append({k: (round(v, 5) if isinstance(v, float) else v) for k, v in e.items()})
-    m["v2"] = dict(extras, algo=ALGO_V, events=ev_extra, bar_labels=list(labels), segments=G["segments"], beats_per_bar=bpb,
+    kicky_window = (not drops) or bool(kd) or (SEC.get("anchor") is not None and SEC["anchor"] >= 0)       # no drops at all: nothing for the planner to anchor on, nothing to get wrong
+    m["v2"] = dict(extras, kicky_window=kicky_window, algo=ALGO_V, events=ev_extra, bar_labels=list(labels), segments=G["segments"], beats_per_bar=bpb,
                    beat_in_bar=[int((i - (down[0] if down else 0)) % bpb) for i in range(nb)],
                    bar_index=[int(bar_of_beat[i]) for i in range(nb)], beat_segment=[int(x) for x in G["seg"]],
                    downbeat_confidence=round(float(G["down_conf"]), 3), downbeats_low_confidence=bool(G["down_conf"] < 0.6),

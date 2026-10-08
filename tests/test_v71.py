@@ -18,8 +18,8 @@ import numpy as np                                                              
 import test_v7 as T7                                                                          # noqa: E402
 from test_v7 import M, PB, check, section, songmap_v2, synth, bench                           # noqa: E402
 
-ALLOWED = ("songmap_v2/", "songmap_compare.py", "tests/test_v71.py", "tests/test_v7.py", "docs/", "CHANGELOG.md", "CLAUDE.md", ".gitignore")
-MONTAGE_PY_OK = ("songmap", "SONGMAP", "sc_")          # the only lines montage.py may change: the dropdown / default constant / CLI wiring of songmapcheck
+ALLOWED = ("songmap_v2/", "songmap_compare.py", "tests/test_v71.py", "tests/test_v72.py", "tests/test_v7.py", "docs/", "CHANGELOG.md", "CLAUDE.md", ".gitignore")
+MONTAGE_PY_OK = ("songmap", "SONGMAP", "sc_", "APP_VERSION")          # the only lines montage.py may change: the dropdown / default constant / CLI wiring of songmapcheck
 
 
 def part_fallback_v2(tmp, maps):

@@ -17,14 +17,15 @@ if str(HERE) not in sys.path:
 SET8 = ["Silicon XX", "pretty afternoon", "prety - ", "Beautiful Now - Zedd", "life kinda sucks", "too much (hardtekk)", "#eurodab", "ALWAYS BEEN MINE"]
 SET19_EXTRA = ["(nendest)", "530 - DONDA", "24 songs - Six Zeta", "AI Slop", "16 - Baby Keem", "A Bar Song", "No Time To Die", "Better Now - Post Malone",
                "2 time zones", "INSONAMIA", "Beautiful Now - Yosuf"]
-V1_CACHE = HERE / "compare_out" / "iter_v1.json"
+import os
+V1_CACHE = HERE / "compare_out" / ("iter_v1_frozen.json" if os.environ.get("V7_DATA_SRC") else "iter_v1_live.json")      # V1 results belong to the data they were planned on
 
 
 def _one(args):
     frag, want_v1 = args
     import montage as M
     import songmap_compare as SC
-    from songmap_v2 import bench, planbench as PB, timebase
+    from songmap_v2 import bench, drophit, planbench as PB, timebase
     t0 = time.time()
     with PB.data_copy(M):                       # EVERYTHING (song listing included) runs on the copy: song_pool() writes its caches
         songs = [s for s in SC.v7_song_list(M, lambda *a: None) if frag.lower() in s[0].lower()]
@@ -44,6 +45,8 @@ def _one(args):
         y, sr = timebase.decode(path)
         kicks = bench.strong_kicks(y, sr)
         res["dur"] = round(len(y) / sr, 1)
+        kt_all, ks_all = bench.indep_kicks(y, sr)
+        res["indep_drop"] = drophit.independent_drop(y, sr, kt_all[ks_all >= 0.3] if len(kt_all) else kt_all)
         modes = ["v2"] + (["v1"] if want_v1 else [])
         for mode in modes:
             allk, info = [], {"sets": {}}
@@ -57,6 +60,8 @@ def _one(args):
                 kt = PB.kill_times(plan)
                 mm["kills"] = [round(t, 3) for t, *_ in kt]
                 mm["fallback"] = next((l for l in lines if "fallback" in l), None)
+                mm["headline"] = drophit.headline(plan)
+                mm["drophit"] = drophit.distances(mm["headline"], res["indep_drop"]["t"] if res["indep_drop"]["clear"] else None)
                 info["sets"][sname] = mm
                 allk += mm["dists"]
             info["all"] = PB.summarize(allk)
