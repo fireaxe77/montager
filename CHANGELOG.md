@@ -5,6 +5,12 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V7.5.1.2 (branch work-v7512, merged to main, APP_VERSION = V7.5.1.2) - 2026-10-08
+- A: CS2 kill dating gate replaces the denylist (no clip names in code): a move is accepted only when the 5 frames (0.15 s at 30 fps) before the proposed time show no outline in the tracked slot (+-40 px) and patch correlation < 0.6; text-only frames before the outline (<= 0.2 s) are walked through first. More than half of a clip's moves failing the gate keeps all its cached times. Memo `cs2_dating_v6.json`. Scan of 528 clips (`cs2_dating_scan.txt`): counts identical, 63 kills in 59 clips moved (median 0.13 s, p95 0.57 s, max 1.63 s), the three known-bad moves are kept, the two known-good ones (19.6 -> 17.97, 16.73 -> 16.43) move.
+- B (CS2 only): `anchor_all_drops` / `shift_take_kill`: every drop inside the montage (labelled or auto-detected) gets a kill on its exact time (kick time if within 0.15 s, grid beat if the drop is within 30 ms of it) by re-cutting the take's own first / last segment or sliding its window (lever a only; levers b / c not implemented). The shifted take must pass the same cut-list rules as before; otherwise "drop <t> not anchorable: <reason>" and the placement stays. One anchor per take; takes, kills and total length unchanged.
+- C: the V7.5.1.1 outro hold is removed; the video fade is the last 0.5 s (0.3-0.5 s when the tail after the last kill is under 0.8 s). Music fade, take length and intro punch unchanged.
+- tests/test_v7512.py.
+
 ## V7.5.1.1 (branch work-v7511, merged to main, APP_VERSION = V7.5.1.1) - 2026-10-08
 - A: `CS2_DATING_ON = [True]` (V7.5.1 dating unchanged) plus `CS2_DATING_DENY`: 2026.02.12 - 19.24.00.20 cached 6.97 and 14.8, 2026.02.10 - 19.09.46.22 cached 7.47 keep the cached time (log "CS2 kill time kept (known bad move)"). Full scan of 528 clips: kill counts identical, 83 kills in 67 clips moved.
 - B: Song map window: drag a red drop line (time shown live, saved on release to `song_drops.json` via `song_drops_write`), double-click adds, right-click removes, "Reset" deletes the song's hand labels and reloads the automatic map, banner says "hand-edited". Automatic maps untouched.
