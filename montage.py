@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.4.5"
+APP_VERSION = "V7.4.7"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6833,6 +6833,21 @@ def take_estimate(e, bd, rname):
     return max(MIN_TAKE_S, math.ceil(((lo + hi) / 2 * bd + fight + tail) / td) * td)
 
 
+def drop_fail(drops, S, E, bt, fr):
+    """V7.4.7: which condition rejected each map drop for the headline (printed with 'drop kept')."""
+    out = []
+    for d in drops:
+        b = int(d["beat"])
+        t = bt[b] if 0 <= b < len(bt) else -1
+        if not (S < b < E):
+            out.append(f"{ts(t)} is outside the section")
+        else:
+            bad = [w for ok_, w in ((0.1 <= fr(b) <= 0.8, f"room {fr(b):.0%} not in 10-80 %"), (t - bt[S] >= 10.0, f"only {t - bt[S]:.0f} s run-up (< 10 s)"),
+                                    (bt[E] - t >= 8.0, f"only {bt[E] - t:.0f} s after it (< 8 s)")) if not ok_]
+            out.append(f"{ts(t)} " + ", ".join(bad or ["fits"]))
+    return "; ".join(out) or "the map has no drops"
+
+
 def song_drop_labels(song_path):
     """V7.4: [seconds] the user labelled for this song with `montage.py dropsave` (montage_data\song_drops.json, keyed by file name), else None."""
     if not song_path:
@@ -6901,17 +6916,24 @@ def optimal_fit(clips, an, style, song_path=None):
         best = (0.0, 0, last_b, [d for d in drops if d["beat"] < last_b])
     _, S, E, inside = best
     fr = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
+    # V7.4.7: a map drop inside the section that misses the strict 20-60 % room (but has a run-up and a tail) still beats the anchor / a computed downbeat
+    lenient = [d for d in drops if S < int(d["beat"]) < E and 0.1 <= fr(int(d["beat"])) <= 0.8 and bt[int(d["beat"])] - bt[S] >= 10.0 and bt[E] - bt[int(d["beat"])] >= 8.0]
     main_in = main is not None and 0.2 <= fr(main) <= 0.6
     main_listed = main_in and any(abs(int(d["beat"]) - int(main)) <= 1 for d in drops)       # V7.4: the main drop may be the planner anchor (~10 s after the real drop), not a map drop
-    if main_in and (main_listed or not inside):
-        drop_b, dwhy = int(main), "the song's main drop" + ("" if main_listed else " - drop kept (no map drop in section)")
+    if main_in and (main_listed or not (inside or lenient)):
+        drop_b, dwhy = int(main), "the song's main drop" + ("" if main_listed else " - drop kept (no map drop in section: " + drop_fail(drops, S, E, bt, fr) + ")")
     elif inside:
         d = max(inside, key=lambda d: d.get("strength", 0))
         drop_b, dwhy = int(d["beat"]), "the strongest drop inside the section"
+    elif lenient:
+        d = min(lenient, key=lambda d: (abs(fr(int(d["beat"])) - 0.38) - 0.05 * float(d.get("strength", 0))))
+        drop_b, dwhy = int(d["beat"]), "the strongest drop inside the section" if len(lenient) == 1 else "the map drop with the best room inside the section"
+        dwhy += f" (room {fr(drop_b):.0%}, outside the usual 20-60 %)"
     else:
         tgt = bt[S] + 0.38 * (bt[E] - bt[S])
         drop_b = min([d for d in down if S < d < E] or [S], key=lambda d: abs(bt[d] - tgt))
-        dwhy = "no drop fits inside this section - a downbeat ~38% in" + (" - drop kept (no map drop in section)" if drops else "")
+        dwhy = "no drop fits inside this section - a downbeat ~38% in" + (" - drop kept (no map drop in section: " + drop_fail(drops, S, E, bt, fr) + ")" if drops else "")
+    second = [d for d in drops if S < int(d["beat"]) < E and abs(int(d["beat"]) - drop_b) > 2]
     end_kind = "the song end" if E == last_b else "a section boundary" if E in sec_b else "a 4-bar phrase"
     rng_txt = (f"range {OPT_RANGE[0]:.0f}-{mx:.0f} s" if mx >= OPT_RANGE[0] else f"at most {mx:.0f} s") + \
         f" ({'the 150 s maximum' if mx >= OPT_RANGE[1] else 'the whole song is ' + format(avail, '.0f') + ' s'})"
@@ -6921,7 +6943,7 @@ def optimal_fit(clips, an, style, song_path=None):
            + (f"; {len(left)} weakest didn't fit: " + ", ".join(Path(e["path"]).name for e, _ in left) if left else "")
            + f". Song section {ts(bt[S])}-{ts(bt[E])} ends on {end_kind}; drop at {ts(bt[drop_b])} ({dwhy}, {fr(drop_b):.0%} in)")
     return {"length": round(L, 2), "start_beat": int(S), "end_beat": int(E), "drop_beat": int(drop_b), "clips": chosen,
-            "left": left, "max": mx, "why": why, "drop_why": dwhy}
+            "left": left, "max": mx, "why": why, "drop_why": dwhy, "second": [round(float(bt[int(d["beat"])]), 1) for d in second]}
 
 
 def why_no_take(ev):
@@ -7276,7 +7298,10 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                          (" (no longer run-up fits its footage or the take before)" if manual else ""))
     if drop_note:
         notes.append(drop_note)
-    plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock)
+    if fit and fit.get("second"):                          # V7.4.7: a second map drop inside the section is only logged (take lengths / run-ups / selection stay as they are)
+        notes.append("second drop: no fit (" + ", ".join(ts(x) for x in fit["second"]) + " - anchoring another finisher there would change take lengths / run-ups; placement left unchanged)")
+    plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock,
+                      used_drop_beat=(fit["drop_beat"] if fit else None))       # V7.4.7: TIMELINE / song.drop_t print the drop actually used
     if HEADLINE_RULES_V73:                                 # which kill sits on which drop (read by `montage.py dropcheck`)
         plan["drop_anchor"] = {"drop_t": round(float(U[drop]), 3), "source": (fit or {}).get("drop_why") or "nearest 8-bar downbeat to the map drop (planner fallback)",
                                "n": head_take["ev"]["n"], "anchor": "last" if head_take.get("anchor") == "last" else "first",
@@ -7386,7 +7411,7 @@ def _game_gain(cfg, song_lufs, clip_lufs):
     return round(base + lift, 2), round(lift, 2)
 
 
-def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock):
+def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock, used_drop_beat=None):
     """Frame-exact take list + V4 effects (centred zoom punches on kills, ramps, slow-mo) + hard cuts (V5.2: no flashes)."""
     import numpy as np
     S0 = float(U[takes[0]["c"]])
@@ -7482,7 +7507,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
     return {"game": game, "seed": seed, "recipe": rname, "recipe_why": why, "placement": placement,
             "params": {k: (round(v, 3) if isinstance(v, float) else v) for k, v in rp.items()},
             "song": {"path": song["path"], "artist": song["artist"], "title": song["title"], "bpm": an["bpm"],
-                     "start_t": round(bt0, 6), "drop_t": None if drop_beat is None else round(float(bt[drop_beat]) - bt0, 3),
+                     "start_t": round(bt0, 6), "drop_t": None if drop_beat is None else round(float(bt[drop_beat if used_drop_beat is None else used_drop_beat]) - bt0, 3),
                      "drop_beat": drop_beat, "fade_in": FADE_IN, "fade_out_start": fade_st, "lufs": an.get("lufs"),
                      "section_s": round(float(an.get("dur") or (bt[-1] + U[1] - U[0])) - bt0, 3)},
             "takes": out_takes, "duration": round(total_s, 4), "total_frames": total_f, "notes": notes,
@@ -14672,11 +14697,13 @@ def _dc_planner_drop(plan):
     src_map = {"the song's main drop - drop kept (no map drop in section)": "kept: map field 'drop' (the planner's anchor; no map drop in the section)",
                "no drop fits inside this section - a downbeat ~38% in - drop kept (no map drop in section)": "kept: planner's own search (no map drop in the section)",
                "the song's main drop": "map field 'drop' (the map's main drop)",
+               "the map drop with the best room inside the section": "map field 'drops' (the map drop with the best room inside the chosen section)",
                "the strongest drop inside the section": "map field 'drops' (the strongest drop inside the chosen section)",
                "no drop fits inside this section - a downbeat ~38% in": "planner's own search (a downbeat ~38% into the section; no map drop fits)",
                "nearest 8-bar downbeat to the map drop (planner fallback)": "planner fallback (the downbeat nearest to the map's main drop)"}
+    pre = lambda k: next((v for kk, v in sorted(src_map.items(), key=lambda kv: -len(kv[0])) if str(k or "").startswith(kk)), None)      # V7.4.7: sources carry details after the name
     if da.get("drop_t") is not None:
-        return float(da["drop_t"]), src_map.get(da.get("source"), da.get("source") or "unknown")
+        return float(da["drop_t"]), src_map.get(da.get("source")) or pre(da.get("source")) or da.get("source") or "unknown"
     for n_ in plan.get("notes", []):
         m = re.search(r"drop at (\d+):(\d+(?:\.\d+)?) \((.+?), \d+% in\)", n_)
         if m:
