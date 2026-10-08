@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.4 - 2026-10-08: Drops found earlier and on the beat
+- Drops in the first minute of a song are found now, and drops sit on the beat where the bass comes back.
+- The montage's main drop is now always a real drop of the song, and you can save your own drop times with "dropsave".
+- CS2 Force new reaches 60 seconds.
+
 ## V7.3 - 2026-10-08: Drop kills with real impact
 - The last kill of a multikill now lands on the drop (the first kill for a double kill), so the payoff hits the beat.
 - CS2 "Force new" now fills the montage up to the 60 second minimum, like Valorant.
