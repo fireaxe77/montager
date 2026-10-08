@@ -12,3 +12,11 @@
 - SONGMAPV1 (`build_song_map`, `analyse_song`, `song_cache.json`) is frozen; SONGMAPV2 lives only in `songmap_v2/` and is reached only through `get_songmap()` (V6.9.5). Run `python test_v695.py` for it.
 - V6.9.7: `tests/test_v697.py` (cloud: `xvfb-run -a python3 tests/test_v697.py`, needs python with tkinter) is the new version's test file; every test that starts a subprocess uses `tests/_run.py` (UTF-8 decoding, child PYTHONIOENCODING/PYTHONUTF8). Kill ledger + proof-based clip merging live in `build_events` / `KillLedger` (`python montage.py ledger`, `timeanchor`); the per-clip utility override is `clip_overrides.json` (`python montage.py utilclip`), Valorant only. Detection stays frozen.
 - docs/CHANGELOG_SIMPLE.md is the readable history shown in Settings. Each new version gets ONE headline (3 to 8 words) and 1 to 4 plain user-facing points; no function names, tests, timings or refactors. Technical details only in CHANGELOG.md. No KNOWN ISSUE or on-hold lists; one entry per version, newest first. Do not read either file unless asked.
+
+## Release routine
+- Work on a branch named `work-vXYZ` (never `vX.Y.Z`: it collides with the tag name on Windows); merge with `refs/heads/work-vXYZ`.
+- Commit and push everything except videos, backups and `montage_data`. Title-bar version (`APP_VERSION`) = the version.
+- `docs/CHANGELOG_SIMPLE.md`: one entry (see the rule above); `CHANGELOG.md`: short technical entry.
+- Run only that version's test file plus the guards (50+50 generated clips, 7 real Valorant clips, the 4K).
+- Tag the previous main `<prev>-good`, normal merge commit (`git merge --no-ff refs/heads/work-vXYZ`), tag the new version, push main and tags, remove extra worktrees, leave main clean.
+- End with the line "done, main = <version>, safe to pull".

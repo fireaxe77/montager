@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.5"
+APP_VERSION = "V7.5.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2718,7 +2718,7 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
     return kept
 
 
-CS2_DATING_ON = [False]              # V7.5: OFF - impact scan: 60 kills move in 528 clips, a confirmed-good clip (2026.02.12 - 19.24.00.20) moves 3 kills that could not be confirmed on frames; test / scan switch
+CS2_DATING_ON = [False]              # V7.5.1: set True only after the impact checks pass; test / scan switch
 CS2_DATING_MAX_S = 2.0               # never more than this far before the cached time
 CS2_DATING_MIN_MOVE = 0.1            # smaller moves are noise and are ignored
 CS2_DATING_MEMO = {}                 # (sidecar key, track id) -> first visible frame or None
@@ -2726,7 +2726,7 @@ _DATING_LOGGED = set()
 
 
 def _dating_file():
-    return DATA / "cs2_dating_v1.json"
+    return DATA / "cs2_dating_v5.json"
 
 
 def _dating_memo_load():
@@ -2749,11 +2749,81 @@ def _dating_memo_save():
         pass
 
 
+def _dating_patch(g, rc):
+    """Grayscale name-area patch of a row (killer + weapon + victim), outline cut off."""
+    return g[rc["y0"] + 4:rc["y1"] - 3, rc["x0"] + 6:rc["x1"] - 6]
+
+
+def cs2_dating_walk(frames, rc, j1, fps, others=()):
+    """Walk back from frame j1 over BGR frames (killfeed region): index of the first frame of the SAME row, or None (see cs2_row_first_frame for the rules).
+    others = [(first, last, [(frame, y), ...])] of the OTHER tracked rows (window-relative frames): a match that sits where another tracked row stood is that row, not ours."""
+    import cv2
+    import numpy as np
+    dh, dw = frames[0].shape[:2]
+    gray = [cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY) for fr in frames]
+    tpl = _dating_patch(gray[j1 + 3], rc)
+    if tpl.shape[0] < 8 or tpl.shape[1] < 40 or float(tpl.std()) <= 4.0:
+        return None
+    ya, yb = max(0, rc["y0"] - 3), rc["y1"] + 4
+    xa, xb = max(0, rc["x0"] - 3), rc["x1"] + 4
+    cnt = [int(border_dm(fr)[0][ya:yb, xa:xb].sum()) for fr in frames]
+    ref = float(np.median(cnt[j1:j1 + 6]))
+    th, tw = tpl.shape
+    tpl_v = tpl[:, int(0.64 * tw):]
+    tpl_v = tpl_v if (tpl_v.shape[1] >= 24 and float(tpl_v.std()) > 4.0) else None
+
+    def corr(j):
+        r0, r1 = max(0, rc["y0"] + 4 - 40), min(dh, rc["y0"] + 4 + th + 40)
+        c0, c1 = max(0, rc["x0"] + 6 - 6), min(dw, rc["x0"] + 6 + tw + 6)
+        reg = gray[j][r0:r1, c0:c1]
+        if reg.shape[0] < th or reg.shape[1] < tw:
+            return -1.0, 0
+        m = cv2.matchTemplate(reg, tpl, cv2.TM_CCOEFF_NORMED)
+        whole = float(m.max())
+        yy = r0 + int(np.unravel_index(int(m.argmax()), m.shape)[0]) - 4
+        if tpl_v is None or whole < 0.3:
+            return whole, yy
+        vw = tpl_v.shape[1]                                    # the victim name alone: rows of one multikill share killer, weapon and outline, only the victim differs
+        reg_v = gray[j][r0:r1, c0 + tw - vw - 6:min(dw, c0 + tw + 6) + 6]
+        if reg_v.shape[0] < th or reg_v.shape[1] < vw:
+            return -1.0, yy
+        return min(whole, float(cv2.matchTemplate(reg_v, tpl_v, cv2.TM_CCOEFF_NORMED).max())), yy
+
+    def other_row_at(j, y):
+        for a, z, sl in others:
+            if a <= j <= z and sl:
+                yo = [yy for f_, yy in sl if f_ <= j]
+                yo = yo[-1] if yo else sl[0][1]
+                if abs(yo - y) <= 8:
+                    return True
+        return False
+    def pstd(j):
+        return float(_dating_patch(gray[j], rc).std())
+    j, fade, gap = j1, 0, False
+    while j - 1 >= 0 and ref >= 30:
+        c, y_at = corr(j - 1)
+        if (c >= 0.3) and other_row_at(j - 1, y_at):
+            gap = True                                         # that is another tracked row
+            break
+        if c >= 0.9:
+            fade = 0
+        elif fade < int(0.5 * fps) and c >= 0.3 and cnt[j - 1] >= 0.3 * ref and pstd(j - 1) < 0.97 * pstd(j):
+            fade += 1                                          # faint fade-in frame: fainter than the frame after it (a row that is just as sharp is another row), previous frame accepted
+        else:
+            gap = True
+            break
+        j -= 1
+    return j if (gap and j < j1) else None
+
+
 def cs2_row_first_frame(rec, det, cfg, sc, tr):
-    """V7.5 (CS2 only): the first sidecar frame (BORDER_FPS grid) at which the SAME row's outline is already in the colour mask, walking back from the frame where
-    the outline lines first paired into a rectangle (tr['first']): same position, mask count >= 30 % of the row's settled count, and the same row appearance
-    (border_desc >= 0.75), continuous, at most CS2_DATING_MAX_S back. A small window of the clip is decoded once per row (memoised in montage_data\cs2_dating_v1.json);
-    the kill cache and the sidecar are not touched. Returns the frame number (<= tr['first']) or None."""
+    """V7.5.1 (CS2 only): the first sidecar frame (BORDER_FPS grid) at which the SAME row is already on screen, walking back from tr['first']. Same row = the row's grayscale
+    name patch (taken at the settled frame) found again within +-40 px in y (a newer row slides it down) with normalised correlation >= 0.9. The faint fade-in stretch
+    (at most 0.5 s) is accepted when the outline is in the colour mask at the tracked x-extent and y, the patch still correlates >= 0.3 and the previous frame of the walk
+    was accepted. The walk stops at the first frame that fails, or where a different row sits in the tracked spot (correlation < 0.6 outside the fade stretch). At most
+    CS2_DATING_MAX_S back; a row that is still there at the start of the decoded window (or of the clip) is not moved. A small window of the clip is decoded once per
+    row (memoised in montage_data\cs2_dating_v5.json); the kill cache and the sidecar are not touched. Returns the frame number (<= tr['first']) or None."""
+    import cv2
     import numpy as np
     fps = float(sc.get("fps", BORDER_FPS))
     f1 = int(tr["first"])
@@ -2770,30 +2840,19 @@ def cs2_row_first_frame(rec, det, cfg, sc, tr):
         cmd = ["ffmpeg", "-v", "error", "-ss", f"{fs / fps:.4f}", "-i", rec["path"], "-an", "-sn", "-vf", f"fps={fps}," + region_filter(rec, det, cfg),
                "-frames:v", str(n), "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
         nb = det.dw * det.dh * 3
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60)
-        raw = p.stdout
+        raw = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60).stdout
         frames = [np.frombuffer(raw[i * nb:(i + 1) * nb], np.uint8).reshape(det.dh, det.dw, 3) for i in range(len(raw) // nb)]
         j1 = f1 - fs
         if len(frames) > j1 + 4:
-            ya, yb, xa, xb = max(0, rc["y0"] - 3), rc["y1"] + 4, max(0, rc["x0"] - 3), rc["x1"] + 4
-            cnt = [int(border_dm(fr)[0][ya:yb, xa:xb].sum()) for fr in frames]
-            ref = float(np.median(cnt[j1:j1 + 6]))
-            dref = border_desc(frames[j1 + 2], rc)
-            if ref >= 30 and dref is not None:
-                j, gap = j1, False
-                while j - 1 >= 0:
-                    d = border_desc(frames[j - 1], rc) if cnt[j - 1] >= 0.3 * ref else None
-                    if d is None or float(np.dot(dref, d)) < 0.75:
-                        gap = True                             # the outline was NOT there before: a real first appearance
-                        break
-                    j -= 1
-                if gap and j < j1:                             # no gap inside the window (row on screen at the clip start / an earlier row in this slot): not moved
-                    res = fs + j
-                    for t2 in sc.get("tracks", []):            # another tracked row that stood in this slot before: it was that row's outline, not ours (similar rows of one multikill look alike)
-                        if t2["id"] != tr["id"] and t2["first"] < f1 and any(abs(sl[1] - y0) <= 8 for sl in t2["slots"]) and t2["last"] >= res:
-                            res = max(res, t2["last"] + 1) if t2["last"] < f1 else f1
-                    if res >= f1:
-                        res = None
+            oth = [(t2["first"] - fs, t2["last"] - fs, [(sl[0] - fs, sl[1]) for sl in t2["slots"]]) for t2 in sc.get("tracks", []) if t2["id"] != tr["id"]]
+            j = cs2_dating_walk(frames, rc, j1, fps, oth)
+            if j is not None:
+                res = fs + j
+                for t2 in sc.get("tracks", []):                # another tracked row that stood in this slot before: it was that row's outline, not ours
+                    if t2["id"] != tr["id"] and t2["first"] < f1 and any(abs(sl[1] - y0) <= 8 for sl in t2["slots"]) and t2["last"] >= res:
+                        res = max(res, t2["last"] + 1) if t2["last"] < f1 else f1
+                if res >= f1:
+                    res = None
     except Exception:
         res = None
     CS2_DATING_MEMO[key] = res
@@ -2809,6 +2868,7 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
         return
     off, fps = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS))
     by_id = {t["id"]: t for t in sc.get("tracks", [])}
+    orig = [(k, k["t"]) for k in b["kills"]]
     prev = None
     for k in sorted(b["kills"], key=lambda k: k["t"]):
         tr = by_id.get(k.get("track")) if k.get("border") else None
@@ -2826,6 +2886,11 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
                     k["t_cached"] = k["t"]
                     k["t"] = nt
         prev = k["t"]
+    ordered = [k for k, _ in sorted(orig, key=lambda x: x[1])]
+    if [id(k) for k in sorted(b["kills"], key=lambda k: k["t"])] != [id(k) for k in ordered]:      # order changed: the whole clip keeps its cached times
+        for k, t in orig:
+            k["t"] = t
+            k.pop("t_cached", None)
     b["kills"].sort(key=lambda k: k["t"])
 
 
