@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.4.8 - 2026-10-08: Later drops found after quiet breaks
+- A song that quiets down and comes back at full strength later on now gets that second drop marked.
+- Drops that were already found stay exactly where they were.
+
 ## V7.4.7 - 2026-10-08: Headline kills land on the real drop
 - The big multikill now lands on a real drop of the song, not on a point a few seconds after it.
 - The timeline line shows the drop that was actually used.

@@ -89,7 +89,7 @@ def low_envelope(y, sr):
     return np.sqrt((low[:m * n].reshape(m, n) ** 2).mean(1) + 1e-12)
 
 
-def kick_return(env, t_bar, bar_s):
+def kick_return(env, t_bar, bar_s, strongest=False):
     """V7.4.5 generalised beat snap: the FIRST low-band step within +-1 bar of the detected rise that is within 70 % of the strongest one wins; the drop sits on the strongest low-band attack within 0.15 s of it. Returns (time, step_db) or (None, best step)."""
     k = int(round(REFINE_SPAN / 0.01))
     lo, hi = int(round((t_bar - REFINE_BACK * bar_s) / 0.01)), int(round((t_bar + REFINE_FWD * bar_s) / 0.01))
@@ -102,7 +102,7 @@ def kick_return(env, t_bar, bar_s):
     if top < REFINE_STEP_DB:
         return None, float(top)
     good = [x for x in steps if x[0] >= max(REFINE_STEP_DB, 0.7 * top)]
-    step, c = min(good, key=lambda x: x[1])
+    step, c = max(good, key=lambda x: x[0]) if strongest else min(good, key=lambda x: x[1])      # a later drop (V7.4.8): the strongest return, not the first
     d = np.diff(env, prepend=env[0])
     a, b = max(0, c - 15), min(len(d), c + 16)
     j = a + int(np.argmax(d[a:b]))
@@ -170,7 +170,7 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
         no_break = kb is not None and d["bar"] >= 1 and kb[d["bar"] - 1] >= 0.6 and kb[d["bar"]] >= 0.6       # the kick never left: nothing returns, the bar line stays
         if env is not None and not no_break:
             try:
-                t_on, step = kick_return(env, t_det, bar_s)
+                t_on, step = kick_return(env, t_det, bar_s, strongest=bool(d.get("later")))
             except Exception:
                 t_on, step = None, 0.0
         t_use = t_det
@@ -183,7 +183,8 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
         seen.add(bt)
         keep_rows.append(dict(d, _step=step, _t=t_use))
         drops.append({"beat": int(bt), "t": round(t_use, 4), "strength": round(float(d["strength"]), 3),
-                      "jump": round(float(d["jump"]), 3), "bass_jump": round(float(d["bass_jump"]), 3), "conf": drop_confidence(SEC, d["bar"], step)})
+                      "jump": round(float(d["jump"]), 3), "bass_jump": round(float(d["bass_jump"]), 3),
+                      "conf": round(drop_confidence(SEC, d["bar"], step) * (0.7 if d.get("later") else 1.0), 2)})
     kd = [d for d, r in zip(drops, keep_rows) if r.get("kicky")]
     big = max(kd or drops, key=lambda d: d["strength"]) if drops else None      # V7.1: the main drop is the strongest one whose planner window has a continuous kick grid
     main_beat = big["beat"] if big else None

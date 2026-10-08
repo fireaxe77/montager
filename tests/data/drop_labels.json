@@ -2,17 +2,64 @@
   "_note": "User's ears, tolerance +-1.0 s. Times in seconds. 'alt' = alternative reading for an ambiguous typed label (reading nearest a V2 map drop is used).",
   "tolerance_s": 1.0,
   "songs": {
-    "Burn": [38, 101],
-    "Ouch": [26, 90],
-    "Reverse Psychology": [44, 156],
-    "All The Things She Said": [39, 83],
-    "Tattoo": [39, 131],
-    "Rave Dream": [30, {"t": 54, "alt": [45]}, 129],
-    "If I Lose Myself": [68, 160],
-    "For Your Entertainment": [42, 109, 169],
-    "Self Aware": [24, 85, 122],
-    "Les": [36, 93],
-    "Beautiful Now": [56.8],
-    "pretty afternoon": [34, 92, 135]
+    "Burn": [
+      38,
+      101
+    ],
+    "Ouch": [
+      26,
+      90
+    ],
+    "Reverse Psychology": [
+      44,
+      156
+    ],
+    "All The Things She Said": [
+      39,
+      83
+    ],
+    "Tattoo": [
+      39,
+      131
+    ],
+    "Rave Dream": [
+      30,
+      {
+        "t": 54,
+        "alt": [
+          45
+        ]
+      },
+      129
+    ],
+    "If I Lose Myself": [
+      68,
+      160
+    ],
+    "For Your Entertainment": [
+      42,
+      109,
+      169
+    ],
+    "Self Aware": [
+      24,
+      85,
+      122
+    ],
+    "Les": [
+      36,
+      93
+    ],
+    "Beautiful Now": [
+      56.8
+    ],
+    "pretty afternoon": [
+      34,
+      92,
+      135
+    ],
+    "Молодость моя": [
+      110
+    ]
   }
 }
