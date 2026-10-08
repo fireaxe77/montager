@@ -160,6 +160,37 @@ def early_candidates(bars, S, low, kick_bar, level_min):
     return keep
 
 
+SOFT_PRE_BARS, SOFT_POST_BARS = 4, 6        # V7.4.5 soft drops: >= 4 kick-less bars, then the kick is back for 6 bars
+SOFT_JUMP = 0.12                            # small loudness rise allowed (chill / gradual songs)
+
+
+def soft_candidates(S, low, kick_bar, level_min):
+    """V7.4.5: a gradual drop - the kick comes back after a kick-less stretch and the bass / spectral weight stays up for SOFT_POST_BARS bars, even though
+    the loudness only rises a little. Short bumps (not sustained) and loud-all-through songs (no kick-less stretch) never qualify."""
+    n = len(S)
+    res = []
+    for i in range(SOFT_PRE_BARS, n - SOFT_POST_BARS + 1):
+        pre_k = float(kick_bar[i - SOFT_PRE_BARS:i].mean())
+        post_k = float(kick_bar[i:i + SOFT_POST_BARS].mean())
+        if pre_k > 0.2 or post_k < 0.55:
+            continue
+        post = float(S[i:i + SOFT_POST_BARS].mean())
+        pre = float(S[i - SOFT_PRE_BARS:i].mean())
+        if post < max(0.6 * level_min, 0.45) or post - pre < SOFT_JUMP:
+            continue
+        if float(np.mean(S[i:i + SOFT_POST_BARS] >= pre + 0.5 * (post - pre))) < DROP_HOLD:
+            continue
+        lstep = float(low[i:i + SOFT_POST_BARS].mean() - low[i - SOFT_PRE_BARS:i].mean())
+        if lstep < 0.1:
+            continue
+        res.append({"bar": i, "jump": post - pre, "post": post, "bass_jump": lstep, "early": False, "soft": True})
+    keep = []
+    for c in sorted(res, key=lambda c: -(c["jump"] + c["post"])):
+        if all(abs(c["bar"] - k["bar"]) > 3 for k in keep):
+            keep.append(c)
+    return keep
+
+
 def analyse(bars, bar_s):
     """Returns {"S","drops","labels","share"}; drops = [{"bar","t","strength","jump","bass_jump"}] (V1 field names)."""
     n = len(bars)
@@ -241,6 +272,10 @@ def analyse(bars, bar_s):
         if ok:
             c["kicky"] = window_kicky(kick_bar, c["bar"], bar_s) and fits(c["bar"])
             drops.append(c)
+    for c in soft_candidates(S, low, kick_bar, level_min):                     # V7.4.5: gradual drops, after everything else, never next to an existing drop
+        if all(abs(c["bar"] - d["bar"]) >= max(16, N) for d in drops):
+            c["kicky"] = window_kicky(kick_bar, c["bar"], bar_s) and fits(c["bar"])
+            drops.append(c)
     drops.sort(key=lambda d: d["bar"])
     labels = ["verse"] * n
     for d in drops:
@@ -284,7 +319,7 @@ def analyse(bars, bar_s):
             break
     out = []
     for d in drops:
-        out.append({"early": bool(d.get("early")), "bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"], "kicky": bool(d["kicky"]),
+        out.append({"early": bool(d.get("early")), "soft": bool(d.get("soft")), "bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"], "kicky": bool(d["kicky"]),
                     "strength": float(d["jump"] + max(d["bass_jump"], 0.0) + d["post"])})
     anchor = None
     if out and not any(d["kicky"] for d in out):               # V7.1: every real drop sits behind a kick-less build: anchor the planner's window on the kick entry instead

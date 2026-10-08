@@ -73,6 +73,57 @@ def snap_to_return(beats, bars, k, EV):
     return j, best
 
 
+REFINE_BAND = (30.0, 130.0)     # V7.4.5: the sub / kick band the drop is measured in
+REFINE_SPAN = 0.3               # seconds before / after a candidate onset that are compared
+REFINE_STEP_DB = 4.0            # a real return: the low band after is at least this much louder than just before
+REFINE_BACK, REFINE_FWD = 0.65, 0.5   # search window around the detected bar line, in bars (the kick returns slightly before or after it)
+REFINE_KEEP_S = 0.1             # an onset this close to the detected bar line leaves the drop where it is
+
+
+def low_envelope(y, sr):
+    """30-130 Hz band, rms every 10 ms (render-timebase samples)."""
+    from scipy.signal import butter, sosfiltfilt
+    low = sosfiltfilt(butter(4, REFINE_BAND, "band", fs=sr, output="sos"), np.asarray(y, np.float64))
+    n = int(0.01 * sr)
+    m = len(low) // n
+    return np.sqrt((low[:m * n].reshape(m, n) ** 2).mean(1) + 1e-12)
+
+
+def kick_return(env, t_bar, bar_s):
+    """V7.4.5 generalised beat snap: the FIRST low-band step within +-1 bar of the detected rise that is within 70 % of the strongest one wins; the drop sits on the strongest low-band attack within 0.15 s of it. Returns (time, step_db) or (None, best step)."""
+    k = int(round(REFINE_SPAN / 0.01))
+    lo, hi = int(round((t_bar - REFINE_BACK * bar_s) / 0.01)), int(round((t_bar + REFINE_FWD * bar_s) / 0.01))
+    steps = []
+    for c in range(max(lo, k), min(hi, len(env) - k)):
+        steps.append((20 * np.log10((float(env[c:c + k].mean()) + 1e-9) / (float(env[c - k:c].mean()) + 1e-9)), c))
+    if not steps:
+        return None, 0.0
+    top = max(x[0] for x in steps)
+    if top < REFINE_STEP_DB:
+        return None, float(top)
+    good = [x for x in steps if x[0] >= max(REFINE_STEP_DB, 0.7 * top)]
+    step, c = min(good, key=lambda x: x[1])
+    d = np.diff(env, prepend=env[0])
+    a, b = max(0, c - 15), min(len(d), c + 16)
+    j = a + int(np.argmax(d[a:b]))
+    return j * 0.01, float(step)
+
+
+def drop_confidence(SEC, k, step_db):
+    """V7.4.5: 0..1 from independent evidence - the low-band step (dB at the kick return, else the bar-level low-band step), persistence of the level after
+    the drop (8 bars) and whether the kick grid is continuous after it. Informational only: no consumer changes behaviour from it."""
+    try:
+        S, low, kb = np.asarray(SEC["S"], float), np.asarray(SEC["low_n"], float), np.asarray(SEC["kick_bar"], float)
+        post = float(S[k:k + 8].mean())
+        persist = float(np.mean(S[k:k + 8] >= 0.8 * post)) if post > 0 else 0.0
+        kick = float(np.mean(kb[k:k + 8] >= 0.35))
+        bar_step = float(low[k:k + 6].mean() - low[max(0, k - 4):k].mean()) / 0.5 if k else 0.5
+        stepn = float(np.clip(max((step_db - REFINE_STEP_DB) / 12.0, bar_step), 0.0, 1.0))
+        return round(float(0.4 * stepn + 0.3 * persist + 0.3 * kick), 2)
+    except Exception:
+        return 0.0
+
+
 def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
     """G = grid dict (beats, bpm, bpb, down, conf ...), EV = associated events, SEC = sections.analyse() + bars."""
     beats = np.asarray(G["beats"], float)
@@ -106,22 +157,33 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
     # drops in V1 shape
     drops, snaps, seen = [], [], set()
     keep_rows = []
+    try:
+        env = low_envelope(y, sr)
+    except Exception:
+        env = None
     for d in SEC["drops"]:
         bt = bars[d["bar"]]["beat0"]
-        try:
-            sn = snap_to_return(beats, bars, d["bar"], EV)
-        except Exception:
-            sn = None
-        if sn is not None and sn[0] != bt:
-            snaps.append({"from": round(float(beats[bt]), 3), "to": round(float(beats[sn[0]]), 3), "delta_s": round(float(beats[sn[0]] - beats[bt]), 3),
-                          "onset": round(sn[1], 3), "early": bool(d.get("early"))})
-            bt = sn[0]
+        t_det = float(beats[bt])
+        bar_s = max(per, float(bars[d["bar"]]["t1"] - bars[d["bar"]]["t0"]))
+        t_on, step = (None, 0.0)
+        kb = SEC.get("kick_bar")
+        no_break = kb is not None and d["bar"] >= 1 and kb[d["bar"] - 1] >= 0.6 and kb[d["bar"]] >= 0.6       # the kick never left: nothing returns, the bar line stays
+        if env is not None and not no_break:
+            try:
+                t_on, step = kick_return(env, t_det, bar_s)
+            except Exception:
+                t_on, step = None, 0.0
+        t_use = t_det
+        if t_on is not None and abs(t_on - t_det) > REFINE_KEEP_S:
+            t_use = float(t_on)
+            snaps.append({"from": round(t_det, 3), "to": round(t_use, 3), "delta_s": round(t_use - t_det, 3), "step_db": round(step, 1), "early": bool(d.get("early"))})
+        bt = int(np.argmin(np.abs(beats - t_use)))
         if bt in seen:
             continue
         seen.add(bt)
-        keep_rows.append(d)
-        drops.append({"beat": int(bt), "t": round(float(beats[bt]), 4), "strength": round(float(d["strength"]), 3),
-                      "jump": round(float(d["jump"]), 3), "bass_jump": round(float(d["bass_jump"]), 3)})
+        keep_rows.append(dict(d, _step=step, _t=t_use))
+        drops.append({"beat": int(bt), "t": round(t_use, 4), "strength": round(float(d["strength"]), 3),
+                      "jump": round(float(d["jump"]), 3), "bass_jump": round(float(d["bass_jump"]), 3), "conf": drop_confidence(SEC, d["bar"], step)})
     kd = [d for d, r in zip(drops, keep_rows) if r.get("kicky")]
     big = max(kd or drops, key=lambda d: d["strength"]) if drops else None      # V7.1: the main drop is the strongest one whose planner window has a continuous kick grid
     main_beat = big["beat"] if big else None
