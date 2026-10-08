@@ -1,0 +1,164 @@
+[
+ {
+  "song": "Burn",
+  "label": 38.0,
+  "status": "hit",
+  "dist": 0.4878
+ },
+ {
+  "song": "Burn",
+  "label": 101.0,
+  "status": "hit",
+  "dist": 0.1354999999999933
+ },
+ {
+  "song": "Ouch",
+  "label": 26.0,
+  "status": "hit",
+  "dist": -0.16189999999999927
+ },
+ {
+  "song": "Ouch",
+  "label": 90.0,
+  "status": "hit",
+  "dist": -0.2693000000000012
+ },
+ {
+  "song": "Reverse Psychology",
+  "label": 44.0,
+  "status": "missed",
+  "dist": -39.8098
+ },
+ {
+  "song": "Reverse Psychology",
+  "label": 156.0,
+  "status": "hit",
+  "dist": 0.3691000000000031
+ },
+ {
+  "song": "All The Things She Said",
+  "label": 39.0,
+  "status": "missed",
+  "dist": -15.8705
+ },
+ {
+  "song": "All The Things She Said",
+  "label": 83.0,
+  "status": "hit",
+  "dist": 0.10429999999999495
+ },
+ {
+  "song": "Tattoo",
+  "label": 39.0,
+  "status": "hit",
+  "dist": -0.11549999999999727
+ },
+ {
+  "song": "Tattoo",
+  "label": 131.0,
+  "status": "hit",
+  "dist": -0.5324999999999989
+ },
+ {
+  "song": "Rave Dream",
+  "label": 30.0,
+  "status": "missed",
+  "dist": 24.0597
+ },
+ {
+  "song": "Rave Dream",
+  "label": 54,
+  "status": "hit",
+  "dist": 0.05969999999999942
+ },
+ {
+  "song": "Rave Dream",
+  "label": 129.0,
+  "status": "hit",
+  "dist": 0.04630000000000223
+ },
+ {
+  "song": "If I Lose Myself",
+  "label": 68.0,
+  "status": "hit",
+  "dist": 0.633899999999997
+ },
+ {
+  "song": "If I Lose Myself",
+  "label": 160.0,
+  "status": "hit",
+  "dist": 0.06039999999998713
+ },
+ {
+  "song": "For Your Entertainment",
+  "label": 42.0,
+  "status": "missed",
+  "dist": -7.7027
+ },
+ {
+  "song": "For Your Entertainment",
+  "label": 109.0,
+  "status": "hit",
+  "dist": 0.2720999999999947
+ },
+ {
+  "song": "For Your Entertainment",
+  "label": 169.0,
+  "status": "hit",
+  "dist": 0.2575999999999965
+ },
+ {
+  "song": "Self Aware",
+  "label": 24.0,
+  "status": "missed",
+  "dist": 62.0924
+ },
+ {
+  "song": "Self Aware",
+  "label": 85.0,
+  "status": "late",
+  "dist": 1.0923999999999978
+ },
+ {
+  "song": "Self Aware",
+  "label": 122.0,
+  "status": "hit",
+  "dist": -0.9714000000000027
+ },
+ {
+  "song": "Les",
+  "label": 36.0,
+  "status": "hit",
+  "dist": -0.3481999999999985
+ },
+ {
+  "song": "Les",
+  "label": 93.0,
+  "status": "missed",
+  "dist": -57.3482
+ },
+ {
+  "song": "Beautiful Now",
+  "label": 56.8,
+  "status": "late",
+  "dist": 1.0179000000000045
+ },
+ {
+  "song": "pretty afternoon",
+  "label": 34.0,
+  "status": "missed",
+  "dist": -19.610799999999998
+ },
+ {
+  "song": "pretty afternoon",
+  "label": 92.0,
+  "status": "missed",
+  "dist": 43.692499999999995
+ },
+ {
+  "song": "pretty afternoon",
+  "label": 135.0,
+  "status": "hit",
+  "dist": 0.6924999999999955
+ }
+]
