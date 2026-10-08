@@ -191,6 +191,41 @@ def soft_candidates(S, low, kick_bar, level_min):
     return keep
 
 
+LATER_DIP = 0.35                    # V7.4.8 later drops: the quietest of the 3 bars before is at least this far under the new level (a real breakdown) ...
+LATER_KICK = 0.35                   # ... and the kick is (almost) gone in it
+LATER_POST = 0.75                   # ... and comes back for at least this share of the next 6 bars
+
+
+def later_candidates(bars, S, low, kick_bar, level_min):
+    """V7.4.8: a LATER drop after a quiet stretch / breakdown in a song that already has a drop (the caller checks that): the level steps back up and stays up
+    for EARLY_M bars, the kick returns (kick-less bar before, kicks in the bars after) and the low band steps up. Added with lower confidence, never moves
+    or removes an existing drop, never inside the first EARLY_S seconds (V7.4.5 rules cover those)."""
+    n = len(S)
+    M_ = EARLY_M
+    res = []
+    for i in range(3, n - M_ + 1):
+        if bars[i]["t0"] <= EARLY_S:
+            continue
+        win = S[i:i + M_]
+        post = float(win.mean())
+        pre3 = S[i - 3:i]
+        if post < level_min or post - float(S[i - 1]) < EARLY_STEP or float(pre3.min()) > post - LATER_DIP:
+            continue
+        if float(kick_bar[i - 3:i].min()) > LATER_KICK or float(kick_bar[i:i + M_].mean()) < LATER_POST:
+            continue
+        base = float(pre3.min())
+        if float(np.mean(win >= base + 0.5 * (post - base))) < DROP_HOLD:
+            continue
+        if float(low[i:i + M_].mean() - low[i - 3:i].min()) < EARLY_LOW:
+            continue
+        res.append({"bar": i, "jump": post - base, "post": post, "bass_jump": float(low[i:i + M_].mean() - low[i - 3:i].min()), "early": False, "later": True})
+    keep = []
+    for c in sorted(res, key=lambda c: -(c["jump"] + c["post"])):
+        if all(abs(c["bar"] - k["bar"]) > 3 for k in keep):
+            keep.append(c)
+    return keep
+
+
 def analyse(bars, bar_s):
     """Returns {"S","drops","labels","share"}; drops = [{"bar","t","strength","jump","bass_jump"}] (V1 field names)."""
     n = len(bars)
@@ -276,6 +311,11 @@ def analyse(bars, bar_s):
         if all(abs(c["bar"] - d["bar"]) >= max(16, N) for d in drops):
             c["kicky"] = window_kicky(kick_bar, c["bar"], bar_s) and fits(c["bar"])
             drops.append(c)
+    if drops:                                                                  # V7.4.8: later drops only in a song that already has one
+        for c in later_candidates(bars, S, low, kick_bar, level_min):
+            if all(abs(c["bar"] - d["bar"]) >= max(16, N) for d in drops):
+                c["kicky"] = window_kicky(kick_bar, c["bar"], bar_s) and fits(c["bar"])
+                drops.append(c)
     drops.sort(key=lambda d: d["bar"])
     labels = ["verse"] * n
     for d in drops:
@@ -319,7 +359,7 @@ def analyse(bars, bar_s):
             break
     out = []
     for d in drops:
-        out.append({"early": bool(d.get("early")), "soft": bool(d.get("soft")), "bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"], "kicky": bool(d["kicky"]),
+        out.append({"early": bool(d.get("early")), "soft": bool(d.get("soft")), "later": bool(d.get("later")), "bar": d["bar"], "jump": d["jump"], "bass_jump": d["bass_jump"], "post": d["post"], "kicky": bool(d["kicky"]),
                     "strength": float(d["jump"] + max(d["bass_jump"], 0.0) + d["post"])})
     anchor = None
     if out and not any(d["kicky"] for d in out):               # V7.1: every real drop sits behind a kick-less build: anchor the planner's window on the kick entry instead

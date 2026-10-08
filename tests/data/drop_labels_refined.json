@@ -270,6 +270,17 @@
     "step_db": 8.6,
     "hard": false
    }
+  ],
+  "Молодость моя": [
+   {
+    "typed": 110.0,
+    "t": 110.08,
+    "shift": 0.08,
+    "status": "refined",
+    "tol": 0.3,
+    "step_db": 20.4,
+    "hard": false
+   }
   ]
  }
 }
