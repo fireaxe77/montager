@@ -35,6 +35,44 @@ def _start_time(path):
         return 0.0
 
 
+SNAP_GAP_BEATS = 1.5            # V7.4: a low-band break = no strong, on-grid kick / bass onset for at least this many beats
+SNAP_MIN_STRENGTH = 0.8         # "strong": a pickup / ghost note (weaker) never marks the return
+SNAP_ON_GRID = 0.25             # on-grid: within this share of a beat of a grid beat (an off-grid 8th-note pickup is not the beat the drop sits on)
+SNAP_RETURN_N = 3               # ... and at least this many such onsets in the 2 bars after it (the kick really returns)
+
+
+def snap_to_return(beats, bars, k, EV):
+    """V7.4 beat snap: the beat of drop bar `k` -> the beat where the kick / bass RETURNS: the first strong on-grid low-band onset after a break (gap >= SNAP_GAP_BEATS),
+    searched within -1 bar .. +0.5 bar of the detected rise, using the beat grid read-only. Returns (beat index, onset time) or None when there is no break to snap to."""
+    b = bars[k]
+    per = float(np.median(np.diff(beats)))
+    bar_s = max(per, float(b["t1"] - b["t0"]))
+    t_bar = float(beats[b["beat0"]])
+    lo, hi = t_bar - bar_s, t_bar + 0.5 * bar_s
+    low = np.sort(np.array([float(e["raw_time"]) for e in EV if e["type"] in ("kick", "bass") and e["strength"] >= SNAP_MIN_STRENGTH]))
+    if len(low):
+        j_ = np.clip(np.searchsorted(beats, low), 1, len(beats) - 1)
+        near = np.minimum(np.abs(beats[j_] - low), np.abs(beats[j_ - 1] - low))
+        low = low[near <= SNAP_ON_GRID * per]
+    if len(low) < SNAP_RETURN_N + 1:
+        return None
+    best = None
+    for j, t in enumerate(low):
+        if not (lo <= t <= hi):
+            continue
+        prev = low[j - 1] if j else -1e9
+        if t - prev < SNAP_GAP_BEATS * per:
+            continue
+        if int(np.sum((low > t) & (low <= t + 2 * bar_s))) < SNAP_RETURN_N:
+            continue
+        if best is None or abs(t - t_bar) < abs(best - t_bar):
+            best = float(t)
+    if best is None:
+        return None
+    j = int(np.argmin(np.abs(beats - best)))
+    return j, best
+
+
 def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
     """G = grid dict (beats, bpm, bpb, down, conf ...), EV = associated events, SEC = sections.analyse() + bars."""
     beats = np.asarray(G["beats"], float)
@@ -66,12 +104,25 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
             sections.append({"label": l, "start": int(a), "end": int(e), "start_t": round(float(beats[a]), 3), "end_t": round(float(b["t1"]), 3),
                              "level": round(float(S[k]), 3)})
     # drops in V1 shape
-    drops = []
+    drops, snaps, seen = [], [], set()
+    keep_rows = []
     for d in SEC["drops"]:
         bt = bars[d["bar"]]["beat0"]
+        try:
+            sn = snap_to_return(beats, bars, d["bar"], EV)
+        except Exception:
+            sn = None
+        if sn is not None and sn[0] != bt:
+            snaps.append({"from": round(float(beats[bt]), 3), "to": round(float(beats[sn[0]]), 3), "delta_s": round(float(beats[sn[0]] - beats[bt]), 3),
+                          "onset": round(sn[1], 3), "early": bool(d.get("early"))})
+            bt = sn[0]
+        if bt in seen:
+            continue
+        seen.add(bt)
+        keep_rows.append(d)
         drops.append({"beat": int(bt), "t": round(float(beats[bt]), 4), "strength": round(float(d["strength"]), 3),
                       "jump": round(float(d["jump"]), 3), "bass_jump": round(float(d["bass_jump"]), 3)})
-    kd = [d for d, r in zip(drops, SEC["drops"]) if r.get("kicky")]
+    kd = [d for d, r in zip(drops, keep_rows) if r.get("kicky")]
     big = max(kd or drops, key=lambda d: d["strength"]) if drops else None      # V7.1: the main drop is the strongest one whose planner window has a continuous kick grid
     main_beat = big["beat"] if big else None
     if SEC.get("anchor") is not None and drops and not kd:        # every drop is behind a kick-less build: the planner's main drop = a point inside the drop that gives it a kicky window
@@ -145,6 +196,7 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
     for e in EV[:EXTRA_EVENTS_CAP]:
         ev_extra.append({k: (round(v, 5) if isinstance(v, float) else v) for k, v in e.items()})
     kicky_window = (not drops) or bool(kd) or (SEC.get("anchor") is not None and SEC["anchor"] >= 0)       # no drops at all: nothing for the planner to anchor on, nothing to get wrong
+    extras = dict(extras, drop_snap=snaps)
     m["v2"] = dict(extras, kicky_window=kicky_window, algo=ALGO_V, events=ev_extra, bar_labels=list(labels), segments=G["segments"], beats_per_bar=bpb,
                    beat_in_bar=[int((i - (down[0] if down else 0)) % bpb) for i in range(nb)],
                    bar_index=[int(bar_of_beat[i]) for i in range(nb)], beat_segment=[int(x) for x in G["seg"]],

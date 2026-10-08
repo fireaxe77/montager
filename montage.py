@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.3"
+APP_VERSION = "V7.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6833,7 +6833,18 @@ def take_estimate(e, bd, rname):
     return max(MIN_TAKE_S, math.ceil(((lo + hi) / 2 * bd + fight + tail) / td) * td)
 
 
-def optimal_fit(clips, an, style):
+def song_drop_labels(song_path):
+    """V7.4: [seconds] the user labelled for this song with `montage.py dropsave` (montage_data\song_drops.json, keyed by file name), else None."""
+    if not song_path:
+        return None
+    try:
+        v = (load_json(DATA / "song_drops.json", {}).get(Path(song_path).name) or {}).get("drops")
+        return sorted(float(x) for x in v) if v else None
+    except Exception:
+        return None
+
+
+def optimal_fit(clips, an, style, song_path=None):
     """V5.42B OPTIMAL - THE length rule, ONE shared function (Manual now; the weekly Auto mode can reuse it unchanged):
     (clips, song map, style) -> {"length", "start_beat", "end_beat", "drop_beat", "clips", "left", "max", "why"}.
       - range: 80 s minimum, 150 s maximum, never longer than the whole song;
@@ -6866,6 +6877,10 @@ def optimal_fit(clips, an, style):
     down = sorted(int(d) for d in an.get("down", [])) or list(range(0, nb, 4))
     drops = an.get("drops") or ([{"beat": an["drop"], "strength": 1.0}] if an.get("drop") is not None else [])
     main = an.get("drop")
+    lab_t = song_drop_labels(song_path)                    # V7.4: the user's own drop labels (montage_data\song_drops.json) replace the map's drop list for this song
+    if lab_t:
+        drops = [{"beat": int(np.argmin(np.abs(bt - t_))), "strength": 2.0} for t_ in lab_t]
+        main = min((d["beat"] for d in drops), key=lambda b: abs(b - main)) if main is not None else drops[0]["beat"]
     best = None
     for E in bounds:
         if E > last_b or bt[E] - bt[0] < L - 1e-6:
@@ -6886,15 +6901,17 @@ def optimal_fit(clips, an, style):
         best = (0.0, 0, last_b, [d for d in drops if d["beat"] < last_b])
     _, S, E, inside = best
     fr = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
-    if main is not None and 0.2 <= fr(main) <= 0.6:
-        drop_b, dwhy = int(main), "the song's main drop"
+    main_in = main is not None and 0.2 <= fr(main) <= 0.6
+    main_listed = main_in and any(abs(int(d["beat"]) - int(main)) <= 1 for d in drops)       # V7.4: the main drop may be the planner anchor (~10 s after the real drop), not a map drop
+    if main_in and (main_listed or not inside):
+        drop_b, dwhy = int(main), "the song's main drop" + ("" if main_listed else " - drop kept (no map drop in section)")
     elif inside:
         d = max(inside, key=lambda d: d.get("strength", 0))
         drop_b, dwhy = int(d["beat"]), "the strongest drop inside the section"
     else:
         tgt = bt[S] + 0.38 * (bt[E] - bt[S])
         drop_b = min([d for d in down if S < d < E] or [S], key=lambda d: abs(bt[d] - tgt))
-        dwhy = "no drop fits inside this section - a downbeat ~38% in"
+        dwhy = "no drop fits inside this section - a downbeat ~38% in" + (" - drop kept (no map drop in section)" if drops else "")
     end_kind = "the song end" if E == last_b else "a section boundary" if E in sec_b else "a 4-bar phrase"
     rng_txt = (f"range {OPT_RANGE[0]:.0f}-{mx:.0f} s" if mx >= OPT_RANGE[0] else f"at most {mx:.0f} s") + \
         f" ({'the 150 s maximum' if mx >= OPT_RANGE[1] else 'the whole song is ' + format(avail, '.0f') + ' s'})"
@@ -6982,7 +6999,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         raise RuntimeError("no kill event has enough footage around it to form a take")
     fit, n_usable = None, len(usable)
     if fitm:                                 # V5.42B: THE shared Optimal rule picks length, section and clips
-        fit = optimal_fit(usable, an, rname)
+        fit = optimal_fit(usable, an, rname, song_path=song.get("path"))
         if not manual and plain:                           # V6.0: best multikills first, then best singles, until >= 80 s (never padded)
             need, added = min(OPT_RANGE[0], fit["max"]) - 0.5, 0
             for e in sorted(plain, key=lambda e: -e["score"]):
@@ -6991,7 +7008,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                 if place(e, U, down, rp, c=16):
                     usable.append(e)
                     added += 1
-                    fit = optimal_fit(usable, an, rname)
+                    fit = optimal_fit(usable, an, rname, song_path=song.get("path"))
             notes.append(f"{added} of {len(plain)} plain single kills added to reach {need + 0.5:.0f} s" if added else
                          f"{len(plain)} plain single kills left out (enough better material)")
         usable = [e for e in usable if any(e is c_ for c_ in fit["clips"])]
@@ -9187,24 +9204,45 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
                       f"take skipped: {Path(p_).name} ({why_b.get(p_)}), re-planned without it" for p_ in gone]
             pool_ev = [e for e in pool_ev if e["path"] not in gone]
         return plan, pool_ev, fixes
-    plan, pool_ev, fixes = plan_loop(events)
+    zero_err = None
+    try:
+        plan, pool_ev, fixes = plan_loop(events)
+    except RuntimeError as ex:
+        if manual or game != "cs2" or not any(k_ in str(ex) for k_ in ("no kill event has enough footage", "no clip could be placed on the drop")):
+            raise
+        zero_err, plan, pool_ev, fixes = ex, None, [], []       # V7.4: zero takes placed: the top-up below still runs (it used to need at least one take)
     rounds = 0
-    while not manual and game == "cs2" and plan["duration"] < WEEKLY_MIN_S - 0.5 and rounds < 6:
+    while not manual and game == "cs2" and (plan is None or plan["duration"] < WEEKLY_MIN_S - 0.5) and rounds < 6:
         # V7.3: CS2 reaches the 60 s weekly minimum with the SAME mechanism as Valorant (weekly_pick: unused first, then previously used clips)
         # - weekly_pick() only counts estimated seconds, and the planner may not be able to place every event (no run-up / tail fits the song's beats)
-        add, reused_ = weekly_more(all_events, picked, style, game, max(8.0, (WEEKLY_MIN_S - plan["duration"]) * 1.5))
+        dur_ = plan["duration"] if plan is not None else 0.0
+        add, reused_ = weekly_more(all_events, picked, style, game, max(8.0, (WEEKLY_MIN_S - dur_) * 1.5))
         if not add:
             break
         rounds += 1
         picked = picked + add
-        notes.append(f"weekly pick: the planner placed only {plan['duration']:.0f} s - {len(add) - len(reused_)} more unused event(s) added (best multikills first, then singles)")
+        notes.append(f"weekly pick: the planner placed only {dur_:.0f} s - {len(add) - len(reused_)} more unused event(s) added (best multikills first, then singles)")
         out(notes[-1])
         if reused_:
             notes.append(f"reused {len(reused_)} previously used clip(s) to reach the {WEEKLY_MIN_S:.0f} s minimum")
             out(notes[-1])
         events, pair = companions(list(picked), pair)
-        plan, pool_ev, fixes = plan_loop(events)
+        try:
+            plan, pool_ev, fixes = plan_loop(events)
+        except RuntimeError as ex:
+            if not any(k_ in str(ex) for k_ in ("no kill event has enough footage", "no clip could be placed on the drop")):
+                raise
+            zero_err, plan, pool_ev, fixes = ex, None, [], []
+    if plan is None:                                       # V7.4: nothing could be placed even with the top-up: say why, per event
+        rs = []
+        for e_ in picked:
+            try:
+                rs.append(f"{Path(e_['path']).name}: {why_no_take(e_)}")
+            except Exception:
+                rs.append(f"{Path(e_['path']).name}: no take could be formed")
+        raise RuntimeError(f"{zero_err} (CS2: {len(picked)} event(s) tried incl. older / used ones) - " + "; ".join(rs[:30]))
     if not manual and game == "cs2" and plan["duration"] < WEEKLY_MIN_S - 0.5:
+        out(f"CS2 Force new: only {plan['duration']:.0f} s possible")
         msg = (f"the whole library only gives ~{plan['duration']:.0f} s of placeable cs2 events - below the {WEEKLY_MIN_S:.0f} s minimum, so this is all "
                "there is; nothing is padded")
         plan["notes"] = list(plan["notes"]) + [msg]
@@ -14471,7 +14509,6 @@ def gui_main(start_tab=0):
 
 
 # ======================================================================= V7.3: dropcheck
-DROPCHECK_KILL_DELAY_MS = 40.0          # a median killfeed-row-minus-gunshot above this is a real edit delay
 DROPCHECK_NEAR_BEATS = 1.0              # a drop within this many beats (and at least DROPCHECK_NEAR_S) of another counts as the same drop
 DROPCHECK_NEAR_S = 1.0                  # a typed drop time (m:ss) is only this precise
 
@@ -14632,7 +14669,9 @@ def _dc_planner_drop(plan):
     """(song time of the drop the planner used, the map field or planner step that produced it) - from the plan's drop_anchor (V7.3 plans) or the
     'drop at M:SS.s (why, N% in)' plan note of older plans."""
     da = plan.get("drop_anchor") or {}
-    src_map = {"the song's main drop": "map field 'drop' (the map's main drop)",
+    src_map = {"the song's main drop - drop kept (no map drop in section)": "kept: map field 'drop' (the planner's anchor; no map drop in the section)",
+               "no drop fits inside this section - a downbeat ~38% in - drop kept (no map drop in section)": "kept: planner's own search (no map drop in the section)",
+               "the song's main drop": "map field 'drop' (the map's main drop)",
                "the strongest drop inside the section": "map field 'drops' (the strongest drop inside the chosen section)",
                "no drop fits inside this section - a downbeat ~38% in": "planner's own search (a downbeat ~38% into the section; no map drop fits)",
                "nearest 8-bar downbeat to the map drop (planner fallback)": "planner fallback (the downbeat nearest to the map's main drop)"}
@@ -14646,50 +14685,6 @@ def _dc_planner_drop(plan):
     if hl is not None:
         return float(plan["song"]["start_t"]) + float(hl["out_start"]) + float(hl["kills_out"][0]), "unknown (the plan has no drop note; the headline's first kill)"
     return None, "unknown"
-
-
-def _dc_kill_delays(plan, take_filter=None):
-    """killfeed row time minus gunshot onset (ms) per planned kill, in the SOURCE clip's game audio (gun_onsets, the existing detector).
-    Returns (delays_ms, n_without_gunshot, n_kills)."""
-    clips = load_json(CLIPS_CACHE, {})
-    cache = load_json(ONSET_CACHE, {})
-    delays, nogun, total = [], 0, 0
-    for tk in plan["takes"]:
-        if take_filter is not None and not take_filter(tk):
-            continue
-        rows = tk.get("rows") or tk["kills"]
-        for i, kt in enumerate(tk["kills"]):
-            row = rows[i] if i < len(rows) else kt
-            total += 1
-            pi = 0
-            for sg in tk["segs"]:
-                if sg[0] - 1e-3 <= row <= sg[1] + 1e-3 and sg[2] > 0:
-                    pi = sg[4] if len(sg) > 4 else 0
-                    break
-            src = tk["srcs"][min(pi, len(tk["srcs"]) - 1)]
-            try:
-                rec = dict(clips[file_key(src["path"])], path=src["path"], game=plan["game"])
-                ons = gun_onsets(rec, cache)
-            except Exception:
-                ons = None
-            if not ons:
-                nogun += 1
-                continue
-            rc = row - src.get("shift", 0.0)
-            cand = [o[0] for o in ons if rc - 0.6 <= o[0] <= rc + 0.05]
-            if not cand:
-                nogun += 1
-                continue
-            delays.append((rc - max(cand)) * 1000.0)
-    return delays, nogun, total
-
-
-def _dc_stats(v):
-    import numpy as np
-    if not v:
-        return "n/a"
-    a = np.asarray(v, float)
-    return f"median {np.median(a):.0f} ms, spread {np.percentile(a, 25):.0f}..{np.percentile(a, 75):.0f} ms (IQR), min {a.min():.0f} max {a.max():.0f}, n={len(a)}"
 
 
 def dropcheck_report(plan, plan_name, true_arg=None, cfg=None):
@@ -14776,22 +14771,6 @@ def dropcheck_report(plan, plan_name, true_arg=None, cfg=None):
             L.append(f"  anchor rule (V7.3): the {plan['drop_anchor'].get('anchor')} kill of {plan['drop_anchor'].get('n')}")
         if kind == "middle":
             verdicts.append("anchor kill is a middle kill")
-    # ---- L3 KILL DELAY
-    L.append("")
-    L.append("L3 KILL DELAY (killfeed row time minus gunshot onset in the source clip's game audio)")
-    d_h, med_h = [], None
-    if hl is not None:
-        d_h, ng_h, nk_h = _dc_kill_delays(plan, lambda tk: tk is hl)
-        L.append(f"  headline take kills: {_dc_stats(d_h)}; {ng_h} of {nk_h} kills had no gunshot")
-        for i, dv in enumerate(d_h, 1):
-            L.append(f"      kill delay #{i}: {dv:+.0f} ms")
-        med_h = float(np.median(d_h)) if d_h else None
-    d_a, ng_a, nk_a = _dc_kill_delays(plan)
-    L.append(f"  all kills of the plan: {_dc_stats(d_a)}; {ng_a} of {nk_a} kills had no gunshot")
-    med_all = float(np.median(d_a)) if d_a else None
-    worst = max([x for x in (med_h, med_all) if x is not None], default=None)
-    if worst is not None and worst > DROPCHECK_KILL_DELAY_MS:
-        verdicts.append(f"kill delay {worst:.0f} ms")
     # ---- VERDICT
     if diff_map:
         verdicts.insert(0, "planner chose a different drop than the map")
@@ -14803,8 +14782,8 @@ def dropcheck_report(plan, plan_name, true_arg=None, cfg=None):
 
 
 def cmd_dropcheck(args):
-    """V7.3: python montage.py dropcheck [<montage.mp4 | plan.json>] [--drops 0:34,1:32,2:15] [--game valorant|cs2]. Read-only: prints the three layers (map,
-    planner, kill delay) and a verdict, writes only dropcheck.txt next to montage.py."""
+    """V7.3: python montage.py dropcheck [<montage.mp4 | plan.json>] [--drops 0:34,1:32,2:15] [--game valorant|cs2]. Read-only: prints the two layers (map vs labelled drops,
+    planner drop source) and a verdict, writes only dropcheck.txt next to montage.py."""
     cfg = load_config()
     pf = _dc_resolve_plan(args.target, cfg, getattr(args, "game", None))
     plan = load_json(pf, None)
@@ -14815,6 +14794,37 @@ def cmd_dropcheck(args):
     (HERE / "dropcheck.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
     print(f"(read-only; written to {HERE / 'dropcheck.txt'}; nothing else was changed)")
+
+
+def cmd_dropsave(args):
+    """V7.4: python montage.py dropsave "<song fragment>" 0:34 1:32 2:15 | dropsave --list. Saves the labelled drops of ONE song into montage_data\song_drops.json
+    (atomic write; the other songs stay). Labels replace the song map's drop list for that song in the planner."""
+    f = DATA / "song_drops.json"
+    cur = load_json(f, {})
+    if args.list or not args.song:
+        for k, v in sorted(cur.items()):
+            print(f"{k}: " + ", ".join(_mmss(t) for t in v.get("drops", [])))
+        if not cur:
+            print("no drop labels saved")
+        return
+    cfg = load_config()
+    songs, _, _ = song_pool(cfg, cached_only=True)
+    fr = args.song.lower()
+    hit = [x for x in songs if fr in f"{x.get('artist', '')} {x.get('title', '')} {Path(x['path']).stem}".lower()]
+    if len(hit) != 1:
+        print(("no song matches " if not hit else "several songs match ") + repr(args.song) + (": " + "; ".join(Path(x["path"]).name for x in hit[:10]) if hit else ""))
+        return
+    ts_ = _dc_parse_drops(",".join(args.times))
+    if not ts_:
+        print("no drop times given (e.g. 0:34 1:32 2:15)")
+        return
+    sg = hit[0]
+    cur[Path(sg["path"]).name] = {"title": sg.get("title", ""), "artist": sg.get("artist", ""), "drops": ts_}
+    DATA.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(f) + ".tmp")
+    tmp.write_text(json.dumps(cur, indent=1, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, f)
+    print(f"saved for {sg.get('artist', '')} - {sg.get('title', '')} ({Path(sg['path']).name}): " + ", ".join(_mmss(t) for t in ts_))
 
 
 def cmd_auto(args):
@@ -15018,11 +15028,16 @@ def main():
     pu.add_argument("state", nargs="?", default="", help="on | off")
     pu.add_argument("--list", action="store_true", help="the clips that are ON and how many utility rows each has")
     pu.set_defaults(fn=cmd_utilclip)
-    dc = sp.add_parser("dropcheck", help="V7.3: the three layers behind a drop-sync complaint (song map, planner, kill delay) + a verdict; read-only, writes dropcheck.txt")
+    dc = sp.add_parser("dropcheck", help="V7.3: the two layers behind a drop-sync complaint (song map, planner drop source) + a verdict; read-only, writes dropcheck.txt")
     dc.add_argument("target", nargs="?", help="a montage .mp4 (its saved plan) or a plan .json; default: the newest saved plan")
     dc.add_argument("--drops", help="the true drops, e.g. 0:34,1:32,2:15 (default: an independent detector)")
     dc.add_argument("--game", choices=GAMES, help="newest plan of this game")
     dc.set_defaults(fn=cmd_dropcheck)
+    ds = sp.add_parser("dropsave", help="V7.4: save the drop times you hear for a song (replace the map's drop list in the planner); --list shows them")
+    ds.add_argument("song", nargs="?", help="a fragment of artist / title / file name")
+    ds.add_argument("times", nargs="*", help="m:ss drop times, e.g. 0:34 1:32 2:15")
+    ds.add_argument("--list", action="store_true")
+    ds.set_defaults(fn=cmd_dropsave)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
