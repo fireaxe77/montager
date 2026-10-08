@@ -71,7 +71,11 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
         bt = bars[d["bar"]]["beat0"]
         drops.append({"beat": int(bt), "t": round(float(beats[bt]), 4), "strength": round(float(d["strength"]), 3),
                       "jump": round(float(d["jump"]), 3), "bass_jump": round(float(d["bass_jump"]), 3)})
-    big = max(drops, key=lambda d: d["strength"]) if drops else None
+    kd = [d for d, r in zip(drops, SEC["drops"]) if r.get("kicky")]
+    big = max(kd or drops, key=lambda d: d["strength"]) if drops else None      # V7.1: the main drop is the strongest one whose planner window has a continuous kick grid
+    main_beat = big["beat"] if big else None
+    if SEC.get("anchor") is not None and drops and not kd:        # every drop is behind a kick-less build: the planner's main drop = a point inside the drop that gives it a kicky window
+        main_beat = int(bars[SEC["anchor"]]["beat0"]) if SEC["anchor"] >= 0 else None
     # phrases: 4-bar boundaries where the section changes land
     bar_down = [b["beat0"] for b in bars]
     starts = {s["start"] for s in sections[1:]}
@@ -131,7 +135,7 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
          "bpm_librosa": round(bpm0, 1), "period": round(per, 6), "grid_score": round(float(G["conf"]), 3), "librosa_agree_ms": None,
          "beats": [round(float(t), 4) for t in beats], "down": down, "phrase4": [int(i) for i in ph4], "phrase8": [int(i) for i in ph8],
          "sections": sections, "drops": drops, "accents": acc, "strength": strength, "energy": energy, "level": [int(v) for v in level],
-         "section_of_beat": lab_beat, "drop": big["beat"] if big else None, "drop_strength": round(big["strength"] / 3, 3) if big else 0.0,
+         "section_of_beat": lab_beat, "drop": main_beat, "drop_strength": round(big["strength"] / 3, 3) if big else 0.0,
          "rhythm": round(rhythm, 3), "pattern": [round(float(v), 2) for v in pat], "steady": round(steady, 3), "bpm_fit": round(bpm_fit, 2),
          "dur": round(dur, 3), "onsets": [a[0] for a in acc], "wave": [round(float(v), 3) for v in wv], "lufs": _lufs(path),
          "start_time": round(_start_time(path), 6),
@@ -140,7 +144,8 @@ def to_v1_shape(path, y, sr, G, EV, SEC, csv_bpm, extras):
     ev_extra = []
     for e in EV[:EXTRA_EVENTS_CAP]:
         ev_extra.append({k: (round(v, 5) if isinstance(v, float) else v) for k, v in e.items()})
-    m["v2"] = dict(extras, algo=ALGO_V, events=ev_extra, bar_labels=list(labels), segments=G["segments"], beats_per_bar=bpb,
+    kicky_window = (not drops) or bool(kd) or (SEC.get("anchor") is not None and SEC["anchor"] >= 0)       # no drops at all: nothing for the planner to anchor on, nothing to get wrong
+    m["v2"] = dict(extras, kicky_window=kicky_window, algo=ALGO_V, events=ev_extra, bar_labels=list(labels), segments=G["segments"], beats_per_bar=bpb,
                    beat_in_bar=[int((i - (down[0] if down else 0)) % bpb) for i in range(nb)],
                    bar_index=[int(bar_of_beat[i]) for i in range(nb)], beat_segment=[int(x) for x in G["seg"]],
                    downbeat_confidence=round(float(G["down_conf"]), 3), downbeats_low_confidence=bool(G["down_conf"] < 0.6),
