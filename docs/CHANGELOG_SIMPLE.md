@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.4.7 - 2026-10-08: Headline kills land on the real drop
+- The big multikill now lands on a real drop of the song, not on a point a few seconds after it.
+- The timeline line shows the drop that was actually used.
+
 ## V7.4.5 - 2026-10-08: Drops found within a fraction of a second
 - Drops now land on the moment the bass really comes back, usually within about a quarter of a second.
 - Gentle, slow songs get their drops found too.
