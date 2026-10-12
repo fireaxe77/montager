@@ -39,6 +39,7 @@ def part_changelog():
         ks, kt = [key(h) for h in hs], [key(h) for h in ht]
         check(ks == kt, "same versions in the same order in both files" + ("" if ks == kt else f" (differ at {[(a, b) for a, b in zip(ks, kt) if a != b][:3]})"))
         check(len(set(ks)) == len(ks), "no version twice")
+        check(M.APP_VERSION == "V7.6.1" and ks[0] == "V7.6.1", "title-bar version V7.6.1 and its changelog entry on top")
         check(ks[0] == "V7.6.1" or ks[0] == "V7.6.0", f"newest first ({ks[0]})")
         for need in ("V7.6.0", "V7.5.1.2", "V7.5.1.1", "V7.5.1", "V6.9.7.2", "V6.1.2", "V5.42B", "V3"):
             check(need in ks, f"{need} has its own entry")

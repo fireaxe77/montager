@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.6.1 - 2026-10-12: Far more kills fit, softer cuts
+- Clips that end right after the kill are no longer left out: the tail plays in smooth slow motion, so a 70-kill selection no longer shrinks to a 20 second montage. Every event that cannot be placed is listed with the exact reason.
+- Almost every drop of the song gets a kill on its exact time (takes can now be re-ordered to reach it), and the main drop is always a real drop of the song.
+- Slow motion eases in and out smoothly, cuts between takes dissolve softly where there is footage, and drops are also found where a build-up repeats in the song.
+- The song and style in the summary are the ones that get rendered, songs have a trash icon, and the quality check no longer reports false problems.
+
 ## V7.6.0 - 2026-10-12: A kill on every drop
 - Every drop in the song now gets a kill on its exact time far more often, in CS2 and Valorant, with or without hand-marked drops.
 - The montage now ends right after the final kill with a short fade to black, and the unused end of the last clip is cut off.
