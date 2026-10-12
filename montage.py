@@ -6102,6 +6102,7 @@ def ledger_finalize(led, picked, planned, plan):
     planned_k = {KillLedger.evkey(e) for e in (planned or [])}
     takes = plan.get("takes", [])
     skipped_names = [x[0] for x in (plan.get("fit") or {}).get("skipped", [])]
+    rule_names = {a: b for a, b in (plan.get("fit") or {}).get("rule_skips", [])}      # V7.7.0: takes dropped by the cut-list check, with the rule
 
     def placed(e):
         for t in takes:
@@ -6133,6 +6134,8 @@ def ledger_finalize(led, picked, planned, plan):
             nm = Path(e["path"]).name
             if placed(e):
                 st, inf = ("OVERRIDE_ADMITTED" if r["tag"] == "util" else "PLACED"), {"take": nm}
+            elif nm in rule_names:
+                st, inf = "CLIP_UNUSABLE", {"reason": "NOT PLACED: " + rule_names[nm]}
             elif k in planned_k and nm in skipped_names:
                 st, inf = "CLIP_UNUSABLE", {"reason": "cannot form a take: " + why_no_take(e)}
             elif k not in picked_k:
@@ -6854,6 +6857,29 @@ def release_speeds(rem, v0, post, margin=0.017):
     return None
 
 
+_SLOW_GAP = {}
+
+
+def slow_out_gap(g):
+    """V7.7.0: output seconds a source gap `g` (s) after the last kill of a slow-mo take takes on screen: the speed curve of release_speeds (0.5x plateau, then the smooth release), not a flat
+    0.5x - so the tail window the planner aims for is the window verify_cutlist allows."""
+    if g <= 0:
+        return 0.0
+    if not _SLOW_GAP:
+        sp = release_speeds(6 * OUT_FPS, SLOW_V0, 99.0)
+        cum = [0.0]
+        for v in sp:
+            cum.append(cum[-1] + v / OUT_FPS)
+        _SLOW_GAP["cum"] = cum
+    cum = _SLOW_GAP["cum"]
+    if g >= cum[-1]:
+        return (len(cum) - 1) / OUT_FPS + (g - cum[-1])
+    import bisect
+    k = bisect.bisect_left(cum, g)
+    a, b = cum[k - 1], cum[k]
+    return (k - 1 + (g - a) / max(1e-9, b - a)) / OUT_FPS
+
+
 def speeds_to_segments(src_start, speeds, group=3):
     """Constant-speed source segments [a, b, speed, frames] from per-frame speeds: equal speeds merge, the rest are cut every `group` frames; the source position stays continuous."""
     segs, pos, i, n = [], src_start, 0, len(speeds)
@@ -7193,7 +7219,8 @@ def row_tail_window(ev, slow, win, post, ext=True):
     ext=False: only the old window's upper end (place() tries that first, so takes that already showed the row stay as they were)."""
     last = ev["times"][-1]
     spd = 0.5 if slow else 1.0
-    rdo = max(0.0, max(ev.get("rows") or ev["times"]) - last) / spd      # output s from the last kill to its row
+    gap_ = max(0.0, max(ev.get("rows") or ev["times"]) - last)
+    rdo = slow_out_gap(gap_) if slow else gap_                          # output s from the last kill to its row (V7.7.0: slow takes follow the real speed curve: plateau, then the release)
     need = rdo + ROW_TAIL
     if need <= win[0] + 1e-6:
         return win
@@ -7443,6 +7470,74 @@ DROP_ANCHOR_ON = [True]              # V7.5.1.2: test switch (every drop in the 
 DROP_ANCHOR_TOL = 0.03               # s: anchored when the kill is within this of the drop
 DROP_ANCHOR_MAX = 1.0                # s: a kill farther than this from the drop is not a candidate
 REPEAT_DROP_MIN_CONF = 0.0          # V7.6.0: map drops below this confidence are never anchored (repeat drops carry a conf)
+
+
+DROP_ONSET_WIN = 0.5                 # V7.7.0: the audible onset of a drop is searched this far (s) either side of its stored time
+DROP_ONSET_TOL = 0.040               # s: a stored drop further than this from its audible onset is anchored on the onset instead (anchor only, the stored drop map stays)
+DROP_ONSET_MIN_DB = 6.0              # an onset must rise this much (dB, 20 ms before -> 20 ms after) to count as the drop's hit
+
+
+def drop_onset_near(y, sr, t, win=DROP_ONSET_WIN):
+    """V7.7.0: the STRONGEST onset in the mp3's own samples within +-win s of t (the hit that makes a drop a drop). Strength = the rise of the 20 ms loudness (30 Hz and up) over the
+    20 ms before it; the position is the steepest point of that rise (the same point the kill-sound detector, a peak of the onset envelope, reports for a gunshot). Returns (onset time, rise in dB) or (None, 0.0) when nothing rises by DROP_ONSET_MIN_DB. `y` = mono samples decoded like the render (decode_mono)."""
+    import numpy as np
+    from scipy.signal import butter, sosfilt
+    a, b = max(0, int((t - win - 0.3) * sr)), min(len(y), int((t + win + 0.3) * sr))
+    if b - a < int(0.3 * sr):
+        return None, 0.0
+    seg = np.asarray(y[a:b], np.float64)
+    hp = sosfilt(butter(2, 30.0 / (sr / 2), "high", output="sos"), seg)          # causal: no pre-echo before the hit
+    e = np.abs(hp)
+    w = max(2, int(0.020 * sr))
+    cs = np.concatenate([[0.0], np.cumsum(e)])
+    mean_fwd = (cs[w:] - cs[:-w]) / w                    # mean |x| over [i, i+w)
+    n = len(mean_fwd)
+    idx = np.arange(w, n)                                # compare [i, i+w) with [i-w, i)
+    rise_db = 20 * np.log10((mean_fwd[idx] + 1e-6) / (mean_fwd[idx - w] + 1e-6))
+    t_axis = (a + idx) / sr
+    m = (t_axis >= t - win) & (t_axis <= t + win)
+    if not m.any():
+        return None, 0.0
+    j = int(np.argmax(np.where(m, rise_db, -1e9)))
+    if rise_db[j] < DROP_ONSET_MIN_DB:
+        return None, float(rise_db[j])
+    return float(t_axis[j]), float(rise_db[j])
+
+
+def song_drop_onset(song_path, drops, win=DROP_ONSET_WIN):
+    """V7.7.0: [(stored, onset or None, rise dB)] for stored drop times of one song, measured on the mp3 itself (decoded once)."""
+    y, sr = decode_mono(song_path, 44100)
+    return [(float(d), *drop_onset_near(y, sr, float(d), win)) for d in drops]
+
+
+_ONSET_MEMO = {}
+
+
+def refine_drop_anchors(song_path, drops):
+    """V7.7.0: [(time, strength, source)] -> (same list with each ANCHOR time moved onto the strongest audible onset within +-DROP_ONSET_WIN s of the stored time when that onset is more than
+    DROP_ONSET_TOL (40 ms) away, log lines). Only the anchor changes - the stored drop map / hand labels are never rewritten. A drop with no clear onset (< DROP_ONSET_MIN_DB) keeps its time."""
+    if not drops or not song_path:
+        return list(drops), []
+    try:
+        key = (str(song_path), os.path.getmtime(song_path), tuple(round(float(d[0]), 3) for d in drops))
+    except OSError:
+        return list(drops), []
+    if key not in _ONSET_MEMO:
+        try:
+            y, sr = decode_mono(str(song_path), 44100)
+            res = [drop_onset_near(y, sr, float(d[0])) for d in drops]
+        except Exception as ex:                            # noqa: BLE001
+            LOGONLY(f"drop onset check skipped: {type(ex).__name__}: {ex}")
+            res = [(None, 0.0) for _ in drops]
+        _ONSET_MEMO[key] = res
+    out_l, lines = [], []
+    for (t_, s_, src_), (on, db) in zip(drops, _ONSET_MEMO[key]):
+        if on is not None and abs(on - t_) > DROP_ONSET_TOL:
+            lines.append(f"anchor refined: {t_:.3f} -> {on:.3f} (strongest onset within {DROP_ONSET_WIN:.1f} s is {(on - t_) * 1000:+.0f} ms away, rise {db:.0f} dB; the stored drop is unchanged)")
+            out_l.append((float(on), s_, src_))
+        else:
+            out_l.append((float(t_), s_, src_))
+    return out_l, lines
 
 
 def shift_take_kill(plan, ht, kidx, target, fps, s0):
@@ -7743,6 +7838,80 @@ def reorder_for_drop(plan, t_d, fps, protected):
             continue
         return mv, q, kj, "b+" + lev
     return None, None, None, why
+
+
+def take_tail_bounds(t):
+    """V7.7.0: (tail, lo, hi) in output seconds of a take: the tail after its last kill, the shortest the kill-row rule allows (0.4 s after the row), the longest verify_cutlist allows."""
+    ko = t["kills_out"][-1]
+    rows = max(t.get("rows_out") or t["kills_out"])
+    hi = max(TAIL[1], rows - ko + ROW_TAIL + ROW_SLACK)
+    if t.get("slow"):
+        hi = max(hi, SLOW_TAIL_MAX)
+    return t["dur"] - ko, rows - ko + ROW_TAIL, hi
+
+
+TAIL_REPAIR_MAX_FR = 30              # V7.7.0: a tail repair moves at most this many frames
+
+
+def repair_tails(plan, notes):
+    """V7.7.0: a take whose tail broke the max (or min) tail rule is REPAIRED before anything is skipped: the tail is cut (lengthened) inside the window the rule allows and the take
+    after it takes over the frames as a longer (shorter) run-up, so every kill of every take keeps its exact time, the length and the order never change. Returns the log lines;
+    a take no repair fits is left as it is (the caller then skips it and lists the rule)."""
+    import copy
+    takes, fps = plan["takes"], OUT_FPS
+    lines = []
+    for i in range(len(takes)):
+        t = takes[i]
+        if t.get("ending") or not t.get("kills_out") or i + 1 >= len(takes):
+            continue
+        tail, lo, hi = take_tail_bounds(t)
+        if lo - 1.0 / fps - 1e-9 <= tail <= hi + 1.0 / fps + 1e-9:
+            continue
+        base_bad = verify_cutlist(plan)
+        base_dup = plan_duplicate_ranges(plan)
+        if tail > hi:                                      # too long: cut d frames, the next take's run-up grows by d
+            want = max(1, int(math.ceil((tail - hi) * fps - 1e-9)))
+            ds = [-d for d in range(want, min(TAIL_REPAIR_MAX_FR, int((tail - lo) * fps + 1.0)) + 1)]
+        else:                                              # too short: add d frames, the next take's run-up shrinks by d
+            want = int(math.ceil((lo - tail) * fps - 1e-9))
+            ds = [d for d in range(want, TAIL_REPAIR_MAX_FR + 1)]
+        why = "no repair fits"
+        anch = {x_.get("take") for x_ in (plan.get("drop_sync") or []) if x_.get("take")}
+        tries = [("next", d) for d in ds[:6]] + ([("self", d) for d in ds[:DRIFT_FR + 1] if abs(d) <= DRIFT_FR + 1] if tail > hi and (i + 1) not in anch else [])
+        for how, d in tries:
+            new = copy.deepcopy(takes)
+            if how == "next":                              # the take after gives / takes the frames at its start
+                r = flex_tail(new[i], d, fps) or flex_lead(new[i + 1], -d, fps)
+            else:                                          # inside the take (lever a): its kills sit |d| frames later, the tail shorter; no anchored kill moves
+                r = flex_lead(new[i], -d, fps) or flex_tail(new[i], d, fps)
+            if r:
+                why = r
+                continue
+            if _relayout(new, fps) != plan["total_frames"]:
+                why = "the montage length would change"
+                continue
+            trial = dict(plan, takes=new)
+            nb = [x for x in verify_cutlist(trial) if x not in base_bad]
+            nd = [x for x in plan_duplicate_ranges(trial) if x not in base_dup]
+            if nb or nd:
+                why = (nb + nd)[0].split(":", 1)[-1].strip()[:90]
+                continue
+            takes[:] = new
+            t2 = new[i]
+            tail2 = take_tail_bounds(t2)[0]
+            if how == "next":
+                lines.append(f"tail repaired: {Path(t2['path']).name}: tail {tail:.2f} s -> {tail2:.2f} s (allowed {lo:.2f}-{hi:.2f} s); the next take's run-up is "
+                             f"{'longer' if d < 0 else 'shorter'} by {abs(d)} frame(s), every kill keeps its time")
+            else:
+                lines.append(f"tail repaired: {Path(t2['path']).name}: tail {tail:.2f} s -> {tail2:.2f} s (allowed {lo:.2f}-{hi:.2f} s); the take's kills sit {abs(d)} frame(s) "
+                             f"({abs(d) / fps * 1000:.0f} ms) later inside it (the next take had no footage to give), no other take moves")
+            break
+        else:
+            lines.append(f"tail NOT repairable: {Path(t['path']).name}: tail {tail:.2f} s (allowed {lo:.2f}-{hi:.2f} s): {why}")
+    for l_ in lines:
+        notes.append(l_)
+        LOGONLY(l_)
+    return lines
 
 
 def anchor_all_drops(plan, drops, game, notes, grid=None):
@@ -8298,6 +8467,10 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     # (V7.6.1: the 'second drop' note is written at the end, from the window the montage really covers)
     plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock,
                       used_drop_beat=(fit["drop_beat"] if fit else None))       # V7.4.7: TIMELINE / song.drop_t print the drop actually used
+    try:                                                   # V7.7.0: a tail the planner's tick grid left outside the allowed window is repaired first (the drop levers need valid takes)
+        repair_tails(plan, plan["notes"])
+    except Exception as ex_:
+        LOGONLY(f"tail repair skipped: {type(ex_).__name__}: {ex_}")
     if HEADLINE_RULES_V73:                                 # which kill sits on which drop (read by `montage.py dropcheck`)
         plan["drop_anchor"] = {"drop_t": round(float(U[drop]), 3), "source": (fit or {}).get("drop_why") or "nearest 8-bar downbeat to the map drop (planner fallback)",
                                "n": head_take["ev"]["n"], "anchor": "last" if head_take.get("anchor") == "last" else "first",
@@ -8313,9 +8486,17 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             dl_ = [(float(t_), 2.0, "label") for t_ in lab_] if lab_ else \
                 [(float(d_["t"]), float(d_.get("strength", 1.0)), d_.get("source") or "map") for d_ in (an.get("drops") or [])
                  if d_.get("t") is not None and float(d_.get("conf", 1.0)) >= REPEAT_DROP_MIN_CONF]
+            dl_, rl_ = refine_drop_anchors(song["path"], dl_)       # V7.7.0: the anchor sits on the audible onset of the drop (stored drop unchanged)
+            for l_ in rl_:
+                plan["notes"].append(l_)
+                LOGONLY(l_)
             anchor_all_drops(plan, dl_, game, plan["notes"], grid=bt)
         except Exception as ex_:
             LOGONLY(f"drop anchoring skipped: {ex_}")
+    try:                                                   # V7.7.0: a take that broke the tail rule is repaired (tail cut inside the allowed window), never silently skipped
+        repair_tails(plan, plan["notes"])
+    except Exception as ex_:
+        LOGONLY(f"tail repair skipped: {type(ex_).__name__}: {ex_}")
     if OUTRO_TRIM_ON[0]:                                   # V7.6.0: the video ends 0.5 s after the fade to black starts, ~0.5 s after the final kill
         trim_outro(plan, plan["notes"])
     assign_soft_cuts(plan, plan["notes"])                  # V7.6.1: soft dissolves where footage allows it, hard cuts elsewhere
@@ -8701,6 +8882,30 @@ def verify_cutlist(plan):
     return bad
 
 
+def headline_report(plan):
+    """V7.7.0: the headline sentence of the plan header, generated from the FINAL cut list (never from a stale first plan): is the best multikill (the headline take) really on a drop?
+    Returns (on_drop, text, drop_t in montage seconds or None)."""
+    takes = plan.get("takes", [])
+    hi = next((i for i, t in enumerate(takes) if t.get("role") == "headline"), None)
+    s0 = float(plan["song"]["start_t"])
+    if hi is None:
+        return False, "no headline take", None
+    h = takes[hi]
+    for x in plan.get("drop_sync") or []:
+        if x.get("take") == hi + 1 and x.get("err_ms") is not None and abs(x["err_ms"]) <= DROP_ANCHOR_TOL * 1000 + 1e-6:
+            ds_ = sorted(y["drop"] for y in plan["drop_sync"])
+            k_ = ds_.index(x["drop"]) + 1
+            rule_ = "" if k_ == 1 else f" (drop {k_} of {len(ds_)}: the best multikill goes on the main drop, the one about 38% into the montage with the build-up before it)"
+            return True, f"best multikill ({h['n']}k) on the drop at {x['drop'] - s0:.3f}s{rule_}", x["drop"] - s0
+    dt = plan["song"].get("drop_t")
+    da = plan.get("drop_anchor") or {}
+    if not plan.get("drop_sync") and dt is not None:        # no per-drop solver result (older plans / the solver switched off): the planner's own anchor
+        return True, f"best multikill on the drop at {dt}s", dt
+    near = [x for x in plan.get("drop_sync") or [] if x.get("take") is None]
+    why = (near[0].get("why") if near else None) or ("the song has no drop inside the montage" if not (plan.get("drops_out") or []) else "its drop went to a stronger kill")
+    return False, f"best multikill ({h['n']}k) at {h['f0'] / OUT_FPS + h['kills_out'][-1]:.2f}s is NOT on a drop ({why})", None
+
+
 def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     L = []
     sg = plan["song"]
@@ -8713,7 +8918,7 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
         L.append(f"AUTO STYLE {plan['recipe_why']}")
     L.append(f"SONG     {sg['artist']} - {sg['title']}   [{Path(sg['path']).name}]   BPM {sg['bpm']}   placement {plan['placement']}")
     L.append(f"TIMELINE song starts at {ts(sg['start_t'])} (music + video fade in {sg['fade_in']} s); {plan['duration']:.1f}s at 60 fps "
-             f"({plan['total_frames']} frames); best multikill on the drop at {sg['drop_t']}s; "
+             f"({plan['total_frames']} frames); {headline_report(plan)[1]}; "
              f"{'slow-mo ending, music fades from ' + format(sg['fade_out_start'], '.2f') + 's' if plan['ending'] else 'music fade-out over the last 2 s'}; "
              f"video fades from {outro_fade(plan)[0]:.2f}s over {outro_fade(plan)[1]:.2f}s")
     if score_info:
@@ -10550,6 +10755,37 @@ def pairscan_rows(cfg, recs, store, det, used, limit=30):
     return lines, len(rows)
 
 
+def apply_rule_skips(plan, skips):
+    """V7.7.0: takes the cut-list check dropped (after a repair was tried) are part of the FINAL plan's story: 'NOT PLACED <clip>: <exact rule and numbers>', the fit / summary lists and
+    the ledger (plan['fit']['rule_skips']) count them, so the plan, its summary and the ledger agree. `skips` = {path: rule text}."""
+    fit = plan.setdefault("fit", {})
+    have = {a for a, _b in fit.get("unplaced", [])}
+    add = []
+    for p_, why in skips.items():
+        nm_ = Path(p_).name
+        txt = f"cut-list rule broke and no repair fits: {why}"
+        fit.setdefault("rule_skips", []).append([nm_, txt])
+        if nm_ not in have:
+            add.append([nm_, txt])
+        plan["notes"].append(f"NOT PLACED {nm_}: {txt}")
+    fit["unplaced"] = list(fit.get("unplaced", [])) + add
+    n_un = len(fit["unplaced"])
+    for i_, n_ in enumerate(plan["notes"]):
+        m_ = re.match(r"(\d+) of (\d+) events could not be fitted", n_)
+        if m_:
+            plan["notes"][i_] = f"{n_un} of {int(m_.group(2)) + len(add)} events could not be fitted (listed above, one line each)"
+            break
+    else:
+        plan["notes"].append(f"{n_un} events could not be fitted (listed above, one line each)")
+
+
+def ledger_plan_check(led, plan):
+    """V7.7.0: (kills the ledger calls placed, kills in the plan's cut list): they must be equal."""
+    n_led = sum(1 for r in led.rows if r.get("state") in ("PLACED", "OVERRIDE_ADMITTED"))
+    n_plan = sum(len(t.get("kills", [])) for t in plan.get("takes", []))
+    return n_led, n_plan
+
+
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None):
     """scan=False: plan from what is already scanned (the Manual status-line estimate runs exactly this, quietly).
     V7.6.1 pin = {"song": path, "at": "HH:MM:SS"}: the song the summary (the estimate) already picked for this job. A song the user chose (song_path) always wins; otherwise the
@@ -10626,7 +10862,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     if style is None:
         style = cfg.get("style", "auto")
     def plan_loop(events):
-        pool_ev, fixes, extended = list(events), [], set()
+        pool_ev, fixes, extended, rule_skips = list(events), [], set(), {}
         for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
             n2 = list(notes)
             plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
@@ -10638,6 +10874,8 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
             gone = {plan["takes"][i - 1]["path"] for i in idx if 0 < i <= len(plan["takes"])}
             if not gone:
                 break
+            for p_ in gone:                                    # V7.7.0: every skipped take is listed in the final plan with the exact rule
+                rule_skips.setdefault(p_, why_b.get(p_) or "kill row outside its footage")
             if manual:                                         # V5.42B: first extend the take's window (no jump-cuts over its fight)
                 ext = {p_ for p_ in gone if p_ not in extended and "kill row" in why_b.get(p_, "")}
                 if ext:
@@ -10651,6 +10889,8 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
                       if "kill row" in why_b.get(p_, "kill row") else
                       f"take skipped: {Path(p_).name} ({why_b.get(p_)}), re-planned without it" for p_ in gone]
             pool_ev = [e for e in pool_ev if e["path"] not in gone]
+        if rule_skips:
+            apply_rule_skips(plan, rule_skips)
         return plan, pool_ev, fixes
     zero_err = None
     try:
@@ -10708,6 +10948,10 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
             ledger_finalize(led_, events, pool_ev, plan)
             for l_ in ledger_report(led_):
                 out(l_)
+            n_l_, n_p_ = ledger_plan_check(led_, plan)
+            if n_l_ != n_p_:
+                out(f"LEDGER CHECK: the ledger counts {n_l_} kills placed, the cut list holds {n_p_}")
+                plan["notes"].append(f"LEDGER CHECK: the ledger counts {n_l_} kills placed, the cut list holds {n_p_}")
             if scan:
                 ledger_save(led_, plan)
     except Exception as ex:                                # noqa: BLE001
