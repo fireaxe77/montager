@@ -9912,6 +9912,20 @@ def sync_report(plan, outfile, cfg):
 QUALITY_ALIGN = (0, -1, 1, -2, 2, -3, 3)     # V7.6.0: output-frame offsets searched by quality_check
 
 
+def ssim_gray(a, b):
+    """Mean SSIM of two grey frames (11x11 gaussian window, the usual constants)."""
+    import cv2
+    import numpy as np
+    a = a.astype(np.float32)
+    b = b.astype(np.float32)
+    c1, c2 = 6.5025, 58.5225
+    mu_a, mu_b = cv2.GaussianBlur(a, (11, 11), 1.5), cv2.GaussianBlur(b, (11, 11), 1.5)
+    saa = cv2.GaussianBlur(a * a, (11, 11), 1.5) - mu_a ** 2
+    sbb = cv2.GaussianBlur(b * b, (11, 11), 1.5) - mu_b ** 2
+    sab = cv2.GaussianBlur(a * b, (11, 11), 1.5) - mu_a * mu_b
+    return float((((2 * mu_a * mu_b + c1) * (2 * sab + c2)) / ((mu_a ** 2 + mu_b ** 2 + c1) * (saa + sbb + c2))).mean())
+
+
 def quality_check(plan, outfile, cfg, preview=False):
     """SSIM of the rendered frames vs the source frames on one effect-free stretch (1.0x, no zoom/flash/transition, away from the
     fades). Target >= 0.97. Returns the value (or None when no clean stretch exists)."""
@@ -9947,22 +9961,25 @@ def quality_check(plan, outfile, cfg, preview=False):
     crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, src["wh"][0], src["wh"][1]] else ""
     size = "1280:720" if preview else "1920:1080"
     ref = f"{crop}scale={size}:flags=lanczos," if (crop or preview or list(src["wh"]) != [1920, 1080]) else ""
-    meas = {}
-    for k in QUALITY_ALIGN:                                # V7.6.0: the render keeps real source timestamps, the reference is re-based: search +-3 output frames
-        r = run(["ffmpeg", "-hide_banner", "-ss", f"{g0 + k / OUT_FPS:.4f}", "-t", "0.5", "-i", str(outfile), "-ss", f"{max(0.0, s0):.4f}", "-t", "0.5",
-                 "-i", src["path"], "-filter_complex",
-                 f"[0:v]setpts=PTS-STARTPTS,format=yuv420p[a];[1:v]{ref}fps=60,setpts=PTS-STARTPTS,format=yuv420p[b];[a][b]ssim",
-                 "-f", "null", "-"], timeout=120)
-        m = re.findall(r"SSIM Y:([\d.]+).*?All:([\d.]+)", r.stderr.decode(errors="replace"))
-        if m:
-            meas[k] = (float(m[-1][0]), float(m[-1][1]))
-    if not meas:
+    # V7.6.1: timing-independent. The old check compared the output with a re-timed copy of the source; DVR clips have jittery frame timestamps, so the reference picked a neighbouring
+    # source frame and a perfectly good picture read 0.76 - 0.86. Now every output frame of the stretch is compared with the best-matching source frame of the window around it
+    # (source cropped / scaled by the renderer's own rule), so only the picture quality counts.
+    import numpy as np
+    W_, H_ = 960, 540
+    vf_src = (ref + f"scale={W_}:{H_}:flags=area,format=gray")
+    ro = run(["ffmpeg", "-v", "error", "-ss", f"{g0:.4f}", "-t", "0.4", "-i", str(outfile), "-an", "-vf", f"scale={W_}:{H_}:flags=area,format=gray", "-f", "rawvideo", "-"], timeout=120)
+    rs = run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, s0 - 0.1):.4f}", "-t", "0.65", "-i", src["path"], "-an", "-vf", vf_src, "-f", "rawvideo", "-"], timeout=120)
+    fo_ = np.frombuffer(ro.stdout, np.uint8)
+    fs_ = np.frombuffer(rs.stdout, np.uint8)
+    if len(fo_) < W_ * H_ or len(fs_) < W_ * H_:
         out("QUALITY CHECK: could not measure SSIM")
         return None
-    kb = max(meas, key=lambda k: meas[k][1])
-    y, al = meas[kb]
-    out(f"QUALITY CHECK: SSIM {al:.4f} (luma {y:.4f}) output vs source on an effect-free stretch at {g0:.2f}s, best alignment {kb:+d} frame"
-        f"{'s' if abs(kb) != 1 else ''} (unaligned {meas.get(0, (0, 0))[1]:.4f}) - {'OK (>= 0.97)' if al >= 0.97 else 'BELOW 0.97'}")
+    fo_ = fo_[:len(fo_) // (W_ * H_) * W_ * H_].reshape(-1, H_, W_)
+    fs_ = fs_[:len(fs_) // (W_ * H_) * W_ * H_].reshape(-1, H_, W_)
+    vals = [max(ssim_gray(o_, s_) for s_ in fs_) for o_ in fo_[:20]]
+    al, wo = float(np.mean(vals)), float(min(vals))
+    out(f"QUALITY CHECK: SSIM {al:.4f} (worst frame {wo:.4f}) output vs source, each output frame against its best-matching source frame (timing-independent), on an effect-free stretch at {g0:.2f}s"
+        f" - {'OK (>= 0.97)' if al >= 0.97 else 'BELOW 0.97'}")
     plan["ssim"] = round(al, 4)
     return al
 
