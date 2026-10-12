@@ -6453,6 +6453,33 @@ def cmd_ledger(args):
     print(f"(read-only; written to {HERE / 'ledger.txt'}; nothing else was changed)")
 
 
+def cmd_dupclips(args):
+    """V7.7.0: python montage.py dupclips. Read-only: the same-fight check (the same fight saved twice) over EVERY cached clip of both games; lists each pair that would be merged
+    with the kill-by-kill evidence, and how many clip pairs the rule looked at. Writes dupclips.txt next to montage.py; changes no cache, flag or config file."""
+    cfg = load_config()
+    lines, keep = [], (out, LOGONLY)
+    globals()["out"] = globals()["LOGONLY"] = lambda *a, **k: None
+    try:
+        for game in ("valorant", "cs2"):
+            pool, _st = game_pool(cfg, game, None)
+            for it in pool:
+                it["anc"] = clip_anchor(it["rec"]["path"], it["rec"].get("dur"))
+            dups = find_duplicate_clips(pool, game)
+            kills = lambda i: ", ".join(f"{ts(k['t'])} {k.get('victim') or '?'}" for k in sorted(i["kills"], key=lambda k: k["t"]))
+            lines.append(f"== {game}: {len(pool)} cached clips with kills, {len(dups)} merged as the same fight saved twice")
+            for s_, d_, rule in dups:
+                lines.append(f"  KEEP {Path(s_['rec']['path']).name} ({len(s_['kills'])}k, {s_['rec'].get('dur', 0):.1f} s)  DROP {Path(d_['rec']['path']).name} ({len(d_['kills'])}k, {d_['rec'].get('dur', 0):.1f} s)")
+                lines.append(f"       rule: {rule}")
+                lines.append(f"       kept clip:    {kills(s_)}")
+                lines.append(f"       dropped clip: {kills(d_)}")
+    finally:
+        globals()["out"], globals()["LOGONLY"] = keep
+    text = "\n".join(lines)
+    (HERE / "dupclips.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(read-only; written to {HERE / 'dupclips.txt'}; nothing else was changed)")
+
+
 FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
 
 
@@ -6492,8 +6519,111 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
             LAST_LEDGER[0] = led
 
 
+SAME_FIGHT_S = 0.3                      # V7.7.0: two clips show the same fight saved twice when every kill is within this of its twin (and the victims agree)
+_SAVE_SUFFIX = re.compile(r"(?:_\d+)+$")
+
+
+def clip_name_base(path):
+    """V7.7.0: a clip's file name without a '_N' suffix a second save of the same recording gets ('x.DVR_1.mp4' -> 'x.dvr.mp4')."""
+    p = Path(str(path))
+    return _SAVE_SUFFIX.sub("", p.stem).lower() + p.suffix.lower()
+
+
+def _same_fight_victim(game, a, b, lenient=False):
+    a, b = (a or "").strip(), (b or "").strip()
+    if not _alnum(a) or not _alnum(b) or a.startswith("(unread") or b.startswith("(unread"):
+        return lenient                                       # an unreadable name says nothing: only the file name rule may accept it
+    from rapidfuzz import fuzz
+    if game == "cs2" and cs2_same_victim(a, b):
+        return True
+    r = fuzz.ratio(_alnum(a.lower()), _alnum(b.lower()))
+    return r >= (60 if lenient else 80)                      # the same file saved twice reads the same row with a different OCR slip; two files only agree on a clean read
+
+
+def same_fight_pair(a, b, game, tol=SAME_FIGHT_S):
+    """V7.7.0: (rule text or '', why not) for two pool items. The SAME fight saved twice when
+      (1) the file names differ only by a '_N' suffix and every kill of the clip with fewer kills has a twin in the other (time within `tol`, same victim), or
+      (2) both clips show the same number of kills, every kill is within `tol` of its twin with the same (readable) victim, AND the two were recorded at the same time
+          (their saved time ranges overlap by at least half; no saved time = no merge) - the same victim (a Valorant agent, a recurring player) at the same clip time
+          of a clip cut to a fixed length around the kill, in a different match, never merges."""
+    ka, kb = sorted(a["kills"], key=lambda k: k["t"]), sorted(b["kills"], key=lambda k: k["t"])
+    if not ka or not kb:
+        return "", "a clip without kills"
+    by_name = clip_name_base(a["rec"]["path"]) == clip_name_base(b["rec"]["path"])
+    if not by_name and len(ka) != len(kb):
+        return "", "different number of kills"
+    small, big = (ka, kb) if len(ka) <= len(kb) else (kb, ka)
+    used = set()
+    for k in small:
+        j = next((j for j, y in enumerate(big) if j not in used and abs(y["t"] - k["t"]) <= tol and _same_fight_victim(game, k.get("victim"), y.get("victim"), lenient=by_name)), None)
+        if j is None:
+            return "", f"the kill at {k['t']:.1f} s ({k.get('victim') or '?'}) has no twin within {tol:.1f} s with the same victim"
+        used.add(j)
+    if by_name:
+        return f"file names differ only by a _N suffix, {len(small)} of {len(big)} kills have a twin within {tol:.1f} s", ""
+    aa, ab = a.get("anc"), b.get("anc")
+    if not (aa and ab):
+        return "", "saved time unknown: two files only merge by name, or when they were recorded at the same time"
+    ov = min(aa["end"], ab["end"]) - max(aa["start"], ab["start"])
+    if ov < 0.5 * min(aa["end"] - aa["start"], ab["end"] - ab["start"]):
+        return "", "recorded at different times (saved time ranges do not overlap)"
+    return f"{len(ka)} kills, every kill within {tol:.1f} s of its twin, same victims, recorded at the same time", ""
+
+
+def find_duplicate_clips(items, game):
+    """V7.7.0: [(survivor item, duplicate item, rule)] - the same fight saved twice. The survivor has the more kills, then the more footage, then the plain file name
+    (no _N suffix). Pairs are matched inside buckets (same name base / same kill count), so a pool of thousands of clips stays fast."""
+    buckets = {}
+    for it in items:
+        if not it.get("kills"):
+            continue
+        buckets.setdefault(("n", clip_name_base(it["rec"]["path"])), []).append(it)
+        buckets.setdefault(("k", len(it["kills"])), []).append(it)
+    seen, res, gone = set(), [], set()
+    for bk in sorted(buckets, key=lambda b: str(b)):
+        lst = sorted(buckets[bk], key=lambda i: str(i["rec"]["path"]))
+        for x in range(len(lst)):
+            for y in range(x + 1, len(lst)):
+                a, b = lst[x], lst[y]
+                pk = (id(a), id(b))
+                if pk in seen or a["rec"]["path"] == b["rec"]["path"]:
+                    continue
+                seen.add(pk)
+                rule, _why = same_fight_pair(a, b, game)
+                if rule:
+                    res.append((a, b, rule))
+    out_ = []
+    drop = {}
+    for a, b, rule in res:
+        rank = lambda i: (-len(i["kills"]), -float(i["rec"].get("dur", 0)), len(Path(i["rec"]["path"]).name), str(i["rec"]["path"]))
+        s, d = (a, b) if rank(a) <= rank(b) else (b, a)
+        drop.setdefault(id(d), (s, d, rule))
+    for s, d, rule in drop.values():                       # a duplicate of a duplicate follows its survivor's survivor (no chain, one copy stays)
+        while id(s) in drop:
+            s = drop[id(s)][0]
+        out_.append((s, d, rule))
+    return out_
+
+
 def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
     from rapidfuzz import fuzz
+    try:                                                   # V7.7.0: the same fight saved twice is ONE fight - the lesser copy leaves the pool (its kill rows merge into the survivor's)
+        dupc = find_duplicate_clips(items, game)
+    except Exception as ex_:                               # noqa: BLE001
+        dupc = []
+        LOGONLY(f"same-fight check skipped: {type(ex_).__name__}: {ex_}")
+    if dupc:
+        gone_ = {id(d) for _s, d, _r in dupc}
+        for s_, d_, rule_ in dupc:
+            for k in d_["kills"]:
+                drow = led.row(d_, k)
+                tw = min(s_["kills"], key=lambda y: abs(y["t"] - k["t"]))
+                srow = led.row(s_, tw)
+                if srow and drow and not drow["merged"]:
+                    drow["merged"] = {"into": srow["id"], "proof": None, "pair": [s_["rec"]["path"], d_["rec"]["path"]], "same_fight": True,
+                                      "reason": f"merged duplicate: same fight saved twice ({rule_})"}
+            notes.append(f"merged duplicate: same fight saved twice: {Path(d_['rec']['path']).name} = {Path(s_['rec']['path']).name} ({rule_}); one copy stays")
+        items[:] = [it for it in items if id(it) not in gone_]
     # duplicates / continuations
     refine = load_json(REFINE_CACHE, {})
     kref = {}
@@ -17026,6 +17156,7 @@ def main():
     ds.add_argument("times", nargs="*", help="m:ss drop times, e.g. 0:34 1:32 2:15")
     ds.add_argument("--list", action="store_true")
     ds.set_defaults(fn=cmd_dropsave)
+    sp.add_parser("dupclips", help="V7.7.0: list the clips that are the same fight saved twice (read-only; writes dupclips.txt only)").set_defaults(fn=cmd_dupclips)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
