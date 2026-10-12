@@ -10833,6 +10833,11 @@ class SongMapView:
                       f"{' (hand-edited)' if self.hand else ''}   sections: {' > '.join(s['label'] for s in an.get('sections', []))}")
 
     def show(self, an):
+        try:                                               # V7.6.0: the window may be closed before the song map arrives (TclError 'bad window path name')
+            if not self.win.winfo_exists():
+                return
+        except Exception:
+            return
         self.an = an
         self._load_drops()
         self.win.title(f"Song map ({SONGMAP_CHOICES.get(str(an.get('songmap_version', 'v1'))[:2], 'Songmap V1')}) - {Path(self.path).name}" if getattr(self, "path", None) else self.win.title())
