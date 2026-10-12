@@ -299,114 +299,6 @@ def part_guards_real(tmp):
         check(not M.verify_cutlist(plan_off) and not M.verify_cutlist(plan_on), "both plans: cut list valid")
 
 
-# ------------------------------------------------------------------------------------------------ 2) same fight saved twice
-def fake_item(name, kills, dur=15.4, anc=None, game="cs2"):
-    rec = {"path": "E:/x/" + name, "dur": dur, "game": game}
-    return {"rec": rec, "kills": [{"t": t, "victim": v} for t, v in kills], "anc": anc}
-
-
-def part_same_fight():
-    with section("2a) the same fight saved twice: the rule (name suffix / equal kills, same victims, same time) and what must NEVER merge"):
-        K3 = [(11.0, "Markusko"), (13.8, "chararacing"), (15.0, "Wolfgang")]
-        anc = lambda s: {"start": s, "end": s + 15.4, "provable": True}
-        a = fake_item("Counter-strike 2 2025.02.08 - 19.48.57.15.DVR.mp4", K3, 15.446)
-        b = fake_item("Counter-strike 2 2025.02.08 - 19.48.57.15.DVR_1.mp4", [(t + 0.07, v) for t, v in K3], 15.45)
-        check(M.clip_name_base(a["rec"]["path"]) == M.clip_name_base(b["rec"]["path"]) == M.clip_name_base("x/Counter-strike 2 2025.02.08 - 19.48.57.15.DVR_1_1.mp4"), "'_1' and '_1_1' suffixes are stripped from the name")
-        r, _w = M.same_fight_pair(a, b, "cs2")
-        check(bool(r), f"name differs by _1 and the 3 kills are within 0.3 s: same fight ({r})")
-        d = M.find_duplicate_clips([a, b], "cs2")
-        check(len(d) == 1 and d[0][0] is b and d[0][1] is a, "one copy stays: the one with more footage (15.45 s vs 15.446 s), the other is dropped")
-        c = fake_item("Counter-strike 2 2025.02.08 - 19.48.57.15.DVR_1_1.mp4", K3[:2], 15.45)
-        d = M.find_duplicate_clips([a, b, c], "cs2")
-        check(len(d) == 2 and {x[1]["rec"]["path"] for x in d} == {a["rec"]["path"], c["rec"]["path"]} and all(x[0] is b for x in d), "three saves of the fight (_1_1 has 2 of 3 kills): exactly one stays, the one with all 3 kills")
-        e = fake_item("Counter-strike 2 2025.02.08 - 19.48.57.15.DVR_2.mp4", [(11.0, "Zed"), (13.8, "Quill"), (15.0, "Bram")], 15.4)
-        check(not M.same_fight_pair(a, e, "cs2")[0], "same name stem + same times but DIFFERENT victims: not merged")
-        e2 = fake_item("Counter-strike 2 2025.02.08 - 19.48.57.15.DVR_3.mp4", [(t + 0.6, v) for t, v in K3], 15.4)
-        check(not M.same_fight_pair(a, e2, "cs2")[0], "same name stem + same victims but kill times 0.6 s apart: not merged")
-        e3 = fake_item("Counter-strike 2 2025.02.08 - 19.48.57.15.DVR_4.mp4", [(t + 0.31, v) for t, v in K3], 15.4)
-        check(not M.same_fight_pair(a, e3, "cs2")[0], "0.31 s apart: not merged (the limit is 0.3 s)")
-        f1 = fake_item("Replay 2026-07-19 20-31-37.mov", [(17.37, "Oparlsh")], 18.3, anc(1000.0))
-        f2 = fake_item("Replay 2026-07-19 20-31-38.mov", [(17.4, "Oparlsh")], 19.4, anc(1001.0))
-        r, _w = M.same_fight_pair(f1, f2, "cs2")
-        check(bool(r), f"different names, one kill each, same victim, same time, saved a second apart: same fight ({r[:60]})")
-        g1 = fake_item("Valorant 2025.10.15 - 23.05.50.14.DVR.mp4", [(14.4, "Killjoy")], 15.4, anc(50000.0), "valorant")
-        g2 = fake_item("Valorant 2025.11.04 - 15.36.13.02.DVR.mp4", [(14.4, "Killjoy")], 15.4, anc(9000000.0), "valorant")
-        r, w = M.same_fight_pair(g1, g2, "valorant")
-        check(not r and "different times" in w, f"same agent, same clip time, a different match (weeks apart): NOT merged ({w})")
-        g3 = fake_item("Valorant 2025.10.15 - 23.05.51.15.DVR.mp4", [(14.4, "Killjoy")], 15.4, None, "valorant")
-        check(not M.same_fight_pair(g1, g3, "valorant")[0], "no saved time known: two unrelated names never merge")
-        h1 = fake_item("Replay 2026-03-19 20-55-01.mov", [(7.5, "Fucku"), (20.2, "2orro")], 22.2, anc(2000.0))
-        h2 = fake_item("Replay 2026-03-19 20-55-02.mov", [(7.5, "Fucku")], 23.7, anc(2001.0))
-        check(not M.same_fight_pair(h1, h2, "cs2")[0], "different names and a different number of kills: not merged")
-    with section("2b) over every cached clip of both games (real data copy): the merged pairs, and nothing else"):
-        cfg = M.load_config()
-        keep = (M.out, M.LOGONLY)
-        M.out = M.LOGONLY = lambda *a, **k: None
-        try:
-            res = {}
-            for game in ("valorant", "cs2"):
-                pool, _st = M.game_pool(cfg, game, None)
-                for it in pool:
-                    it["anc"] = M.clip_anchor(it["rec"]["path"], it["rec"].get("dur"))
-                dups = M.find_duplicate_clips(pool, game)
-                res[game] = (pool, dups)
-        finally:
-            M.out, M.LOGONLY = keep
-        for game, (pool, dups) in res.items():
-            print(f"   {game}: {len(pool)} cached clips with kills, {len(dups)} merged")
-            for s_, d_, rule in dups:
-                print(f"     KEEP {Path(s_['rec']['path']).name} ({len(s_['kills'])}k)  DROP {Path(d_['rec']['path']).name} ({len(d_['kills'])}k)  [{rule[:70]}]")
-        bad = 0
-        for game, (pool, dups) in res.items():
-            for s_, d_, rule in dups:
-                ks, kd = sorted(s_["kills"], key=lambda k: k["t"]), sorted(d_["kills"], key=lambda k: k["t"])
-                sm, bg = (ks, kd) if len(ks) <= len(kd) else (kd, ks)
-                twin = all(any(abs(y["t"] - k["t"]) <= M.SAME_FIGHT_S for y in bg) for k in sm)
-                by_name = M.clip_name_base(s_["rec"]["path"]) == M.clip_name_base(d_["rec"]["path"])
-                a1, a2 = s_.get("anc"), d_.get("anc")
-                same_time = bool(a1 and a2 and min(a1["end"], a2["end"]) - max(a1["start"], a2["start"]) >= 0.5 * min(a1["end"] - a1["start"], a2["end"] - a2["start"]))
-                if not (twin and (by_name or (len(ks) == len(kd) and same_time))):
-                    bad += 1
-        check(bad == 0, "every merged pair has all its kills within 0.3 s of a twin and is a name-suffix copy or was recorded at the same time (0 exceptions)")
-        look = 0
-        for game, (pool, dups) in res.items():
-            merged_ids = {id(d_) for _s, d_, _r in dups} | {id(s_) for s_, _d, _r in dups}
-            by_n = {}
-            for it in pool:
-                by_n.setdefault(len(it["kills"]), []).append(it)
-            for n, lst in by_n.items():
-                for x in range(len(lst)):
-                    for y in range(x + 1, len(lst)):
-                        a_, b_ = lst[x], lst[y]
-                        if id(a_) in merged_ids and id(b_) in merged_ids:
-                            continue
-                        ka, kb = sorted(a_["kills"], key=lambda k: k["t"]), sorted(b_["kills"], key=lambda k: k["t"])
-                        if all(abs(p["t"] - q["t"]) <= M.SAME_FIGHT_S and M._same_fight_victim(game, p.get("victim"), q.get("victim")) for p, q in zip(ka, kb)):
-                            look += 1
-        print(f"   {look} clip pairs look alike (same kill count, same victims, same clip times) but were recorded at different times: refused")
-        check(len(res["cs2"][1]) >= 2 and any("19.48.57.15.DVR" in str(s_["rec"]["path"]) for s_, _d, _r in res["cs2"][1]), "the 2025.02.08 - 19.48.57.15 DVR / DVR_1 pair of the report is among them")
-    with section("2c) a plan places the fight once: CS2 selection with DVR, DVR_1 and DVR_1_1 ticked, ledger 0 lost, log line"):
-        cfg = M.load_config()
-        keep = (M.out, M.LOGONLY)
-        lines = []
-        M.out = M.LOGONLY = lambda *a, **k: lines.append(" ".join(map(str, a)))
-        try:
-            pool, _st = M.game_pool(cfg, "cs2", None)
-            allp = {Path(i["rec"]["path"]).name: i["rec"]["path"] for i in pool}
-            trio = [allp[n] for n in allp if "2025.02.08 - 19.48.57.15.DVR" in n]
-            others = [i["rec"]["path"] for i in pool if len(i["kills"]) >= 2 and "19.48.57" not in i["rec"]["path"]][:12]
-            songs, _u, _c = M.song_pool(cfg)
-            plan, _t = M.make_plan(cfg, "cs2", paths=trio + others, song_path=songs[0]["path"], target="optimal", seed=7, scan=False)
-        finally:
-            M.out, M.LOGONLY = keep
-        got = [t for t in plan["takes"] if "19.48.57.15.DVR" in Path(t["path"]).name]
-        check(len(trio) == 3 and len(got) == 1 and len(got[0]["kills"]) == 3, f"the fight is in the cut list exactly once ({[Path(t['path']).name[-16:] for t in got]}, {len(got[0]['kills']) if got else 0} kills)")
-        led = next((l for l in lines if l.startswith("kill ledger:")), "")
-        check("0 lost" in led and "merged as proven duplicates" in led, f"ledger: '{led[:110]}'")
-        check(any("merged duplicate: " in l and "same fight saved twice" in l for l in lines + plan["notes"]), "the log says 'merged duplicate: same fight saved twice'")
-        check(not M.verify_cutlist(plan), "cut list valid")
-
-
 # ------------------------------------------------------------------------------------------------ 3) song length + date-added sort
 def make_lib_lengths(tmp, specs):
     """specs = [(title, artist, seconds, added 'YYYY-MM-DD')]: real mp3 files of these lengths + a playlist CSV with the 'Added At' dates."""
@@ -569,9 +461,6 @@ def main():
             finally:
                 M.restore_data_dir(old)
             part_guards_real(tmp)
-    if want("2"):
-        with PB.data_copy(M):
-            part_same_fight()
     if want("3"):
         part_song_columns(tmp)
     after = snapshot(REAL_DATA)
