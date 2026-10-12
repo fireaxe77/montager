@@ -5,6 +5,19 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V7.6.1 (branch work-v761, merged to main, APP_VERSION = V7.6.1) - 2026-10-12
+- Item 0: both changelogs rebuilt, one entry per version (66 each).
+- Item 1 (render timing): no render offset exists. The "flash 6-11 frames late" of V7.6.0 was the test: the planner dates a kill at its gunshot, the test drew its flash on the killfeed row 0.1 s later (6 frames at 1.0x, 12 at 0.5x). New `tests/marker761.py` (flash + click at the shot, 8 sizes / fps / containers / VFR, stitched take, ramps, slow-mo, soft cuts): every kill within 1 frame, audio within 17 ms; `tests/audit761.py` on real renders: video 0 +-0.5 frame, audio 0-12 ms (DVR audio timestamps jitter up to 22 ms against their sample count: the source, not the render), music offset 0-2 ms over 150 s.
+- Item 2 (determinism / one pick): the plans differed with PYTHONHASHSEED, not with load: `_side_col` decided a red / green tie by set order (a row was a death in one run, a revive in the next); ties are now red. Hang-guard caps no longer change plans (pairing 2 s -> 20 s, proof 5 s -> 30 s, song analysis 60 s -> 180 s). The summary and the render disagreed because the playlist CSV and the used-song history changed in between: one pick per job (`make_plan(pin=)`), and the render renders the very plan the summary showed (`run_job(pin=)`, log "rendered as shown").
+- Item 3 (drops): lever b `reorder_for_drop` (move one take to the drop), lever d (the take before may drift its kills 3 frames), candidate song sections (`plan_montage` tries the 4 best and keeps the one that places the most kills / drops), real drops outrank the planner's fallback anchor, truthful window notes. 8 songs x Valorant pool: all but one drop anchored (worst planned error 8 ms), the rest names its rule.
+- Item 4 (kills lost): the failing events were rule-bound: clips end 0.3-0.5 s after the kill, so the tail window collapsed to one tick. Relaxation ladder `RX_LADDER` (slow tail down to 0.4x with a smooth slow-down, first kill on a half-beat, run-up down to 0.12 s with a 0.9 s minimum take), plain events keep priority; length and section follow all the material; `NOT PLACED <clip>: <rule and numbers>` lines. The 45-clip CS2 selection: 11 -> 38 kills placed, 20 s -> 60 s; the 6k and the stitched 4k are placed; two events stay out (death 0.03 s / 0.33 s after the kill).
+- Item 5 (slow-mo): eased speed curve (slow-down in the 9 frames before the last kill, 0.4 s plateau, release to 1.0x about 1 s after) for headline / ending takes, rendered as one time-warp chain with the audio aligned on the kill; log "slowmo release: take <n> <len> s". Not built: a slow-in / slow-out for every kill of a multikill.
+- Item 6 (soft cuts): 5-frame dissolve (2 + 3 frames) with handle footage of both takes, hard cut within 0.3 s of a kill, on a drop or without footage; cut positions and kill times unchanged.
+- Item 7 (repeat drops): `songmap_v2/repeat.py`, additive. Leave-one-out on the 17 hand labels: all drops that have a repeat are recovered, only 1 / 17 within 50 ms because hand labels agree only to ~200 ms. Found e.g. Reverse Psychology 1:39.9 and Congratulations 1:49.1 / 3:07.2.
+- Item 8 (quality): every take reads >= 0.97 (most 0.99) when each frame is compared with its best source frame. The 0.76 / 0.86 readings came from the quality check re-timing the source (DVR timestamps jitter); `quality_check` now compares best-matching frames. No picture change.
+- Item 9: trash icon for songs (Manual list and Songs tab), same Recycle Bin behaviour as clips; caches removed, hand labels kept.
+- tests/test_v761.py, tests/marker761.py, tests/audit761.py, tests/ssim761.py, tests/ssim761b.py.
+
 ## V7.6.0 (branch work-v760, merged to main, APP_VERSION = V7.6.0) - 2026-10-12
 - Item 1: `anchor_all_drops` rewritten (both games): exact label / map drop times (never the grid beat; `grid:` log line when they differ > 30 ms), drops solved strongest first, multikill finishers first, `move_kill` with levers a (`flex_lead` / `flex_tail` inside the take) + c (cut before / after moves into the neighbour's tail / run-up); every other kill stays on its frame, takes / order / length unchanged. Impact = `impact_time` (segment integral). `plan['drop_sync']` + `SYNC DROP` lines in the sync report. Bench (8 songs, CS2, same takes / kills / frames as main): 10/12 drops anchored (main 2/12), worst plan error 8.2 ms. The "headline -211 ms" numbers were SYNC REPORT measuring the headline's FIRST kill against the grid while its LAST kill is the anchor (no remap bug). Levers b (reorder) and d (multi-neighbour) not implemented.
 - Item 3: `trim_outro`: fade 0.5 s after the last kill (>= 0.4 s after its row), 0.5 s long, video ends with it, unused tail trimmed, held frames never shown, music fades from the last kill to the final frame; render_check / smoketest ending rule updated.
@@ -89,6 +102,9 @@ version contained, the entry says "Details not recorded". Dates are the commit d
   - Tools: `songmap_v2/bench.py` (independent kick detector), `synth.py` (14-genre generated suite with truth), `planbench.py` (dry planner V1 vs V2 map); `python songmap_compare.py v7bench | v7plan`.
   - Result: genre suite passes; song-level V2 locks better on several real songs; at plan level V2-auto is NOT clearly better (see docs/SONGMAP_V7.md). Not merged.
 
+## V6.9.11 - 2026-10-07
+- Settings shows `docs/CHANGELOG_SIMPLE.md` (falls back to `CHANGELOG.md`): `CHANGELOG_SIMPLE_PATH`, `changelog_lines()` parses `## ` version headings, `- ` bullets (commit 21884f8). No detection, planner or render change.
+
 ## V6.9.10 - 2026-10-07
 - CS2 only: a "kill" row that first appears within 10 s of the clip start and whose victim matches a pre-clip row of the same clip is the same row read again and is dropped ("CS2 stale feed row: already on screen at clip start"). Changes 4 of 291 cached CS2 clips (phantom kills at 2.8 / 5.4 s removed); the known-good multikills are unchanged. Valorant, shape filter, fragment merge and kill-cache format untouched. Not fixed: `2026.02.10 - 19.09.46.22` (real kill dated late, separate cause).
 - `docs/CHANGELOG_SIMPLE.md` added (plain-language history). Tests: `tests/test_v6910.py`.
@@ -116,6 +132,9 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 - "detector found 18 kill rows for 51 planned kills" is the post-render sync check (`sync_report`): it scans the finished montage with the name-based detector as ONE clip, whose CS2 rules (5 kills per 115 s, short killfeed exposure in 1-3 s takes) cap what it can see; most 1K takes read 0/1. Older CS2 montages show the same ratios. Not a missing-kill signal; the sync detector is unchanged.
 - Companion rule for random / weekly picks: `pair_time_index` / `pair_player_kills` / `pair_find` / `pairing_run` take a `game`; the V6.9 neighbour step now also runs for Valorant (neighbours by the V6.9.7.1 save-time rule, no edge-kill precondition; the planner's own link rules and veto decide). Manual picks unchanged for both games.
 - Tests: `tests/test_v698.py`.
+
+## V6.9.7.2 - 2026-10-07
+- Tests only (commit 700975a, tagged v6.9.7.2-good): `tests/test_v6971.py` redirects MATCH_CACHE to the data copy (`use_data_dir` left it on the real montage_data). No runtime change; APP_VERSION stays V6.9.7.1.
 
 ## V6.9.7.1 - 2026-10-07
 - Small real-data fix (branch v6.9.7.1 from v6.9.7, not merged). Detector, kill-cache formats, planner scoring / beat logic, effects, render, songmap, theme and settings are untouched.
@@ -174,6 +193,7 @@ version contained, the entry says "Details not recorded". Dates are the commit d
   - `fixtures/` stays at the root: `montage.py` opens it by relative path (`smoketest`), moving it needs a code edit (stated in `docs/REPO_AUDIT.md`). Kept at the root: `montage.py`, `songmap_compare.py`, `songmap_v2/`, launchers, icons, README / CHANGELOG / CLAUDE.md, `.gitignore`.
   - `.gitignore`: `fpscontent.txt`, `grouporder.txt`, `interpbench_*/` added (none was tracked). New `docs/BRANCHES.md`: every remote branch with last commit date, merged-into-main flag, ahead / behind counts and ready-to-copy delete commands for the merged ones (nothing deleted, tags untouched, no history rewrite). `docs/REPO_LAYOUT.md`, `docs/REPO_AUDIT.md` (round 2) and `CLAUDE.md` updated with the final layout (the CS2 frozen line is kept).
   - Tests: `tests/v696_partc.py` (py_compile of every .py, `import montage` and `python montage.py cfgdump` from the root, root resolution of every moved test, no tracked file deleted, history intact, docs / .gitignore).
+
 ## V6.9.5.2 - 2026-10-07
 - SONGMAPV2 tempo lock + honest grid confidence + "Songmap V2 (auto, V1 fallback)" option. Default stays Songmap V1. Changed: `songmap_v2/grid.py`, `build.py` (cache key suffix only in the key), the dispatcher `get_songmap()` and the Settings dropdown entry in `montage.py`, `songmap_compare.py` (auto column + new numbers only), `tests/test_v6952.py`. SONGMAPV1, `events.py`, `sections.py`, `adapter.py` (unchanged), Valorant / CS2 detection, planner, effects, render, theme, other settings and song matching are untouched.
   - Grid confidence 0.0 almost everywhere: ROOT CAUSE in the old `confidence = obs_frac * (1 - min(median residual ms, 30) / 30)`: the residual was the distance of the beat TRACKER's snapped beats to their own fitted line, the tracker may snap anywhere inside +-22 % of a beat, so any song that is not a metronome has a median residual above 30 ms and the clamp turns the value into exactly 0 (reproduced on generated irregular audio: 0.0 for every track). It never measured whether the grid sits on the kicks. Now: confidence = 0.7 x share of strong low-band onsets (kicks / bass) within +-25 ms of the final grid + 0.3 x periodicity of the low / mid onset envelope at the chosen tempo (normalised autocorrelation at 1, 2 and 4 beats); 0..1; both components are logged in the V2 extras (`confidence_parts`, `confidence_log`).
@@ -287,7 +307,7 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 - Killfeed region: unchanged. It is a fraction of the content rectangle (CS2 0.58-1.0 x 0.03-0.40), so 1280x960 and 1920x1080 clips crop the same part of the picture.
 - New `test_v67.py` (fixtures from the reported reads; compares with origin/main; Valorant kill counts and timestamps must be identical).
 
-## V6.5.2 - RELEASE
+## V6.5.2 - 2026-10-05
 - Release tag `v6.5.2-release` (commit 031cb64, 2026-10-05): this is the Valorant kill-registration baseline; later versions must give the same Valorant kills.
 - Manual clip list: clicking an EMPTY Used cell now flags that clip as used with today's date (the same flag a finished render writes, so the weekly pick - including its reuse of previously used clips - the Used filter and "Include used clips" treat it as used), saves it, refreshes the row and logs "flagged <clip>". Clicking a filled Used cell still unflags it. The click never ticks or unticks the row. New `test_v652.py`.
 
@@ -315,6 +335,10 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 - perflog: the widget-creation hook called `winfo_class()` before the Tk window existed ("bad window path name .!toplevelN" broke "Calibrate killfeed region" and the Song map); it now uses the Python class name and can never raise.
 - Housekeeping: `perflog.txt` untracked, `perflog*.txt` ignored. New `test_v612.py`: workers, audio files, matcher titles, cache, first show, theme, length, open column, and a popup test that opens and closes every window in normal and perflog mode.
 
+## V6.1.2 (carried into V6.1.3, APP_VERSION never set to V6.1.2) - 2026-10-05
+- Song matching speed: match cache (`montage_data\match_cache.json`: hit / incremental, keyed by CSV name / song folder state) and the first Manual fill no longer waits for the matcher (commits de448de, 56d0224). The faster token-index matcher of item 2b mismatched songs and was reverted in V6.1.3 (8002271); the match cache stayed.
+- The V6.1.2 theme rework is not part of any later version (V6.1.3 starts from V6.2).
+
 ## V6.2 - 2026-10-05
 - Measurement build (detection, planner, effects and render pipeline untouched; no behaviour change without the switches below). `python montage.py perflog` now also records:
   - a stack sampler (daemon thread, main thread sampled every 10 ms); for every main-loop gap above 50 ms the most frequent stack (top 6 Python frames) is kept and the summary lists the top 10 by total blocked time. If the main thread was inside Tk's C code the entry is labelled "Tk C-level" with the last Python frame;
@@ -331,12 +355,6 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 - Poll cost (~140 ms on the UI thread): the "done" step of App.poll ran refresh_auto on the UI thread: it re-read the clip and kills caches, built a Detector per game, stat()ed every clip and listed the output folders. It now runs in a worker thread that hands the finished status texts to the UI through the queue, and is skipped when none of the files it reads changed.
 - Priority (Windows): ffmpeg / ffprobe child processes start with BELOW_NORMAL_PRIORITY_CLASS so the window stays responsive during scans and renders. Linux unchanged; worker counts and encoder settings unchanged.
 
-## V5.6 - 2026-10-05
-- GUI only, no more widgets or lists appearing one after another. The main window stays withdrawn while every tab is built and laid out once, then it is shown in one step (no alpha trick). Popups (changelog, date range, playlist track picker) are created withdrawn, laid out, centred over the main window and then shown.
-- Lists (clips, songs, tables) are filled in one pass while the list is unmapped and shown once; no row-by-row growth. While clips are being scanned the lists are not refilled at all: the status line shows "Scanning 51 / 210" and the lists are refilled once when the scan ends.
-- Scan progress label and bar update at most 4 times per second (final value always shown). Log lines are collected and inserted every 250 ms in one block; the log keeps the last 2000 lines.
-- Tab switching only shows the existing frame (unchanged from V5.58). Detection, planner and render logic are untouched; the clip scan only reports its progress now.
-
 ## V6.0 - 2026-10-05
 - Auto / weekly length: the Auto path now sizes the montage with the same `optimal_fit` rule as Manual (80-150 s, never past the song, nothing padded). Cause of the 63 s montage: the old Auto sizing counted every fight at its raw length (dead air included, which is jump-cut in the render) and cut events to a "120 s" budget that rendered as ~63 s. Plain singles now top up, best first, until 80 s when the multikills fall short. A fixed length is unchanged.
 - Audio: if Auto picks a silent or unusable track for one clip, only that clip uses Legacy (loudest track); the log says "audio fallback for <clip>: <reason>" and Auto stays for the other clips. A failure of the whole render still falls back to Legacy for the whole montage. Gain logic unchanged.
@@ -344,6 +362,12 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 - Weekly pick: clips already used are never reused; this week's new clips come first, older unused clips follow only as needed (best multikills first, then singles); clips are flagged used only after a successful render; with no unused material the run is skipped with a stated reason, with little material the montage is shorter.
 - New `python montage.py perflog` (or MONTAGE_PERFLOG=1): timeline recorder, writes perflog.txt on exit or Ctrl+Shift+P. No behaviour change without it. The pop-in fix itself is not part of this version.
 - New `test_v60.py` (generated data, no render). Detection, song-map beat logic, effects and render pipeline are unchanged.
+
+## V5.6 - 2026-10-05
+- GUI only, no more widgets or lists appearing one after another. The main window stays withdrawn while every tab is built and laid out once, then it is shown in one step (no alpha trick). Popups (changelog, date range, playlist track picker) are created withdrawn, laid out, centred over the main window and then shown.
+- Lists (clips, songs, tables) are filled in one pass while the list is unmapped and shown once; no row-by-row growth. While clips are being scanned the lists are not refilled at all: the status line shows "Scanning 51 / 210" and the lists are refilled once when the scan ends.
+- Scan progress label and bar update at most 4 times per second (final value always shown). Log lines are collected and inserted every 250 ms in one block; the log keeps the last 2000 lines.
+- Tab switching only shows the existing frame (unchanged from V5.58). Detection, planner and render logic are untouched; the clip scan only reports its progress now.
 
 ## V5.58 - 2026-10-05
 - Live themes: changing Accent colour or Base in Settings applies at once, no restart. The theme is re-applied in the running window (one Sun Valley theme per accent x base, loaded once, then reused) and every classic widget that carried an old palette colour (log, dividers, Settings canvas, drop-down lists, changelog popout and its headings) is recoloured. "Applies after restart" removed for these two options (UI scale still applies after restart). Choice is saved in config as before.
@@ -385,7 +409,7 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 - Pre-clip / same-victim duplicate check.
 - A rejected stitch is re-planned on the single clip.
 
-## V5.44
+## V5.44 (date unknown)
 Details not recorded. No commit, tag or note in the repository carries this version number.
 
 ## V5.43 - 2026-10-05
@@ -428,8 +452,6 @@ Five items, one commit each:
 ## V5.2 - 2026-10-05
 - Effects: V4 centred zoom punches only, no flashes, no zoom/flash cuts.
 - Output: `<SONG>_<GAME>_<version>_<date>.mp4` names, plan txt/json in `logs\`, APP_VERSION in the window title.
-
-## Between V5.1 and V5.2 (no version label) - 2026-10-04
 - Render never aborts on a kill row outside the take; smooth float zoom, no shake.
 
 ## V5.1 - 2026-10-04
