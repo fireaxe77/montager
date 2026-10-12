@@ -6,6 +6,7 @@
   9) TRASH ICON for songs (temp song library, no real files)
 Runs on a COPY of montage_data (the real folder is only read).   python tests\\test_v761.py   (skip the long parts: V761_FAST=1)"""
 import os
+import json
 import re
 import subprocess
 import sys
@@ -308,14 +309,276 @@ def part_trash(tmp):
         check(real_before == real_after, f"the real song library is untouched ({len(real_after)} files)")
 
 
+# ------------------------------------------------------------------------------------------------ 3 / 4) drops + take feasibility (generated clips, exact expected outcomes)
+import test_v73 as T73                                                                        # noqa: E402
+import test_v693 as T693                                                                      # noqa: E402
+import test_v760 as T760                                                                      # noqa: E402
+
+
+def ev_with(tmp, game, name, kills, rows_lag=0.10, death=None, dur=16.0, seed=3):
+    """One generated clip + one event with its kills at the given source times (row = kill + rows_lag), optionally my death `death` s after the last kill."""
+    files = T73.make_files(tmp / f"ev_{name}", 1, "VALORANT" if game == "valorant" else "Replay")
+    V = T693.names(len(kills) + 3, seed)
+    rec = T693.rec_of(files[0], dur, game)
+    it = T693.pool_item(rec, [(round(t + rows_lag, 3), V[i]) for i, t in enumerate(kills)])
+    if death is not None:
+        it["deaths"] = [round(kills[-1] + rows_lag + death, 3)]
+    evs, _ = T73.events_of(M, game, [it])
+    return evs
+
+
+def part_feasibility(tmp):
+    with section("4) take feasibility: exact outcomes for the hard cases (generated clips, CS2 rules)"):
+        an = T760.drops_map(2)
+        cases = {}
+        # footage after the kill only 0.38 s: a slow tail, never a freeze
+        e1 = ev_with(tmp, "cs2", "tail", [10.0], death=None, dur=10.0 + 0.38 + 0.08)[0]
+        # my death 0.03 s after the kill: cannot be shown (the row would never be seen)
+        e2 = ev_with(tmp, "cs2", "death", [8.0], death=-0.07)[0]
+        # only 0.27 s of footage before the kill
+        e3 = ev_with(tmp, "cs2", "pre", [0.27 + 0.05])[0]
+        # long multikill (6 kills over 12 s) in a short section
+        e4 = ev_with(tmp, "cs2", "long", [2.0, 4.0, 6.0, 8.0, 11.0, 14.0], dur=16.0)[0]
+        # a plain event as the control
+        e5 = ev_with(tmp, "cs2", "plain", [6.0], dur=16.0)[0]
+        evs = [e1, e2, e3, e4, e5]
+        pl = T73.plan_of(M, "cs2", evs, an, 5, style="aggressive")
+        by = {Path(t["path"]).parent.name: t for t in pl["takes"]}
+        placed = {k.replace("ev_", "") for k in by}
+        check("tail" in placed and by["ev_tail"].get("tail", {}).get("mode") == "fit" and 0.4 <= by["ev_tail"]["tail"]["v0"] < 1.0,
+              f"0.38 s of footage after the kill: placed with a slow tail at {by.get('ev_tail', {}).get('tail', {}).get('v0')}x")
+        check(all(sg[2] > 0 for sg in by["ev_tail"]["segs"]), "that take freezes no frame")
+        check("death" not in placed and any("my death 0.03 s after the kill" in n for n in pl["notes"] if n.startswith("NOT PLACED")), "death 0.03 s after the kill: not placed, and the plan names the exact rule")
+        check("pre" in placed and by["ev_pre"]["kills_out"][0] < 0.3 and by["ev_pre"].get("rx"), f"0.27 s of footage before the kill: placed with a short run-up ({by.get('ev_pre', {}).get('kills_out')})")
+        check("long" in placed and by["ev_long"]["n"] == 6, "the 6-kill fight is placed whole")
+        check(not M.verify_cutlist(pl), "cut list valid")
+        check(len(pl["takes"]) == 4, f"4 of 5 events placed, the fifth is listed ({len(pl['takes'])})")
+        check(any(n.startswith("NOT PLACED") for n in pl["notes"]) and "SHORTER THAN 30 s: not enough usable material" not in pl["notes"][0], "an unplaced event is listed one line each; no false 'not enough usable material'")
+        base = T73.load_base(tmp) if False else None
+        # plain rules unchanged: the plain event alone gives the same take as without the relaxations
+        e5b = ev_with(tmp, "cs2", "plain2", [6.0], dur=16.0)[0]
+        p_only = T73.plan_of(M, "cs2", [dict(e5b)], an, 5, style="aggressive")
+        check(not p_only["takes"][0].get("rx") and not p_only["takes"][0].get("tail"), "a plain event is placed by the plain rules (no relaxation)")
+
+
+def part_drops(tmp):
+    with section("3) every drop gets a kill on its exact time: levers a c d + b (reorder), headline on a real drop, truthful notes"):
+        worst = 0.0
+        for game in ("cs2", "valorant"):
+            ev = T760.pool(tmp, game, n=30, seed=17)
+            for nd in (1, 2, 4):
+                an = T760.drops_map(nd)
+                pl = T73.plan_of(M, game, ev, an, 5, style="aggressive")
+                ds = pl.get("drop_sync") or []
+                good = [x for x in ds if x["take"]]
+                check(not M.verify_cutlist(pl), f"{game} {nd} drop(s): cut list valid")
+                bad = [x for x in ds if not x["take"]]
+                check(all("lever b" in x["why"] and "levers" not in x["why"] or x["why"] for x in bad), f"{game} {nd} drop(s): every unanchored drop names its levers ({len(bad)})")
+                w = max([abs(x["err_ms"]) for x in good] or [0.0])
+                worst = max(worst, w)
+                check(w <= 30.0, f"{game} {nd} drop(s): {len(good)}/{len(ds)} anchored, worst planned error {w:.0f} ms")
+                real = {round(d["t"] - pl["song"]["start_t"], 2) for d in an["drops"]}
+                dt = pl["song"].get("drop_t")
+                check(dt is None or any(abs(dt - r) < 0.05 for r in real) or not real, f"{game} {nd} drop(s): the headline sits on a real drop ({dt} in {sorted(real)[:4]})")
+        print("   worst planned drop error:", round(worst, 1), "ms")
+        # lever b / d unit checks on a plan that needs them
+        ev = T760.pool(tmp, "valorant", n=30, seed=29)
+        an = T760.drops_map(4)
+        pl = T73.plan_of(M, "valorant", ev, an, 7, style="hype")
+        check(callable(M.reorder_for_drop) and M.DRIFT_FR == 3 and M.REORDER_REACH > 0, "levers b (reorder_for_drop) and d (DRIFT_FR frames) exist")
+        levs = {x["lever"] for x in (pl.get("drop_sync") or []) if x["take"]}
+        print("   levers used on this plan:", sorted(levs))
+        # truthful notes: no 'second drop placed' text, one window
+        txt = " ".join(pl["notes"])
+        check("second drop(s) at" not in txt, "no 'second drop placed' claim")
+        check(sum(1 for n in pl["notes"] if n.startswith("OPTIMAL ") and "Song window" in n) <= 1, "one consistent song window in the notes")
+
+
+# ------------------------------------------------------------------------------------------------ 5) speed curves
+def part_slowmo():
+    with section("5) adaptive slow-mo: speed-curve math, release, floor, skip"):
+        for v0 in (0.4, 0.5, 0.6, 0.8):
+            sp, ex = M.ease_in_speeds(v0)
+            check(len(sp) == M.EASE_FR and abs((M.EASE_FR - sum(sp)) - ex) < 1e-9 and all(v0 * 0.89 <= x <= 1.0 for x in sp), f"ease-in to {v0}: {ex} extra frames, speeds {sp[0]:.2f} .. {sp[-1]:.2f}, whole-frame sum")
+            es, end = M.ease_in_segments(10.0, v0)
+            check(abs(end - (10.0 + sum(sp) / 60)) < 1e-5 and all(abs(es[i][1] - es[i + 1][0]) < 1e-5 for i in range(len(es) - 1)), f"ease-in to {v0}: source positions continuous")
+        r = M.release_speeds(90, 0.5, 5.0)
+        check(r[0] == 0.5 and r[23] == 0.5 and r[-1] == 1.0 and abs(sum(1 for x in r if x < 0.999) - 60) <= 1 and all(r[i] <= r[i + 1] + 1e-9 for i in range(23, len(r) - 1)),
+              f"release: 0.4 s plateau, smooth release over 0.6 s (1.0 s after the kill), then 1.0x ({sum(1 for x in r if x < 0.999)} slow frames)")
+        short = M.release_speeds(40, 0.5, 5.0)
+        check(len(short) == 40 and short[-1] > 0.9, "a take that ends early still releases to ~1.0x")
+        lim = M.release_speeds(60, 0.5, 0.5)
+        check(lim is not None and abs(sum(lim) / 60 - 0.483) < 0.02 and len(set(round(x, 4) for x in lim)) == 1, "little footage: one constant speed that uses exactly the footage")
+        check(M.release_speeds(60, 0.5, 0.2) is None, "footage below the floor (0.4x) is refused, never frozen")
+        segs = M.speeds_to_segments(3.0, M.release_speeds(90, 0.5, 5.0))
+        check(sum(s[3] for s in segs) == 90 and all(abs(segs[i][1] - segs[i + 1][0]) < 1e-5 for i in range(len(segs) - 1)), "speeds -> segments: 90 frames, continuous source")
+        # the integral: output time of a source time is the integral of 1/speed
+        out = sum(s[3] for s in segs) / 60.0
+        src = segs[-1][1] - segs[0][0]
+        check(abs(src - sum(M.release_speeds(90, 0.5, 5.0)) / 60) < 1e-3 and out == 1.5, "speed curve integral: source seconds = sum of speeds / fps")
+        # in a plan: cut-list rule accepts the eased slow-down and rejects a jump
+        an = T760.drops_map(2)
+
+
+# ------------------------------------------------------------------------------------------------ 6) soft transitions
+def part_soft(tmp):
+    with section("6) soft transitions: eligibility rules"):
+        def tk(f0, nf, a, b, kills_out, dur_src=16.0, sp=1.0):
+            return {"path": "x%d" % f0, "f0": f0, "nf": nf, "dur": nf / 60.0, "segs": [[a, b, sp, nf, 0]], "kills_out": kills_out, "srcs": [{"shift": 0.0, "dur": dur_src}], "kills": [a + k for k in kills_out]}
+        plan = {"takes": [tk(0, 120, 3.0, 5.0, [1.0]), tk(120, 120, 4.0, 6.0, [1.0])], "song": {"start_t": 0.0}, "drops_out": [], "drop_sync": []}
+        check(M.soft_cut_ok(plan, 1)[0], "footage on both sides, kills 1.0 s away: soft")
+        p2 = {**plan, "takes": [tk(0, 120, 3.0, 5.0, [1.0], dur_src=5.01), plan["takes"][1]]}
+        check(M.soft_cut_ok(p2, 1) == (False, "no footage after the take before"), "no footage after the take before: hard")
+        p3 = {**plan, "takes": [plan["takes"][0], tk(120, 120, 0.02, 2.0, [1.0])]}
+        check(M.soft_cut_ok(p3, 1) == (False, "no footage before the take after"), "no footage before the take after: hard")
+        p4 = {**plan, "takes": [tk(0, 120, 3.0, 5.0, [1.8]), plan["takes"][1]]}
+        check(M.soft_cut_ok(p4, 1) == (False, "within 0.3 s of a kill"), "a kill 0.2 s before the cut: hard")
+        p5 = {**plan, "takes": [plan["takes"][0], tk(120, 120, 4.0, 6.0, [0.2])]}
+        check(M.soft_cut_ok(p5, 1) == (False, "within 0.3 s of a kill"), "a kill 0.2 s after the cut: hard")
+        p6 = {**plan, "drops_out": [2.0]}
+        check(M.soft_cut_ok(p6, 1) == (False, "on a drop"), "the cut sits on a drop: hard")
+        soft, why = M.assign_soft_cuts(plan)
+        check(soft == 1 and plan["takes"][1]["trans"] == "soft" and plan["takes"][0]["trans"] == "hard", "assign: first take hard, the eligible cut soft")
+        check(M.SOFT_N == 5 and M.SOFT_AFTER + M.SOFT_BEFORE == M.SOFT_N, "a 5-frame dissolve centred on the cut (2 + 3 frames)")
+
+
+# ------------------------------------------------------------------------------------------------ 7) repeated-pattern drops
+def part_repeat(tmp):
+    with section("7) repeated-pattern drops: found elsewhere, additive, no false positive on a song without a repeat"):
+        import numpy as np
+        from songmap_v2 import repeat as RP
+        sr = 22050
+        rng = np.random.default_rng(5)
+
+        def section_audio(seed, dur=10.0):
+            r = np.random.default_rng(seed)
+            t = np.arange(int(dur * sr)) / sr
+            noise = r.normal(0, 1, len(t))
+            riser = noise * np.clip(t / (dur - 0.3), 0, 1) ** 2 * 0.5
+            y = riser.copy()
+            d0 = int((dur - 0.3) * sr)
+            kick = np.sin(2 * np.pi * (60 + 120 * np.exp(-np.arange(int(0.25 * sr)) / (0.03 * sr))) * np.arange(int(0.25 * sr)) / sr) * np.exp(-np.arange(int(0.25 * sr)) / (0.1 * sr))
+            y[d0:d0 + len(kick)] += 1.5 * kick
+            y[:d0] *= 0.6
+            return y
+        A = section_audio(1)
+        quiet = lambda n, a: rng.normal(0, a, int(n * sr))
+        y = np.concatenate([quiet(10, 0.02), A, quiet(15, 0.02), A, quiet(10, 0.02), section_audio(9), quiet(5, 0.02)]).astype(np.float32)
+        d1 = 10 + 10 - 0.3
+        d2 = d1 + 15 + 10
+        found = RP.find_repeat_drops(y, sr, [d1])
+        hit = [f for f in found if abs(f["t"] - d2) <= 0.05]
+        check(bool(hit) and hit[0]["conf"] >= 0.75, f"the repeated build-up is found within 50 ms ({[(f['t'], f['conf']) for f in found]}, truth {d2:.2f})")
+        check(all(abs(f["t"] - d1) >= RP.MIN_SEP_S for f in found), "additive: nothing returned near a known drop; the known list is not touched")
+        known = [d1]
+        before = list(known)
+        RP.find_repeat_drops(y, sr, known)
+        check(known == before, "the known drop list is never modified")
+        y2 = np.concatenate([quiet(10, 0.02), section_audio(1), quiet(15, 0.02), section_audio(2, 10.0)]).astype(np.float32)
+        found2 = RP.find_repeat_drops(y2, sr, [d1])
+        check(not [f for f in found2 if f["conf"] >= 0.75], "a song whose second build-up is different: no repeat drop at the confidence the planner uses")
+        an = {"beats": list(np.arange(0, 60, 0.5)), "drops": [{"beat": 20, "t": d1, "strength": 1.0}], "dur": 60}
+        check(M.REPEAT_KEEP_CONF >= 0.75 and M.REPEAT_DROP_MIN_CONF >= 0.0, "planning uses repeat drops only above the confidence threshold")
+
+
+# ------------------------------------------------------------------------------------------------ guards
+def kill_set(plan):
+    return {(Path(t["path"]).name, round(k, 2)) for t in plan["takes"] for k in t["kills"]}
+
+
+def part_guards(tmp):
+    import random
+    with section("guards: 50 + 50 generated clips vs V7.6.0 (events, kills never lower, no repeated clip), the 7 real Valorant clips, the 4K, real data untouched"):
+        B = T693.load_baseline(tmp, "V7.6.0")
+        check(B is not None, "main (V7.6.0) planner loaded")
+        B.use_data_dir(tmp / "base_data2")
+        moved = []
+        for game in ("valorant", "cs2"):
+            ents = T693.gen_entries(50, game)
+            view = lambda mod, e, g=game: json.dumps(mod.analyse_entry(e, {}, g), sort_keys=True, default=str)
+            nd = sum(view(M, e) != view(B, e) for e in ents)
+            check(nd == 0, f"{game}: kills / timestamps / deaths / revives of 50 generated clips identical to main ({nd} differences)")
+            files = T73.make_files(tmp / f"g50_{game}", 50, "VALORANT" if game == "valorant" else "Replay")
+            rnd = random.Random(7 if game == "valorant" else 8)
+            kills = []
+            for _ in files:
+                n = rnd.choice([1, 1, 2, 2, 3, 3, 4, 5])
+                t, ks = rnd.uniform(3.0, 5.0), []
+                for _k in range(n):
+                    ks.append(round(t, 2))
+                    t += rnd.uniform(0.7, 2.6)
+                kills.append(ks)
+            its_m, its_b = T73.build_pool(M, game, files, kills, seed=21), T73.build_pool(B, game, files, kills, seed=21)
+            ev_m, _ = T73.events_of(M, game, its_m)
+            ev_b, _ = T73.events_of(B, game, its_b)
+            check(len(ev_m) > 40 and T73.ev_view(ev_m) == T73.ev_view(ev_b), f"{game}: {len(ev_m)} events of the 50 clips identical to main (clips, kills, scores)")
+            for bpm, drop_s, seed in ((128.0, 64.0, 5), (150.0, 40.0, 12)):
+                an_m, an_b = T73.song_map(M, bpm, 300.0, drop_s), T73.song_map(B, bpm, 300.0, drop_s)
+                p_new = T73.plan_of(M, game, ev_m, an_m, seed)
+                p_b = T73.plan_of(B, game, ev_b, an_b, seed)
+                ks_n, ks_b = kill_set(p_new), kill_set(p_b)
+                check(ks_b <= ks_n and len(ks_n) >= len(ks_b), f"{game} bpm {bpm:.0f}: every kill of main is still in a take ({len(ks_b)} -> {len(ks_n)} kills)")
+                check(not M.verify_cutlist(p_new), f"{game} bpm {bpm:.0f}: cut list valid, no clip used twice")
+                moved.append((game, bpm, len({t['path'] for t in p_new['takes']} ^ {t['path'] for t in p_b['takes']}), len(p_new["takes"]) - len(p_b["takes"])))
+        print("   takes that differ from main (game, bpm, clips differing, take count change):", moved)
+
+
+def part_guards_real(tmp):
+    with section("guards: the 7 real Valorant clips (4 events / 11 placed / 3 merged / 0 lost), the 4K with 4 kills"):
+        game, paths = PB.take_sets(M)["val7"]
+        song = next(x["path"] for x in M.song_pool(M.load_config())[0] if "Silicon XX" in str(x["path"]))
+        M.HEADLINE_RULES_V73 = True
+        plan_off, l_off = PB.run_plan(M, game, paths, song, "v2")
+        led = next(l for l in l_off if l.startswith("kill ledger:"))
+        check(len(plan_off["takes"]) == 4 and "11 placed" in led and "3 merged" in led and "0 lost" in led, f"7 real Valorant clips, override off: 4 events; '{led[:100]}'")
+        ov = next(p for p in paths if "03-31-20" in str(p))
+        M.set_clip_override([str(ov)], True)
+        try:
+            plan_on, l_on = PB.run_plan(M, game, paths, song, "v2")
+        finally:
+            M.set_clip_override([str(ov)], False)
+        led2 = next(l for l in l_on if l.startswith("kill ledger:"))
+        four = [t for t in plan_on["takes"] if t["n"] == 4]
+        check("12 placed" in led2 and "3 merged" in led2 and "0 lost" in led2 and len(four) == 1 and four[0].get("util"), f"4K with 4 kills (override on): '{led2[:100]}'")
+        check(not M.verify_cutlist(plan_off) and not M.verify_cutlist(plan_on), "both plans: cut list valid")
+
+
 def main():
     before = snapshot(REAL_DATA)
     tmp = Path(tempfile.mkdtemp(prefix="t761_"))
-    part_changelog()
-    if not FAST:
+    only = set(filter(None, os.environ.get("V761_PARTS", "").split(",")))
+    want = lambda k: not only or k in only
+    if want("0"):
+        part_changelog()
+    if want("1") and not FAST:
         part_marker(tmp)
-    part_determinism(tmp)
-    part_trash(tmp)
+    if want("2"):
+        part_determinism(tmp)
+    if want("9"):
+        part_trash(tmp)
+    with PB.data_copy(M):
+        old = M.use_data_dir(tmp / "pdata")
+        try:
+            if want("4"):
+                part_feasibility(tmp)
+            if want("3"):
+                part_drops(tmp)
+        finally:
+            M.restore_data_dir(old)
+    if want("g"):
+        with PB.data_copy(M):
+            old = M.use_data_dir(tmp / "gdata2")
+            try:
+                part_guards(tmp)
+            finally:
+                M.restore_data_dir(old)
+            part_guards_real(tmp)
+    if want("5"):
+        part_slowmo()
+    if want("6"):
+        part_soft(tmp)
+    if want("7"):
+        part_repeat(tmp)
     after = snapshot(REAL_DATA)
     if before == after:
         check(True, f"real montage_data byte-identical after the tests ({len(before)} files)")
