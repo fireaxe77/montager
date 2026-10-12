@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.5.1.2"
+APP_VERSION = "V7.6.0"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}

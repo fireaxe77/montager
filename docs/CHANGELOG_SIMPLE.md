@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.6.0 - 2026-10-12: A kill on every drop
+- Every drop in the song now gets a kill on it far more often, in CS2 and Valorant, with or without hand-marked drops.
+- The montage now ends right after the final kill with a short fade to black, with no dead time at the end.
+- The quality check after a render no longer reports false drops in quality.
+- Closing the Song map window early no longer causes an error.
+
 ## V7.5.1.2 - 2026-10-08: Drops land on the beat
 - CS2 montages now put a kill on every drop in the song where the clips allow it, without needing hand labels.
 - Kill timing only moves a kill earlier when the kill row clearly appears on screen at that moment.
