@@ -6744,7 +6744,9 @@ ROW_TAIL, ROW_SLACK = 0.4, 0.3          # V5.42B: the take lasts >= 0.4 s after 
 SLOW_FLOOR = 0.4                        # V7.6.1: the slowest speed a footage-limited tail plays at
 EASE_FR = 9                             # V7.6.1: output frames (0.15 s) of the smooth slow-down that leads into a slow tail
 LEAD_SOFT = 0.12                        # V7.6.1: shortest run-up (s) used as a last resort for a kill with almost no footage before it
-RX_LADDER = ({}, {"slowtail": True}, {"lead_min": LEAD_SOFT}, {"slowtail": True, "lead_min": LEAD_SOFT})      # V7.6.1: placement relaxations tried in this order (the plain rules first)
+RX_LADDER = ({}, {"slowtail": True}, {"half": True}, {"slowtail": True, "half": True}, {"lead_min": LEAD_SOFT}, {"slowtail": True, "lead_min": LEAD_SOFT},
+             {"half": True, "lead_min": LEAD_SOFT}, {"slowtail": True, "half": True, "lead_min": LEAD_SOFT})      # V7.6.1: placement relaxations tried in this order (the plain rules first;
+                                                                                                                   # half = the first kill may sit on a half-beat tick, lead_min = a shorter run-up)
 
 
 def _smooth(x):
@@ -7121,7 +7123,8 @@ def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, endi
     elif kb is not None:
         pairs = [(kb - k, kb, k) for k in range(1, min(kb, 16) + 1)]
     else:
-        pairs = [(c, c + k, k) for k in range(1, 17) if c + k < nt and (c + k) % 2 == 0]
+        half_ok = bool((ev.get("_rx") or {}).get("half"))
+        pairs = [(c, c + k, k) for k in range(1, 17) if c + k < nt and ((c + k) % 2 == 0 or half_ok)]
     if c_only is not None and anchor != "last":
         pairs = [(c_only, kb, kb - c_only)] if kb is not None and kb > c_only else []
     pairs = [q for q in pairs if _lead_min(ev) - 1e-6 <= lead_of(q) <= ev["pre"] + 1e-6]
@@ -7635,7 +7638,7 @@ def optimal_fit(clips, an, style, song_path=None):
     est = {id(e): take_estimate(e, bd, rname) for e in clips}
     end_x = (END_FADE[0] + END_FADE[1]) / 2 - 0.4           # the slow-mo ending runs longer than a normal tail
     total = lambda lst: sum(est[id(e)] for e in lst) + (end_x if len(lst) >= 3 else 0.0)
-    chosen = sorted(clips, key=lambda e: -e["score"])
+    chosen = sorted(clips, key=lambda e: (1 if e.get("_rx") else 0, -e["score"]))      # V7.6.1: events that need a relaxed rule come after the plain ones, so they never push a plain event out of a full montage
     left = []
     while len(chosen) > 1 and total(chosen) > mx - bd:         # one beat of room for the drop alignment
         e = chosen.pop()
@@ -7705,15 +7708,22 @@ def optimal_fit(clips, an, style, song_path=None):
 
 
 def why_no_take(ev):
-    """Plain-language reason an event cannot form a take."""
-    post = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
-    if ev.get("death_after") is not None and ev["death_after"] < TAIL[0] + 0.05:
-        return f"my death {ev['death_after']:.2f} s after the kill"
-    if ev["pre"] < LEAD_MIN:
-        return f"only {max(0.0, ev['pre']):.2f} s of footage before the kill"
-    if post < TAIL[0]:
-        return f"only {max(0.0, post):.2f} s of footage after the kill"
-    return "no run-up / tail fits the song's beats"
+    """Plain-language reason an event cannot form a take, with the numbers of the rule that stops it (V7.6.1)."""
+    da = ev.get("death_after")
+    post = ev["post"] if da is None else min(ev["post"], da - 0.05)
+    rows = ev.get("rows") or ev["times"]
+    rdo = max(0.0, max(rows) - ev["times"][-1])
+    if da is not None and post < rdo + 0.05:
+        return f"my death {da:.2f} s after the kill: the take must end before it and the kill row appears {rdo:.2f} s after the kill, so the row would not be seen"
+    if ev["pre"] < LEAD_SOFT:
+        return f"only {max(0.0, ev['pre']):.2f} s of footage before the kill (the shortest run-up used is {LEAD_SOFT} s)"
+    need_v = (post - 0.017 - rdo) / ROW_TAIL
+    if post < rdo + ROW_TAIL and need_v < SLOW_FLOOR:
+        why = f"my death {da:.2f} s after the kill leaves {post:.2f} s of footage" if da is not None and post < ev["post"] else f"only {max(0.0, post):.2f} s of footage after the kill"
+        return f"{why}; the kill row appears {rdo:.2f} s after it and needs {ROW_TAIL} s of tail, that would take {max(need_v, 0.0):.2f}x slow-motion (slowest used {SLOW_FLOOR}x)"
+    n = len(ev["times"])
+    return (f"no start / end tick of the song's beat grid fits this {'fight' if n > 1 else 'kill'} ({n} kill{'s' * (n > 1)} over {ev['span']:.1f} s, {ev['pre']:.2f} s of footage before, "
+            f"{post:.2f} s after)")
 
 
 def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
@@ -7783,8 +7793,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             continue
         usable.append(e)
         if e["_rx"]:
-            notes.append(f"relaxed rule for {nm(e)}: " + ", ".join({"slowtail": f"slow tail (only {max(0.0, min(e['post'], (e['death_after'] - 0.05) if e.get('death_after') is not None else 99.0)):.2f} s of footage after the kill)",
-                                                                     "lead_min": f"short run-up ({e['pre']:.2f} s of footage before the kill)"}[k_] for k_ in e["_rx"]))
+            pass
     if skipped:
         notes.append(f"{len(skipped)} events cannot form a take: " + "; ".join(f"{nm(e)} ({why_no_take(e)})" for e in skipped))
     if not usable:
@@ -7997,7 +8006,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         E = float(U[end_take["fade_end"]]) if end_take else float(U[takes[-1]["end"]])
         if fit:                                            # V5.42B: within min(150 s, song), never just for a 'nice' length
             target = fit["max"]
-        for e in sorted(cut_len + left + left_song, key=lambda e: -e["score"]):
+        for e in sorted(cut_len + left + left_song, key=lambda e: (1 if e.get("_rx") else 0, -e["score"])):      # V7.6.1: events that needed a relaxed rule come last
             c1, got = takes[0]["c"], None
             reach = 48 + (nat(e) + int(e["span"] / td) if fit else 0)     # V5.42B: long fights need more room in front
             cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - reach), -1) if E - U[cc] <= target + 1e-6]
@@ -8094,7 +8103,26 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         trim_outro(plan, plan["notes"])
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
-    plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
+    placed_ = {t["path"] for t in plan["takes"]}
+    why_m_ = {id(e): w for e, w in (fit["left"] if fit else [])}
+    unplaced = [[nm(e), why_no_take(e)] for e in skipped if e["path"] not in placed_] + \
+               [[nm(e), why_m_.get(id(e)) or "no free slot before / after the other takes in the song section (no run-up / tail fits there)"] for e in strong
+                if e["path"] not in placed_ and not any(e is x for x in skipped)]
+    for nm_, why_ in unplaced:
+        plan["notes"].append(f"NOT PLACED {nm_}: {why_}")
+    if unplaced:
+        plan["notes"].append(f"{len(unplaced)} of {len(strong)} events could not be fitted (listed above, one line each)")
+    if D < 30:
+        plan["notes"][0] = plan["notes"][0].replace(" - SHORTER THAN 30 s: not enough usable material", "") + \
+            (f" - short because {len(unplaced)} event(s) could not be fitted (see the NOT PLACED lines)" if unplaced else " - that is all the usable material (nothing is padded)")
+    for t_ in plan["takes"]:
+        if t_.get("tail"):
+            plan["notes"].append(f"slow tail: {Path(t_['path']).name} - the clip ends right after the kill; the tail plays at {t_['tail']['v0']:.2f}x after a smooth slow-down in the 0.15 s before the last kill (no frame is frozen)")
+        if (t_.get("rx") or {}).get("half") or (t_.get("rx") or {}).get("lead_min"):
+            plan["notes"].append(f"relaxed rule: {Path(t_['path']).name} - " + ", ".join(
+                {"half": "first kill on a half-beat tick", "lead_min": f"run-up shortened to {t_['kills_out'][0]:.2f} s (only that much footage before the kill)"}[k_]
+                for k_ in t_["rx"] if k_ in ("half", "lead_min")))
+    plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "unplaced": unplaced, "skipped": [[nm(e), why_no_take(e)] for e in skipped],
                    "left_out": [] if fitm else [nm(e) for e in cut_len + left],
                    "song_short": [nm(e) for e in (cut_len + left + left_song if fitm else left_song)],
                    "section_s": plan["song"]["section_s"], "manual": manual, "optimal": optimal}
@@ -10294,8 +10322,12 @@ def plan_summary_text(plan, n_clips):
         txt = (f"song too short: fits {fit['used']} of {fit['usable']} clips; pick a longer song or untick some  |  " + txt)
     if fit.get("left_out"):
         txt += f"; fixed length leaves out {len(fit['left_out'])}: " + ", ".join(fit["left_out"][:4]) +                (" ..." if len(fit["left_out"]) > 4 else "")
-    if fit.get("skipped"):
-        txt += f"; {len(fit['skipped'])} can't form a take: " + ", ".join(f"{a} ({b})" for a, b in fit["skipped"][:3]) +                (" ..." if len(fit["skipped"]) > 3 else "")
+    if fit.get("unplaced"):                                # V7.6.1: every event that could not be fitted, with its reason
+        txt += f"  |  {len(fit['unplaced'])} events could not be fitted"
+        for a, b in fit["unplaced"]:
+            txt += f"  |  not placed: {a} - {b}"
+    elif fit.get("skipped"):
+        txt += f"; {len(fit['skipped'])} can't form a take: " + ", ".join(f"{a} ({b})" for a, b in fit["skipped"][:3]) + (" ..." if len(fit["skipped"]) > 3 else "")
     return txt
 
 
