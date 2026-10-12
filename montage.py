@@ -6770,6 +6770,47 @@ def ease_extra(v0, E=EASE_FR):
     return ease_in_speeds(v0, E)[1]
 
 
+SLOW_V0 = 0.5                           # V7.6.1 adaptive slow-mo: the speed through the impact
+SLOW_HOLD_S, SLOW_RELEASE_S = 0.40, 0.60            # ... held 0.4 s after the kill, released to 1.0x over the next 0.6 s (1.0 s after the kill)
+SLOW_TAIL_MAX = 1.15                    # longest tail (s) after the last kill of a slow-mo take
+
+
+def release_speeds(rem, v0, post, margin=0.017):
+    """V7.6.1: per-frame speeds of the `rem` output frames after the last kill of a slow-mo take: v0 held, smooth release to 1.0x, then 1.0x. A take that ends before the
+    release is over keeps the plateau 40 % / release 60 % of its frames. Not enough footage after the kill (post, s): ONE constant speed that uses exactly the footage
+    (never below SLOW_FLOOR). Returns the list, or None when even that is too slow."""
+    if rem <= 0:
+        return []
+    h = int(round(SLOW_HOLD_S * OUT_FPS))
+    r = int(round(SLOW_RELEASE_S * OUT_FPS))
+    if rem < h + r:
+        h = int(round(0.4 * rem))
+        r = rem - h
+    sp = [v0] * h + [v0 + (1.0 - v0) * _smooth((j + 0.5) / max(1, r)) for j in range(r)] + [1.0] * (rem - h - r)
+    if sum(sp) / OUT_FPS <= post - margin:
+        return sp
+    v = (post - margin) / (rem / OUT_FPS)
+    if v >= SLOW_FLOOR:
+        return [min(v, 0.999)] * rem
+    return None
+
+
+def speeds_to_segments(src_start, speeds, group=3):
+    """Constant-speed source segments [a, b, speed, frames] from per-frame speeds: equal speeds merge, the rest are cut every `group` frames; the source position stays continuous."""
+    segs, pos, i, n = [], src_start, 0, len(speeds)
+    while i < n:
+        j = i + 1
+        if abs(speeds[i] - 1.0) < 1e-9 or abs(speeds[i] - speeds[i - 1 if i else 0]) < 1e-9:
+            while j < n and abs(speeds[j] - speeds[i]) < 1e-9:
+                j += 1
+        else:
+            j = min(n, i + group)
+        b = pos + sum(speeds[i:j]) / OUT_FPS
+        segs.append([round(pos, 6), round(b, 6), (b - pos) * OUT_FPS / (j - i), j - i])
+        pos, i = b, j
+    return segs
+
+
 def ease_in_segments(src_start, v0, E=EASE_FR, group=3):
     """V7.6.1: the slow-down as source segments [a, b, speed, frames]: `group` frames each, the source position continuous (a piece ends where the next begins).
     Returns (segments, source time where the ease ends = where the slow tail begins)."""
@@ -7067,9 +7108,17 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first", 
     win = row_tail_window(ev, slow, win, post, ext)
     if win is None:
         return None
+    if slow:
+        win = (win[0], max(win[1], SLOW_TAIL_MAX))         # V7.6.1: the slow-mo is released about 1.0 s after the kill
     if not (win[0] - 1e-6 <= tail <= win[1] + 1e-6):
         return None
-    src_tail = tail * (0.5 if slow else 1.0)
+    if slow:
+        spd_ = release_speeds(int(round(tail * OUT_FPS)), SLOW_V0, post)
+        if spd_ is None:
+            return None
+        src_tail = sum(spd_) / OUT_FPS
+    else:
+        src_tail = tail
     if src_tail > post + 1e-6:
         return None
     if end - c < 2 * MIN_TAKE_BEATS or D < MIN_TAKE_S:
@@ -7141,10 +7190,12 @@ def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, endi
             continue
         last_out = U[kk] if anchor == "last" else U[kk] + dead_air_cuts(ev, U, kk)[1]
         hi = max(TAIL[1], 2 * max(0.0, max(ev.get("rows") or ev["times"]) - ev["times"][-1]) + ROW_TAIL + ROW_SLACK)
+        if slow:
+            hi = max(hi, SLOW_TAIL_MAX)
         ends = [end] if end is not None else \
             sorted([j for j in range(kk + 1, min(nt + 1, kk + 40 + int(span / max(1e-3, float(U[1] - U[0]))) + 1))   # long fights too
                     if TAIL[0] - 0.12 <= U[j] - last_out <= hi + 0.01],
-                   key=lambda j: (j % 2, abs(U[j] - last_out - 0.32)))
+                   key=lambda j: (j % 2, abs(U[j] - last_out - (1.0 if slow else 0.32))))
         for j in ends:
             g = geom(ev, U, cc, kk, j, ramp, slow, ext=ext, anchor=anchor)
             if g:
@@ -8208,6 +8259,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             LOGONLY(f"drop anchoring skipped: {ex_}")
     if OUTRO_TRIM_ON[0]:                                   # V7.6.0: the video ends 0.5 s after the fade to black starts, ~0.5 s after the final kill
         trim_outro(plan, plan["notes"])
+    assign_soft_cuts(plan, plan["notes"])                  # V7.6.1: soft dissolves where footage allows it, hard cuts elsewhere
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     win_drops = [float(d_["t"]) for d_ in (an.get("drops") or []) if d_.get("t") is not None and S0 + 0.5 < float(d_["t"]) < S0 + D - 1.0]
@@ -8232,7 +8284,15 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     if D < 30:
         plan["notes"][0] = plan["notes"][0].replace(" - SHORTER THAN 30 s: not enough usable material", "") + \
             (f" - short because {len(unplaced)} event(s) could not be fitted (see the NOT PLACED lines)" if unplaced else " - that is all the usable material (nothing is padded)")
-    for t_ in plan["takes"]:
+    for i_, t_ in enumerate(plan["takes"], 1):
+        if t_.get("slow") and t_.get("kills_out"):
+            o_, rel_ = 0, 0.0
+            for sg_ in t_["segs"]:
+                if o_ / OUT_FPS >= t_["kills_out"][-1] - 1e-6 and sg_[2] < 0.999:
+                    rel_ += sg_[3] / OUT_FPS
+                o_ += sg_[3]
+            plan["notes"].append(f"slowmo release: take {i_} {rel_:.2f} s")
+            LOGONLY(f"slowmo release: take {i_} {rel_:.2f} s")
         if t_.get("tail"):
             plan["notes"].append(f"slow tail: {Path(t_['path']).name} - the clip ends right after the kill; the tail plays at {t_['tail']['v0']:.2f}x after a smooth slow-down in the 0.15 s before the last kill (no frame is frozen)")
         if (t_.get("rx") or {}).get("half") or (t_.get("rx") or {}).get("lead_min"):
@@ -8290,13 +8350,14 @@ def take_segments(tk, f_c, f_k, f_x):
     segs = []
     n_lead = f_k - f_c
     nr = 0
-    if tk["ramp"] > 1.0 and n_lead > OUT_FPS + 6:
+    slow_ex = ease_extra(SLOW_V0) if (tk["slow"] and not tk.get("tailmode")) else 0     # V7.6.1: the smooth slow-down into the last kill takes slow_ex frames the 1.0x run does not show:
+    if tk["ramp"] > 1.0 and n_lead > OUT_FPS + 6:                                      # the take starts that much later in the source, the last kill stays on its frame
         n1 = OUT_FPS
         nr = n_lead - n1
-        a1 = k0 - n1 / OUT_FPS
+        a1 = k0 - n1 / OUT_FPS + slow_ex / OUT_FPS
         segs.append([round(a1 - nr / OUT_FPS * tk["ramp"], 6), round(a1, 6), tk["ramp"], nr])
     else:
-        a1 = k0 - n_lead / OUT_FPS
+        a1 = k0 - n_lead / OUT_FPS + slow_ex / OUT_FPS
     cuts = tk.get("cuts") or []
     n_kill = int(round(tk.get("ospan", kl - k0) * OUT_FPS))
 
@@ -8326,20 +8387,23 @@ def take_segments(tk, f_c, f_k, f_x):
         v = max(SLOW_FLOOR * 0.95, min(float(tk["v0"]) + 0.02, (post - 0.017) / max(1e-6, rem / OUT_FPS), 0.999))
         segs.append([round(kl2, 6), round(kl2 + rem / OUT_FPS * v, 6), v, rem])
         return [s_ for s_ in segs if s_[3] > 0]
-    if tk["slow"]:
+    if tk["slow"]:                                         # V7.6.1: 1.0x, a smooth slow-down in the 9 frames before the last kill, slow through the impact, released to 1.0x about 1 s after it
         n_to_last = (f_k - f_c - nr) + n_kill
+        n_1x = n_to_last - (EASE_FR if slow_ex > 0 else 0)
         if cuts:
-            p1, kl2 = run_1x(n_to_last)
+            p1, ae = run_1x(n_1x)
             segs += p1
         else:
-            kl2 = a1 + n_to_last / OUT_FPS
-            segs.append([round(a1, 6), round(kl2, 6), 1.0, n_to_last])
+            ae = a1 + n_1x / OUT_FPS
+            segs.append([round(a1, 6), round(ae, 6), 1.0, n_1x])
+        es, kl2 = ease_in_segments(ae, SLOW_V0)
+        segs += es
         rem = (f_x - f_c) - nr - n_to_last
         post = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
-        src = rem / OUT_FPS * 0.5
-        if src <= post + 1e-6:
-            segs.append([round(kl2, 6), round(kl2 + src, 6), 0.5, rem])
-        else:                                              # not enough footage: slow-mo as long as it lasts, then hold the frame
+        spd_ = release_speeds(rem, SLOW_V0, post)
+        if spd_ is not None:
+            segs += speeds_to_segments(kl2, spd_)
+        else:                                              # not enough footage even at the slowest speed: slow-mo as long as it lasts, then hold the frame (as before)
             ns = int(max(0.0, post) * 2 * OUT_FPS)
             if ns > 0:
                 segs.append([round(kl2, 6), round(kl2 + ns / OUT_FPS * 0.5, 6), 0.5, ns])
@@ -8447,7 +8511,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         slow_at = None
         o = 0
         for sg in segs:
-            if sg[2] in (0.5, 0.0) or (tk.get("tailmode") == "fit" and sg[2] < 0.999):
+            if sg[2] < 0.999:
                 slow_at = o / OUT_FPS
                 break
             o += sg[3]
@@ -8551,7 +8615,7 @@ def verify_cutlist(plan):
         for sg in t["segs"]:
             a, b, sp = sg[:3]
             if sp != 1.0 and a < kl - 1.0 / OUT_FPS and b > k0 - 1.0 + 1.0 / OUT_FPS:
-                if t.get("tail") and sp < 1.0 and a >= kl - 0.3:        # V7.6.1: the smooth slow-down into a footage-limited tail (the last 0.15 s before the final kill)
+                if (t.get("tail") or t.get("slow")) and sp < 1.0 and a >= kl - 0.3:        # V7.6.1: the smooth slow-down into the last kill (the last 0.15 s before it)
                     continue
                 bad.append(f"take {i}: speed {sp} between 1.0 s before the first kill and the last kill")
             src = t["srcs"][sg[4] if len(sg) > 4 else 0]
@@ -8560,6 +8624,8 @@ def verify_cutlist(plan):
         tail = t["dur"] - t["kills_out"][-1]
         row_tail = t["dur"] - max(t.get("rows_out") or t["kills_out"])
         tmax = max(TAIL[1], t["dur"] - row_tail - t["kills_out"][-1] + ROW_TAIL + ROW_SLACK)
+        if t.get("slow"):
+            tmax = max(tmax, SLOW_TAIL_MAX)                    # V7.6.1: a slow-mo take is released about 1 s after the kill
         if not t.get("ending") and tail > tmax + 1.0 / OUT_FPS:
             bad.append(f"take {i}: tail {tail:.2f} s after the last kill (max {tmax:.2f})")
         sg_l = [sg for sg in t["segs"] if sg[2] > 0][-1:]                   # my death or the clip end may come sooner
@@ -8751,6 +8817,74 @@ def outro_fade(plan):
     return round(D - vlen, 4), round(vlen, 4)
 
 
+GROUP_AUDIO_LEAD = -0.0196
+def _group_runs(segs):
+    """V7.6.1: runs of >= 2 consecutive slowed segments of one clip with contiguous footage (a smooth slow-down / release made of short pieces). Returns [(first index, last index)]."""
+    runs, i, n = [], 0, len(segs)
+    while i < n:
+        if 0 < segs[i][2] < 0.999:
+            j = i
+            while j + 1 < n and 0 < segs[j + 1][2] < 0.999 and (segs[j + 1][4] if len(segs[j + 1]) > 4 else 0) == (segs[i][4] if len(segs[i]) > 4 else 0) and abs(segs[j + 1][0] - segs[j][1]) < 1e-3:
+                j += 1
+            if j > i:
+                runs.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return runs
+
+
+SOFT_N, SOFT_AFTER, SOFT_BEFORE = 5, 3, 2          # V7.6.1 soft cut: a 5-frame dissolve centred on the cut: 2 frames before it, 3 from it on (handle footage of both takes)
+SOFT_KILL_S = 0.3                                   # no soft cut within this many seconds of a kill impact on either side
+
+
+def soft_cut_ok(plan, i):
+    """V7.6.1: (True, '') when the cut INTO take i (0-based, i >= 1) can be a soft dissolve, else (False, reason). The dissolve uses real footage past the end of the take before and
+    before the start of the take after (the same output timeline), so cut positions, take lengths and kill times never change. A hard cut stays where either side lacks that footage,
+    where a kill impact is within SOFT_KILL_S of the cut, or where the cut sits on a drop."""
+    takes = plan["takes"]
+    if i < 1 or i >= len(takes):
+        return False, "first take"
+    A, B = takes[i - 1], takes[i]
+    if A.get("util") or B.get("util"):
+        return False, "utility take"
+    sa, sb = A["segs"][-1], B["segs"][0]
+    if sa[2] <= 0 or sb[2] <= 0:
+        return False, "held frame"
+    srcA = (A.get("srcs") or [{}])[sa[4] if len(sa) > 4 and sa[4] < len(A.get("srcs") or [{}]) else 0]
+    srcB = (B.get("srcs") or [{}])[sb[4] if len(sb) > 4 and sb[4] < len(B.get("srcs") or [{}]) else 0]
+    if not srcA.get("dur") or sa[1] + SOFT_AFTER * sa[2] / OUT_FPS - srcA.get("shift", 0.0) > srcA["dur"] - 0.02:
+        return False, "no footage after the take before"
+    if sb[0] - SOFT_BEFORE * sb[2] / OUT_FPS - srcB.get("shift", 0.0) < 0.0:
+        return False, "no footage before the take after"
+    if A["kills_out"] and A["dur"] - A["kills_out"][-1] < SOFT_KILL_S:
+        return False, "within 0.3 s of a kill"
+    if B["kills_out"] and B["kills_out"][0] < SOFT_KILL_S:
+        return False, "within 0.3 s of a kill"
+    cut_t = B["f0"] / OUT_FPS
+    if any(abs(cut_t - float(d)) < 0.1 for d in (plan.get("drops_out") or [])) or \
+            any(x.get("impact") is not None and abs(float(x["impact"]) - float(plan["song"]["start_t"]) - cut_t) < SOFT_KILL_S + 0.1 for x in (plan.get("drop_sync") or [])):
+        return False, "on a drop"
+    return True, ""
+
+
+def assign_soft_cuts(plan, notes=None):
+    """V7.6.1: every cut INTO a take is 'soft' (short dissolve) or 'hard' (the V5.2 hard cut): take['trans']. Returns (soft, {hard reason: count})."""
+    soft, why = 0, {}
+    for i, t in enumerate(plan["takes"]):
+        ok, r = soft_cut_ok(plan, i)
+        t["trans"] = "soft" if ok else "hard"
+        if ok:
+            soft += 1
+        elif i >= 1:
+            why[r] = why.get(r, 0) + 1
+    ln = f"cuts: {soft} soft (5-frame dissolve), {max(0, len(plan['takes']) - 1 - soft)} hard" + (" (" + ", ".join(f"{n} {r}" for r, n in sorted(why.items())) + ")" if why else "")
+    if notes is not None:
+        notes.append(ln)
+    LOGONLY(ln)
+    return soft, why
+
+
 def build_filter(plan, cfg, preview, fx=FX_ALL):
     """ONE filter graph (V4 engine). Effects sit on each take's own output timeline: centred V4 zoom punches on kills (overlaid
     only inside the punch), ramps before kills, V4 slow-mo (frame blending only inside slow-mo segments). V5.2: no flashes, no
@@ -8760,6 +8894,8 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
     takes = plan["takes"]
     exact = plan.get("placement", "v5") != "v4"
     vl = []
+    soft = [False] + [bool("transition" in fx and takes[i].get("trans") == "soft" and soft_cut_ok(plan, i)[0]) for i in range(1, len(takes))] + [False]       # soft[i]: the cut INTO take i is a dissolve (V7.6.1)
+    vparts = []                                                                         # video pieces in order when any cut is soft
     for ti, t in enumerate(takes):
         srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"], "audio": t["audio"],
                                   "a_stream": 0, "gain_db": -6.0}]
@@ -8770,7 +8906,67 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
                     s[1], s[2] = s[0] + s[3] / OUT_FPS, 1.0
         tv, ta = [], []
         off_f = 0
-        for s in segs:
+        gruns = _group_runs(segs) if "slow" in fx else []
+        items, gi_ = [], 0
+        while gi_ < len(segs):
+            gr_ = next((r_ for r_ in gruns if r_[0] == gi_), None)
+            if gr_:
+                items.append(("G", segs[gr_[0]:gr_[1] + 1]))
+                gi_ = gr_[1] + 1
+            else:
+                items.append(("S", segs[gi_]))
+                gi_ += 1
+        for s in items:
+            if s[0] == "G":                                # V7.6.1: a smooth slow-down / release = ONE input with a time-warp expression (no per-piece frame snapping), one audio chain aligned on the last kill
+                g = s[1]
+                k0_ = k
+                a0, b0 = g[0][0], g[-1][1]
+                n = sum(x[3] for x in g)
+                src = srcs[g[0][4] if len(g[0]) > 4 and g[0][4] < len(srcs) else 0]
+                sa = a0 - src["shift"]
+                inputs += ["-threads", "2", "-ss", f"{max(0.0, sa):.4f}", "-t", f"{(b0 - a0) + 0.3:.4f}", "-i", src["path"]]
+                cx, cy, cw, ch = src["rect"]
+                crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, src["wh"][0], src["wh"][1]] else ""
+                scl = "scale=1920:1080:flags=lanczos," if (crop or list(src["wh"]) != [1920, 1080]) else ""
+                kn, tau = [], 0.0
+                for x in g:
+                    kn.append((x[0] - a0, tau, (x[3] / OUT_FPS) / max(1e-9, x[1] - x[0])))
+                    tau += x[3] / OUT_FPS
+                T = "(PTS*TB)"
+                ex_ = f"{kn[-1][1]:.6f}+({T}-{kn[-1][0]:.6f})*{kn[-1][2]:.6f}"
+                for m_ in range(len(kn) - 2, -1, -1):
+                    ex_ = f"if(lt({T},{kn[m_ + 1][0]:.6f}),{kn[m_][1]:.6f}+({T}-{kn[m_][0]:.6f})*{kn[m_][2]:.6f},{ex_})"
+                v = f"[{k}:v:0]{crop}{scl}setsar=1,setpts='({ex_})/TB',framerate=fps=60:scene=100,fps=60:start_time=0"
+                v += f",tpad=stop_mode=clone:stop_duration=0.3,trim=end_frame={n},setpts=PTS-STARTPTS[s{k0_}v]"
+                chains.append(v)
+                tv.append(f"[s{k0_}v]")
+                out_len = n / OUT_FPS
+                off = off_f / OUT_FPS
+                vbar = (b0 - a0) / out_len
+                if src["audio"]:
+                    gain = 10 ** (float(src.get("gain_db", -6.0)) / 20)
+                    boost = min(1.0, gain * 1.585)
+                    kl_ = (t["kills"][-1] - src["shift"]) if t.get("kills") else None
+                    if kl_ is not None and a0 - src["shift"] - 1e-6 <= kl_ <= b0 - src["shift"] + 1e-6:
+                        tk_ = src_to_out([[x[0] - src["shift"], x[1] - src["shift"], x[2], x[3]] for x in g], kl_)
+                    else:
+                        kl_, tk_ = a0 - src["shift"], 0.0
+                    ssa = max(0.0, kl_ - tk_ * vbar + GROUP_AUDIO_LEAD * vbar)        # GROUP_AUDIO_LEAD: measured on the marker clips (atempo comes out ~10 ms late over the first 0.3 s)
+                    inputs += ["-threads", "2", "-ss", f"{ssa:.4f}", "-t", f"{out_len * vbar + 0.6:.4f}", "-i", src["path"]]
+                    ka = k + 1
+                    at = f"atempo={min(2.0, max(0.5, vbar)):.4f}," if vbar >= 0.5 else f"atempo=0.5,atempo={vbar / 0.5:.4f},"
+                    kt = [f"between(t,{ko - off - 0.2:.3f},{ko - off + 0.2:.3f})" for ko in t["kills_out"] if -0.25 < ko - off < out_len + 0.25]
+                    vol = f"volume='{gain:.4f}+{max(0.0, boost - gain):.4f}*min(1,{_sum_expr(kt)})':eval=frame" if kt else f"volume={gain:.4f}"
+                    chains.append(f"[{ka}:a:{int(src.get('a_stream') or 0)}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                                  f"{at}{vol},asetpts=PTS-STARTPTS,apad,atrim=duration={out_len:.4f}[s{k0_}a]")
+                    k += 1
+                else:
+                    chains.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={out_len:.4f},asetpts=PTS-STARTPTS[s{k0_}a]")
+                ta.append(f"[s{k0_}a]")
+                off_f += n
+                k += 1
+                continue
+            s = s[1]
             a, b, sp, n = s[:4]
             src = srcs[s[4] if len(s) > 4 and s[4] < len(srcs) else 0]
             sa = a - src["shift"]
@@ -8812,6 +9008,27 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             k += 1
         nf = off_f
         base = f"t{ti}"
+        for hseg, hn, hside in (([(segs[-1], SOFT_AFTER, "a")] if soft[ti + 1] else []) + ([(segs[0], SOFT_BEFORE, "b")] if soft[ti] else [])):
+            ha, hb, hsp = hseg[0], hseg[1], hseg[2]
+            hsrc = srcs[hseg[4] if len(hseg) > 4 and hseg[4] < len(srcs) else 0]
+            if hside == "a":
+                h0, h1 = hb, hb + hn * hsp / OUT_FPS                                    # footage right after the last frame of the take
+            else:
+                h0, h1 = ha - hn * hsp / OUT_FPS, ha                                    # footage right before the first frame of the take
+            inputs += ["-threads", "2", "-ss", f"{max(0.0, h0 - hsrc['shift']):.4f}", "-t", f"{(h1 - h0) + 0.3:.4f}", "-i", hsrc["path"]]
+            hcx, hcy, hcw, hch = hsrc["rect"]
+            hcrop = f"crop={hcw}:{hch}:{hcx}:{hcy}," if [hcx, hcy, hcw, hch] != [0, 0, hsrc["wh"][0], hsrc["wh"][1]] else ""
+            hscl = "scale=1920:1080:flags=lanczos," if (hcrop or list(hsrc["wh"]) != [1920, 1080]) else ""
+            hv = f"[{k}:v:0]{hcrop}{hscl}setsar=1,"
+            if hsp < 1:
+                hv += f"setpts=(PTS-STARTPTS)/{hsp:.4f},framerate=fps=60:scene=100"
+            elif exact:
+                hv += f"setpts=PTS/{hsp:.4f},fps=60:start_time=0"
+            else:
+                hv += f"setpts=(PTS-STARTPTS)/{hsp:.4f},fps=60"
+            hv += f",tpad=stop_mode=clone:stop_duration=0.3,trim=end_frame={hn},setpts=PTS-STARTPTS,format=yuv420p[h{ti}{hside}]"
+            chains.append(hv)
+            k += 1
         chains.append("".join(tv) + (f"concat=n={len(tv)}:v=1:a=0" if len(tv) > 1 else "null") + f"[{base}c]")
         chains.append("".join(ta) + (f"concat=n={len(ta)}:v=0:a=1" if len(ta) > 1 else "anull") + f"[{base}a]")
         # effects on the take's own timeline; frames outside an effect window stay untouched
@@ -8835,12 +9052,35 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             chains.append(f"[{base}m]format=yuv420p[{base}m2]")
             chains.append(f"[{base}m2][{base}e]overlay=0:0:eof_action=pass:enable='{en_}'[{base}o]")
             lab = f"[{base}o]"
-        chains.append(lab + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
+        if soft[ti] or soft[ti + 1]:
+            s_ = SOFT_AFTER if soft[ti] else 0
+            e_ = SOFT_BEFORE if soft[ti + 1] else 0
+            outs = ["body"] + (["head"] if soft[ti] else []) + (["tail"] if soft[ti + 1] else [])
+            chains.append(lab + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS,split={len(outs)}" + "".join(f"[{base}{o_}]" for o_ in outs))
+            chains.append(f"[{base}body]trim=start_frame={s_}:end_frame={nf - e_},setpts=PTS-STARTPTS[{base}v]")
+            if soft[ti]:
+                chains.append(f"[{base}head]trim=start_frame=0:end_frame={SOFT_AFTER},setpts=PTS-STARTPTS[{base}hd]")
+            if soft[ti + 1]:
+                chains.append(f"[{base}tail]trim=start_frame={nf - SOFT_BEFORE}:end_frame={nf},setpts=PTS-STARTPTS[{base}tl]")
+            if soft[ti]:                                                               # the dissolve into this take: 2 frames of footage before its start + its first 3, against the take before
+                pb = f"t{ti - 1}"
+                chains.append(f"[{pb}tl][h{ti - 1}a]concat=n=2:v=1:a=0[sa{ti}]")
+                chains.append(f"[h{ti}b][{base}hd]concat=n=2:v=1:a=0[sb{ti}]")
+                chains.append(f"[sa{ti}][sb{ti}]blend=all_expr='A*(1-(N+0.5)/{SOFT_N})+B*((N+0.5)/{SOFT_N})',format=yuv420p,setpts=PTS-STARTPTS,fps=60[x{ti}]")
+                vparts.append(f"[x{ti}]")
+            vparts.append(f"[{base}v]")
+        else:
+            chains.append(lab + f"format=yuv420p,trim=end_frame={nf},setpts=PTS-STARTPTS[{base}v]")
+            vparts.append(f"[{base}v]")
         vl.append(f"[{base}v][{base}a]")
     D = plan["duration"]
     fo = float(plan["song"].get("fade_out_start", max(0.0, D - 2.0)))
     fo = min(fo, D - 0.3)
-    chains.append("".join(vl) + f"concat=n={len(takes)}:v=1:a=1[vc][gc]")
+    if any(soft):                                                                      # V7.6.1: dissolves: the video pieces and the take audio are joined by two concats (same frames, same audio)
+        chains.append("".join(vparts) + f"concat=n={len(vparts)}:v=1:a=0[vc]")
+        chains.append("".join(f"[t{i_}a]" for i_ in range(len(takes))) + f"concat=n={len(takes)}:v=0:a=1[gc]")
+    else:
+        chains.append("".join(vl) + f"concat=n={len(takes)}:v=1:a=1[vc][gc]")
     vfo, vlen = outro_fade(plan)
     LOGONLY(f"outro fade: video fades from {vfo:.2f}s over {vlen:.2f}s (music from {fo:.2f}s)")
     chains.append(f"[vc]{'scale=1280:720:flags=bicubic,' if preview else ''}fade=t=in:st=0:d={FADE_IN},"
@@ -9257,7 +9497,7 @@ def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
             d = e - s0
             sp = r_["speed"]
             urate = min(m["ts_fps"], m["content_fps"]) or m["ts_fps"] or float(OUT_FPS)
-            out(f"effective fps: {nm} {lo:.2f}-{hi:.2f} s container {pr['eff']:.0f}, content {m['content_fps']:.0f}, speed {sp:.2f} -> "
+            LOGONLY(txt[-600:]); out(f"effective fps: {nm} {lo:.2f}-{hi:.2f} s container {pr['eff']:.0f}, content {m['content_fps']:.0f}, speed {sp:.2f} -> "
                 f"{min(m['ts_fps'], m['content_fps']) * sp:.0f} effective -> interpolating ({' + '.join(r_['why'])})")
             if d < 0.2:
                 continue
@@ -9562,11 +9802,11 @@ def _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nv
             break
         low = txt.lower()
         culprit = next((n for key, n in (("overlay", "zoom"), ("drawbox", "flash"), ("framerate", "slow"), ("atempo", "slow"),
-                                         ("tpad", "slow")) if key in low and n in fx), None) or \
+                                         ("blend", "transition"), ("tpad", "slow")) if key in low and n in fx), None) or \
             next(n for n in ("transition", "zoom", "flash", "slow") if n in fx)
         failed.append(culprit)
         fx.discard(culprit)
-        out(f"effect '{culprit}' failed - retrying without it" + ("" if fx else " (no effects left)"))
+        LOGONLY(txt[-600:]); out(f"effect '{culprit}' failed - retrying without it" + ("" if fx else " (no effects left)"))
     raise RuntimeError(f"render failed even without effects - see {elog} and {gp}")
 
 
@@ -14881,7 +15121,7 @@ def planner_selftest(verbose=True):
             elif abs(plan["song"]["fade_out_start"] - (last["out_start"] + last["kills_out"][-1])) > 0.02 or \
                     not ((OUTRO_MUSIC_MIN - 0.05 if plan.get("outro") else END_FADE[0] - 0.05) <= plan["duration"] - plan["song"]["fade_out_start"] <= END_FADE[1] + 0.05):
                 fails.append(f"seed {seed}: the fades do not run from the final kill to the end")
-            if last["slow_at"] is None or abs(last["slow_at"] - last["kills_out"][-1]) > 1.5 / OUT_FPS:
+            if last["slow_at"] is None or not (-1.5 / OUT_FPS <= last["kills_out"][-1] - last["slow_at"] <= (EASE_FR + 1.5) / OUT_FPS):
                 fails.append(f"seed {seed}: the ending slow-mo does not start on the final kill")
             if not (29.5 <= plan["duration"] <= 121):
                 fails.append(f"seed {seed}: length {plan['duration']:.0f} s outside 30-120 s")
