@@ -9304,6 +9304,9 @@ def sync_report(plan, outfile, cfg):
     out(f"SYNC SUMMARY: detector found {len(seen)} kill rows for {sum(t['n'] for t in plan['takes'])} planned kills")
 
 
+QUALITY_ALIGN = (0, -1, 1, -2, 2, -3, 3)     # V7.6.0: output-frame offsets searched by quality_check
+
+
 def quality_check(plan, outfile, cfg, preview=False):
     """SSIM of the rendered frames vs the source frames on one effect-free stretch (1.0x, no zoom/flash/transition, away from the
     fades). Target >= 0.97. Returns the value (or None when no clean stretch exists)."""
@@ -9339,17 +9342,22 @@ def quality_check(plan, outfile, cfg, preview=False):
     crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, src["wh"][0], src["wh"][1]] else ""
     size = "1280:720" if preview else "1920:1080"
     ref = f"{crop}scale={size}:flags=lanczos," if (crop or preview or list(src["wh"]) != [1920, 1080]) else ""
-    r = run(["ffmpeg", "-hide_banner", "-ss", f"{g0:.4f}", "-t", "0.5", "-i", str(outfile), "-ss", f"{max(0.0, s0):.4f}", "-t", "0.5",
-             "-i", src["path"], "-filter_complex",
-             f"[0:v]setpts=PTS-STARTPTS,format=yuv420p[a];[1:v]{ref}fps=60,setpts=PTS-STARTPTS,format=yuv420p[b];[a][b]ssim",
-             "-f", "null", "-"], timeout=120)
-    m = re.findall(r"SSIM Y:([\d.]+).*?All:([\d.]+)", r.stderr.decode(errors="replace"))
-    if not m:
+    meas = {}
+    for k in QUALITY_ALIGN:                                # V7.6.0: the render keeps real source timestamps, the reference is re-based: search +-3 output frames
+        r = run(["ffmpeg", "-hide_banner", "-ss", f"{g0 + k / OUT_FPS:.4f}", "-t", "0.5", "-i", str(outfile), "-ss", f"{max(0.0, s0):.4f}", "-t", "0.5",
+                 "-i", src["path"], "-filter_complex",
+                 f"[0:v]setpts=PTS-STARTPTS,format=yuv420p[a];[1:v]{ref}fps=60,setpts=PTS-STARTPTS,format=yuv420p[b];[a][b]ssim",
+                 "-f", "null", "-"], timeout=120)
+        m = re.findall(r"SSIM Y:([\d.]+).*?All:([\d.]+)", r.stderr.decode(errors="replace"))
+        if m:
+            meas[k] = (float(m[-1][0]), float(m[-1][1]))
+    if not meas:
         out("QUALITY CHECK: could not measure SSIM")
         return None
-    y, al = float(m[-1][0]), float(m[-1][1])
-    out(f"QUALITY CHECK: SSIM {al:.4f} (luma {y:.4f}) output vs source on an effect-free stretch at {g0:.2f}s - "
-        f"{'OK (>= 0.97)' if al >= 0.97 else 'BELOW 0.97'}")
+    kb = max(meas, key=lambda k: meas[k][1])
+    y, al = meas[kb]
+    out(f"QUALITY CHECK: SSIM {al:.4f} (luma {y:.4f}) output vs source on an effect-free stretch at {g0:.2f}s, best alignment {kb:+d} frame"
+        f"{'s' if abs(kb) != 1 else ''} (unaligned {meas.get(0, (0, 0))[1]:.4f}) - {'OK (>= 0.97)' if al >= 0.97 else 'BELOW 0.97'}")
     plan["ssim"] = round(al, 4)
     return al
 
