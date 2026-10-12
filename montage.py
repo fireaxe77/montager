@@ -7232,10 +7232,10 @@ def headline_on_kick(plan, kick_t, notes):
     return True
 
 
-DROP_ANCHOR_ON = [True]              # V7.5.1.2: test switch (every drop in the montage gets a kill impact on its exact time, CS2 only)
+DROP_ANCHOR_ON = [True]              # V7.5.1.2: test switch (every drop in the montage gets a kill impact on its exact time; V7.6.0: both games)
 DROP_ANCHOR_TOL = 0.03               # s: anchored when the kill is within this of the drop
 DROP_ANCHOR_MAX = 1.0                # s: a kill farther than this from the drop is not a candidate
-DROP_GRID_MIN = 0.03                 # s: a drop closer than this to a grid beat keeps the beat time
+REPEAT_DROP_MIN_CONF = 0.0          # V7.6.0: map drops below this confidence are never anchored (repeat drops carry a conf)
 
 
 def shift_take_kill(plan, ht, kidx, target, fps, s0):
@@ -7290,52 +7290,232 @@ def shift_take_kill(plan, ht, kidx, target, fps, s0):
     return True, abs(target - (s0 + ht["out_start"] + ht["kills_out"][kidx]))
 
 
-def anchor_all_drops(plan, drops, kick_for, game, notes):
-    """V7.5.1.2 (CS2 only): every drop [(time, strength)] of the song that lies inside the montage gets a kill impact on its exact time (kick time when an independent kick lies
-    within HEAD_KICK_WIN, else the drop time; a drop within DROP_GRID_MIN of a grid beat keeps the beat). Lever a only (re-cut inside the take); one anchor per take, headline
-    first. A drop nothing can serve logs 'drop <t> not anchorable: <reason>' and keeps today's placement. Returns the log lines."""
-    if game != "cs2" or not DROP_ANCHOR_ON[0] or not drops:
+DROP_SEARCH = 2.5                    # V7.6.0: kills this far from a drop are candidates (levers a + c decide whether one can move there)
+
+
+def _retime_take(tk, d, fps):
+    """V7.6.0: every take-time mark of `tk` moves by d frames (its run-up got d frames longer at the start)."""
+    sh = d / fps
+    tk["kills_out"] = [round(x + sh, 5) for x in tk["kills_out"]]
+    tk["rows_out"] = [round(x + sh, 5) for x in tk["rows_out"]]
+    tk["pulses"] = [round(p + sh, 4) for p in tk.get("pulses", [])]
+    if tk.get("slow_at") is not None:
+        tk["slow_at"] = round(tk["slow_at"] + sh, 4)
+
+
+def _src_of(tk, sg):
+    srcs = tk.get("srcs") or []
+    return srcs[sg[4]] if len(sg) > 4 and 0 <= sg[4] < len(srcs) else {"shift": 0.0, "dur": 0}
+
+
+def _resize_take(tk, d, fps):
+    bl = (tk["beat_end"] - tk["beat0"]) / max(1e-6, tk["nf"] / fps)
+    tk["nf"] += d
+    tk["dur"] = round(tk["nf"] / fps, 4)
+    tk["beat_end"] = tk["beat0"] + tk["nf"] / fps * bl
+
+
+def flex_lead(tk, d, fps):
+    """V7.6.0 lever a / c: the take's run-up gets d frames longer (d < 0: shorter) at its START; its kills move d frames later on the take's own timeline.
+    Returns '' or the reason it cannot. Only the first segment changes (a ramp keeps its speed), the 1.0x second before the first kill stays."""
+    if d == 0:
+        return ""
+    segs = [list(sg) for sg in tk["segs"]]
+    f = segs[0]
+    if f[2] <= 0:
+        return "the take starts on a held frame"
+    if f[3] + d < 6:
+        return "its run-up would get too short"
+    n0 = f[0] - d * f[2] / fps
+    if n0 - float(_src_of(tk, f).get("shift", 0.0)) < 0:
+        return "footage would start before the clip start"
+    f[0], f[3] = round(n0, 6), f[3] + d
+    tk["segs"] = segs
+    _resize_take(tk, d, fps)
+    _retime_take(tk, d, fps)
+    if tk["kills_out"][0] < LEAD_MIN - 1e-6:
+        return "run-up before the first kill would be under the minimum"
+    return ""
+
+
+def flex_tail(tk, d, fps):
+    """V7.6.0 lever c: the take's tail after its last kill gets d frames longer (d < 0: shorter) at its END. Returns '' or the reason it cannot."""
+    if d == 0:
+        return ""
+    segs = [list(sg) for sg in tk["segs"]]
+    z = segs[-1]
+    if z[2] <= 0:
+        if d > 0 or z[3] + d < 1:
+            return "the take ends on a held frame"
+        z[3] += d
+    else:
+        if z[3] + d < 6:
+            return "its last segment would get too short"
+        n1 = z[1] + d * z[2] / fps
+        src = _src_of(tk, z)
+        if src.get("dur") and n1 - float(src.get("shift", 0.0)) > float(src["dur"]) - 0.02:
+            return "footage runs past the clip end"
+        if d > 0 and tk.get("death_after") is not None and n1 > tk["kills"][-1] + float(tk["death_after"]) - 0.05:
+            return "footage would reach my death"
+        z[1], z[3] = round(n1, 6), z[3] + d
+    tk["segs"] = segs
+    _resize_take(tk, d, fps)
+    return ""
+
+
+def _take_rules(tk):
+    return verify_cutlist({"takes": [dict(tk, f0=0)], "total_frames": tk["nf"]})
+
+
+def _relayout(takes, fps):
+    f = 0
+    for t in takes:
+        t["f0"] = f
+        t["out_start"] = round(f / fps, 4)
+        f += t["nf"]
+    return f
+
+
+def impact_time(plan, ti, kj):
+    """V7.6.0: song time of kill kj of take ti on the OUTPUT timeline, straight from the take's segments (integral of the speed curve: ramps, jump cuts, slow-mo)."""
+    t = plan["takes"][ti]
+    return float(plan["song"]["start_t"]) + t["f0"] / OUT_FPS + src_to_out(t["segs"], t["kills"][kj])
+
+
+def move_kill(plan, ti, kj, target, fps):
+    """V7.6.0: move kill kj of take ti onto song time `target` with levers a (re-cut inside the take: longer / shorter run-up, its tail gives / takes the frames)
+    and c (the cut before / after the take moves: the neighbour's tail or run-up absorbs the frames). Every OTHER take keeps every kill on its frame; the set of
+    takes, their order and the montage length never change. Returns (new takes, levers used, '') or (None, '', reason)."""
+    import copy
+    takes = plan["takes"]
+    m = int(round((target - impact_time(plan, ti, kj)) * fps))
+    if m == 0:
+        return copy.deepcopy(takes), "none", ""
+    base_bad = verify_cutlist(plan)
+    base_dup = plan_duplicate_ranges(plan)
+    tk = takes[ti]
+    prv = takes[ti - 1] if ti > 0 and not takes[ti - 1].get("util") and not takes[ti - 1].get("ending") else None
+    nxt = takes[ti + 1] if ti + 1 < len(takes) and not takes[ti + 1].get("util") else None
+
+    def reach(t, fn, want):
+        """largest |d| <= |want| (same sign) the item allows alone without a new per-take rule problem."""
+        if t is None or want == 0:
+            return 0, ""
+        b0 = _take_rules(t)
+        sg = 1 if want > 0 else -1
+        lo, hi, why = 0, abs(want), ""
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            c = copy.deepcopy(t)
+            r = fn(c, sg * mid, fps)
+            nb = [x for x in _take_rules(c) if x not in b0] if not r else []
+            if not r and not nb:
+                lo = mid
+            else:
+                why = r or nb[0].split(":", 1)[-1].strip()
+                hi = mid - 1
+        return sg * lo, why
+    lead_r, why_l = reach(tk, flex_lead, m)
+    tailp_r, why_tp = reach(prv, flex_tail, m) if prv is not None else (0, "no take before" if ti == 0 else "")
+    tail_r, why_t = reach(tk, flex_tail, -m)
+    leadn_r, why_ln = reach(nxt, flex_lead, -m) if nxt is not None else (0, "no take after")
+    word = "later" if m > 0 else "earlier"
+    if abs(lead_r) + abs(tailp_r) < abs(m):
+        return None, "", f"{abs(m) / fps:.2f} s {word} needed, before the kill only {(abs(lead_r) + abs(tailp_r)) / fps:.2f} s: " + \
+            ("; ".join(f"{k} {w}" for k, w in (("run-up:", why_l), ("take before:", why_tp)) if w) or "no run-up / tail room")
+    if abs(tail_r) + abs(leadn_r) < abs(m):
+        return None, "", f"{abs(m) / fps:.2f} s {word} needed, after the kill only {(abs(tail_r) + abs(leadn_r)) / fps:.2f} s: " + \
+            ("; ".join(f"{k} {w}" for k, w in (("tail:", why_t), ("take after:", why_ln)) if w) or "no tail / run-up room")
+    splits = set()
+    for pre_first in ("lead", "tail"):
+        for post_first in ("tail", "lead"):
+            d2 = lead_r if pre_first == "lead" else m - tailp_r
+            d1 = m - d2
+            d3 = tail_r if post_first == "tail" else -m - leadn_r
+            d4 = -m - d3
+            if abs(d1) <= abs(tailp_r) and abs(d2) <= abs(lead_r) and abs(d3) <= abs(tail_r) and abs(d4) <= abs(leadn_r):
+                splits.add((d1, d2, d3, d4))
+    why = "the levers together break a cut-list rule"
+    for d1, d2, d3, d4 in sorted(splits, key=lambda s: (sum(1 for x in s if x), s)):
+        new = copy.deepcopy(takes)
+        r = (flex_tail(new[ti - 1], d1, fps) if d1 else "") or flex_lead(new[ti], d2, fps) or flex_tail(new[ti], d3, fps) or \
+            (flex_lead(new[ti + 1], d4, fps) if d4 else "")
+        if r:
+            why = r
+            continue
+        if _relayout(new, fps) != plan["total_frames"]:
+            why = "the montage length would change"
+            continue
+        trial = dict(plan, takes=new)
+        nb = [x for x in verify_cutlist(trial) if x not in base_bad]
+        nd = [x for x in plan_duplicate_ranges(trial) if x not in base_dup]
+        if nb or nd:
+            why = (nb + nd)[0].split(":", 1)[-1].strip()[:80]
+            continue
+        lev = "+".join(x for x, on in (("a", bool(d2 or d3)), ("c", bool(d1 or d4))) if on)
+        return new, lev, ""
+    return None, "", why
+
+
+def anchor_all_drops(plan, drops, game, notes, grid=None):
+    """V7.6.0 (both games): every drop [(time, strength, source)] of the song inside the montage gets a kill impact on its EXACT time (label / map time, never the
+    grid beat). Drops are solved together, strongest first (the planner's drop first): candidates are the kills of the selected takes within DROP_SEARCH s,
+    multikill finishers first; a kill moves with levers a + c (move_kill), never losing a kill, never changing which takes are used or their order, never moving
+    an earlier anchor. A drop nothing can serve logs 'drop <t> not anchorable: <reason> (levers tried: ...)'. Writes plan['drop_sync']; returns the log lines."""
+    if not DROP_ANCHOR_ON[0] or not drops:
         return []
+    import numpy as np
     fps = round(plan["total_frames"] / plan["duration"])
     s0, D = float(plan["song"]["start_t"]), plan["duration"]
-    used, lines = set(), []
+    used, lines, sync = set(), [], []
     hd = plan["song"].get("drop_t")
     hdrop = s0 + hd if hd is not None else None
     order = sorted(drops, key=lambda d: (0 if (hdrop is not None and abs(d[0] - hdrop) < 1.0) else 1, -d[1], d[0]))
-    for t_d, _st in order:
+    for t_d, _st, src_ in order:
         if not (s0 + 0.5 < t_d < s0 + D - 1.0):
             continue
-        tgt = kick_for(t_d) or t_d
-        best = None
+        if grid is not None and len(grid):
+            gb = float(grid[int(np.argmin(np.abs(np.asarray(grid) - t_d)))])
+            if abs(gb - t_d) > DROP_ANCHOR_TOL:
+                lines.append(f"grid: drop {t_d:.3f} is {(t_d - gb) * 1000:+.0f} ms from the nearest grid beat {gb:.3f} - anchored on the exact drop time")
+        is_head = hdrop is not None and abs(t_d - hdrop) < 1.0
         cands = []
         for ti, tk in enumerate(plan["takes"]):
             if tk.get("ending") or tk.get("util") or ti in used or not tk.get("kills_out"):
                 continue
-            for kj, ko in enumerate(tk["kills_out"]):
-                e = (s0 + tk["out_start"] + ko) - tgt
-                if abs(e) <= DROP_ANCHOR_MAX:
-                    cands.append((abs(e) + (0.0 if tk.get("role") == "headline" else 0.001), ti, kj))
-        why = "no kill within 1 s of the drop"
-        for _e, ti, kj in sorted(cands):
-            import copy
-            tk = copy.deepcopy(plan["takes"][ti])
-            ok, r = shift_take_kill(plan, tk, kj, tgt, fps, s0)
-            if ok and r <= DROP_ANCHOR_TOL:
-                one = lambda t_: [b_ for b_ in verify_cutlist({"takes": [dict(t_, f0=0)], "total_frames": t_["nf"]})]
-                new_bad = [b_ for b_ in one(tk) if b_ not in one(plan["takes"][ti])]
-                if new_bad:                                  # the shifted take must pass the same cut-list rules as before (else the planner would drop it and re-plan)
-                    why = "the shifted take breaks a cut-list rule (" + new_bad[0].split(":", 1)[-1].strip()[:60] + ")"
-                    continue
-                plan["takes"][ti] = tk
-                best = (ti, kj, r)
-                break
-            why = r if not ok else f"error {r * 1000:.0f} ms after the shift"
+            nk = len(tk["kills"])
+            for kj in range(nk):
+                e = impact_time(plan, ti, kj) - t_d
+                if abs(e) <= DROP_SEARCH:
+                    tier = (-1 if is_head and tk.get("role") == "headline" else 0 if nk >= 2 else 1) + (0.0 if kj == nk - 1 else 0.5)
+                    cands.append((tier, -nk, round(abs(e), 3), ti, kj))
+        why, best = f"no kill of a selected take within {DROP_SEARCH} s of the drop", None
+        for _tier, _n, _e, ti, kj in sorted(cands):
+            new, lev, r = move_kill(plan, ti, kj, t_d, fps)
+            if new is None:
+                if why.startswith("no kill"):
+                    why = f"take {ti + 1} kill {kj + 1}/{len(plan['takes'][ti]['kills'])}: {r}"
+                continue
+            plan["takes"] = new
+            best = (ti, kj, lev)
+            break
         if best is None:
-            lines.append(f"drop {t_d:.3f} not anchorable: {why}")
+            ln = f"drop {t_d:.3f} not anchorable: {why} (levers tried: a re-cut inside the take, c move the cuts before / after it; {len(cands)} candidate kills)"
+            sync.append({"drop": round(t_d, 3), "source": src_, "take": None, "kill": None, "impact": None, "err_ms": None, "lever": None, "why": why})
         else:
-            ti, kj, r = best
+            ti, kj, lev = best
             used.add(ti)
-            lines.append(f"drop {t_d:.3f} anchored: take {ti + 1} kill at {s0 + plan['takes'][ti]['out_start'] + plan['takes'][ti]['kills_out'][kj]:.3f} error {r * 1000:.0f} ms via a")
+            imp = impact_time(plan, ti, kj)
+            tk = plan["takes"][ti]
+            ln = f"drop {t_d:.3f} anchored: take {ti + 1} kill {kj + 1}/{len(tk['kills'])} at {imp:.3f} error {(imp - t_d) * 1000:+.0f} ms via {lev}"
+            sync.append({"drop": round(t_d, 3), "source": src_, "take": ti + 1, "kill": kj + 1, "n": len(tk["kills"]), "impact": round(imp, 4),
+                         "err_ms": round((imp - t_d) * 1000, 1), "lever": lev, "why": ""})
+            if is_head:
+                plan["song"]["drop_t"] = round(t_d - s0, 3)
+                if plan.get("drop_anchor"):
+                    plan["drop_anchor"]["drop_t"] = round(t_d, 3)
+        lines.append(ln)
+    plan["drop_sync"] = sorted(sync, key=lambda x: x["drop"])
     for ln in lines:
         notes.append(ln)
         LOGONLY(ln)
@@ -7783,7 +7963,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     if drop_note:
         notes.append(drop_note)
     if fit and fit.get("second"):                          # V7.4.7: a second map drop inside the section is only logged (take lengths / run-ups / selection stay as they are)
-        notes.append("second drop: no fit (" + ", ".join(ts(x) for x in fit["second"]) + " - anchoring another finisher there would change take lengths / run-ups; placement left unchanged)")
+        notes.append("second drop(s) at " + ", ".join(ts(x) for x in fit["second"]) + ": placed by the drop solver (see the 'drop ...' lines)")
     plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock,
                       used_drop_beat=(fit["drop_beat"] if fit else None))       # V7.4.7: TIMELINE / song.drop_t print the drop actually used
     if HEADLINE_RULES_V73:                                 # which kill sits on which drop (read by `montage.py dropcheck`)
@@ -7795,21 +7975,13 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                 headline_on_kick(plan, float(fit["head_kick_t"]), plan["notes"])
             except Exception as ex_:
                 LOGONLY(f"headline kick anchor skipped: {ex_}")
-    if game == "cs2" and DROP_ANCHOR_ON[0]:                # V7.5.1.2: every drop in the montage, labelled or auto-detected
+    if DROP_ANCHOR_ON[0]:                                  # V7.6.0: every drop in the montage, labelled or auto-detected, both games, exact times
         try:
             lab_ = song_drop_labels(song["path"])
-            dl_ = [(float(t_), 2.0) for t_ in lab_] if lab_ else [(float(d_["t"]), float(d_.get("strength", 1.0))) for d_ in (an.get("drops") or []) if d_.get("t") is not None]
-
-            def kick_for_(td):
-                gi = int(np.argmin(np.abs(np.asarray(bt) - td)))
-                if abs(float(bt[gi]) - td) <= DROP_GRID_MIN:
-                    return float(bt[gi])
-                try:
-                    ks_ = [k_ for k_ in song_kicks(song["path"]) if abs(k_ - td) <= HEAD_KICK_WIN]
-                except Exception:
-                    ks_ = []
-                return round(min(ks_, key=lambda k_: abs(k_ - td)), 3) if ks_ else None
-            anchor_all_drops(plan, dl_, kick_for_, game, plan["notes"])
+            dl_ = [(float(t_), 2.0, "label") for t_ in lab_] if lab_ else \
+                [(float(d_["t"]), float(d_.get("strength", 1.0)), d_.get("source") or "map") for d_ in (an.get("drops") or [])
+                 if d_.get("t") is not None and float(d_.get("conf", 1.0)) >= REPEAT_DROP_MIN_CONF]
+            anchor_all_drops(plan, dl_, game, plan["notes"], grid=bt)
         except Exception as ex_:
             LOGONLY(f"drop anchoring skipped: {ex_}")
     D, S0 = plan["duration"], plan["song"]["start_t"]
@@ -9044,6 +9216,19 @@ def sync_report(plan, outfile, cfg):
             f"kill rows seen by the detector {found}/{len(rows)} | tail {t['dur'] - t['kills_out'][-1]:.2f}s | "
             f"zoom {len(t['pulses'])} flash {'yes' if t['flash'] is not None else 'no'} trans {t['trans']} "
             f"slow-mo {'yes' if t['slow'] else 'no'}")
+    s0_ = float(plan["song"]["start_t"])
+    for d in plan.get("drop_sync") or []:                  # V7.6.0: one line per drop of the song inside the montage
+        if not d.get("take"):
+            out(f"  SYNC DROP {d['drop']:8.3f} [{d.get('source', 'map')}] not anchored: {d.get('why', '')}")
+            continue
+        t = plan["takes"][d["take"] - 1]
+        imp = s0_ + t["f0"] / OUT_FPS + src_to_out(t["segs"], t["kills"][d["kill"] - 1])
+        row = t["out_start"] + t["rows_out"][d["kill"] - 1]
+        near = [x for x in seen if abs(x - row) <= 0.3]
+        det = f"detector row at {min(near, key=lambda x: abs(x - row)):.3f} s ({(min(near, key=lambda x: abs(x - row)) - row) * 1000:+.0f} ms vs planned row)" if near \
+            else "row not seen by the detector"
+        out(f"  SYNC DROP {d['drop']:8.3f} [{d.get('source', 'map')}] take {d['take']} kill {d['kill']}/{d.get('n', '?')}: rendered impact {imp:.3f} s, "
+            f"error {(imp - d['drop']) * 1000:+.0f} ms, lever {d.get('lever')} | {det}")
     out(f"SYNC SUMMARY: detector found {len(seen)} kill rows for {sum(t['n'] for t in plan['takes'])} planned kills")
 
 
