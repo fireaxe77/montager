@@ -5059,7 +5059,56 @@ def _songmap_auto_pick(path, csv_bpm, v1m, m2, name):
     return dict(v1m, songmap_version="v1-auto", songmap_auto=dec)
 
 
+REPEAT_ALGO = "r1"
+REPEAT_KEEP_CONF = 0.75                 # V7.6.1: repeat drops below this confidence are not added to the map at all
+REPEAT_CACHE = DATA / "repeat_cache.json"
+
+
+def add_repeat_drops(an, path):
+    """V7.6.1 ADDITIVE: drops found by a repeated pattern (songmap_v2/repeat.py): the build-up of every known drop of the map is looked for again elsewhere in the song. Existing drops are
+    never removed or moved; a new drop is tagged source 'repeat' with a confidence (and the drop it was found from). Cached per song file. Any problem = the map unchanged."""
+    try:
+        known = [float(d["t"]) for d in (an.get("drops") or []) if d.get("t") is not None and d.get("source") != "repeat"]
+        if not known:
+            return an
+        import songmap_v2.repeat as RP
+        key = f"{REPEAT_ALGO}|{songmap_v2_sig(path)}|" + ",".join(f"{t:.2f}" for t in sorted(known))
+        cache = load_json(REPEAT_CACHE, {})
+        found = cache.get(key)
+        if found is None:
+            y, sr = decode_mono(path)
+            found = RP.find_repeat_drops(y, sr, known)
+            cache[key] = found
+            save_json(REPEAT_CACHE, cache)
+        new = [f for f in found if f["conf"] >= REPEAT_KEEP_CONF and all(abs(f["t"] - k_) >= RP.MIN_SEP_S for k_ in known)]
+        if not new:
+            return an
+        import numpy as np
+        bt = np.asarray(an["beats"], float)
+        add = [{"beat": int(np.argmin(np.abs(bt - f["t"]))), "t": f["t"], "strength": 0.8, "source": "repeat", "conf": f["conf"], "from": f["from"]} for f in new]
+        an2 = dict(an)
+        an2["drops"] = list(an.get("drops") or []) + add
+        an2["repeat_drops"] = add
+        return an2
+    except Exception as ex:                                # noqa: BLE001 - the map is used as it was
+        LOGONLY(f"repeat drops skipped for {Path(path).name}: {type(ex).__name__}: {ex}")
+        return an
+
+
+def songmap_v2_sig(path):
+    try:
+        import songmap_v2
+        return songmap_v2.build.file_signature(path)
+    except Exception:
+        return file_key(path)
+
+
 def get_songmap(path, csv_bpm=None, version=None):
+    """V7.6.1: the routed map plus the drops found by repeated patterns (additive, see add_repeat_drops)."""
+    return add_repeat_drops(_get_songmap_routed(path, csv_bpm, version), path)
+
+
+def _get_songmap_routed(path, csv_bpm=None, version=None):
     """THE routing point for song map requests (V6.9.5): V1 = analyse_song() exactly as before; V2 = the isolated songmap_v2 package with its
     own cache file; V6.9.5.2 'v2auto' = V2 or V1 per song (see _songmap_auto_pick). Any V2 problem (error, timeout, missing module) logs
     'songmap v2 fallback: <song> (<reason>)' and returns the V1 map flagged songmap_version = 'v1-fallback', so a montage never fails because of V2."""
@@ -6739,6 +6788,13 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
 LEAD_MIN = 0.3                          # run-up before the first kill (V4: 1-2 beats)
 SLOW_OUT = 0.4
 MIN_TAKE_BEATS, MIN_TAKE_S, OUT_FPS = 2, 1.2, 60
+MIN_TAKE_RELAX_S = 0.9                  # V7.6.1: shortest take for a kill with almost no footage before it (run-up relaxed): lead + the longest tail still reaches it
+
+
+def _min_take_s(x):
+    """The minimum take length (s) for an event (ev) or a take (ev inside tk['ev'] / tk['rx'])."""
+    rx = (x.get("_rx") or x.get("rx") or ((x.get("ev") or {}).get("_rx")) or {})
+    return MIN_TAKE_RELAX_S if rx.get("lead_min") else MIN_TAKE_S
 TAIL = (0.2, 0.5)                       # after the last kill (no dead air)
 ROW_TAIL, ROW_SLACK = 0.4, 0.3          # V5.42B: the take lasts >= 0.4 s after my last kill ROW appears (+ up to 0.3 s to a tick)
 SLOW_FLOOR = 0.4                        # V7.6.1: the slowest speed a footage-limited tail plays at
@@ -6759,11 +6815,14 @@ def ease_in_speeds(v0, E=EASE_FR):
     (E - sum of speeds) is a whole number. Returns (speeds, extra frames); extra 0 = no ease (v0 is within a few percent of 1.0)."""
     base = [1.0 - (1.0 - v0) * _smooth((j + 0.5) / E) for j in range(E)]
     saved = E - sum(base)
-    extra = int(round(saved))
-    if extra <= 0:
-        return [1.0] * E, 0
-    k = extra / saved
-    return [max(SLOW_FLOOR * 0.9, 1.0 - k * (1.0 - v)) for v in base], extra
+    for extra in (int(round(saved)), int(saved)):          # nearest whole frame; the next lower one when scaling to it would dip more than 5 % under the plateau speed
+        if extra <= 0:
+            return [1.0] * E, 0
+        k = extra / saved
+        sp = [1.0 - k * (1.0 - v) for v in base]
+        if min(sp) >= v0 * 0.95 - 1e-9:
+            return sp, extra
+    return [1.0] * E, 0
 
 
 def ease_extra(v0, E=EASE_FR):
@@ -7097,7 +7156,7 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first", 
     D = float(U[end] - U[c])
     if tailmode == "fit":                                  # V7.6.1: footage-limited tail (see _fit_tail)
         ft = _fit_tail(ev, lead_t, span, D)
-        if ft is None or slow or end - c < 2 * MIN_TAKE_BEATS or D < MIN_TAKE_S:
+        if ft is None or slow or end - c < 2 * MIN_TAKE_BEATS or D < _min_take_s(ev):
             return None
         return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "ramp": r, "slow": False, "ending": False, "dur": D, "tailmode": "fit", "v0": ft[0], "ex": ft[1],
                 **({"cuts": cuts, "ospan": span} if cuts else {})}
@@ -7121,7 +7180,7 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first", 
         src_tail = tail
     if src_tail > post + 1e-6:
         return None
-    if end - c < 2 * MIN_TAKE_BEATS or D < MIN_TAKE_S:
+    if end - c < 2 * MIN_TAKE_BEATS or D < _min_take_s(ev):
         return None
     return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "ramp": r, "slow": slow, "ending": False, "dur": D,
             **({"cuts": cuts, "ospan": span} if cuts else {}), **({"anchor": "last", "kt": t0_last, "ospan": span} if anchor == "last" else {})}
@@ -8210,7 +8269,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         elif miss:
             notes.append(f"{len(miss)} ticked clips didn't fit in this song: " + ", ".join(nm(e) for e in miss))
     for t in list(takes):
-        if not t.get("ending") and (t["end"] - t["c"] < 2 * MIN_TAKE_BEATS or U[t["end"]] - U[t["c"]] < MIN_TAKE_S):
+        if not t.get("ending") and (t["end"] - t["c"] < 2 * MIN_TAKE_BEATS or U[t["end"]] - U[t["c"]] < _min_take_s(t)):
             i = takes.index(t)
             if manual:                                     # V5.42B repair: a longer run-up (the take before ends earlier)
                 fixed = None
@@ -8604,7 +8663,7 @@ def verify_cutlist(plan):
             bad.append(f"take {i} starts at frame {t['f0']}, expected {pos}")
         if sum(sg[3] for sg in t["segs"]) != t["nf"]:
             bad.append(f"take {i} segment frames do not add up")
-        if not t.get("ending") and (t["nf"] < MIN_TAKE_S * OUT_FPS - 1 or t["beat_end"] - t["beat0"] < MIN_TAKE_BEATS - 0.05):
+        if not t.get("ending") and (t["nf"] < _min_take_s(t) * OUT_FPS - 1 or t["beat_end"] - t["beat0"] < MIN_TAKE_BEATS - 0.05):
             bad.append(f"take {i} is under the minimum ({t['nf']} frames)")
         if any(not (0 <= k < t["nf"] / OUT_FPS) for k in t["kills_out"]) or t["kills_out"] != sorted(t["kills_out"]):
             bad.append(f"take {i}: a kill is not inside the take (or out of order)")
@@ -11332,6 +11391,7 @@ def forget_song(path, fk=None, sig=None):
         try:
             import songmap_v2
             tasks.append((DATA / songmap_v2.CACHE_NAME, lambda k: f"|{sig}|" in k))
+            tasks.append((REPEAT_CACHE, lambda k: f"|{sig}|" in k))
         except Exception:
             pass
     for cpath, hit in tasks:
@@ -11656,7 +11716,8 @@ class SongMapView:
     def _load_drops(self):
         lab = song_drop_labels(self.path)
         self.hand = bool(lab)
-        self.drops = list(lab) if lab else [float(d["t"]) for d in (self.an or {}).get("drops", [])]
+        self.drops = list(lab) if lab else [float(d["t"]) for d in (self.an or {}).get("drops", []) if d.get("source") != "repeat"]
+        self.rdrops = [(float(d["t"]), float(d.get("conf", 0.0))) for d in (self.an or {}).get("repeat_drops", [])]       # V7.6.1: found by a repeated pattern (dashed orange, not editable)
 
     def _t_at(self, ev):
         x = self.cv.canvasx(ev.x)
@@ -11804,6 +11865,9 @@ class SongMapView:
             ln = cv.create_line(X(t), top, X(t), H - 18, fill="#d00000", width=3, tags=("drop",))
             tx = cv.create_text(X(t) + 3, H - 34, text=f"DROP {self._fmt(t)}", anchor="w", fill="#d00000", font=("Segoe UI", F(9), "bold"), tags=("drop",))
             self._dl.append([ln, tx])
+        for t, cf in getattr(self, "rdrops", []):
+            cv.create_line(X(t), top, X(t), H - 18, fill="#e08000", width=2, dash=(6, 4))
+            cv.create_text(X(t) + 3, H - 50, text=f"REPEAT {self._fmt(t)} ({cf:.2f})", anchor="w", fill="#e08000", font=("Segoe UI", F(9)))
         for s in range(0, int(dur) + 1, 10 if z == 1 else 5):
             cv.create_text(X(s), H - 2, text=ts(s)[:-2], anchor="s", font=("Segoe UI", F(8)), fill="#444")
 
@@ -14369,7 +14433,7 @@ def grab_gray_bgr(path, t, w, h):
 
 
 DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "VAL_BACKUP", "REGION_DEFAULTS", "JOB_LOCK", "USED_SONGS",
-                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE", "BORDER_DIR")
+                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE", "BORDER_DIR", "REPEAT_CACHE")
 
 
 def use_data_dir(d):
