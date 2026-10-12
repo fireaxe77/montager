@@ -555,6 +555,11 @@ def scan_audio(cfg, rescan=False):
         try:
             if k not in cache:
                 a, t, d = read_tags(p)
+                if not d:
+                    try:
+                        d = probe_duration(p) or 0           # V7.7.0: the song length is cached with the tags (a file mutagen cannot read is probed once)
+                    except Exception:
+                        d = 0
                 if not t:
                     fa, ft = parse_filename(p)
                     a, t = a or fa, ft
@@ -5341,7 +5346,7 @@ def song_pool(cfg, cached_only=False):
             old = songs.get(a["path"])
             if old is None or (added and (old["added"] is None or added > old["added"])):
                 songs[a["path"]] = {"path": a["path"], "artist": r["artist"], "title": r["title"], "added": added,
-                                    "csv_bpm": r.get("tempo") or None, "energy": r.get("energy"), "dance": r.get("dance"), "score": sc}
+                                    "csv_bpm": r.get("tempo") or None, "energy": r.get("energy"), "dance": r.get("dance"), "score": sc, "dur": a.get("dur") or 0}
         try:
             if not cached_only:
                 write_song_matches(audio, matched)
@@ -5357,8 +5362,17 @@ def song_pool(cfg, cached_only=False):
     if not songs:
         out("no playlist matches: using every audio file in the MP3 folder")
         for a in audio:
-            songs[a["path"]] = {"path": a["path"], "artist": a["artist"], "title": a["title"], "added": None}
+            songs[a["path"]] = {"path": a["path"], "artist": a["artist"], "title": a["title"], "added": None, "dur": a.get("dur") or 0}
     return list(songs.values()), unmatched, (csvp.name if csvp else None)
+
+
+def fmt_mss(sec):
+    """V7.7.0: a song length as m:ss (nearest second); '' when unknown. The lists sort it by the number of seconds (sort_key reads m:ss)."""
+    try:
+        s = int(float(sec) + 0.5)
+    except (TypeError, ValueError):
+        return ""
+    return f"{s // 60}:{s % 60:02d}" if s > 0 else ""
 
 
 def hist_list(path, game):
@@ -13191,17 +13205,19 @@ class App:
         ttk.Entry(r2, textvariable=self.m_search, width=30).pack(side="left", padx=4)
         self.btn(r2, "Play selected song", self.play_song).pack(side="left", padx=8)
         self.btn(r2, "Song map", self.map_song, name="Song map (Manual)").pack(side="left")
-        fr2, self.stree = make_tree(s2, ("bpm", "added", "trash"), height=2, selectmode="browse")
+        fr2, self.stree = make_tree(s2, ("bpm", "len", "added", "trash"), height=2, selectmode="browse")
         fr2.pack(fill="both", expand=True)
         self.stree.column("#0", width=520)
         self.stree.column("bpm", width=70)
+        self.stree.column("len", width=64)                                      # V7.7.0: the song length (m:ss)
         self.stree.column("added", width=110)
         self.stree.column("trash", width=40, minwidth=36, stretch=False, anchor="center")        # V7.6.1: same Recycle Bin column as the clip list
         self.stree.heading("trash", text="")
         self.stree.heading("#0", text="Song")
         self.stree.heading("bpm", text="BPM")
+        self.stree.heading("len", text="Length")
         self.stree.heading("added", text="Added")
-        self.make_sortable(self.stree, self.refresh_songs, {"#0": "Song", "bpm": "BPM", "added": "Added"})
+        self.make_sortable(self.stree, self.refresh_songs, {"#0": "Song", "bpm": "BPM", "len": "Length", "added": "Added"})
         self.stree.bind("<<TreeviewSelect>>", lambda e: self.update_status())
         self.stree.bind("<Button-1>", lambda e: self.on_song_click(self.stree, self.STREE_TRASH_COL, e))
 
@@ -13359,8 +13375,8 @@ class App:
         self.apply_filter()
         out(f"moved to Recycle Bin: {name}")
 
-    STREE_TRASH_COL = "#3"                                 # V7.6.1: the Manual song list (bpm, added, trash)
-    MTREE_TRASH_COL = "#6"                                 # V7.6.1: the Songs tab list (track, artist, bpm, score, flag, trash)
+    STREE_TRASH_COL = "#4"                                 # V7.6.1: the Manual song list (bpm, len, added, trash)
+    MTREE_TRASH_COL = "#8"                                 # V7.6.1: the Songs tab list (track, artist, bpm, len, added, score, flag, trash)
 
     def on_song_click(self, tree, col, e):
         """V7.6.1: a click on the trash cell of a song row = the same Recycle Bin question as a clip. Any other click is the normal row selection."""
@@ -13699,12 +13715,12 @@ class App:
 
     def refresh_songs(self):
         q = self.m_search.get().strip().lower()
-        rows = [("auto", "★ Auto pick (this week's best fit)", ("", "", ""))]
+        rows = [("auto", "★ Auto pick (this week's best fit)", ("", "", "", ""))]
         for s in self.songs:
             if q and q not in f"{s['artist']} {s['title']}".lower():
                 continue
             rows.append((s["path"], f"{s['title']}  -  {s['artist']}" if s["artist"] else s["title"],
-                         (self.song_bpm(s), s["added"].strftime("%Y-%m-%d") if s["added"] else "", self.TRASH_GLYPH)))
+                         (self.song_bpm(s), fmt_mss(s.get("dur")), s["added"].strftime("%Y-%m-%d") if s["added"] else "", self.TRASH_GLYPH)))
         rows = self.sorted_rows(self.stree, rows)
         if getattr(self, "_fill_sig", {}).get(self.stree) == rows and self._fill_token.get(self.stree) is not None:
             return                                                  # V6.1: same data as the list shows: no refill, no selection reset
@@ -13968,15 +13984,15 @@ class App:
         self.btn(bar, "Song map of selected file...", self.map_match).pack(side="left", padx=3)
         self.m_info = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
-        fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "score", "flag", "trash"), height=18, selectmode="browse")
+        fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "len", "added", "score", "flag", "trash"), height=18, selectmode="browse")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 420, "MP3 file"), ("track", 300, "Matched playlist track"), ("artist", 200, "Artist"),
-                        ("bpm", 60, "BPM"), ("score", 70, "Score"), ("flag", 130, "Flag"), ("trash", 40, "")):
+                        ("bpm", 60, "BPM"), ("len", 64, "Length"), ("added", 100, "Added"), ("score", 70, "Score"), ("flag", 130, "Flag"), ("trash", 40, "")):
             self.mtree.column(c, width=w, minwidth=(36 if c == "trash" else 50), stretch=(c in ("#0", "track")), **({"anchor": "center"} if c == "trash" else {}))
             self.mtree.heading(c, text=t)
         self.mtree.bind("<Button-1>", lambda e: self.on_song_click(self.mtree, self.MTREE_TRASH_COL, e))
         self.make_sortable(self.mtree, self.fill_matches, {"#0": "MP3 file", "track": "Matched playlist track", "artist": "Artist",
-                                                            "bpm": "BPM", "score": "Score", "flag": "Flag"})
+                                                            "bpm": "BPM", "len": "Length", "added": "Added", "score": "Score", "flag": "Flag"})
         self.mtree.tag_configure("weak", foreground="#ffc65c")
         self.mtree.tag_configure("none", foreground="#ff8a80")
         self.match_rows, self.match_audio = [], []
@@ -13992,17 +14008,20 @@ class App:
         with pstage("load_matches: write_song_matches"):
             write_song_matches(audio, matched)
         by = {a["path"]: (r, sc) for r, a, sc in matched}
-        items = []
-        for a in sorted(audio, key=lambda a: a["path"].lower()):
-            r, sc = by.get(a["path"], (None, 0))
-            items.append((a["path"], Path(a["path"]).name, r["title"] if r else "", r["artist"] if r else "", sc,
-                          match_flag(a["path"], r, sc),
-                          f"{r['tempo']:.0f}" if r and r.get("tempo") else ""))
-        weak = sum(1 for i in items if i[5] != "ok")
         songs = None
         if rows and cfg.get("mp3_dir"):
             with pstage("load_matches: song_pool (cache hit)"):
                 songs = sorted(song_pool(cfg)[0], key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
+        added_of = {s["path"]: s["added"] for s in (songs or [])}          # V7.7.0: the SAME 'date added' as the Manual song list (song_pool: the newest playlist 'Added At' of the file)
+        items = []
+        for a in sorted(audio, key=lambda a: a["path"].lower()):
+            r, sc = by.get(a["path"], (None, 0))
+            ad = added_of.get(a["path"]) if songs is not None else (parse_added(r["added"]) if r and r.get("added") else None)
+            items.append((a["path"], Path(a["path"]).name, r["title"] if r else "", r["artist"] if r else "", sc,
+                          match_flag(a["path"], r, sc),
+                          f"{r['tempo']:.0f}" if r and r.get("tempo") else "",
+                          fmt_mss(a.get("dur")), ad.strftime("%Y-%m-%d") if ad else ""))
+        weak = sum(1 for i in items if i[5] != "ok")
 
         def fill():
             _f0 = time.perf_counter()
@@ -14019,10 +14038,10 @@ class App:
 
     def fill_matches(self):
         items = getattr(self, "match_items", [])
-        rows = self.sorted_rows(self.mtree, [(pth, nm, (tr, ar, bpm, sc, fl, self.TRASH_GLYPH)) for pth, nm, tr, ar, sc, fl, bpm in items])
+        rows = self.sorted_rows(self.mtree, [(pth, nm, (tr, ar, bpm, ln, ad, sc, fl, self.TRASH_GLYPH)) for pth, nm, tr, ar, sc, fl, bpm, ln, ad in items])
         self.mtree.delete(*self.mtree.get_children())
         for pth, nm, vals in rows:
-            fl = vals[4]
+            fl = vals[6]
             self.mtree.insert("", "end", iid=pth, text=nm, values=vals, tags=("none" if fl == "NO MATCH" else "weak" if fl != "ok" else "",))
 
     def map_song(self):
