@@ -6,7 +6,7 @@ Three separate analyses: (1) beat grid (grid.py) = where the rhythm is, (2) even
 ALGO_V = "v2.0"                 # bump to invalidate ONLY the V2 cache
 CACHE_NAME = "song_cache_v2.json"
 CACHE_NS = "songmap_v2"
-ANALYSIS_CAP_S = 60.0           # hard cap per song (a 4 minute song takes a few seconds)
+ANALYSIS_CAP_S = 180.0          # hang guard per song (a 4 minute song takes ~10 s; V7.6.1: was 60 s - a timeout is cached for good, so load changed which songs got V2)
 
 from . import timebase, grid, events, sections, adapter   # noqa: E402,F401
 try:
