@@ -8,6 +8,7 @@
   g) guards: 50 + 50 generated clips vs V7.6.1, the 7 real Valorant clips (4 / 11 / 3 / 0), the 4K
 Runs on a COPY of montage_data (V7_DATA_SRC picks the folder; the real folder is only read).   python tests\\test_v770.py   (parts: V770_PARTS=0,1,2,3,4,g)"""
 import os
+import datetime
 import json
 import re
 import subprocess
@@ -406,7 +407,145 @@ def part_same_fight():
         check(not M.verify_cutlist(plan), "cut list valid")
 
 
+# ------------------------------------------------------------------------------------------------ 3) song length + date-added sort
+def make_lib_lengths(tmp, specs):
+    """specs = [(title, artist, seconds, added 'YYYY-MM-DD')]: real mp3 files of these lengths + a playlist CSV with the 'Added At' dates."""
+    import csv
+    lib, pl = tmp / "songs3", tmp / "pl3"
+    lib.mkdir(exist_ok=True)
+    pl.mkdir(exist_ok=True)
+    files = []
+    for i, (title, artist, sec, _ad) in enumerate(specs):
+        f = lib / f"{title} - {artist}.mp3"
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"sine=f={220 + 90 * i}:d={sec}", "-c:a", "libmp3lame", "-b:a", "32k", str(f)], capture_output=True)
+        assert r.returncode == 0, r.stderr.decode()[-200:]
+        t = time.time() - 900
+        os.utime(f, (t, t))
+        files.append(str(f))
+    with open(pl / "list.csv", "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(["Track URI", "Track Name", "Artist Name(s)", "Duration (ms)", "Added At", "Danceability", "Energy", "Tempo"])
+        for i, (title, artist, sec, ad) in enumerate(specs):
+            w.writerow([f"spotify:track:{i}", title, artist, int(sec * 1000), ad + "T10:00:00Z", 0.7, 0.8, 128.0 + i])
+    return lib, pl, files
+
+
+def part_song_columns(tmp):
+    with section("3) song length (m:ss) in the Songs tab and the Manual song list, 'Added' sort in the Songs tab = the Manual tab's (temp library, nothing real touched)"):
+        try:
+            import tkinter  # noqa: F401
+        except Exception:
+            check(False, "tkinter missing - the GUI checks could not run")
+            return
+        check(M.fmt_mss(0) == "" and M.fmt_mss(None) == "" and M.fmt_mss(59.4) == "0:59" and M.fmt_mss(60) == "1:00" and M.fmt_mss(224.7) == "3:45" and M.fmt_mss(3725) == "62:05", "fmt_mss: 59.4 -> 0:59, 60 -> 1:00, 224.7 -> 3:45, unknown -> ''")
+        specs = [("Alpha Song", "Artist A", 41, "2026-10-01"), ("Beta Song", "Artist B", 125, "2026-10-09"), ("Gamma Song", "Artist C", 63, "2026-10-05"), ("Delta Song", "Artist D", 200, "2026-10-03")]
+        lib, pl, files = make_lib_lengths(tmp, specs)
+        real_lib = Path(M.load_config().get("mp3_dir") or "")
+        real_before = sorted((f.name, f.stat().st_mtime_ns, f.stat().st_size) for f in real_lib.glob("*.mp3")) if real_lib.is_dir() else []
+        keep = M.use_data_dir(tmp / "d3")
+        try:
+            cfg = dict(M.load_config(), mp3_dir=str(lib), playlist_dir=str(pl), clip_dirs={"valorant": [], "cs2": []}, song_overrides={})
+            M.save_json(M.CONFIG_PATH, cfg)
+            aud = M.scan_audio(cfg)
+            durs = {Path(a["path"]).name: a["dur"] for a in aud}
+            check(all(abs(durs[f"{t} - {a}.mp3"] - s) < 1.0 for t, a, s, _d in specs), f"scan_audio reads each song's length from the mp3 ({ {k[:5]: round(v) for k, v in durs.items()} })")
+            cache_before = M.load_json(M.AUDIO_CACHE, {})
+            t0 = time.perf_counter()
+            M.scan_audio(cfg)
+            check(M.load_json(M.AUDIO_CACHE, {}) == cache_before and time.perf_counter() - t0 < 1.0, f"the length is cached with the tags: a second scan reads no file again ({time.perf_counter() - t0:.2f} s)")
+            songs, _un, _c = M.song_pool(cfg)
+            check({Path(s["path"]).name: M.fmt_mss(s["dur"]) for s in songs} == {"Alpha Song - Artist A.mp3": "0:41", "Beta Song - Artist B.mp3": "2:05", "Gamma Song - Artist C.mp3": "1:03", "Delta Song - Artist D.mp3": "3:20"}, "song_pool carries the length of every song")
+            real_sc, real_eb = M.scan_clips, M.ensure_bars
+            M.scan_clips = lambda cfg, rescan=False: []
+            M.ensure_bars = lambda cfg, force=False: None
+            app = M.App(0)
+            root = app.root
+            root.geometry("1500x900+0+0")
+            app.nb.select(app.tabs["Manual"])
+            try:
+                def settle(n=300):
+                    for _ in range(n):
+                        root.update()
+                        time.sleep(0.04)
+                        if not app.busy and not app.pending:
+                            break
+                settle()
+                app.run_task("matches", app.load_matches)
+                settle(600)
+                for _ in range(60):
+                    root.update()
+                    time.sleep(0.05)
+                M.scan_clips, M.ensure_bars = real_sc, real_eb
+                exp_len = {Path(f).name: M.fmt_mss(s) for f, (_t, _a, s, _d) in zip(files, specs)}
+                exp_add = {Path(f).name: d for f, (_t, _a, _s, d) in zip(files, specs)}
+                check("len" in app.stree["columns"] and "len" in app.mtree["columns"] and list(app.stree["columns"])[-1] == "trash" and list(app.mtree["columns"])[-1] == "trash",
+                      f"both lists have a Length column and still end with the trash column ({list(app.stree['columns'])} / {list(app.mtree['columns'])})")
+                check(app.stree.heading("len")["text"] == "Length" and app.mtree.heading("len")["text"] == "Length" and app.mtree.heading("added")["text"] == "Added", "headings: Length (both lists), Added (Songs tab)")
+                ch = [i for i in app.stree.get_children() if i != "auto"]
+                got_s = {Path(i).name: app.stree.set(i, "len") for i in ch}
+                got_m = {Path(i).name: app.mtree.set(i, "len") for i in app.mtree.get_children()}
+                check(got_s == exp_len and got_m == exp_len, f"Manual list and Songs tab show the same lengths: {sorted(got_m.values())}")
+                add_s = {Path(i).name: app.stree.set(i, "added") for i in ch}
+                add_m = {Path(i).name: app.mtree.set(i, "added") for i in app.mtree.get_children()}
+                check(add_s == exp_add and add_m == exp_add, f"the Songs tab shows the same 'date added' as the Manual list ({sorted(add_m.values())})")
+                check(app.MTREE_TRASH_COL == "#%d" % (list(app.mtree["columns"]).index("trash") + 1) and app.STREE_TRASH_COL == "#%d" % (list(app.stree["columns"]).index("trash") + 1), "the trash click columns follow the new layout")
+
+                def order(tree):
+                    return [Path(i).name for i in tree.get_children() if i != "auto"]
+
+                def settle2():
+                    for _ in range(80):
+                        root.update()
+                        time.sleep(0.02)
+                by_add = sorted(exp_add, key=lambda n: exp_add[n])
+                by_len = sorted(exp_len, key=lambda n: sum(int(x) * m for x, m in zip(exp_len[n].split(":"), (60, 1))))
+                for tree, nm in ((app.stree, "Manual"), (app.mtree, "Songs")):
+                    for col, exp in (("added", by_add), ("len", by_len)):
+                        app.sorts.pop(str(tree), None)
+                        app.sort_by(tree, col)
+                        settle2()
+                        o1 = order(tree)
+                        app.sort_by(tree, col)
+                        settle2()
+                        o2 = order(tree)
+                        check(o1 == list(reversed(exp)) and o2 == exp and app.sorts[str(tree)] == (col, False),
+                              f"{nm}: click '{col}' = largest/newest first, click again = reversed ({[n[:5] for n in o1]} then {[n[:5] for n in o2]})")
+                        h = tree.heading(col)["text"]
+                        check(h.endswith("▲"), f"{nm}: the '{col}' heading shows the direction arrow ({h})")
+                # same default + toggle as the Manual list: first click descending for 'added'
+                app.sorts.pop(str(app.mtree), None)
+                app.sort_by(app.mtree, "added")
+                check(app.sorts[str(app.mtree)] == ("added", True), "Songs tab: the first click on 'Added' sorts newest first, like the Manual tab")
+                # no lag with 1900+ songs
+                app.songs = [{"path": f"s{i}.mp3", "artist": "a", "title": f"t{i}", "added": datetime.datetime(2026, 1, 1) + datetime.timedelta(days=i % 500), "csv_bpm": 90.0 + i % 80, "dur": 120 + i % 240} for i in range(2000)]
+                app.sorts.pop(str(app.stree), None)
+                app.sort_by(app.stree, "len")
+                t0 = time.perf_counter()
+                app.refresh_songs()
+                t_s = time.perf_counter() - t0
+                app.match_items = [(f"s{i}.mp3", f"s{i}.mp3", "t", "a", 100, "ok", "128", M.fmt_mss(120 + i % 240), "2026-01-01") for i in range(2000)]
+                app.sort_by(app.mtree, "added")
+                t0 = time.perf_counter()
+                app.fill_matches()
+                t_m = time.perf_counter() - t0
+                check(t_s < 0.5 and t_m < 1.0, f"2000 songs: Manual list refill + sort {t_s * 1000:.0f} ms, Songs tab refill + sort {t_m * 1000:.0f} ms")
+            finally:
+                M.scan_clips, M.ensure_bars = real_sc, real_eb
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+        finally:
+            M.restore_data_dir(keep)
+        real_after = sorted((f.name, f.stat().st_mtime_ns, f.stat().st_size) for f in real_lib.glob("*.mp3")) if real_lib.is_dir() else []
+        check(real_before == real_after, f"the real song library is untouched ({len(real_after)} files)")
+
+
 def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     before = snapshot(REAL_DATA)
     tmp = Path(tempfile.mkdtemp(prefix="t770_"))
     only = set(filter(None, os.environ.get("V770_PARTS", "").split(",")))
@@ -433,6 +572,8 @@ def main():
     if want("2"):
         with PB.data_copy(M):
             part_same_fight()
+    if want("3"):
+        part_song_columns(tmp)
     after = snapshot(REAL_DATA)
     if before == after:
         check(True, f"real montage_data byte-identical after the tests ({len(before)} files)")
