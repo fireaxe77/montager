@@ -7479,7 +7479,10 @@ def impact_time(plan, ti, kj):
     return float(plan["song"]["start_t"]) + t["f0"] / OUT_FPS + src_to_out(t["segs"], t["kills"][kj])
 
 
-def move_kill(plan, ti, kj, target, fps):
+DRIFT_FR = 3                         # V7.6.1 lever d: the neighbour take before may drift its own kills by this many frames (50 ms) when a drop is a frame or two out of reach
+
+
+def move_kill(plan, ti, kj, target, fps, protected=frozenset()):
     """V7.6.0: move kill kj of take ti onto song time `target` with levers a (re-cut inside the take: longer / shorter run-up, its tail gives / takes the frames)
     and c (the cut before / after the take moves: the neighbour's tail or run-up absorbs the frames). Every OTHER take keeps every kill on its frame; the set of
     takes, their order and the montage length never change. Returns (new takes, levers used, '') or (None, '', reason)."""
@@ -7514,28 +7517,33 @@ def move_kill(plan, ti, kj, target, fps):
         return sg * lo, why
     lead_r, why_l = reach(tk, flex_lead, m)
     tailp_r, why_tp = reach(prv, flex_tail, m) if prv is not None else (0, "no take before" if ti == 0 else "")
+    leadp_r = 0                                            # lever d: the take before may move its own kills a few frames (its run-up shrinks / grows at its start)
+    if prv is not None and prv["path"] not in protected and abs(m) > abs(lead_r) + abs(tailp_r) and (m > 0) == (m > 0):
+        leadp_r, _w = reach(prv, flex_lead, max(-DRIFT_FR, min(DRIFT_FR, m)))
     tail_r, why_t = reach(tk, flex_tail, -m)
     leadn_r, why_ln = reach(nxt, flex_lead, -m) if nxt is not None else (0, "no take after")
     word = "later" if m > 0 else "earlier"
-    if abs(lead_r) + abs(tailp_r) < abs(m):
-        return None, "", f"{abs(m) / fps:.2f} s {word} needed, before the kill only {(abs(lead_r) + abs(tailp_r)) / fps:.2f} s: " + \
+    if abs(lead_r) + abs(tailp_r) + abs(leadp_r) < abs(m):
+        return None, "", f"{abs(m) / fps:.2f} s {word} needed, before the kill only {(abs(lead_r) + abs(tailp_r) + abs(leadp_r)) / fps:.2f} s: " + \
             ("; ".join(f"{k} {w}" for k, w in (("run-up:", why_l), ("take before:", why_tp)) if w) or "no run-up / tail room")
     if abs(tail_r) + abs(leadn_r) < abs(m):
         return None, "", f"{abs(m) / fps:.2f} s {word} needed, after the kill only {(abs(tail_r) + abs(leadn_r)) / fps:.2f} s: " + \
             ("; ".join(f"{k} {w}" for k, w in (("tail:", why_t), ("take after:", why_ln)) if w) or "no tail / run-up room")
     splits = set()
-    for pre_first in ("lead", "tail"):
-        for post_first in ("tail", "lead"):
-            d2 = lead_r if pre_first == "lead" else m - tailp_r
-            d1 = m - d2
-            d3 = tail_r if post_first == "tail" else -m - leadn_r
-            d4 = -m - d3
-            if abs(d1) <= abs(tailp_r) and abs(d2) <= abs(lead_r) and abs(d3) <= abs(tail_r) and abs(d4) <= abs(leadn_r):
-                splits.add((d1, d2, d3, d4))
+    for d0 in ((0, leadp_r) if leadp_r else (0,)):         # d0 = lever d: frames the take before gives by shrinking / growing its own run-up
+        mb = m - d0
+        for pre_first in ("lead", "tail"):
+            for post_first in ("tail", "lead"):
+                d2 = lead_r if pre_first == "lead" else mb - tailp_r
+                d1 = mb - d2
+                d3 = tail_r if post_first == "tail" else -m - leadn_r
+                d4 = -m - d3
+                if abs(d1) <= abs(tailp_r) and abs(d2) <= abs(lead_r) and abs(d3) <= abs(tail_r) and abs(d4) <= abs(leadn_r) and (d1 + d2) == mb:
+                    splits.add((d0, d1, d2, d3, d4))
     why = "the levers together break a cut-list rule"
-    for d1, d2, d3, d4 in sorted(splits, key=lambda s: (sum(1 for x in s if x), s)):
+    for d0, d1, d2, d3, d4 in sorted(splits, key=lambda s: (sum(1 for x in s if x), s)):
         new = copy.deepcopy(takes)
-        r = (flex_tail(new[ti - 1], d1, fps) if d1 else "") or flex_lead(new[ti], d2, fps) or flex_tail(new[ti], d3, fps) or \
+        r = (flex_lead(new[ti - 1], d0, fps) if d0 else "") or (flex_tail(new[ti - 1], d1, fps) if d1 else "") or flex_lead(new[ti], d2, fps) or flex_tail(new[ti], d3, fps) or \
             (flex_lead(new[ti + 1], d4, fps) if d4 else "")
         if r:
             why = r
@@ -7549,9 +7557,82 @@ def move_kill(plan, ti, kj, target, fps):
         if nb or nd:
             why = (nb + nd)[0].split(":", 1)[-1].strip()[:80]
             continue
-        lev = "+".join(x for x, on in (("a", bool(d2 or d3)), ("c", bool(d1 or d4))) if on)
+        lev = "+".join(x for x, on in (("a", bool(d2 or d3)), ("c", bool(d1 or d4)), ("d", bool(d0))) if on)
         return new, lev, ""
     return None, "", why
+
+
+REORDER_REACH = 1.5                  # V7.6.1 lever b: a kill of another take that would land this close to the drop after the take is moved is a candidate
+REORDER_TRIES = 60
+
+
+def _relayout_beats(takes, fps, bd):
+    f = 0
+    for t in takes:
+        t["f0"] = f
+        t["out_start"] = round(f / fps, 4)
+        t["beat0"] = f / fps / bd
+        t["beat_end"] = t["beat0"] + t["nf"] / fps / bd
+        f += t["nf"]
+    return f
+
+
+def reorder_for_drop(plan, t_d, fps, protected):
+    """V7.6.1 lever b: move ONE take (any take that holds no anchored kill, is no headline / ending / utility take and whose length is a whole number of beat ticks, so every take after it
+    keeps its beat phase) to another place in the take list so that one of its kills lands near the drop, then lever a + c put it on the exact time. The takes between its old and new
+    place shift by its length; none of them may hold an anchored kill. Returns (new takes, index of the moved take, kill index, levers) or (None, None, None, why)."""
+    import copy
+    takes = plan["takes"]
+    n = len(takes)
+    s0 = float(plan["song"]["start_t"])
+    bo = plan.get("beats_out") or []
+    if len(bo) < 3:
+        return None, None, None, "no beat grid"
+    bd = float(statistics.median([b - a for a, b in zip(bo, bo[1:])]))
+    td = bd / 2
+    cand = []
+    for xi, X in enumerate(takes):
+        if X.get("ending") or X.get("util") or X.get("role") == "headline" or X["path"] in protected or not X.get("kills_out"):
+            continue
+        ticks = X["nf"] / fps / td
+        if abs(ticks - round(ticks)) > 0.1 or int(round(ticks)) % 2:
+            continue
+        rest = [t for k, t in enumerate(takes) if k != xi]
+        last_q = len(rest) - (1 if takes[-1].get("ending") and takes[-1] is not X else 0)
+        for q in range(0, last_q + 1):
+            if q == xi:
+                continue
+            lo, hi = min(xi, q), max(xi, q)
+            if any(takes[k]["path"] in protected for k in range(lo, hi + 1) if k != xi):
+                continue
+            start_f = sum(t["nf"] for t in rest[:q])
+            for kj in range(len(X["kills"])):
+                e = s0 + start_f / fps + src_to_out(X["segs"], X["kills"][kj]) - t_d
+                if abs(e) <= REORDER_REACH:
+                    cand.append((0 if kj == len(X["kills"]) - 1 else 1, -len(X["kills"]), round(abs(e), 3), abs(q - xi), xi, q, kj))
+    if not cand:
+        return None, None, None, f"no movable take has a kill within {REORDER_REACH} s of the drop after being moved"
+    base_bad = verify_cutlist(plan)
+    base_dup = plan_duplicate_ranges(plan)
+    why = "every reordered take broke a cut-list rule"
+    for _a, _n, _e, _d, xi, q, kj in sorted(cand)[:REORDER_TRIES]:
+        new = copy.deepcopy(takes)
+        X = new.pop(xi)
+        new.insert(q, X)
+        _relayout_beats(new, fps, bd)
+        trial = dict(plan, takes=new)
+        nb = [x for x in verify_cutlist(trial) if x not in base_bad]
+        nd = [x for x in plan_duplicate_ranges(trial) if x not in base_dup]
+        if nb or nd:
+            why = (nb + nd)[0].split(":", 1)[-1].strip()[:80]
+            continue
+        trial2 = dict(plan, takes=new)
+        mv, lev, r = move_kill(trial2, q, kj, t_d, fps, protected=set(protected) | {X["path"]})
+        if mv is None:
+            why = r
+            continue
+        return mv, q, kj, "b+" + lev
+    return None, None, None, why
 
 
 def anchor_all_drops(plan, drops, game, notes, grid=None):
@@ -7564,7 +7645,7 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
     import numpy as np
     fps = round(plan["total_frames"] / plan["duration"])
     s0, D = float(plan["song"]["start_t"]), plan["duration"]
-    used, lines, sync = set(), [], []
+    used, lines, sync = set(), [], []                      # used = paths of the takes that carry an anchored kill (V7.6.1: paths, because lever b moves takes)
     hd = plan["song"].get("drop_t")
     hdrop = s0 + hd if hd is not None else None
     order = sorted(drops, key=lambda d: (0 if (hdrop is not None and abs(d[0] - hdrop) < 1.0) else 1, -d[1], d[0]))
@@ -7578,7 +7659,7 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
         is_head = hdrop is not None and abs(t_d - hdrop) < 1.0
         cands = []
         for ti, tk in enumerate(plan["takes"]):
-            if tk.get("ending") or tk.get("util") or ti in used or not tk.get("kills_out"):
+            if tk.get("ending") or tk.get("util") or tk["path"] in used or not tk.get("kills_out"):
                 continue
             nk = len(tk["kills"])
             for kj in range(nk):
@@ -7588,7 +7669,7 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
                     cands.append((tier, -nk, round(abs(e), 3), ti, kj))
         why, best = f"no kill of a selected take within {DROP_SEARCH} s of the drop", None
         for _tier, _n, _e, ti, kj in sorted(cands):
-            new, lev, r = move_kill(plan, ti, kj, t_d, fps)
+            new, lev, r = move_kill(plan, ti, kj, t_d, fps, protected=used)
             if new is None:
                 if why.startswith("no kill"):
                     why = f"take {ti + 1} kill {kj + 1}/{len(plan['takes'][ti]['kills'])}: {r}"
@@ -7596,22 +7677,34 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
             plan["takes"] = new
             best = (ti, kj, lev)
             break
+        b_why = ""
+        if best is None:                                   # lever b: another take moves to the drop
+            new, ti, kj, lev = reorder_for_drop(plan, t_d, fps, used)
+            if new is not None:
+                plan["takes"] = new
+                best = (ti, kj, lev)
+            else:
+                b_why = lev
         if best is None:
-            ln = f"drop {t_d:.3f} not anchorable: {why} (levers tried: a re-cut inside the take, c move the cuts before / after it; {len(cands)} candidate kills)"
-            sync.append({"drop": round(t_d, 3), "source": src_, "take": None, "kill": None, "impact": None, "err_ms": None, "lever": None, "why": why})
+            ln = f"drop {t_d:.3f} not anchorable: {why} (levers tried: a re-cut inside the take, c move the cuts before / after it, b reorder the takes [{b_why}]; {len(cands)} candidate kills)"
+            sync.append({"drop": round(t_d, 3), "source": src_, "take": None, "kill": None, "impact": None, "err_ms": None, "lever": None, "why": why + " | lever b: " + b_why})
         else:
             ti, kj, lev = best
-            used.add(ti)
-            imp = impact_time(plan, ti, kj)
             tk = plan["takes"][ti]
+            used.add(tk["path"])
+            imp = impact_time(plan, ti, kj)
             ln = f"drop {t_d:.3f} anchored: take {ti + 1} kill {kj + 1}/{len(tk['kills'])} at {imp:.3f} error {(imp - t_d) * 1000:+.0f} ms via {lev}"
             sync.append({"drop": round(t_d, 3), "source": src_, "take": ti + 1, "kill": kj + 1, "n": len(tk["kills"]), "impact": round(imp, 4),
-                         "err_ms": round((imp - t_d) * 1000, 1), "lever": lev, "why": ""})
+                         "err_ms": round((imp - t_d) * 1000, 1), "lever": lev, "why": "", "_path": tk["path"]})
             if is_head:
                 plan["song"]["drop_t"] = round(t_d - s0, 3)
                 if plan.get("drop_anchor"):
                     plan["drop_anchor"]["drop_t"] = round(t_d, 3)
         lines.append(ln)
+    for x_ in sync:                                        # lever b may have moved takes after a drop was anchored: take numbers follow the final order
+        pth_ = x_.pop("_path", None)
+        if pth_ is not None:
+            x_["take"] = next((i_ + 1 for i_, t_ in enumerate(plan["takes"]) if t_["path"] == pth_), x_["take"])
     plan["drop_sync"] = sorted(sync, key=lambda x: x["drop"])
     for ln in lines:
         notes.append(ln)
@@ -7619,7 +7712,7 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
     return lines
 
 
-def optimal_fit(clips, an, style, song_path=None):
+def optimal_fit(clips, an, style, song_path=None, rank=0):
     """V5.42B OPTIMAL - THE length rule, ONE shared function (Manual now; the weekly Auto mode can reuse it unchanged):
     (clips, song map, style) -> {"length", "start_beat", "end_beat", "drop_beat", "clips", "left", "max", "why"}.
       - range: 80 s minimum, 150 s maximum, never longer than the whole song;
@@ -7656,7 +7749,7 @@ def optimal_fit(clips, an, style, song_path=None):
     if lab_t:
         drops = [{"beat": int(np.argmin(np.abs(bt - t_))), "strength": 2.0} for t_ in lab_t]
         main = min((d["beat"] for d in drops), key=lambda b: abs(b - main)) if main is not None else drops[0]["beat"]
-    best = None
+    best, allc = None, []
     for E in bounds:
         if E > last_b or bt[E] - bt[0] < L - 1e-6:
             continue
@@ -7665,13 +7758,28 @@ def optimal_fit(clips, an, style, song_path=None):
         frac = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
         inside = [d for d in drops if 0.2 <= frac(d["beat"]) <= 0.6 and d["beat"] < E]
         sc = 0.0
-        if main is not None and 0.2 <= frac(main) <= 0.6 and main < E:
+        main_real = main is not None and any(abs(int(d["beat"]) - int(main)) <= 1 for d in drops)
+        if drops and not main_real:                        # V7.6.1: the planner's fallback anchor is not a drop of the song; a section with a REAL drop in the right place always beats it
+            real_sc = [3.0 - 4.0 * abs(frac(d["beat"]) - 0.38) + 0.2 * float(d.get("strength", 1.0)) for d in inside]
+            if real_sc:
+                sc += max(real_sc)
+            elif main is not None and 0.2 <= frac(main) <= 0.6 and main < E:
+                sc += 0.5                                  # no real drop fits this section: the anchor is only a last resort
+        elif main is not None and 0.2 <= frac(main) <= 0.6 and main < E:
             sc += 3.0 - 4.0 * abs(frac(main) - 0.38)       # V5.43: ~38% build-up before the drop (V5.42 order)
         elif inside:
             sc += 1.5
         sc += 0.5 * (E in sec_b) + 0.3 * (E == last_b) + 0.2 * float(np.mean(an["level"][S:E] if len(an.get("level", [])) >= E else [0]))
-        if best is None or sc > best[0] + 1e-9:
-            best = (sc, S, E, inside)
+        allc.append((sc, S, E, inside))
+    allc = sorted(allc, key=lambda c_: -c_[0])             # V7.6.1: every candidate section, best first; plan_montage tries the best few and keeps the one that places the most
+    seen_c, uniq = set(), []
+    for c_ in allc:
+        if (c_[1], c_[2]) not in seen_c:
+            seen_c.add((c_[1], c_[2]))
+            uniq.append(c_)
+    allc = uniq
+    if allc:
+        best = allc[min(rank, len(allc) - 1)]
     if best is None:                                       # the material needs the whole song
         best = (0.0, 0, last_b, [d for d in drops if d["beat"] < last_b])
     _, S, E, inside = best
@@ -7702,7 +7810,7 @@ def optimal_fit(clips, an, style, song_path=None):
               if L < min(OPT_RANGE[0], mx) - 0.5 and not left else "")
            + (f"; {len(left)} weakest didn't fit: " + ", ".join(Path(e["path"]).name for e, _ in left) if left else "")
            + f". Song section {ts(bt[S])}-{ts(bt[E])} ends on {end_kind}; drop at {ts(bt[drop_b])} ({dwhy}, {fr(drop_b):.0%} in)")
-    return {"length": round(L, 2), "start_beat": int(S), "end_beat": int(E), "drop_beat": int(drop_b), "clips": chosen,
+    return {"cands_n": max(1, len(allc)), "rank": rank, "length": round(L, 2), "start_beat": int(S), "end_beat": int(E), "drop_beat": int(drop_b), "clips": chosen,
             "left": left, "max": mx, "why": why, "drop_why": dwhy, "second": [round(float(bt[int(d["beat"])]), 1) for d in second],
             "head_kick_t": head_kick_time(song_path, bt, int(drop_b), drops)}
 
@@ -7726,7 +7834,7 @@ def why_no_take(ev):
             f"{post:.2f} s after)")
 
 
-def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
+def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False, fit_rank=0):
     """Event-driven, song-anchored layout (V4): the best multikill lands on the biggest drop's downbeat; build-up before it,
     the rest after it, a strong slow-mo ending last; takes on the song's beat grid, first kills on beats.
     manual=True (ticked clips): every usable event is used; Optimal = optimal_fit() (V5.42B: 80-150 s, never past the song,
@@ -7800,7 +7908,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         raise RuntimeError("no kill event has enough footage around it to form a take")
     fit, n_usable = None, len(usable)
     if fitm:                                 # V5.42B: THE shared Optimal rule picks length, section and clips
-        fit = optimal_fit(usable, an, rname, song_path=song.get("path"))
+        fit = optimal_fit(usable, an, rname, song_path=song.get("path"), rank=fit_rank)
         if not manual and plain:                           # V6.0: best multikills first, then best singles, until >= 80 s (never padded)
             need, added = min(OPT_RANGE[0], fit["max"]) - 0.5, 0
             for e in sorted(plain, key=lambda e: -e["score"]):
@@ -7809,7 +7917,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                 if place(e, U, down, rp, c=16):
                     usable.append(e)
                     added += 1
-                    fit = optimal_fit(usable, an, rname, song_path=song.get("path"))
+                    fit = optimal_fit(usable, an, rname, song_path=song.get("path"), rank=fit_rank)
             notes.append(f"{added} of {len(plain)} plain single kills added to reach {need + 0.5:.0f} s" if added else
                          f"{len(plain)} plain single kills left out (enough better material)")
         usable = [e for e in usable if any(e is c_ for c_ in fit["clips"])]
@@ -8077,8 +8185,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                          (" (no longer run-up fits its footage or the take before)" if manual else ""))
     if drop_note:
         notes.append(drop_note)
-    if fit and fit.get("second"):                          # V7.4.7: a second map drop inside the section is only logged (take lengths / run-ups / selection stay as they are)
-        notes.append("second drop(s) at " + ", ".join(ts(x) for x in fit["second"]) + ": placed by the drop solver (see the 'drop ...' lines)")
+    # (V7.6.1: the 'second drop' note is written at the end, from the window the montage really covers)
     plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock,
                       used_drop_beat=(fit["drop_beat"] if fit else None))       # V7.4.7: TIMELINE / song.drop_t print the drop actually used
     if HEADLINE_RULES_V73:                                 # which kill sits on which drop (read by `montage.py dropcheck`)
@@ -8103,6 +8210,16 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         trim_outro(plan, plan["notes"])
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
+    win_drops = [float(d_["t"]) for d_ in (an.get("drops") or []) if d_.get("t") is not None and S0 + 0.5 < float(d_["t"]) < S0 + D - 1.0]
+    lab_w = song_drop_labels(song["path"])
+    if lab_w:
+        win_drops = [float(t_) for t_ in lab_w if S0 + 0.5 < float(t_) < S0 + D - 1.0]
+    plan["notes"] = [re.sub(r"Song section [0-9:.]+-[0-9:.]+ ends", f"Song window {ts(S0)}-{ts(S0 + D)} (montage) ends", n_) if n_.startswith("OPTIMAL ") else n_
+                     for n_ in plan["notes"]]
+    if win_drops:
+        plan["notes"].append("drops of the song inside the montage window " + f"{ts(S0)}-{ts(S0 + D)}: " + ", ".join(ts(x) for x in sorted(win_drops)) + " (each gets a kill on its exact time where the clips allow it, see the 'drop ...' lines)")
+    elif an.get("drops"):
+        plan["notes"].append(f"no drop of the song lies inside the montage window {ts(S0)}-{ts(S0 + D)}: " + ", ".join(ts(float(d_['t'])) for d_ in an["drops"] if d_.get("t") is not None))
     placed_ = {t["path"] for t in plan["takes"]}
     why_m_ = {id(e): w for e, w in (fit["left"] if fit else [])}
     unplaced = [[nm(e), why_no_take(e)] for e in skipped if e["path"] not in placed_] + \
@@ -8122,7 +8239,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             plan["notes"].append(f"relaxed rule: {Path(t_['path']).name} - " + ", ".join(
                 {"half": "first kill on a half-beat tick", "lead_min": f"run-up shortened to {t_['kills_out'][0]:.2f} s (only that much footage before the kill)"}[k_]
                 for k_ in t_["rx"] if k_ in ("half", "lead_min")))
-    plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "unplaced": unplaced, "skipped": [[nm(e), why_no_take(e)] for e in skipped],
+    plan["fit"] = {"cands_n": (fit or {}).get("cands_n", 1), "usable": n_usable, "used": len(plan["takes"]), "unplaced": unplaced, "skipped": [[nm(e), why_no_take(e)] for e in skipped],
                    "left_out": [] if fitm else [nm(e) for e in cut_len + left],
                    "song_short": [nm(e) for e in (cut_len + left + left_song if fitm else left_song)],
                    "section_s": plan["song"]["section_s"], "manual": manual, "optimal": optimal}
@@ -8130,6 +8247,38 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
                          f"{'usable ' if manual else ''}takes{'' if optimal else f' (slider {target:.0f} s)'}, ends on "
                          f"{'song phrase' if on_ph else 'a beat'} at {ts(S0 + D)} (song section {ts(S0)}-{ts(S0 + plan['song']['section_s'])} "
                          f"= {plan['song']['section_s']:.0f} s available)")
+    return plan
+
+
+SECTION_TRIES = 4                       # V7.6.1: candidate song sections evaluated per plan (Optimal length)
+
+
+def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
+    """V7.6.1: plans the montage in the best-scored song section, then in the next best few, and keeps the plan that places the most kills (then the most drops anchored,
+    then the better section score). The length and the section follow ALL the material, never the result of one first pass. Same inputs = same plan."""
+    kw = dict(lock=lock, placement=placement, manual=manual)
+    n0 = list(notes)
+    first_notes = list(n0)
+    plan = _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_c, first_notes, fit_rank=0, **kw)
+    cands_n = (plan.get("fit") or {}).get("cands_n", 1)
+    best = (plan, first_notes, 0)
+    key = lambda pl: (sum(len(t["kills"]) for t in pl["takes"]), sum(1 for x in (pl.get("drop_sync") or []) if x.get("take")))
+    tried = [(0, key(plan), plan["song"]["start_t"], plan["duration"])]
+    if cands_n > 1 and (plan.get("fit") or {}).get("optimal"):
+        for rk in range(1, min(SECTION_TRIES, cands_n)):
+            nl = list(n0)
+            try:
+                pl2 = _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_c, nl, fit_rank=rk, **kw)
+            except RuntimeError:
+                continue
+            tried.append((rk, key(pl2), pl2["song"]["start_t"], pl2["duration"]))
+            if key(pl2) > key(best[0]):
+                best = (pl2, nl, rk)
+    plan = best[0]
+    if len(tried) > 1:
+        plan["notes"].append("song sections tried: " + "; ".join(f"#{r + 1} from {ts(st)} ({k[0]} kills, {k[1]} drops anchored, {du:.0f} s)" for r, k, st, du in tried) +
+                             f" - kept #{best[2] + 1}")
+    notes[:] = plan["notes"]
     return plan
 
 
