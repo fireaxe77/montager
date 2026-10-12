@@ -7984,6 +7984,8 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             anchor_all_drops(plan, dl_, game, plan["notes"], grid=bt)
         except Exception as ex_:
             LOGONLY(f"drop anchoring skipped: {ex_}")
+    if OUTRO_TRIM_ON[0]:                                   # V7.6.0: the video ends 0.5 s after the fade to black starts, ~0.5 s after the final kill
+        trim_outro(plan, plan["notes"])
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     plan["fit"] = {"usable": n_usable, "used": len(plan["takes"]), "skipped": [[nm(e), why_no_take(e)] for e in skipped],
@@ -8355,14 +8357,84 @@ def _sum_expr(terms):
     return "+".join(terms) if terms else "0"
 
 
+OUTRO_TRIM_ON = [True]      # V7.6.0: test switch (trim_outro)
 OUTRO_FADE_LEN = 0.5        # V7.5.1.2: video fade-out = the last 0.5 s of the final take (music fade keeps fade_out_start .. end); no freeze / hold
 OUTRO_SHORT_TAIL = 0.8      # tail after the last kill shorter than this: shorter fade
 OUTRO_MIN_FADE = 0.3
 INTRO_PUNCH = (0.06, 0.25)  # first take: zoom amount on the first beat, settling time
 
 
+OUTRO_AFTER = 0.5           # V7.6.0: the fade to black starts this long after the last kill impact (never before the last kill row is readable)
+OUTRO_ROW_READ = 0.4        # the last kill row is readable this long after it appears
+OUTRO_MUSIC_MIN = 0.6       # the music fade (last kill -> final frame) is at least this long
+
+
+def trim_outro(plan, notes=None):
+    """V7.6.0: the montage ends right after the final kill: the fade to black starts OUTRO_AFTER s after the last kill impact (output timeline, never before the
+    last kill row has been readable for OUTRO_ROW_READ s), lasts OUTRO_FADE_LEN s and the video ends with it. The unused tail footage of the last take is cut
+    (no freeze / hold at the end); the music fades from the last kill to the same final frame. Only the last take shrinks; nothing ever gets longer. Returns
+    the seconds trimmed (0.0 = unchanged)."""
+    takes = plan.get("takes") or []
+    if not takes or not takes[-1].get("kills_out"):
+        return 0.0
+    fps = OUT_FPS
+    last = takes[-1]
+    ko = last["out_start"] + last["kills_out"][-1]
+    ro = last["out_start"] + max(last.get("rows_out") or last["kills_out"])
+    fs = max(ko + OUTRO_AFTER, ro + OUTRO_ROW_READ)
+    off, hold_at = 0, None
+    for sg in last["segs"]:                                # a held frame (footage ran out) is never shown: the video ends before it
+        if sg[2] <= 0 and last["out_start"] + off / fps > ko:
+            hold_at = last["out_start"] + off / fps
+            break
+        off += sg[3]
+    end = fs + OUTRO_FADE_LEN
+    if hold_at is not None and hold_at < end:
+        end = hold_at
+        fs = max(ko + 0.2, end - OUTRO_FADE_LEN)
+    nf_new = int(round((end - last["out_start"]) * fps))
+    cut = last["nf"] - nf_new
+    if cut <= 0:
+        return 0.0
+    segs = [list(sg) for sg in last["segs"]]
+    rest = cut
+    while rest > 0 and segs:
+        z = segs[-1]
+        if z[3] <= rest:
+            rest -= z[3]
+            segs.pop()
+            continue
+        z[3] -= rest
+        if z[2] > 0:
+            z[1] = round(z[0] + z[3] * z[2] / fps, 6)
+        rest = 0
+    if not segs or sum(sg[3] for sg in segs) != nf_new:
+        return 0.0
+    bl = (last["beat_end"] - last["beat0"]) / max(1e-6, last["nf"] / fps)
+    last["segs"], last["nf"] = segs, nf_new
+    last["dur"] = round(nf_new / fps, 4)
+    last["beat_end"] = last["beat0"] + last["dur"] * bl
+    plan["total_frames"] = last["f0"] + nf_new
+    plan["duration"] = round(plan["total_frames"] / fps, 4)
+    D = plan["duration"]
+    plan["outro"] = {"fade_start": round(min(fs, D - 0.1), 4), "fade_len": round(D - min(fs, D - 0.1), 4), "trimmed": round(cut / fps, 3)}
+    plan["song"]["fade_out_start"] = round(max(0.0, min(ko, D - OUTRO_MUSIC_MIN)), 4)
+    if plan.get("beats_out"):
+        plan["beats_out"] = [b for b in plan["beats_out"] if b <= D + 1e-6]
+    if plan.get("drops_out"):
+        plan["drops_out"] = [d for d in plan["drops_out"] if d <= D]
+    ln = f"outro: last kill at {ko:.2f} s, fade to black from {plan['outro']['fade_start']:.2f} s over {plan['outro']['fade_len']:.2f} s, video ends at {D:.2f} s; trimmed {cut / fps:.2f} s of unused tail" + \
+        (" (stops before a held frame)" if hold_at is not None and hold_at <= D + 1e-6 else "")
+    if notes is not None:
+        notes.append(ln)
+    LOGONLY(ln)
+    return round(cut / fps, 3)
+
+
 def outro_fade(plan):
-    """V7.5.1.2: (video fade start, video fade length). Video only: the music fade and the take length are untouched; never starts before the last kill, no freeze."""
+    """V7.5.1.2: (video fade start, video fade length). V7.6.0: a trimmed outro (trim_outro) uses its own fade; never starts before the last kill, no freeze."""
+    if plan.get("outro"):
+        return plan["outro"]["fade_start"], plan["outro"]["fade_len"]
     takes = plan["takes"]
     D = plan["duration"]
     if not takes:
@@ -13900,8 +13972,9 @@ def render_check(outfile, plan, cfg, verbose=True):
     if plan.get("ending"):
         fo = plan["song"]["fade_out_start"]
         kend = last["out_start"] + last["kills_out"][-1]
-        if abs(fo - kend) > 1.5 / OUT_FPS or not (END_FADE[0] - 0.05 <= plan["duration"] - fo <= END_FADE[1] + 0.05):
-            fails.append("the ending fade does not run from the final kill to the end (2-3 s)")
+        lo_ = OUTRO_MUSIC_MIN - 0.05 if plan.get("outro") else END_FADE[0] - 0.05          # V7.6.0: a trimmed outro ends ~1 s after the final kill
+        if abs(fo - kend) > 1.5 / OUT_FPS or not (lo_ <= plan["duration"] - fo <= END_FADE[1] + 0.05):
+            fails.append("the ending fade does not run from the final kill to the end")
     if verbose:
         print_measure(m, f"RENDER CHECK {Path(outfile).name}")
         out("  " + ("OK: duration = plan and <= the song section, music audible from the start, no gaps, every take shows its kills, tails <= 0.5 s, "
@@ -14326,8 +14399,8 @@ def planner_selftest(verbose=True):
             if not last["ending"] or not last["slow"] or last["n"] < 2:
                 fails.append(f"seed {seed}: the last take is not a strong slow-mo ending")
             elif abs(plan["song"]["fade_out_start"] - (last["out_start"] + last["kills_out"][-1])) > 0.02 or \
-                    not (END_FADE[0] - 0.05 <= plan["duration"] - plan["song"]["fade_out_start"] <= END_FADE[1] + 0.05):
-                fails.append(f"seed {seed}: the fades do not run from the final kill to the end (2-3 s)")
+                    not ((OUTRO_MUSIC_MIN - 0.05 if plan.get("outro") else END_FADE[0] - 0.05) <= plan["duration"] - plan["song"]["fade_out_start"] <= END_FADE[1] + 0.05):
+                fails.append(f"seed {seed}: the fades do not run from the final kill to the end")
             if last["slow_at"] is None or abs(last["slow_at"] - last["kills_out"][-1]) > 1.5 / OUT_FPS:
                 fails.append(f"seed {seed}: the ending slow-mo does not start on the final kill")
             if not (29.5 <= plan["duration"] <= 121):
