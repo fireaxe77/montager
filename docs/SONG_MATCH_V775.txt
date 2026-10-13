@@ -1,0 +1,25 @@
+CSV Nostalgic_songs.csv: 1925 tracks, 1501 MP3 files
+before: 1480 matched, 445 unmatched
+after:  1498 matched, 427 unmatched
+
+NEWLY MATCHED (18):  CSV entry -> MP3 file  [tier 1 = primary artist, tier 2 = primary artist found among the other side's artists]
+  [1] 6YNTHMANE, влад пиво, картье, XI$OW - nonchalance  ->  6YNTHMANE, влад пиво, картье - nonchalance (feat.XIOW) - XIOW.mp3
+  [1] ghost. - ALL OR NOTHING  ->  ALL OR NOTHING - ghost.mp3
+  [1] nervexx, K4tamin - ALWAYS BEEN MINE.  ->  ALWAYS BEEN MINE - nervexx, K4tamin.mp3
+  [1] ROSÉ, Bruno Mars - APT.  ->  APT - ROSÉ, Bruno Mars.mp3
+  [1] t+pazolite, Nanahira - Don't force the vocal to sing like this.  ->  Don't force the vocal to sing like this - t+pazolite, Nanahira.mp3
+  [1] R3HAB - Dream inside a dream...  ->  Dream inside a dream - R3HAB.mp3
+  [1] Emilio - Ride  ->  Emilio - Ride - HMG.mp3
+  [1] S-X - Feels So Good  ->  Feels So Good - S-X [7HMikdsxIGYzXXw6cdKlyY].mp3
+  [1] R.I.O. - Hey Mama  ->  Hey Mama - R.I.O.mp3
+  [1] Klaas, Monkeekid - Icarus  ->  Klaas x Monkeekid - Icarus - KLAAS OFFICIAL.mp3
+  [1] Remady, Manu-L - L.I.F.E.  ->  L.I.F.E - Remady, Manu-L.mp3
+  [1] Mendum - One Third  ->  One Third - Mendum [37JfVaa5zYLREecGe6Xwdk].mp3
+  [1] JAŸ-Z - The Story of O.J.  ->  The Story of O.J - JAŸ-Z.mp3
+  [1] SKYL1NK - The Wizard  ->  The Wizard - SKYL1NK [056vIR7kln2nNoVLdDUgay].mp3
+  [1] Desmeon - Undone  ->  Undone - Desmeon [20XOC1HvJqwhXpBx3bfRnw].mp3
+  [1] Lauv, Troye Sivan - i'm so tired...  ->  i'm so tired - Lauv, Troye Sivan.mp3
+  [1] Три дня дождя, MONA - Отпечатки  ->  Три дня дождя, MONA – Отпечатки (У ЧАСТЬ ВТОРАЯ, Album 2026) - Три дня дождя.mp3
+  [1] Три дня дождя, Polovinka - Стардаст  ->  Три дня дождя, Polovinka – Стардаст (У ЧАСТЬ ВТОРАЯ, Album 2026) - Три дня дождя.mp3
+
+AMBIGUOUS, NOT MATCHED (0):
