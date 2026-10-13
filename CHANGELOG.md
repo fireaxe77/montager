@@ -5,6 +5,12 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V8.0.3 (branch work-v803, merged to main, APP_VERSION = V8.0.3) - 2026-10-14
+- Rainbow Six Siege gadget kills (drone, claymore, impact grenade and similar) are now recognised and left out of your montages, like utility kills in Valorant.
+- A per-clip switch (right-click a clip in the Manual list) lets you include the gadget kills of that clip.
+- The gadget kill icons live in their own icon folder; any image you drop there is used as an extra gadget icon.
+- Normal R6S kills are still read from the killfeed text only.
+
 ## V8.0.2 (branch work-v802, merged to main, APP_VERSION = V8.0.2) - 2026-10-14
 - Half-read names on the killfeed (a name that slides in and is first read as only its first letters) no longer turn one R6S kill into two.
 - R6S clips saved up to 30 seconds apart can now join into one fight, also chains of three or more, and a later clip never continues a round you died in.
