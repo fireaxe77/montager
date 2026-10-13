@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.0.1 - 2026-10-14: Rainbow Six Siege support
+- Rainbow Six Siege is the third game next to CS2 and Valorant: it has its own circle in the Manual list, its own row in Settings and its own output folder.
+- Your R6S clips are only read when you tick or pick them, never all at once.
+- It works without any icon files: kills are read straight from the killfeed, and icon images in the R6S icons folder are only an extra help.
+- Picked clips are always scanned first, then planned, previewed or rendered.
+
 ## V7.7.7 - 2026-10-13: CS2 kills now start at the right moment
 - A CS2 kill that was already on the killfeed when a clip started is no longer used as the opening kill.
 - The last kill of a CS2 multikill is no longer cut off: the take now starts when the kill really appears, not a second or two later.
