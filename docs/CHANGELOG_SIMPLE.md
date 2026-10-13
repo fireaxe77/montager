@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.7.0 - 2026-10-13: Best kill stays on the drop, song lengths
+- A strong multikill is no longer dropped from the montage over a tail that ran a few frames too long: the cut is fixed instead, and any clip that still cannot be placed is listed with the exact reason.
+- The plan header now tells the truth about which kill sits on which drop, and drops line up with the audible hit of the song.
+- Songs show their length in the Songs tab and the Manual list, and the Songs tab can be sorted by date added and by length.
+- New option in Settings (off by default): lower the game sound of clips that already have music playing.
+
 ## V7.6.1 - 2026-10-12: Far more kills fit, softer cuts
 - Clips that end right after the kill are no longer left out: the tail plays in smooth slow motion, so a 70-kill selection no longer shrinks to a 20 second montage. Every event that cannot be placed is listed with the exact reason.
 - Almost every drop of the song gets a kill on its exact time (takes can now be re-ordered to reach it), and the main drop is always a real drop of the song.

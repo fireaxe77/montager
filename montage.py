@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.6.1"
+APP_VERSION = "V7.7.0"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -555,6 +555,11 @@ def scan_audio(cfg, rescan=False):
         try:
             if k not in cache:
                 a, t, d = read_tags(p)
+                if not d:
+                    try:
+                        d = probe_duration(p) or 0           # V7.7.0: the song length is cached with the tags (a file mutagen cannot read is probed once)
+                    except Exception:
+                        d = 0
                 if not t:
                     fa, ft = parse_filename(p)
                     a, t = a or fa, ft
@@ -5341,7 +5346,7 @@ def song_pool(cfg, cached_only=False):
             old = songs.get(a["path"])
             if old is None or (added and (old["added"] is None or added > old["added"])):
                 songs[a["path"]] = {"path": a["path"], "artist": r["artist"], "title": r["title"], "added": added,
-                                    "csv_bpm": r.get("tempo") or None, "energy": r.get("energy"), "dance": r.get("dance"), "score": sc}
+                                    "csv_bpm": r.get("tempo") or None, "energy": r.get("energy"), "dance": r.get("dance"), "score": sc, "dur": a.get("dur") or 0}
         try:
             if not cached_only:
                 write_song_matches(audio, matched)
@@ -5357,8 +5362,17 @@ def song_pool(cfg, cached_only=False):
     if not songs:
         out("no playlist matches: using every audio file in the MP3 folder")
         for a in audio:
-            songs[a["path"]] = {"path": a["path"], "artist": a["artist"], "title": a["title"], "added": None}
+            songs[a["path"]] = {"path": a["path"], "artist": a["artist"], "title": a["title"], "added": None, "dur": a.get("dur") or 0}
     return list(songs.values()), unmatched, (csvp.name if csvp else None)
+
+
+def fmt_mss(sec):
+    """V7.7.0: a song length as m:ss (nearest second); '' when unknown. The lists sort it by the number of seconds (sort_key reads m:ss)."""
+    try:
+        s = int(float(sec) + 0.5)
+    except (TypeError, ValueError):
+        return ""
+    return f"{s // 60}:{s % 60:02d}" if s > 0 else ""
 
 
 def hist_list(path, game):
@@ -6102,6 +6116,7 @@ def ledger_finalize(led, picked, planned, plan):
     planned_k = {KillLedger.evkey(e) for e in (planned or [])}
     takes = plan.get("takes", [])
     skipped_names = [x[0] for x in (plan.get("fit") or {}).get("skipped", [])]
+    rule_names = {a: b for a, b in (plan.get("fit") or {}).get("rule_skips", [])}      # V7.7.0: takes dropped by the cut-list check, with the rule
 
     def placed(e):
         for t in takes:
@@ -6133,6 +6148,8 @@ def ledger_finalize(led, picked, planned, plan):
             nm = Path(e["path"]).name
             if placed(e):
                 st, inf = ("OVERRIDE_ADMITTED" if r["tag"] == "util" else "PLACED"), {"take": nm}
+            elif nm in rule_names:
+                st, inf = "CLIP_UNUSABLE", {"reason": "NOT PLACED: " + rule_names[nm]}
             elif k in planned_k and nm in skipped_names:
                 st, inf = "CLIP_UNUSABLE", {"reason": "cannot form a take: " + why_no_take(e)}
             elif k not in picked_k:
@@ -6448,6 +6465,36 @@ def cmd_ledger(args):
     (HERE / "ledger.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
     print(f"(read-only; written to {HERE / 'ledger.txt'}; nothing else was changed)")
+
+
+def cmd_musicscan(args):
+    """V7.7.0: python montage.py musicscan. Read-only: runs the 'music over gameplay' detector over every cached clip of both games (on the audio track the plan would use),
+    prints how many are flagged and their names, and writes musicscan.txt next to montage.py. Results are cached in the loud cache (the same cache the plan uses)."""
+    cfg = load_config()
+    lines, flagged, tot = [], [], 0
+    keep = (out, LOGONLY)
+    globals()["out"] = globals()["LOGONLY"] = lambda *a, **k: None
+    try:
+        for game in ("valorant", "cs2"):
+            pool, _st = game_pool(cfg, game, None)
+            for n_, it in enumerate(pool, 1):
+                rec = it["rec"]
+                if not rec.get("audio"):
+                    continue
+                tot += 1
+                au = resolve_clip_audio(rec, cfg, game, {})
+                m = music_over_gameplay(rec, au)
+                if m["yes"]:
+                    flagged.append((game, Path(rec["path"]).name, m))
+    finally:
+        globals()["out"], globals()["LOGONLY"] = keep
+    lines.append(f"music over gameplay: {len(flagged)} of {tot} clips with sound flagged ({100.0 * len(flagged) / max(1, tot):.1f} %)")
+    for g, nm, m in sorted(flagged):
+        lines.append(f"  {g:9} {nm}  score {m['score']:.2f}  ({m['why']})")
+    text = "\n".join(lines)
+    (HERE / "musicscan.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(read-only; written to {HERE / 'musicscan.txt'})")
 
 
 FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
@@ -6854,6 +6901,29 @@ def release_speeds(rem, v0, post, margin=0.017):
     return None
 
 
+_SLOW_GAP = {}
+
+
+def slow_out_gap(g):
+    """V7.7.0: output seconds a source gap `g` (s) after the last kill of a slow-mo take takes on screen: the speed curve of release_speeds (0.5x plateau, then the smooth release), not a flat
+    0.5x - so the tail window the planner aims for is the window verify_cutlist allows."""
+    if g <= 0:
+        return 0.0
+    if not _SLOW_GAP:
+        sp = release_speeds(6 * OUT_FPS, SLOW_V0, 99.0)
+        cum = [0.0]
+        for v in sp:
+            cum.append(cum[-1] + v / OUT_FPS)
+        _SLOW_GAP["cum"] = cum
+    cum = _SLOW_GAP["cum"]
+    if g >= cum[-1]:
+        return (len(cum) - 1) / OUT_FPS + (g - cum[-1])
+    import bisect
+    k = bisect.bisect_left(cum, g)
+    a, b = cum[k - 1], cum[k]
+    return (k - 1 + (g - a) / max(1e-9, b - a)) / OUT_FPS
+
+
 def speeds_to_segments(src_start, speeds, group=3):
     """Constant-speed source segments [a, b, speed, frames] from per-frame speeds: equal speeds merge, the rest are cut every `group` frames; the source position stays continuous."""
     segs, pos, i, n = [], src_start, 0, len(speeds)
@@ -7193,7 +7263,8 @@ def row_tail_window(ev, slow, win, post, ext=True):
     ext=False: only the old window's upper end (place() tries that first, so takes that already showed the row stay as they were)."""
     last = ev["times"][-1]
     spd = 0.5 if slow else 1.0
-    rdo = max(0.0, max(ev.get("rows") or ev["times"]) - last) / spd      # output s from the last kill to its row
+    gap_ = max(0.0, max(ev.get("rows") or ev["times"]) - last)
+    rdo = slow_out_gap(gap_) if slow else gap_                          # output s from the last kill to its row (V7.7.0: slow takes follow the real speed curve: plateau, then the release)
     need = rdo + ROW_TAIL
     if need <= win[0] + 1e-6:
         return win
@@ -7443,6 +7514,74 @@ DROP_ANCHOR_ON = [True]              # V7.5.1.2: test switch (every drop in the 
 DROP_ANCHOR_TOL = 0.03               # s: anchored when the kill is within this of the drop
 DROP_ANCHOR_MAX = 1.0                # s: a kill farther than this from the drop is not a candidate
 REPEAT_DROP_MIN_CONF = 0.0          # V7.6.0: map drops below this confidence are never anchored (repeat drops carry a conf)
+
+
+DROP_ONSET_WIN = 0.5                 # V7.7.0: the audible onset of a drop is searched this far (s) either side of its stored time
+DROP_ONSET_TOL = 0.040               # s: a stored drop further than this from its audible onset is anchored on the onset instead (anchor only, the stored drop map stays)
+DROP_ONSET_MIN_DB = 6.0              # an onset must rise this much (dB, 20 ms before -> 20 ms after) to count as the drop's hit
+
+
+def drop_onset_near(y, sr, t, win=DROP_ONSET_WIN):
+    """V7.7.0: the STRONGEST onset in the mp3's own samples within +-win s of t (the hit that makes a drop a drop). Strength = the rise of the 20 ms loudness (30 Hz and up) over the
+    20 ms before it; the position is the steepest point of that rise (the same point the kill-sound detector, a peak of the onset envelope, reports for a gunshot). Returns (onset time, rise in dB) or (None, 0.0) when nothing rises by DROP_ONSET_MIN_DB. `y` = mono samples decoded like the render (decode_mono)."""
+    import numpy as np
+    from scipy.signal import butter, sosfilt
+    a, b = max(0, int((t - win - 0.3) * sr)), min(len(y), int((t + win + 0.3) * sr))
+    if b - a < int(0.3 * sr):
+        return None, 0.0
+    seg = np.asarray(y[a:b], np.float64)
+    hp = sosfilt(butter(2, 30.0 / (sr / 2), "high", output="sos"), seg)          # causal: no pre-echo before the hit
+    e = np.abs(hp)
+    w = max(2, int(0.020 * sr))
+    cs = np.concatenate([[0.0], np.cumsum(e)])
+    mean_fwd = (cs[w:] - cs[:-w]) / w                    # mean |x| over [i, i+w)
+    n = len(mean_fwd)
+    idx = np.arange(w, n)                                # compare [i, i+w) with [i-w, i)
+    rise_db = 20 * np.log10((mean_fwd[idx] + 1e-6) / (mean_fwd[idx - w] + 1e-6))
+    t_axis = (a + idx) / sr
+    m = (t_axis >= t - win) & (t_axis <= t + win)
+    if not m.any():
+        return None, 0.0
+    j = int(np.argmax(np.where(m, rise_db, -1e9)))
+    if rise_db[j] < DROP_ONSET_MIN_DB:
+        return None, float(rise_db[j])
+    return float(t_axis[j]), float(rise_db[j])
+
+
+def song_drop_onset(song_path, drops, win=DROP_ONSET_WIN):
+    """V7.7.0: [(stored, onset or None, rise dB)] for stored drop times of one song, measured on the mp3 itself (decoded once)."""
+    y, sr = decode_mono(song_path, 44100)
+    return [(float(d), *drop_onset_near(y, sr, float(d), win)) for d in drops]
+
+
+_ONSET_MEMO = {}
+
+
+def refine_drop_anchors(song_path, drops):
+    """V7.7.0: [(time, strength, source)] -> (same list with each ANCHOR time moved onto the strongest audible onset within +-DROP_ONSET_WIN s of the stored time when that onset is more than
+    DROP_ONSET_TOL (40 ms) away, log lines). Only the anchor changes - the stored drop map / hand labels are never rewritten. A drop with no clear onset (< DROP_ONSET_MIN_DB) keeps its time."""
+    if not drops or not song_path:
+        return list(drops), []
+    try:
+        key = (str(song_path), os.path.getmtime(song_path), tuple(round(float(d[0]), 3) for d in drops))
+    except OSError:
+        return list(drops), []
+    if key not in _ONSET_MEMO:
+        try:
+            y, sr = decode_mono(str(song_path), 44100)
+            res = [drop_onset_near(y, sr, float(d[0])) for d in drops]
+        except Exception as ex:                            # noqa: BLE001
+            LOGONLY(f"drop onset check skipped: {type(ex).__name__}: {ex}")
+            res = [(None, 0.0) for _ in drops]
+        _ONSET_MEMO[key] = res
+    out_l, lines = [], []
+    for (t_, s_, src_), (on, db) in zip(drops, _ONSET_MEMO[key]):
+        if on is not None and abs(on - t_) > DROP_ONSET_TOL:
+            lines.append(f"anchor refined: {t_:.3f} -> {on:.3f} (strongest onset within {DROP_ONSET_WIN:.1f} s is {(on - t_) * 1000:+.0f} ms away, rise {db:.0f} dB; the stored drop is unchanged)")
+            out_l.append((float(on), s_, src_))
+        else:
+            out_l.append((float(t_), s_, src_))
+    return out_l, lines
 
 
 def shift_take_kill(plan, ht, kidx, target, fps, s0):
@@ -7743,6 +7882,80 @@ def reorder_for_drop(plan, t_d, fps, protected):
             continue
         return mv, q, kj, "b+" + lev
     return None, None, None, why
+
+
+def take_tail_bounds(t):
+    """V7.7.0: (tail, lo, hi) in output seconds of a take: the tail after its last kill, the shortest the kill-row rule allows (0.4 s after the row), the longest verify_cutlist allows."""
+    ko = t["kills_out"][-1]
+    rows = max(t.get("rows_out") or t["kills_out"])
+    hi = max(TAIL[1], rows - ko + ROW_TAIL + ROW_SLACK)
+    if t.get("slow"):
+        hi = max(hi, SLOW_TAIL_MAX)
+    return t["dur"] - ko, rows - ko + ROW_TAIL, hi
+
+
+TAIL_REPAIR_MAX_FR = 30              # V7.7.0: a tail repair moves at most this many frames
+
+
+def repair_tails(plan, notes):
+    """V7.7.0: a take whose tail broke the max (or min) tail rule is REPAIRED before anything is skipped: the tail is cut (lengthened) inside the window the rule allows and the take
+    after it takes over the frames as a longer (shorter) run-up, so every kill of every take keeps its exact time, the length and the order never change. Returns the log lines;
+    a take no repair fits is left as it is (the caller then skips it and lists the rule)."""
+    import copy
+    takes, fps = plan["takes"], OUT_FPS
+    lines = []
+    for i in range(len(takes)):
+        t = takes[i]
+        if t.get("ending") or not t.get("kills_out") or i + 1 >= len(takes):
+            continue
+        tail, lo, hi = take_tail_bounds(t)
+        if lo - 1.0 / fps - 1e-9 <= tail <= hi + 1.0 / fps + 1e-9:
+            continue
+        base_bad = verify_cutlist(plan)
+        base_dup = plan_duplicate_ranges(plan)
+        if tail > hi:                                      # too long: cut d frames, the next take's run-up grows by d
+            want = max(1, int(math.ceil((tail - hi) * fps - 1e-9)))
+            ds = [-d for d in range(want, min(TAIL_REPAIR_MAX_FR, int((tail - lo) * fps + 1.0)) + 1)]
+        else:                                              # too short: add d frames, the next take's run-up shrinks by d
+            want = int(math.ceil((lo - tail) * fps - 1e-9))
+            ds = [d for d in range(want, TAIL_REPAIR_MAX_FR + 1)]
+        why = "no repair fits"
+        anch = {x_.get("take") for x_ in (plan.get("drop_sync") or []) if x_.get("take")}
+        tries = [("next", d) for d in ds[:6]] + ([("self", d) for d in ds[:DRIFT_FR + 1] if abs(d) <= DRIFT_FR + 1] if tail > hi and (i + 1) not in anch else [])
+        for how, d in tries:
+            new = copy.deepcopy(takes)
+            if how == "next":                              # the take after gives / takes the frames at its start
+                r = flex_tail(new[i], d, fps) or flex_lead(new[i + 1], -d, fps)
+            else:                                          # inside the take (lever a): its kills sit |d| frames later, the tail shorter; no anchored kill moves
+                r = flex_lead(new[i], -d, fps) or flex_tail(new[i], d, fps)
+            if r:
+                why = r
+                continue
+            if _relayout(new, fps) != plan["total_frames"]:
+                why = "the montage length would change"
+                continue
+            trial = dict(plan, takes=new)
+            nb = [x for x in verify_cutlist(trial) if x not in base_bad]
+            nd = [x for x in plan_duplicate_ranges(trial) if x not in base_dup]
+            if nb or nd:
+                why = (nb + nd)[0].split(":", 1)[-1].strip()[:90]
+                continue
+            takes[:] = new
+            t2 = new[i]
+            tail2 = take_tail_bounds(t2)[0]
+            if how == "next":
+                lines.append(f"tail repaired: {Path(t2['path']).name}: tail {tail:.2f} s -> {tail2:.2f} s (allowed {lo:.2f}-{hi:.2f} s); the next take's run-up is "
+                             f"{'longer' if d < 0 else 'shorter'} by {abs(d)} frame(s), every kill keeps its time")
+            else:
+                lines.append(f"tail repaired: {Path(t2['path']).name}: tail {tail:.2f} s -> {tail2:.2f} s (allowed {lo:.2f}-{hi:.2f} s); the take's kills sit {abs(d)} frame(s) "
+                             f"({abs(d) / fps * 1000:.0f} ms) later inside it (the next take had no footage to give), no other take moves")
+            break
+        else:
+            lines.append(f"tail NOT repairable: {Path(t['path']).name}: tail {tail:.2f} s (allowed {lo:.2f}-{hi:.2f} s): {why}")
+    for l_ in lines:
+        notes.append(l_)
+        LOGONLY(l_)
+    return lines
 
 
 def anchor_all_drops(plan, drops, game, notes, grid=None):
@@ -8298,6 +8511,10 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     # (V7.6.1: the 'second drop' note is written at the end, from the window the montage really covers)
     plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock,
                       used_drop_beat=(fit["drop_beat"] if fit else None))       # V7.4.7: TIMELINE / song.drop_t print the drop actually used
+    try:                                                   # V7.7.0: a tail the planner's tick grid left outside the allowed window is repaired first (the drop levers need valid takes)
+        repair_tails(plan, plan["notes"])
+    except Exception as ex_:
+        LOGONLY(f"tail repair skipped: {type(ex_).__name__}: {ex_}")
     if HEADLINE_RULES_V73:                                 # which kill sits on which drop (read by `montage.py dropcheck`)
         plan["drop_anchor"] = {"drop_t": round(float(U[drop]), 3), "source": (fit or {}).get("drop_why") or "nearest 8-bar downbeat to the map drop (planner fallback)",
                                "n": head_take["ev"]["n"], "anchor": "last" if head_take.get("anchor") == "last" else "first",
@@ -8313,9 +8530,17 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             dl_ = [(float(t_), 2.0, "label") for t_ in lab_] if lab_ else \
                 [(float(d_["t"]), float(d_.get("strength", 1.0)), d_.get("source") or "map") for d_ in (an.get("drops") or [])
                  if d_.get("t") is not None and float(d_.get("conf", 1.0)) >= REPEAT_DROP_MIN_CONF]
+            dl_, rl_ = refine_drop_anchors(song["path"], dl_)       # V7.7.0: the anchor sits on the audible onset of the drop (stored drop unchanged)
+            for l_ in rl_:
+                plan["notes"].append(l_)
+                LOGONLY(l_)
             anchor_all_drops(plan, dl_, game, plan["notes"], grid=bt)
         except Exception as ex_:
             LOGONLY(f"drop anchoring skipped: {ex_}")
+    try:                                                   # V7.7.0: a take that broke the tail rule is repaired (tail cut inside the allowed window), never silently skipped
+        repair_tails(plan, plan["notes"])
+    except Exception as ex_:
+        LOGONLY(f"tail repair skipped: {type(ex_).__name__}: {ex_}")
     if OUTRO_TRIM_ON[0]:                                   # V7.6.0: the video ends 0.5 s after the fade to black starts, ~0.5 s after the final kill
         trim_outro(plan, plan["notes"])
     assign_soft_cuts(plan, plan["notes"])                  # V7.6.1: soft dissolves where footage allows it, hard cuts elsewhere
@@ -8504,6 +8729,78 @@ def split_parts(segs, ev):
     return out_
 
 
+MUSIC_LOWER_DB = 12.0                # V7.7.0 (Settings > "Lower clips that already have music playing", default OFF): the game audio of such a clip plays this much lower
+MUSIC_MIN_RUN_S = 5.0                # a song is sustained: tonal content lasting at least this long (gaps up to 0.4 s: gunshots) ...
+MUSIC_MIN_TONAL = 0.45               # ... on at least this share of the clip's active frames ...
+MUSIC_MAX_STILL = 0.85               # ... and the pitches CHANGE (a drone / hum / beep holds one chord: chroma similarity above this is not music)
+
+
+def music_features(y, sr=22050):
+    """V7.7.0: (share of active frames whose pitch-class (chroma) profile is concentrated on a few notes, longest run of such frames [s, gaps <= 0.4 s], median
+    similarity of the pitch profile 0.3 s apart [1.0 = one held tone]). Gunshots, abilities and footsteps are broadband (flat profile); ambience is noise or a drone; a song
+    is tonal for seconds AND moves from chord to chord."""
+    import numpy as np
+    import librosa
+    if len(y) < sr * 3 or float(np.sqrt(np.mean(np.square(y)))) < 0.004:
+        return None                                        # too short, or (near) silence: its pitch profile means nothing
+    hop = 1024
+    P = np.abs(librosa.stft(y, n_fft=4096, hop_length=hop)) ** 2
+    fr = librosa.fft_frequencies(sr=sr, n_fft=4096)
+    e = 10 * np.log10(P[(fr >= 100) & (fr <= 4000)].sum(0) + 1e-12)
+    act = e > (e.max() - 35)
+    ch = librosa.feature.chroma_stft(S=P, sr=sr, n_chroma=12, tuning=0.0)
+    chn = ch / (ch.sum(0, keepdims=True) + 1e-9)
+    ent = -(chn * np.log(chn + 1e-9)).sum(0)
+    fps = sr / hop
+    lag = max(1, int(0.3 * fps))
+    a, b = chn[:, :-lag], chn[:, lag:]
+    cs = (a * b).sum(0) / (np.linalg.norm(a, axis=0) * np.linalg.norm(b, axis=0) + 1e-9)
+    both = act[:-lag] & act[lag:]
+    tonal = float(((ent < 2.2) & act).sum() / max(1, act.sum()))
+    mask, g, best, cur, miss = (ent < 2.1) & act, int(0.4 * fps), 0, 0, 0
+    for m_ in mask:
+        if m_:
+            cur += 1 + miss
+            miss = 0
+            best = max(best, cur)
+        else:
+            miss += 1
+            if miss > g:
+                cur = miss = 0
+    return tonal, best / fps, (float(np.median(cs[both])) if both.any() else 1.0)
+
+
+def music_over_gameplay(rec, au):
+    """V7.7.0: is a song playing over this clip's gameplay audio? {'yes', 'score' 0-1, 'why'}. Conservative: only the three gates together say yes. A clip whose chosen track is a
+    game-only track of a multi-track recording ('track 2 of 4') is never analysed. Source files are only read; the result is cached per file and track (loud cache)."""
+    n_tr = max(len(au.get("all") or []), int(au.get("n") or 1))
+    st = int(au.get("stream") or 0)
+    if n_tr > 1 and st > 0:
+        return {"yes": False, "score": 0.0, "why": f"clean game-only track ({st + 1} of {n_tr}), not analysed"}
+    key = file_key(rec["path"]) + f"|music1|{st}"
+    cache = load_json(LOUD_CACHE, {})
+    if key in cache:
+        return cache[key]
+    try:
+        import numpy as np
+        r = run(["ffmpeg", "-v", "error", "-i", rec["path"], "-map", f"0:a:{st}", "-vn", "-ac", "1", "-ar", "22050", "-f", "f32le", "-"], timeout=120)
+        f = music_features(np.frombuffer(r.stdout, np.float32))
+    except Exception as ex:                                # noqa: BLE001
+        f = None
+        LOGONLY(f"music check failed for {Path(rec['path']).name}: {type(ex).__name__}: {ex}")
+    if f is None:
+        res = {"yes": False, "score": 0.0, "why": "too short or unreadable"}
+    else:
+        tonal, run_s, still = f
+        yes = run_s >= MUSIC_MIN_RUN_S and tonal >= MUSIC_MIN_TONAL and 0.3 <= still <= MUSIC_MAX_STILL
+        score = round(min(1.0, run_s / (2 * MUSIC_MIN_RUN_S)) * 0.5 + min(1.0, tonal / 0.9) * 0.5, 2) if still <= MUSIC_MAX_STILL else round(min(0.4, tonal * 0.4), 2)
+        res = {"yes": bool(yes), "score": score, "why": f"tonal {tonal:.2f}, longest run {run_s:.1f} s, pitch stillness {still:.2f}"}
+    cache = load_json(LOUD_CACHE, {})
+    cache[key] = res
+    save_json(LOUD_CACHE, cache)
+    return res
+
+
 def _game_gain(cfg, song_lufs, clip_lufs):
     """V4 balance (game under the music), slightly louder than V4; quiet clips (CS2) lifted by up to +8 dB, never lowered."""
     gv = float(cfg.get("game_audio_level", 0.6))
@@ -8523,6 +8820,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
     sec = an.get("section_of_beat") or []
     song_lufs = an.get("lufs")
     out_takes = []
+    notes_music = []                     # V7.7.0 (only filled when the Settings option is on)
     audio_state = {}                     # V5.57: audio mode used + Auto -> Legacy fallback reasons
     for i, tk in enumerate(takes):
         ev = tk["ev"]
@@ -8580,9 +8878,16 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             r = p["rec"]
             au = resolve_clip_audio(r, cfg, game, audio_state)
             gdb, lift = _game_gain(cfg, song_lufs, au["lufs"])
+            mus = None
+            if cfg.get("lower_music_clips") and r.get("audio"):              # V7.7.0: OFF (default) = this block never runs and nothing below changes
+                mus = music_over_gameplay(r, au)
+                if mus["yes"]:
+                    gdb = round(gdb - MUSIC_LOWER_DB, 2)
+                notes_music.append(f"music over gameplay: {Path(p['path']).name}: {'yes' if mus['yes'] else 'no'} ({mus['score']:.2f}; {mus['why']}) -> {gdb:+.1f} dB"
+                                   + (f" ({MUSIC_LOWER_DB:.0f} dB lower)" if mus["yes"] else ""))
             srcs.append({"path": p["path"], "shift": p.get("shift", 0.0), "rect": content_rect(r, cfg), "wh": [r["w"], r["h"]],
                          "audio": bool(r.get("audio")), "a_stream": au["stream"] or 0, "a_note": au.get("note", ""), "lufs": au["lufs"], "gain_db": gdb,
-                         "lift_db": lift, "dur": r.get("dur", 0)})
+                         "lift_db": lift, "dur": r.get("dur", 0), **({"music_db": -MUSIC_LOWER_DB} if mus and mus["yes"] else {})})
         b0 = (tk["c"] - takes[0]["c"]) / 2
         out_takes.append({"path": ev["path"], "srcs": srcs, "rect": srcs[0]["rect"], "audio": srcs[0]["audio"], "wh": srcs[0]["wh"],
                           "segs": segs, "f0": f_c, "nf": nf, "out_start": round(f_c / OUT_FPS, 4), "dur": round(nf / OUT_FPS, 4),
@@ -8600,6 +8905,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           **({"tail": {"mode": "fit", "v0": round(float(tk["v0"]), 3), "ease": EASE_FR, "ex": int(tk["ex"])}} if tk.get("tailmode") == "fit" else {}),
                           **({"rx": dict(ev["_rx"])} if ev.get("_rx") else {}),
                           **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {}), **({"util": True} if ev.get("util") else {})})
+    notes.extend(notes_music)
     a_mode = audio_state.get("mode") or cfg.get("audio_mode", "auto")
     total_f = out_takes[-1]["f0"] + out_takes[-1]["nf"]
     total_s = total_f / OUT_FPS
@@ -8701,6 +9007,30 @@ def verify_cutlist(plan):
     return bad
 
 
+def headline_report(plan):
+    """V7.7.0: the headline sentence of the plan header, generated from the FINAL cut list (never from a stale first plan): is the best multikill (the headline take) really on a drop?
+    Returns (on_drop, text, drop_t in montage seconds or None)."""
+    takes = plan.get("takes", [])
+    hi = next((i for i, t in enumerate(takes) if t.get("role") == "headline"), None)
+    s0 = float(plan["song"]["start_t"])
+    if hi is None:
+        return False, "no headline take", None
+    h = takes[hi]
+    for x in plan.get("drop_sync") or []:
+        if x.get("take") == hi + 1 and x.get("err_ms") is not None and abs(x["err_ms"]) <= DROP_ANCHOR_TOL * 1000 + 1e-6:
+            ds_ = sorted(y["drop"] for y in plan["drop_sync"])
+            k_ = ds_.index(x["drop"]) + 1
+            rule_ = "" if k_ == 1 else f" (drop {k_} of {len(ds_)}: the best multikill goes on the main drop, the one about 38% into the montage with the build-up before it)"
+            return True, f"best multikill ({h['n']}k) on the drop at {x['drop'] - s0:.3f}s{rule_}", x["drop"] - s0
+    dt = plan["song"].get("drop_t")
+    da = plan.get("drop_anchor") or {}
+    if not plan.get("drop_sync") and dt is not None:        # no per-drop solver result (older plans / the solver switched off): the planner's own anchor
+        return True, f"best multikill on the drop at {dt}s", dt
+    near = [x for x in plan.get("drop_sync") or [] if x.get("take") is None]
+    why = (near[0].get("why") if near else None) or ("the song has no drop inside the montage" if not (plan.get("drops_out") or []) else "its drop went to a stronger kill")
+    return False, f"best multikill ({h['n']}k) at {h['f0'] / OUT_FPS + h['kills_out'][-1]:.2f}s is NOT on a drop ({why})", None
+
+
 def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
     L = []
     sg = plan["song"]
@@ -8713,7 +9043,7 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
         L.append(f"AUTO STYLE {plan['recipe_why']}")
     L.append(f"SONG     {sg['artist']} - {sg['title']}   [{Path(sg['path']).name}]   BPM {sg['bpm']}   placement {plan['placement']}")
     L.append(f"TIMELINE song starts at {ts(sg['start_t'])} (music + video fade in {sg['fade_in']} s); {plan['duration']:.1f}s at 60 fps "
-             f"({plan['total_frames']} frames); best multikill on the drop at {sg['drop_t']}s; "
+             f"({plan['total_frames']} frames); {headline_report(plan)[1]}; "
              f"{'slow-mo ending, music fades from ' + format(sg['fade_out_start'], '.2f') + 's' if plan['ending'] else 'music fade-out over the last 2 s'}; "
              f"video fades from {outro_fade(plan)[0]:.2f}s over {outro_fade(plan)[1]:.2f}s")
     if score_info:
@@ -10550,6 +10880,37 @@ def pairscan_rows(cfg, recs, store, det, used, limit=30):
     return lines, len(rows)
 
 
+def apply_rule_skips(plan, skips):
+    """V7.7.0: takes the cut-list check dropped (after a repair was tried) are part of the FINAL plan's story: 'NOT PLACED <clip>: <exact rule and numbers>', the fit / summary lists and
+    the ledger (plan['fit']['rule_skips']) count them, so the plan, its summary and the ledger agree. `skips` = {path: rule text}."""
+    fit = plan.setdefault("fit", {})
+    have = {a for a, _b in fit.get("unplaced", [])}
+    add = []
+    for p_, why in skips.items():
+        nm_ = Path(p_).name
+        txt = f"cut-list rule broke and no repair fits: {why}"
+        fit.setdefault("rule_skips", []).append([nm_, txt])
+        if nm_ not in have:
+            add.append([nm_, txt])
+        plan["notes"].append(f"NOT PLACED {nm_}: {txt}")
+    fit["unplaced"] = list(fit.get("unplaced", [])) + add
+    n_un = len(fit["unplaced"])
+    for i_, n_ in enumerate(plan["notes"]):
+        m_ = re.match(r"(\d+) of (\d+) events could not be fitted", n_)
+        if m_:
+            plan["notes"][i_] = f"{n_un} of {int(m_.group(2)) + len(add)} events could not be fitted (listed above, one line each)"
+            break
+    else:
+        plan["notes"].append(f"{n_un} events could not be fitted (listed above, one line each)")
+
+
+def ledger_plan_check(led, plan):
+    """V7.7.0: (kills the ledger calls placed, kills in the plan's cut list): they must be equal."""
+    n_led = sum(1 for r in led.rows if r.get("state") in ("PLACED", "OVERRIDE_ADMITTED"))
+    n_plan = sum(len(t.get("kills", [])) for t in plan.get("takes", []))
+    return n_led, n_plan
+
+
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None):
     """scan=False: plan from what is already scanned (the Manual status-line estimate runs exactly this, quietly).
     V7.6.1 pin = {"song": path, "at": "HH:MM:SS"}: the song the summary (the estimate) already picked for this job. A song the user chose (song_path) always wins; otherwise the
@@ -10626,7 +10987,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     if style is None:
         style = cfg.get("style", "auto")
     def plan_loop(events):
-        pool_ev, fixes, extended = list(events), [], set()
+        pool_ev, fixes, extended, rule_skips = list(events), [], set(), {}
         for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
             n2 = list(notes)
             plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
@@ -10638,6 +10999,8 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
             gone = {plan["takes"][i - 1]["path"] for i in idx if 0 < i <= len(plan["takes"])}
             if not gone:
                 break
+            for p_ in gone:                                    # V7.7.0: every skipped take is listed in the final plan with the exact rule
+                rule_skips.setdefault(p_, why_b.get(p_) or "kill row outside its footage")
             if manual:                                         # V5.42B: first extend the take's window (no jump-cuts over its fight)
                 ext = {p_ for p_ in gone if p_ not in extended and "kill row" in why_b.get(p_, "")}
                 if ext:
@@ -10651,6 +11014,8 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
                       if "kill row" in why_b.get(p_, "kill row") else
                       f"take skipped: {Path(p_).name} ({why_b.get(p_)}), re-planned without it" for p_ in gone]
             pool_ev = [e for e in pool_ev if e["path"] not in gone]
+        if rule_skips:
+            apply_rule_skips(plan, rule_skips)
         return plan, pool_ev, fixes
     zero_err = None
     try:
@@ -10708,6 +11073,10 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
             ledger_finalize(led_, events, pool_ev, plan)
             for l_ in ledger_report(led_):
                 out(l_)
+            n_l_, n_p_ = ledger_plan_check(led_, plan)
+            if n_l_ != n_p_:
+                out(f"LEDGER CHECK: the ledger counts {n_l_} kills placed, the cut list holds {n_p_}")
+                plan["notes"].append(f"LEDGER CHECK: the ledger counts {n_l_} kills placed, the cut list holds {n_p_}")
             if scan:
                 ledger_save(led_, plan)
     except Exception as ex:                                # noqa: BLE001
@@ -10760,6 +11129,8 @@ def audio_guard(plan, outfile, cfg, redo):
             au = clip_audio_legacy({"path": sd["path"], "audio": sd["audio"]})
             sd["a_stream"], sd["a_note"], sd["lufs"] = au["stream"] or 0, au.get("note", ""), au["lufs"]
             sd["gain_db"], sd["lift_db"] = _game_gain(cfg, plan["song"].get("lufs"), au["lufs"])
+            if sd.get("music_db"):
+                sd["gain_db"] = round(sd["gain_db"] + sd["music_db"], 2)
     plan["audio_mode"] = "legacy"
     plan.setdefault("audio_fallback", []).append(why)
     out(f"Auto audio failed, used Legacy V5.55 ({why})")
@@ -12311,6 +12682,7 @@ class App:
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
+        cfg["lower_music_clips"] = bool(self.set_music.get())        # V7.7.0
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
         if self.set_names:
             cfg["player_names"] = {g: norm_names(v.get(), g) for g, v in self.set_names.items()}
@@ -12817,17 +13189,19 @@ class App:
         ttk.Entry(r2, textvariable=self.m_search, width=30).pack(side="left", padx=4)
         self.btn(r2, "Play selected song", self.play_song).pack(side="left", padx=8)
         self.btn(r2, "Song map", self.map_song, name="Song map (Manual)").pack(side="left")
-        fr2, self.stree = make_tree(s2, ("bpm", "added", "trash"), height=2, selectmode="browse")
+        fr2, self.stree = make_tree(s2, ("bpm", "len", "added", "trash"), height=2, selectmode="browse")
         fr2.pack(fill="both", expand=True)
         self.stree.column("#0", width=520)
         self.stree.column("bpm", width=70)
+        self.stree.column("len", width=64)                                      # V7.7.0: the song length (m:ss)
         self.stree.column("added", width=110)
         self.stree.column("trash", width=40, minwidth=36, stretch=False, anchor="center")        # V7.6.1: same Recycle Bin column as the clip list
         self.stree.heading("trash", text="")
         self.stree.heading("#0", text="Song")
         self.stree.heading("bpm", text="BPM")
+        self.stree.heading("len", text="Length")
         self.stree.heading("added", text="Added")
-        self.make_sortable(self.stree, self.refresh_songs, {"#0": "Song", "bpm": "BPM", "added": "Added"})
+        self.make_sortable(self.stree, self.refresh_songs, {"#0": "Song", "bpm": "BPM", "len": "Length", "added": "Added"})
         self.stree.bind("<<TreeviewSelect>>", lambda e: self.update_status())
         self.stree.bind("<Button-1>", lambda e: self.on_song_click(self.stree, self.STREE_TRASH_COL, e))
 
@@ -12985,8 +13359,8 @@ class App:
         self.apply_filter()
         out(f"moved to Recycle Bin: {name}")
 
-    STREE_TRASH_COL = "#3"                                 # V7.6.1: the Manual song list (bpm, added, trash)
-    MTREE_TRASH_COL = "#6"                                 # V7.6.1: the Songs tab list (track, artist, bpm, score, flag, trash)
+    STREE_TRASH_COL = "#4"                                 # V7.6.1: the Manual song list (bpm, len, added, trash)
+    MTREE_TRASH_COL = "#8"                                 # V7.6.1: the Songs tab list (track, artist, bpm, len, added, score, flag, trash)
 
     def on_song_click(self, tree, col, e):
         """V7.6.1: a click on the trash cell of a song row = the same Recycle Bin question as a clip. Any other click is the normal row selection."""
@@ -13325,12 +13699,12 @@ class App:
 
     def refresh_songs(self):
         q = self.m_search.get().strip().lower()
-        rows = [("auto", "★ Auto pick (this week's best fit)", ("", "", ""))]
+        rows = [("auto", "★ Auto pick (this week's best fit)", ("", "", "", ""))]
         for s in self.songs:
             if q and q not in f"{s['artist']} {s['title']}".lower():
                 continue
             rows.append((s["path"], f"{s['title']}  -  {s['artist']}" if s["artist"] else s["title"],
-                         (self.song_bpm(s), s["added"].strftime("%Y-%m-%d") if s["added"] else "", self.TRASH_GLYPH)))
+                         (self.song_bpm(s), fmt_mss(s.get("dur")), s["added"].strftime("%Y-%m-%d") if s["added"] else "", self.TRASH_GLYPH)))
         rows = self.sorted_rows(self.stree, rows)
         if getattr(self, "_fill_sig", {}).get(self.stree) == rows and self._fill_token.get(self.stree) is not None:
             return                                                  # V6.1: same data as the list shows: no refill, no selection reset
@@ -13594,15 +13968,15 @@ class App:
         self.btn(bar, "Song map of selected file...", self.map_match).pack(side="left", padx=3)
         self.m_info = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
-        fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "score", "flag", "trash"), height=18, selectmode="browse")
+        fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "len", "added", "score", "flag", "trash"), height=18, selectmode="browse")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 420, "MP3 file"), ("track", 300, "Matched playlist track"), ("artist", 200, "Artist"),
-                        ("bpm", 60, "BPM"), ("score", 70, "Score"), ("flag", 130, "Flag"), ("trash", 40, "")):
+                        ("bpm", 60, "BPM"), ("len", 64, "Length"), ("added", 100, "Added"), ("score", 70, "Score"), ("flag", 130, "Flag"), ("trash", 40, "")):
             self.mtree.column(c, width=w, minwidth=(36 if c == "trash" else 50), stretch=(c in ("#0", "track")), **({"anchor": "center"} if c == "trash" else {}))
             self.mtree.heading(c, text=t)
         self.mtree.bind("<Button-1>", lambda e: self.on_song_click(self.mtree, self.MTREE_TRASH_COL, e))
         self.make_sortable(self.mtree, self.fill_matches, {"#0": "MP3 file", "track": "Matched playlist track", "artist": "Artist",
-                                                            "bpm": "BPM", "score": "Score", "flag": "Flag"})
+                                                            "bpm": "BPM", "len": "Length", "added": "Added", "score": "Score", "flag": "Flag"})
         self.mtree.tag_configure("weak", foreground="#ffc65c")
         self.mtree.tag_configure("none", foreground="#ff8a80")
         self.match_rows, self.match_audio = [], []
@@ -13618,17 +13992,20 @@ class App:
         with pstage("load_matches: write_song_matches"):
             write_song_matches(audio, matched)
         by = {a["path"]: (r, sc) for r, a, sc in matched}
-        items = []
-        for a in sorted(audio, key=lambda a: a["path"].lower()):
-            r, sc = by.get(a["path"], (None, 0))
-            items.append((a["path"], Path(a["path"]).name, r["title"] if r else "", r["artist"] if r else "", sc,
-                          match_flag(a["path"], r, sc),
-                          f"{r['tempo']:.0f}" if r and r.get("tempo") else ""))
-        weak = sum(1 for i in items if i[5] != "ok")
         songs = None
         if rows and cfg.get("mp3_dir"):
             with pstage("load_matches: song_pool (cache hit)"):
                 songs = sorted(song_pool(cfg)[0], key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
+        added_of = {s["path"]: s["added"] for s in (songs or [])}          # V7.7.0: the SAME 'date added' as the Manual song list (song_pool: the newest playlist 'Added At' of the file)
+        items = []
+        for a in sorted(audio, key=lambda a: a["path"].lower()):
+            r, sc = by.get(a["path"], (None, 0))
+            ad = added_of.get(a["path"]) if songs is not None else (parse_added(r["added"]) if r and r.get("added") else None)
+            items.append((a["path"], Path(a["path"]).name, r["title"] if r else "", r["artist"] if r else "", sc,
+                          match_flag(a["path"], r, sc),
+                          f"{r['tempo']:.0f}" if r and r.get("tempo") else "",
+                          fmt_mss(a.get("dur")), ad.strftime("%Y-%m-%d") if ad else ""))
+        weak = sum(1 for i in items if i[5] != "ok")
 
         def fill():
             _f0 = time.perf_counter()
@@ -13645,10 +14022,10 @@ class App:
 
     def fill_matches(self):
         items = getattr(self, "match_items", [])
-        rows = self.sorted_rows(self.mtree, [(pth, nm, (tr, ar, bpm, sc, fl, self.TRASH_GLYPH)) for pth, nm, tr, ar, sc, fl, bpm in items])
+        rows = self.sorted_rows(self.mtree, [(pth, nm, (tr, ar, bpm, ln, ad, sc, fl, self.TRASH_GLYPH)) for pth, nm, tr, ar, sc, fl, bpm, ln, ad in items])
         self.mtree.delete(*self.mtree.get_children())
         for pth, nm, vals in rows:
-            fl = vals[4]
+            fl = vals[6]
             self.mtree.insert("", "end", iid=pth, text=nm, values=vals, tags=("none" if fl == "NO MATCH" else "weak" if fl != "ok" else "",))
 
     def map_song(self):
@@ -14096,6 +14473,10 @@ class App:
         label("Low-fps takes")
         ttk.Checkbutton(holder(), text="Interpolate low-fps takes (slow-mo, duplicated frames, VFR)", variable=self.set_interp).pack(side="left")
         r[0] += 1
+        self.set_music = tk.BooleanVar(value=bool(self.cfg.get("lower_music_clips", False)))      # V7.7.0
+        label("Music in clips")
+        ttk.Checkbutton(holder(), text="Lower clips that already have music playing (12 dB, only when sure; off by default)", variable=self.set_music).pack(side="left")
+        r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
         r[0] += 1
@@ -14133,7 +14514,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_music, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
@@ -16782,6 +17163,7 @@ def main():
     ds.add_argument("times", nargs="*", help="m:ss drop times, e.g. 0:34 1:32 2:15")
     ds.add_argument("--list", action="store_true")
     ds.set_defaults(fn=cmd_dropsave)
+    sp.add_parser("musicscan", help="V7.7.0: run the music-over-gameplay detector over all cached clips (read-only; writes musicscan.txt only)").set_defaults(fn=cmd_musicscan)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
