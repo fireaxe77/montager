@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.0.1"
+APP_VERSION = "V8.0.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -1322,11 +1322,8 @@ class Detector:
         self.game, self.calibrated = game, bool(d.get("region"))
         self.d = {"region": [float(v) for v in reg]}
         self.d["stamp"] = "ocr" + hashlib.md5(repr([round(v, 4) for v in self.d["region"]]).encode()).hexdigest()[:8]
-        if game == "r6s":                                  # V8.0.0: another icon set = another detector (its clips are scanned again, lazily)
-            try:
-                self.d["stamp"] = "ocr" + hashlib.md5(repr([round(v, 4) for v in self.d["region"]] + [r6s_icons_sig(r6s_load_icons(log=False))]).encode()).hexdigest()[:8]
-            except Exception:
-                pass
+        if game == "r6s":                                  # V8.0.0 / V8.0.1 stamp (region + an EMPTY icon set): kept as it was so the cached R6S entries stay valid; icons are not part of it
+            self.d["stamp"] = "ocr" + hashlib.md5(repr([round(v, 4) for v in self.d["region"]] + [r6s_icons_sig([])]).encode()).hexdigest()[:8]
         self.dw = max(16, int(round((reg[2] - reg[0]) * NORM_W)) & ~1)
         self.dh = max(16, int(round((reg[3] - reg[1]) * NORM_H)) & ~1)
 
@@ -2181,12 +2178,14 @@ def compute_kills(entry, cfg, game=None):
 # (kill), the victim side holds my name (death), everything else is a reject. Every step fails soft: a bad clip / icon / frame logs one R6S line
 # and skips only itself.
 R6S_ICON_EXT = (".png", ".jpg", ".jpeg")
-R6S_MATCH_THR = 0.80                 # normalised template correlation that counts as 'the kill icon is here'
-R6S_SCALES = (0.6, 0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.4, 1.6, 1.8, 2.0)     # templates are tried at these scales (crops are 1920-space, HUD scale varies)
+R6S_MATCH_THR = 0.85                 # normalised template correlation that counts as 'the kill icon is here'
+R6S_SCALES = (0.8, 0.9, 1.0, 1.12, 1.25, 1.4, 1.6, 1.8, 2.0)     # templates are tried at these scales (crops are 1920-space, HUD scale varies)
 R6S_GAP_F = 8                        # a row survives this many frames without its icon (compression flicker, fade)
 R6S_BLIP_F = 3                       # a row seen in fewer frames than this (and not at the very end) is a one-frame blip
 R6S_READ_AGES = (1, 6, 15, 40)       # frames after a row's first sighting at which its names are read (voting)
 R6S_SAMETIME_S = 0.3                 # kills this close are one 'same timestamp' group (each needs its own victim)
+R6S_PAIR_GAP = 30.0                  # R6S only: clips saved up to this far apart (end of one -> start of the next) can be one fight (CS2 / Valorant keep PAIR_MAX_GAP_S = 12 s)
+R6S_FRAG_S = 1.5                     # R6S only: victim reads this close in time, in the same killfeed slot, where one is a prefix / near-match of the other = ONE row
 R6S_BACK_F = 3                       # at most this many frames a row is dated back through sub-threshold sightings (fade-in)
 R6S_MISSING_MSG = "R6S kill icons missing: put the icon images in montage_data\\r6s\\icons"
 _R6S_ICON_CACHE = {}
@@ -2490,6 +2489,45 @@ def _r6s_side(boxes, thr):
     return (first[2] if first else ""), best, (r6s_name_score(first[2]) if first else 0.0)
 
 
+def r6s_merge_fragments(kills, rej):
+    """R6S: a killfeed row slides in, so its victim is first read half ('Sam', then 'Sambeario'). Two kills within R6S_FRAG_S in the same killfeed slot whose victims
+    are a prefix of each other (or near-identical) are ONE row: the fullest name stays, with the earliest time. Two different victims stay two kills (no prefix /
+    near-match), and so do two rows in different slots."""
+    from rapidfuzz import fuzz
+    kills.sort(key=lambda k: k["t"])
+    i = 0
+    while i < len(kills):
+        a = kills[i]
+        j = i + 1
+        merged = False
+        while j < len(kills) and kills[j]["t"] - a["t"] <= R6S_FRAG_S:
+            b = kills[j]
+            va, vb = _alnum(a.get("victim") or "").lower(), _alnum(b.get("victim") or "").lower()
+            s_, l_ = (va, vb) if len(va) <= len(vb) else (vb, va)
+            hh = max(a.get("h") or 0, b.get("h") or 0, 14)
+            same_slot = a.get("y") is None or b.get("y") is None or abs(a["y"] - b["y"]) <= 0.75 * hh
+            if same_slot and len(s_) >= 1 and (l_.startswith(s_) or (len(s_) >= 3 and fuzz.ratio(s_, l_) >= 80)):
+                keep, drop = (a, b) if len(vb) <= len(va) else (b, a)          # the fullest name stays
+                keep["t"] = min(a["t"], b["t"])
+                keep["hits"] = max(a["hits"], b["hits"])
+                keep["ks"] = max(a["ks"], b["ks"])
+                keep["t_last"] = max(a.get("t_last", a["t"]), b.get("t_last", b["t"]))
+                keep["needs_shot"] = bool(a.get("needs_shot") and b.get("needs_shot"))
+                rej.append({"t": drop["t"], "reason": f"R6S fragment merged: '{drop.get('victim')}' and '{keep.get('victim')}' are one killfeed row (read {abs(a['t'] - b['t']):.2f} s apart)", "ks": drop["ks"]})
+                kills.remove(drop)
+                kills.sort(key=lambda k: k["t"])
+                i = kills.index(keep) if kills.index(keep) < i else i
+                a = kills[i]
+                merged = True
+                j = i + 1
+                continue
+            j += 1
+        if not merged:
+            i += 1
+        else:
+            kills.sort(key=lambda k: k["t"])
+
+
 def r6s_sametime_guard(kills, rej):
     """R6S copy of the CS2 same-timestamp guard: several kills inside R6S_SAMETIME_S are real only when each has a victim distinct from the others
     in the group; the better read (more sightings, higher name score) stays, the duplicate is rejected (listed in `rej`). Single kills untouched."""
@@ -2559,12 +2597,13 @@ def _r6s_core(rows, entry, cfg):
             continue
         if a == "kill":
             vis.append((tt, round(r["last"] / FPS + off + 0.3, 3)))
-            kills.append({"t": tt, "ks": ks, "hs": False, "row": row, "hits": r["hits"], "victim": vtext, "weapon": "gun",
+            kills.append({"t": tt, "ks": ks, "hs": False, "row": row, "hits": r["hits"], "victim": vtext, "weapon": "gun", "y": r["y"], "h": r["h"],
                           "box": [max(0, r["x"] - 420), max(0, r["y"] - r["h"]), r["x"] + r["w"] + 420, r["y"] + r["h"]],
                           "t_last": round(r["last"] / FPS + off, 3), "needs_shot": bool(len(r.get("reads", [])) < 2 and ks < 0.9)})
         else:
             deaths.append(tt)
             rej.append({"t": tt, "reason": f"death: my name on the victim side ('{vtext}') - not a kill", "ks": vs})
+    r6s_merge_fragments(kills, rej)
     drop_fake_kills(kills, rej, "r6s", pre, [])
     kills[:] = r6s_sametime_guard(kills, rej)
     ev = sorted([(r["first"], 1) for r in rows] + [(r["last"] + 1, -1) for r in rows])
@@ -2577,29 +2616,26 @@ def _r6s_core(rows, entry, cfg):
 
 
 def r6s_analyse_entry(entry, cfg):
-    """Template rows (when icons were used) + OCR rows (always): the template rows are the primary list, the OCR rows only add kills / deaths the templates
-    did not see (nothing within 1.5 s with the same victim). Without icons this is the OCR row analysis alone."""
+    """OCR rows are the result. Icon-template rows (when icons were used) only CONFIRM them: a kill both lists have is confirmed; where the two lists disagree
+    (a kill only the icons saw, or only the OCR saw) the difference is listed in result['disagree'] (the scan logs it) and the OCR result is kept. No template
+    hit = the OCR kill stands (OCR-only fallback)."""
     from rapidfuzz import fuzz
     tpl = entry.get("rows") or []
     ocr_r = r6s_rows_from_ocr(entry) if entry.get("ocr") else []
     b = _r6s_core(ocr_r, entry, cfg)
+    b["disagree"], b["confirmed"] = [], 0
     if not tpl:
         return b
     a = _r6s_core(tpl, entry, cfg)
+    if not entry.get("ocr"):                               # an entry without any OCR frames (never produced by a scan): the icon rows are all there is
+        a["disagree"], a["confirmed"] = [], 0
+        return a
     near = lambda o, k: abs(o["t"] - k["t"]) <= 1.5 and (not o.get("victim") or not k.get("victim") or fuzz.ratio(_alnum(o["victim"]).lower(), _alnum(k["victim"]).lower()) >= 60)
-    add = [o for o in b["kills"] if not any(near(o, k) for k in a["kills"])]
-    res = dict(a)
-    res["kills"] = sorted(a["kills"] + add, key=lambda k: k["t"])
-    res["deaths"] = sorted(a["deaths"] + [d for d in b["deaths"] if not any(abs(d - x) <= 1.5 for x in a["deaths"])])
-    res["rej"] = sorted(a["rej"] + b["rej"], key=lambda r: r["t"])
-    res["vis"] = a["vis"] + [v for v in b["vis"] if any(v[0] == k["t"] for k in add)]
-    res["mine"] = sorted(a["mine"] + b["mine"], key=lambda m: m["t"])
-    for k_ in ("best_k", "best_v"):
-        res[k_] = max(a[k_], b[k_])
-    res["rows_n"], res["ocr_calls"], res["rows_max"] = a["rows_n"] + b["rows_n"], a["ocr_calls"] + b["ocr_calls"], max(a["rows_max"], b["rows_max"])
-    if add:
-        drop_fake_kills(res["kills"], res["rej"], "r6s", [], [])
-    return res
+    only_icon = [o for o in a["kills"] if not any(near(o, k) for k in b["kills"])]
+    only_ocr = [k for k in b["kills"] if not any(near(k, o) for o in a["kills"])]
+    b["confirmed"] = len(b["kills"]) - len(only_ocr)
+    b["disagree"] = [f"icon rows only: {o['row']} @ {ts(o['t'])}" for o in only_icon] + [f"OCR rows only: {k['row']} @ {ts(k['t'])}" for k in only_ocr]
+    return b
 
 
 def r6s_safe_analyse(entry, cfg):
@@ -4878,6 +4914,8 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
                     f" victim-side {a['best_v']:.2f} | rect {content_rect(r, cfg)} crop {'yes' if r.get('bars') else 'no'} | {name} ({res['secs']}s)")
                 for m in a["mine"]:
                     out(f"      my row @ {ts(m['t'])} {m['row']} -> {m['verdict'].upper()}: {m['why']} ({m['hits']} sightings)")
+                if g == "r6s" and a.get("disagree"):
+                    out(f"R6S: icon rows and OCR rows disagree in {name}: " + "; ".join(a["disagree"][:6]) + " - OCR result kept")
                 if g == "r6s" and not a["kills"]:
                     out(f"R6S: no kill rows read in {name} (killfeed region {res.get('region')} of the content rect, crop {res.get('size')} px)")
     out(f"scan finished: {done} in {time.time() - t0:.0f}s, errors {errs}")
@@ -6791,8 +6829,12 @@ def save_time_link(a, b):
     if not aa or not ab:
         return None, "save time unknown (no modified time / duration)"
     ov = min(aa["end"], ab["end"]) - max(aa["start"], ab["start"])
-    if ov < -PAIR_MAX_GAP_S:
-        return None, f"saved {-ov:.1f} s apart (gap larger than the {PAIR_MAX_GAP_S:.0f} s continuation window)"
+    if ov < -pair_gap():
+        return None, f"saved {-ov:.1f} s apart (gap larger than the {pair_gap():.0f} s continuation window)"
+    if ov < 0 and getattr(PAIR_CTX, "game", None) == "r6s":    # R6S is one life per round: a death of mine after my kills ends that round, a later clip cannot continue it
+        kt = [k["t"] for k in a.get("kills", [])]
+        if kt and any(d > min(kt) for d in a.get("deaths", [])):
+            return None, "my death row appears after my kills in the earlier clip (one life per round): a later clip is another round"
     off_t = ab["start"] - aa["start"]
     diffs, shared = [], 0
     for x in a["kills"]:
@@ -6850,10 +6892,10 @@ def prove_same_fight(a, b, rf, budget):
     if not aa or not ab or not aa["provable"] or not ab["provable"]:
         return None, "clip time not provable (" + (", ".join(Path(x["rec"]["path"]).name for x, an in ((a, aa), (b, ab)) if not an or not an["provable"])) + ")"
     ov = min(aa["end"], ab["end"]) - max(aa["start"], ab["start"])
-    if ov < -PAIR_MAX_GAP_S:                                    # (a) the existing continuation window (V6.9): overlapping, or at most PAIR_MAX_GAP_S apart
-        return None, f"time ranges neither overlap nor lie within the {PAIR_MAX_GAP_S:.0f} s continuation window (gap {-ov:.1f} s)"
+    if ov < -pair_gap():                                        # (a) the existing continuation window (V6.9): overlapping, or at most PAIR_MAX_GAP_S apart
+        return None, f"time ranges neither overlap nor lie within the {pair_gap():.0f} s continuation window (gap {-ov:.1f} s)"
     off_abs = ab["start"] - aa["start"]                         # a-time of a moment = b-time + off_abs
-    win = PAIR_MAX_GAP_S                                        # the kill pair's offset must agree with the clip times within that same window
+    win = pair_gap()                                            # the kill pair's offset must agree with the clip times within that same window
     cands = []
     for x in a["kills"]:
         for y in b["kills"]:
@@ -7023,6 +7065,10 @@ def ledger_report(led):
             i = r["info"]
             lines.append(f"  merged duplicate: {led.label(r)} = {i['survivor']} ({i.get('reason') or i['match']}; {' / '.join(i['pair']) or 'same clip'}, offset "
                          f"{('%+.2f s' % i['offset']) if i['offset'] is not None else 'n/a'})")
+    if led.game == "r6s":                                  # V8.0.2: every R6S kill that is not placed gets its own line with the reason (and is counted in the summary above)
+        for r in led.rows:
+            if r["state"] in ("CLIP_UNUSABLE", "RANKED_OUT", "LOST"):
+                lines.append(f"  NOT PLACED (R6S): {led.label(r)} - {r['state'].lower().replace('_', ' ')}: {(r.get('info') or {}).get('reason') or 'ranked below the events that were planned'}")
     lines += ["  " + x for x in led.released]
     lines += ["  " + x for x in led.splits]
     lost = [r for r in led.rows if r["state"] == "LOST"]
@@ -7327,6 +7373,7 @@ def music_fight_groups(items):
     """Pool items grouped like _build_events groups them (clips saved right next to each other = one fight; read-only, same save_time_link rule)."""
     its = [dict(it, ctime=clip_ctime(it["rec"]), anc=clip_anchor(it["rec"]["path"], it["rec"].get("dur"))) for it in items]
     its.sort(key=lambda i: ((i["anc"] or {}).get("end", i["ctime"]), (i["anc"] or {}).get("start", i["ctime"])))
+    PAIR_CTX.game = (items[0]["rec"].get("game") if items else None)       # V8.0.2: the continuation window of this group's game
     groups, i = [], 0
     while i < len(its):
         g, j = [its[i]], i + 1
@@ -7412,6 +7459,7 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
     frame-exact (first frame the row is visible)."""
     det = load_dets(game).get(game)
     gap = fight_gap(cfg, game)
+    PAIR_CTX.game = game                                   # V8.0.2: the continuation window below is per game (R6S 30 s, the others 12 s)
     notes = []
     items = []
     for it in pool:
@@ -7524,7 +7572,7 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
         revs = sorted(rv + off for it, off in g for rv in it.get("revives", []))
         gap_g = fight_gap_for(gap, [it for it, _ in g])    # V6.9.7.1: a group with a clip of LONG_CLIP_S or more splits only on FIGHT_GAP_LONG_CLIP
         if len(g) > 1:                                     # clips saved right next to each other are one fight: the continuation window also bounds the kill gap
-            gap_g = max(gap_g, PAIR_MAX_GAP_S)
+            gap_g = max(gap_g, pair_gap())
         clusters, cur = [], [allk[0]]
         for k in allk[1:]:                                 # one fight = one event: split only on a long gap with no revive in it
             if k["tt"] - cur[-1]["tt"] <= gap_g or any(cur[-1]["tt"] < rv < k["tt"] for rv in revs):
@@ -7639,8 +7687,9 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
         # V6.9.7.1: the clips were linked by their SAVE times and aligned by the kill-pair / save-time offset (build_events); the order is the save order
         # (spans sorted by the aligned start). The frame match is ADVISORY only: it is logged, never a veto and never moves a clip.
         chain = [spans[0]]
+        sgap = R6S_PAIR_GAP if getattr(PAIR_CTX, "game", None) == "r6s" else STITCH_GAP_S      # V8.0.2: R6S rounds are long: clips up to R6S_PAIR_GAP apart join the take (the missing footage is closed below)
         for s_ in spans[1:]:
-            if s_["start"] <= chain[-1]["end"] + STITCH_GAP_S and s_["end"] > chain[-1]["end"]:        # overlapping, or back to back (saved one right after the other)
+            if s_["start"] <= chain[-1]["end"] + sgap and s_["end"] > chain[-1]["end"]:        # overlapping, or back to back (saved one right after the other)
                 chain.append(s_)
         spans = chain
         ok_all = True
@@ -11637,10 +11686,17 @@ def weekly_song_fit(song, an, sinfo, runners):
 # never planned alone. Nothing here reads or decodes a clip: only file names, the cached clip records and the cached kill entries.
 PAIR_EDGE_S = 3.0                       # a kill this close to either end of the clip makes it a candidate for a larger fight
 PAIR_SINGLE_EDGE_S = 4.0                # a 1k clip: its single kill this close to either end
+PAIR_CTX = threading.local()            # V8.0.2: PAIR_CTX.game = the game of the plan being built (build_events sets it); R6S has its own continuation window
 PAIR_MAX_GAP_S = 12.0                   # build_events() tests continuations inline (not reusable on a pair outside the selection)
 PAIR_MAX_HOPS, PAIR_MAX_EXTRA = 2, 3    # per direction / per selected clip
 PAIR_CAP_S = 20.0                       # hang guard for the whole step (V7.6.1: was 2.0 s - on a loaded PC the step timed out and the plan changed; it takes ~1 s)
 PAIR_TEST_HOOK = [None]                 # tests only: called at the start of the step (inject an error / a delay)
+
+
+def pair_gap(game=None):
+    """The continuation window (s) of the game: R6S_PAIR_GAP for R6S, PAIR_MAX_GAP_S (12 s) for everything else."""
+    g = game or getattr(PAIR_CTX, "game", None)
+    return R6S_PAIR_GAP if g == "r6s" else PAIR_MAX_GAP_S
 
 
 def pair_clip_start(path):
@@ -11697,6 +11753,7 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
     """Neighbour lookup for the selected CS2 clips. Returns {"partners": [(partner rec, selected clip path, gap s)], "checked": N,
     "lookups": L, "skip": {...}, "lines": [log lines]}. recs = cached clip records, selected = set of path keys."""
     kills_fn = kills_fn or (lambda r: pair_player_kills(r, store, det, cfg, game))
+    pg = pair_gap(game)
     idx, bad = pair_time_index(recs, game)
     pos = {k: i for i, (_, k, _, _) in enumerate(idx)}
     res = {"partners": [], "checked": 0, "lookups": 0, "lines": [], "skip": {"not scanned": 0, "used": 0, "no kills": 0, "no match": 0}}
@@ -11736,7 +11793,7 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
                 nb = idx[j]
                 gap = (nb[0] - cur[2]) if d > 0 else (cur[0] - nb[2])
                 nm = Path(nb[3]["path"]).name
-                if gap > PAIR_MAX_GAP_S or nb[1] in selected or nb[1] in added:
+                if gap > pg or nb[1] in selected or nb[1] in added:
                     alive[d] = False
                     sk["no match"] += 1
                     continue
@@ -11812,8 +11869,6 @@ def pairing_run(cfg, recs, selected_paths, quiet=False, game="cs2", allow_used=F
 def random_companions(cfg, game, paths):
     """V6.9.8.1 Random pick: the companion clips (used or not) of the randomly picked clips, so the ticked list is what renders. Returns
     (extra paths not in `paths`, log lines). Any problem = no companions. Clips the user ticks by hand never go through here."""
-    if game == "r6s":                                         # V8.0.0: R6S has no companion pairing
-        return [], []
     try:
         tagged = [r for r in scan_clips(cfg) if r.get("game") == game]
         res = pairing_run(cfg, tagged, paths, quiet=True, game=game, allow_used=True)
@@ -12115,7 +12170,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     picked = list(events)
 
     def companions(evs, pair_):
-        if not manual and game in ("cs2", "valorant"):     # V6.9 (CS2) / V6.9.8 (both): companion clips of the picked clips (same slot, same count)
+        if not manual and game in ("cs2", "valorant", "r6s"):     # V6.9 (CS2) / V6.9.8 (both) / V8.0.2 (R6S): companion clips of the picked clips (same slot, same count)
             sel_ = set().union(*[pair_event_clips(e) for e in evs]) if evs else set()
             pair_ = pairing_run(cfg, tagged, sel_, quiet=not scan, game=game, allow_used=True)
             if pair_ and pair_["partners"]:
