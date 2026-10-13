@@ -28,7 +28,7 @@ NOTES (V5): clips come from the explicit folder lists in Settings (the list deci
   "python montage.py smoketest" = GUI + OCR + planner + a real render whose sync is measured from the file (< 3 min).
   "python montage.py detectcheck" = V4 vs V5 kill classification on all cached OCR data.
 
-CLI (same engine):  python montage.py auto [--game valorant|cs2] [--force] [--dry] [--preview] [--max-quality] [--seed N]
+CLI (same engine):  python montage.py auto [--game valorant|cs2|r6s] [--force] [--dry] [--preview] [--max-quality] [--seed N]
                     python montage.py plan --game cs2        (dry plan only)     python montage.py pick   (GUI, Manual tab)
                     python montage.py selfcheck | selftest | smoketest | detectcheck | inventory | scan | verify <game> | calibrate-bars | tag <path> <game>
 Data: montage_data\ (config.json, caches, calibration, plans, logs\montage.log). Output: E:\Movies\Montages\<Game>\<SONG INITIALS>_<VAL|CS2>_<version>_<date>.mp4 (+ logs\ with its plan .txt/.json).
@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.7.6"
+APP_VERSION = "V8.0.0"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -77,7 +77,7 @@ SKIP_DIR_NAMES = {"windows", "program files", "program files (x86)", "appdata", 
                   "$recycle.bin", "system volume information", "montage_data", "node_modules", ".git"}
 BAR_THRESHOLD = 12        # pixel brightness (0-255) counted as content
 BAR_FRAMES = 24
-GAMES = ("valorant", "cs2")
+GAMES = ("valorant", "cs2", "r6s")        # V8.0.0: r6s = Rainbow Six Siege (own folders, own icon-template detection, nothing shared with the other two)
 
 LEN_MIN_S, LEN_MAX_S = 80, 150                      # V6.1.3: fixed-length range = the Optimal rule of V5.42B (80-150 s)
 DEFAULT_CONFIG = {
@@ -100,7 +100,7 @@ DEFAULT_CONFIG = {
     "name_match": 80,               # V4 OCR: rapidfuzz partial_ratio needed for FIREAXE (killer side = kill, victim side = death)
     "death_lock_s": 8.0,            # no kills counted this long after my own death
     "sync_report": True,
-    "gap_s": {"valorant": 6.0, "cs2": 5.0},
+    "gap_s": {"valorant": 6.0, "cs2": 5.0, "r6s": 6.0},
     "game_overrides": {},           # path prefix -> game
     "match_threshold": 85,
     "length_s": "optimal",          # "optimal" (default) or seconds (80-150, like Optimal)
@@ -113,9 +113,10 @@ DEFAULT_CONFIG = {
     # V5: explicit clip folders; the game comes from the list a folder is in (replaces folder-name matching)
     "clip_dirs": {"valorant": [r"E:\Movies\VALORANT\Clips", r"E:\Movies\LEGACY\Valorant"],
                   "cs2": [r"E:\Movies\2026\Counter-strike 2", r"E:\Movies\2026\cs clips",
-                          r"E:\Movies\Movies 2025\Counter-strike 2", r"E:\Movies\LEGACY\Counter-strike 2"]},
-    "player_names": {"valorant": ["fireaxe"], "cs2": ["fireaxe", "火斧"]},      # V6.0: Settings > Player names (; separated)
-    "game_audio_track": {"valorant": "auto", "cs2": "auto"},     # V5.56: which audio track of a clip is the game sound: auto | 1 | 2 | 3
+                          r"E:\Movies\Movies 2025\Counter-strike 2", r"E:\Movies\LEGACY\Counter-strike 2"],
+                  "r6s": [r"E:\Movies\Pre 2025 FPS\Tom Clancy's Rainbow Six  Siege", r"E:\Movies\LEGACY\Tom Clancy's Rainbow Six  Siege"]},   # V8.0.0: note the double space before 'Siege'
+    "player_names": {"valorant": ["fireaxe"], "cs2": ["fireaxe", "火斧"], "r6s": ["fireaxe0"]},      # V6.0: Settings > Player names (; separated)
+    "game_audio_track": {"valorant": "auto", "cs2": "auto", "r6s": "auto"},     # V5.56: which audio track of a clip is the game sound: auto | 1 | 2 | 3
     "ui_scale": 1.0,                # GUI font / row height scale
     "audio_mode": "auto",           # V5.57: auto = V5.56 track pick | legacy = the exact V5.55 audio path
     "accent": "lime",               # V5.57: lime | yellow | orange | red | pink | purple
@@ -195,6 +196,9 @@ def load_config():
         cfg["clip_dirs"] = cfg.get("clip_dirs") or DEFAULT_CONFIG["clip_dirs"]
     if cfg.get("cfg_version", 1) < 3:
         cfg["cfg_version"] = 3
+    for k_ in ("clip_dirs", "player_names", "game_audio_track", "gap_s"):          # V8.0.0: a config saved before R6S gets the R6S entry only; the other games' entries stay as saved
+        if isinstance(cfg.get(k_), dict) and "r6s" not in cfg[k_]:
+            cfg[k_] = dict(cfg[k_], r6s=DEFAULT_CONFIG[k_]["r6s"])
     cfg.pop("theme", None)                            # V5.56: one theme only
     cfg.pop("duck_db", None)                          # never read by the engine
     cfg.pop("game_under_music_db", None)
@@ -449,21 +453,44 @@ def clip_folder(path, cfg):
         return Path(path).parent.name
 
 
+R6S_PROBE = set()          # V8.0.0: R6S clips are only probed (ffprobe) when they are asked for (ticked / picked): the library of ~800 is never read in bulk
+
+
+def r6s_want(cfg, paths):
+    """Mark R6S clips among `paths` as 'probe these on the next scan_clips()' (nothing else changes; other games' paths are ignored)."""
+    try:
+        R6S_PROBE.update(p for p in (paths or []) if tag_game(p, cfg)[0] == "r6s")
+    except Exception as ex:
+        LOGONLY(f"R6S: could not mark clips for probing: {type(ex).__name__}: {ex}")
+
+
 def scan_clips(cfg, rescan=False):
     roots = clip_roots(cfg)
     out(f"Scanning {'; '.join(roots) or '(no clip folder found - check Settings)'} ...")
     max_b = int(cfg.get("max_mb", 60)) * 1024 * 1024
-    paths = []
+    paths, r6s_paths = [], set()
     with pstage("  scan_clips: walk + stat clips + tag_game"):
         for p in sorted(set(walk_files(roots, VIDEO_EXT, MIN_VIDEO, cfg))):
             try:
-                if tag_game(p, cfg)[0] and os.path.getsize(p) <= max_b:
+                g_ = tag_game(p, cfg)[0]
+                if g_ and os.path.getsize(p) <= max_b:
                     paths.append(p)
+                    if g_ == "r6s":
+                        r6s_paths.add(p)
             except OSError:
                 pass
         paths.sort()
     with pstage("  scan_clips: read clips cache"):
         cache = {} if rescan else load_json(CLIPS_CACHE, {})
+    lazy = []                                                  # V8.0.0: R6S clips never probed before and not asked for: listed as stubs, not probed
+    if r6s_paths:
+        try:
+            lazy = [p for p in paths if p in r6s_paths and p not in R6S_PROBE and (rescan or file_key(p) not in cache)]
+        except OSError:
+            lazy = []
+        if lazy:
+            ls_ = set(lazy)
+            paths = [p for p in paths if p not in ls_]
     with pstage("  scan_clips: cache check (file_key stat per clip)"):
         todo = [p for p in paths if rescan or file_key(p) not in cache or cache[file_key(p)].get("bar_sig") != json.dumps(cfg["bar"])]
     out(f"  {len(paths)} clips found" + (f", {len(todo)} new/changed to probe" if todo else " (all cached)"))
@@ -478,6 +505,7 @@ def scan_clips(cfg, rescan=False):
     with pstage("  scan_clips: save clips cache"):
         live = {file_key(p) for p in paths}
         save_json(CLIPS_CACHE, {k: v for k, v in cache.items() if k in live})
+    recs += [{"path": p, "unprobed": True} for p in lazy]       # V8.0.0: R6S stubs (no size / duration yet: skipped by every scan / pool, shown in the Manual list)
     maxd = float(cfg.get("max_dur_s", 60))
     keep = []
     for r in recs:
@@ -920,7 +948,8 @@ MY_NAME_CS2 = "火斧"               # V5.42B: CS2 renders my name 'fireaxe火�
 NAME_MIN = 80                   # rapidfuzz partial_ratio needed for FIREAXE
 # V6.0: Settings > Player names. Latin names match fuzzily (as 'fireaxe' always did); a name with non-ASCII letters (CJK) is found as exact
 # text and makes the row mine when the Latin read is garbled (as '火斧' in CS2 always did). Defaults = exactly what V5.x hardcoded.
-DEFAULT_PLAYER_NAMES = {"valorant": [MY_NAME], "cs2": [MY_NAME, MY_NAME_CS2]}
+MY_NAME_R6S = "fireaxe0"                          # V8.0.0: Rainbow Six Siege name
+DEFAULT_PLAYER_NAMES = {"valorant": [MY_NAME], "cs2": [MY_NAME, MY_NAME_CS2], "r6s": [MY_NAME_R6S]}
 _NAMES = {g: list(v) for g, v in DEFAULT_PLAYER_NAMES.items()}
 
 
@@ -944,7 +973,7 @@ def set_player_names(cfg):
 
 def names_split(game=None):
     """(Latin names, non-ASCII names) for one game; game None = every game's names together."""
-    ns = [n for g in ([game] if game in _NAMES else list(_NAMES)) for n in _NAMES[g]]
+    ns = [n for g in ([game] if game in _NAMES else ["valorant", "cs2"]) for n in _NAMES[g]]       # V8.0.0: 'every game' stays Valorant + CS2 (R6S names never leak into their checks)
     ns = list(dict.fromkeys(ns))
     return [n for n in ns if n.isascii()], [n for n in ns if not n.isascii()]
 
@@ -961,7 +990,7 @@ def entry_names(entry, game):
 
 def names_stale(entry, game):
     return entry_names(entry, game) != names_for_cache(game)
-DEFAULT_REGION = {"valorant": [0.58, 0.05, 1.0, 0.42], "cs2": [0.58, 0.03, 1.0, 0.40]}   # fractions of the content rect
+DEFAULT_REGION = {"valorant": [0.58, 0.05, 1.0, 0.42], "cs2": [0.58, 0.03, 1.0, 0.40], "r6s": [0.58, 0.05, 1.0, 0.42]}   # fractions of the content rect
 
 
 def read_img(path):
@@ -1293,6 +1322,11 @@ class Detector:
         self.game, self.calibrated = game, bool(d.get("region"))
         self.d = {"region": [float(v) for v in reg]}
         self.d["stamp"] = "ocr" + hashlib.md5(repr([round(v, 4) for v in self.d["region"]]).encode()).hexdigest()[:8]
+        if game == "r6s":                                  # V8.0.0: another icon set = another detector (its clips are scanned again, lazily)
+            try:
+                self.d["stamp"] = "ocr" + hashlib.md5(repr([round(v, 4) for v in self.d["region"]] + [r6s_icons_sig(r6s_load_icons(log=False))]).encode()).hexdigest()[:8]
+            except Exception:
+                pass
         self.dw = max(16, int(round((reg[2] - reg[0]) * NORM_W)) & ~1)
         self.dh = max(16, int(round((reg[3] - reg[1]) * NORM_H)) & ~1)
 
@@ -1566,6 +1600,8 @@ def scan_frames(frames):
 def scan_clip(path, rec, det, cfg, scale=None):
     """Full 15 fps pass over the killfeed crop. Stores RAW per-frame OCR results (boxes, text, confidence, icon blobs) so any
     later logic or threshold change needs no rescan."""
+    if rec.get("game") == "r6s" or det.game == "r6s":           # V8.0.0: R6S has its own scan (icon templates)
+        return r6s_scan_clip(path, rec, det, cfg)
     t0 = time.time()
     ocr, n = scan_frames(frame_stream(path, rec, det, cfg, FPS))
     e = {"v": CACHE_V, "names": names_for_cache(rec.get("game")), "ocr": ocr, "frames": n, "size": [det.dw, det.dh], "region": det.d["region"],
@@ -1936,8 +1972,10 @@ def analyse_entry(entry, cfg, game=None):
     """Raw OCR frames -> rows -> verdicts -> content-tracked rows (identity = killer text + victim text + weapon) -> kills /
     deaths / rejected rows with reasons. The ONE implementation behind Dry plan, Render, the sync report, Self-test and the
     killfeed crop view."""
-    off = entry.get("v_off", 0.0)
     game = game or entry.get("game")
+    if game == "r6s":                                          # V8.0.0: Rainbow Six Siege has its own icon-template row analysis
+        return r6s_safe_analyse(entry, cfg)
+    off = entry.get("v_off", 0.0)
     bk = bv = 0.0
     tracks, mine, seen_rows, dead_others = [], [], 0, {}
     last_ocr = entry["ocr"][-1][0] if entry.get("ocr") else 0
@@ -2124,6 +2162,356 @@ def _analyse_entry_v4(entry, cfg):
 def compute_kills(entry, cfg, game=None):
     a = analyse_entry(entry, cfg, game)
     return a["kills"], a["deaths"]
+
+
+# ======================================================================= RAINBOW SIX SIEGE (V8.0.0)
+# R6S has its own, self-contained detection (nothing below is reached for CS2 / Valorant): the killfeed ROW is found by the kill icon TEMPLATES
+# in montage_data\r6s\icons (any png / jpg, any number: the icon changed shade in season 10, so both shades go in), then the names left and
+# right of the icon are read with the same OCR engine and the same fuzzy name rule as the other games. Kills only: the killer side holds my name
+# (kill), the victim side holds my name (death), everything else is a reject. Every step fails soft: a bad clip / icon / frame logs one R6S line
+# and skips only itself.
+R6S_ICON_EXT = (".png", ".jpg", ".jpeg")
+R6S_MATCH_THR = 0.80                 # normalised template correlation that counts as 'the kill icon is here'
+R6S_SCALES = (0.6, 0.7, 0.8, 0.9, 1.0, 1.12, 1.25, 1.4, 1.6, 1.8, 2.0)     # templates are tried at these scales (crops are 1920-space, HUD scale varies)
+R6S_GAP_F = 8                        # a row survives this many frames without its icon (compression flicker, fade)
+R6S_BLIP_F = 3                       # a row seen in fewer frames than this (and not at the very end) is a one-frame blip
+R6S_READ_AGES = (1, 6, 15, 40)       # frames after a row's first sighting at which its names are read (voting)
+R6S_SAMETIME_S = 0.3                 # kills this close are one 'same timestamp' group (each needs its own victim)
+R6S_BACK_F = 3                       # at most this many frames a row is dated back through sub-threshold sightings (fade-in)
+R6S_MISSING_MSG = "R6S kill icons missing: put the icon images in montage_data\\r6s\\icons"
+_R6S_ICON_CACHE = {}
+
+
+def r6s_icon_dir():
+    return DATA / "r6s" / "icons"
+
+
+def r6s_load_icons(folder=None, log=True):
+    """Every png / jpg in the icons folder as a grayscale template: [{'name', 'gray'}]. 0 images, a missing folder or an unreadable image never
+    raises: the list is just shorter (empty = R6S detection off, see R6S_MISSING_MSG)."""
+    import cv2
+    import numpy as np
+    d = Path(folder) if folder else r6s_icon_dir()
+    try:
+        files = sorted(p for p in d.iterdir() if p.is_file() and p.suffix.lower() in R6S_ICON_EXT) if d.is_dir() else []
+        sig = tuple((p.name, p.stat().st_size, int(p.stat().st_mtime)) for p in files)
+    except OSError:
+        files, sig = [], ()
+    if folder is None and _R6S_ICON_CACHE.get("sig") == (str(d), sig):
+        return _R6S_ICON_CACHE["icons"]
+    icons = []
+    for p in files:
+        try:
+            im = cv2.imdecode(np.fromfile(str(p), np.uint8), cv2.IMREAD_UNCHANGED)
+            if im is None:
+                raise ValueError("not an image")
+            if im.ndim == 3 and im.shape[2] == 4:                      # transparent icon: composite on black
+                a = im[..., 3:4].astype(np.float32) / 255.0
+                im = (im[..., :3].astype(np.float32) * a).astype(np.uint8)
+            g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) if im.ndim == 3 else im
+            if g.shape[0] < 6 or g.shape[1] < 6 or float(g.std()) < 3.0:
+                raise ValueError("too small or flat")
+            icons.append({"name": p.name, "gray": np.ascontiguousarray(g)})
+        except Exception as ex:
+            if log:
+                out(f"R6S icon {p.name} unusable: {type(ex).__name__}: {ex} - skipped")
+    if folder is None:
+        _R6S_ICON_CACHE.update(sig=(str(d), sig), icons=icons)
+    return icons
+
+
+def r6s_icons_sig(icons):
+    h = hashlib.md5()
+    for ic in sorted(icons, key=lambda i: i["name"]):
+        h.update(ic["name"].encode("utf-8", "ignore"))
+        h.update(ic["gray"].tobytes())
+    return h.hexdigest()[:8]
+
+
+def r6s_find_matches(gray, icons, scales=R6S_SCALES, thr=R6S_MATCH_THR):
+    """Kill-icon sightings in one grayscale killfeed crop: [(x, y, w, h, score, icon index, scale index)], best first, overlapping hits merged."""
+    import cv2
+    import numpy as np
+    hits = []
+    H, W = gray.shape[:2]
+    for ii, ic in enumerate(icons):
+        t0 = ic["gray"]
+        for s in scales:
+            si = R6S_SCALES.index(s) if s in R6S_SCALES else 0
+            t = t0 if s == 1.0 else cv2.resize(t0, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
+            th, tw = t.shape[:2]
+            if th < 6 or tw < 6 or th >= H or tw >= W or float(t.std()) < 3.0:
+                continue
+            r = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
+            ys, xs = np.where(r >= thr)
+            for y, x in zip(ys.tolist(), xs.tolist()):
+                hits.append((int(x), int(y), int(tw), int(th), float(r[y, x]), ii, si))
+    hits.sort(key=lambda h: -h[4])
+    keep = []
+    for h in hits:
+        for k in keep:
+            ix = min(h[0] + h[2], k[0] + k[2]) - max(h[0], k[0])
+            iy = min(h[1] + h[3], k[1] + k[3]) - max(h[1], k[1])
+            if ix > 0 and iy > 0 and ix * iy > 0.3 * min(h[2] * h[3], k[2] * k[3]):
+                break
+        else:
+            keep.append(h)
+    return keep
+
+
+def _r6s_band(gray, m):
+    """The row's own pixels (icon + both name boxes, a window of the icon's height): what identifies a row when the list scrolls."""
+    bh = int(max(m[3], 14))
+    cy = m[1] + m[3] // 2
+    y0 = max(0, min(gray.shape[0] - 2 * bh, cy - bh))
+    x0, x1 = max(0, m[0] - 280), min(gray.shape[1], m[0] + m[2] + 280)
+    return gray[y0:y0 + 2 * bh, x0:x1], y0
+
+
+def _r6s_same(a, b):
+    """Correlation (-1..1) of two row bands of equal shape; 0 when they cannot be compared (other shape / flat)."""
+    import cv2
+    if a.shape != b.shape or a.size == 0 or float(a.std()) < 3 or float(b.std()) < 3:
+        return 0.0
+    return float(cv2.matchTemplate(a, b, cv2.TM_CCOEFF_NORMED)[0, 0])
+
+
+def r6s_read_band(fr, m):
+    """OCR of the strip around one icon sighting: ([[x0, x1, text, conf], ...] left of the icon, same right of it). Boxes on the icon are ignored."""
+    import cv2
+    import numpy as np
+    bh = int(max(m[3], 14) * 1.2)
+    cy = m[1] + m[3] // 2
+    y0, y1 = max(0, cy - bh), min(fr.shape[0], cy + bh)
+    strip = np.ascontiguousarray(fr[y0:y1, :])
+    strip = cv2.copyMakeBorder(strip, 8, 8, 8, 8, cv2.BORDER_REPLICATE)
+    boxes = _ocr_raw(strip)
+    left, right = [], []
+    for b in boxes:
+        x0, x1 = b[0] - 8, b[2] - 8
+        row = [int(x0), int(x1), b[4], float(b[5])]
+        c = (x0 + x1) / 2.0
+        if c < m[0]:
+            left.append(row)
+        elif c > m[0] + m[2]:
+            right.append(row)
+    return sorted(left), sorted(right)
+
+
+def r6s_scan_frames(frames, icons, thr=R6S_MATCH_THR, reader=None):
+    """Template pass over the killfeed crop frames (15 fps): every kill-icon sighting becomes / extends a ROW track (position, or the row's pixels
+    when the list scrolls); each row's names are read a few times for voting. Returns (rows, frames). A row's first frame is dated back through
+    the few frames before its first full match in which the icon was already faintly there (fade-in = the late-read correction)."""
+    import cv2
+    import numpy as np
+    reader = reader or r6s_read_band
+    tracks, buf, n = [], [], 0
+    lock, quiet = None, 0
+    for f, fr in enumerate(frames):
+        n += 1
+        gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+        scales = R6S_SCALES if lock is None else tuple(R6S_SCALES[i] for i in sorted(lock))
+        try:
+            ms = r6s_find_matches(gray, icons, scales, thr)
+        except Exception as ex:
+            LOGONLY(f"R6S: frame {f}: template match failed: {type(ex).__name__}: {ex}")
+            ms = []
+        if ms:
+            quiet = 0
+            bi = ms[0][6]
+            lock = {max(0, bi - 1), bi, min(len(R6S_SCALES) - 1, bi + 1)}
+        else:
+            quiet += 1
+            if quiet > 60:
+                lock = None
+        live = [t for t in tracks if f - t["last"] <= R6S_GAP_F]
+        used = set()
+        for m in ms:
+            cx, cy = m[0] + m[2] / 2.0, m[1] + m[3] / 2.0
+            band, _ = _r6s_band(gray, m)
+            # identity = the row's own pixels (names): a scrolling list puts another row at a row's old height, so position alone would swap them
+            sc_ = sorted(((_r6s_same(band, t["band"]), t) for t in live if id(t) not in used and abs(cx - t["cx"]) <= 0.6 * max(t["w"], 14) + 6),
+                         key=lambda x: -x[0])
+            hit = sc_[0][1] if sc_ and sc_[0][0] >= 0.8 else None
+            if hit is None:                                    # same place, text pixels disturbed (fade, compression): still the same row
+                for c_, t in sc_:
+                    if c_ >= 0.5 and abs(cy - t["cy"]) <= 0.45 * max(t["h"], 14):
+                        hit = t
+                        break
+            if hit is not None:
+                used.add(id(hit))
+                hit.update(last=f, cx=cx, cy=cy, w=m[2], h=m[3], band=band, m=m, hits=hit["hits"] + 1, sc=max(hit["sc"], m[4]))
+                age = f - hit["seen"]
+                nr = len(hit["reads"])
+                if nr < len(R6S_READ_AGES) and age >= R6S_READ_AGES[nr]:
+                    try:
+                        l_, r_ = reader(fr, m)
+                        hit["reads"].append([f, l_, r_])
+                    except Exception as ex:
+                        hit["reads"].append([f, [], []])
+                        LOGONLY(f"R6S: frame {f}: row read failed: {type(ex).__name__}: {ex}")
+            else:
+                first = f
+                for back in range(1, R6S_BACK_F + 1):          # fade-in: was the icon already (faintly) there just before?
+                    if len(buf) < back:
+                        break
+                    pf, pg = buf[-back]
+                    y0, x0 = max(0, m[1] - 4), max(0, m[0] - 4)
+                    win = pg[y0:m[1] + m[3] + 4, x0:m[0] + m[2] + 4]
+                    t_ = icons[m[5]]["gray"]
+                    s = R6S_SCALES[m[6]]
+                    t_ = t_ if s == 1.0 else cv2.resize(t_, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
+                    if win.shape[0] < t_.shape[0] or win.shape[1] < t_.shape[1] or float(cv2.matchTemplate(win, t_, cv2.TM_CCOEFF_NORMED).max()) < 0.5 * thr + 0.1:
+                        break
+                    first = pf
+                t = {"first": first, "seen": f, "last": f, "hits": 1, "cx": cx, "cy": cy, "w": m[2], "h": m[3], "sc": m[4], "m": m,
+                     "tpl": icons[m[5]]["name"], "band": band, "reads": []}
+                tracks.append(t)
+                used.add(id(t))
+        buf.append((f, gray))
+        if len(buf) > R6S_BACK_F:
+            buf.pop(0)
+    rows = []
+    for t in tracks:
+        rows.append({"first": int(t["first"]), "seen": int(t["seen"]), "last": int(t["last"]), "hits": int(t["hits"]), "x": int(t["m"][0]), "y": int(t["cy"]),
+                     "w": int(t["w"]), "h": int(t["h"]), "sc": round(float(t["sc"]), 3), "tpl": t["tpl"], "reads": t["reads"]})
+    return rows, n
+
+
+def r6s_scan_clip(path, rec, det, cfg):
+    """R6S counterpart of scan_clip(): the icon-template pass. Icons missing -> logs R6S_MISSING_MSG and returns an entry with 'error' (no kills)."""
+    t0 = time.time()
+    names = names_for_cache("r6s")
+    base = {"v": CACHE_V, "names": names, "ocr": [], "rows": [], "frames": 0, "size": [det.dw, det.dh], "region": det.d["region"], "v_off": rec.get("v_off", 0.0),
+            "ocr_calls": 0, "game": "r6s", "best_name": 0.0, "best_vic": 0.0}
+    icons = r6s_load_icons()
+    if not icons:
+        out(R6S_MISSING_MSG)
+        return dict(base, error=R6S_MISSING_MSG, secs=0.0)
+    rows, n = r6s_scan_frames(frame_stream(path, rec, det, cfg, FPS), icons)
+    e = dict(base, rows=rows, frames=n, icons=r6s_icons_sig(icons), ocr_calls=sum(len(r["reads"]) for r in rows), secs=round(time.time() - t0, 1))
+    a = r6s_analyse_entry(e, cfg)
+    e["best_name"], e["best_vic"] = round(a["best_k"], 3), round(a["best_v"], 3)
+    return e
+
+
+def r6s_name_score(text):
+    """0-100: how well `text` reads as one of my R6S names. Same fuzzy rule as the other games (rapidfuzz, a text under 5 letters must match whole)
+    plus the zero / letter-O fold ('fireaxeO' is 'fireaxe0'); a non-ASCII alias counts when it is contained as exact text."""
+    t = (text or "").lower()
+    if not t:
+        return 0.0
+    fold = lambda s: s.replace("o", "0")
+    best = 0.0
+    for nm_ in names_split("r6s")[0] or [MY_NAME_R6S]:
+        best = max(best, _name_match1(fold(t), fold(nm_))[0])
+    if any(c in t for c in names_split("r6s")[1]):
+        best = 100.0
+    return best
+
+
+def _r6s_side(boxes, thr):
+    """(first substantial text, best name score over the side's boxes, score of the first substantial box). Weapon silhouettes read as junk are never 'first'."""
+    subs = [b for b in sorted(boxes) if len(_alnum(b[2])) >= 3 and b[3] >= 0.4]
+    first = subs[0] if subs else None
+    best = max([r6s_name_score(b[2]) for b in boxes] or [0.0])
+    return (first[2] if first else ""), best, (r6s_name_score(first[2]) if first else 0.0)
+
+
+def r6s_sametime_guard(kills, rej):
+    """R6S copy of the CS2 same-timestamp guard: several kills inside R6S_SAMETIME_S are real only when each has a victim distinct from the others
+    in the group; the better read (more sightings, higher name score) stays, the duplicate is rejected (listed in `rej`). Single kills untouched."""
+    from rapidfuzz import fuzz
+    keep, groups, cur = [], [], []
+    for k in sorted(kills, key=lambda k: k["t"]):
+        if cur and k["t"] - cur[-1]["t"] > R6S_SAMETIME_S:
+            groups.append(cur)
+            cur = []
+        cur.append(k)
+    if cur:
+        groups.append(cur)
+    for g in groups:
+        good = []
+        for k in sorted(g, key=lambda k: (-k["hits"], -k["ks"])):
+            vn = _alnum(k.get("victim") or "").lower()
+            if len(g) > 1 and any(vn and _alnum(o.get("victim") or "").lower() and fuzz.ratio(vn, _alnum(o["victim"]).lower()) >= 80 for o in good):
+                rej.append({"t": k["t"], "reason": f"R6S same-timestamp kill rejected: same victim as another row of the group ({k['row']})", "ks": k["ks"]})
+                continue
+            good.append(k)
+        keep += good
+    return sorted(keep, key=lambda k: k["t"])
+
+
+def r6s_analyse_entry(entry, cfg):
+    """Cached R6S rows -> kills / deaths / rejects, in the same result shape as analyse_entry(). Rules (copied from the CS2 / Valorant row analysis):
+    killer side (first name left of the icon) = me -> kill; victim side = me -> death; both sides me -> not a kill; a row already on screen when the
+    clip starts = pre-clip (rejected, still counts as a known kill for the duplicate rules); a row seen in under R6S_BLIP_F frames = one-frame blip;
+    duplicates / same victim twice in a fight (drop_fake_kills); same-timestamp guard; a single sighting with a weak name needs a gunshot."""
+    off = entry.get("v_off", 0.0)
+    thr = float((cfg or {}).get("name_match", NAME_MIN))
+    rows = entry.get("rows") or []
+    bk = bv = 0.0
+    kills, deaths, rej, vis, mine, pre = [], [], [], [], [], []
+    last_f = max([r["last"] for r in rows] + [max(0, int(entry.get("frames", 0)) - 1)])
+    for r in rows:
+        tt = round(r["first"] / FPS + off, 3)
+        votes = {"kill": 0, "death": 0}
+        ktext = vtext = ""
+        ks = vs = 0.0
+        for _f, left, right in r.get("reads", []):
+            kt, _kbest, kfirst = _r6s_side(left, thr)
+            vt, vbest, _vfirst = _r6s_side(right, thr)
+            bk, bv = max(bk, kfirst / 100.0), max(bv, vbest / 100.0)
+            if kfirst >= thr and vbest < thr:
+                votes["kill"] += 1
+                if kfirst / 100.0 >= ks:
+                    ks, ktext, vtext = kfirst / 100.0, kt, vt
+            elif vbest >= thr and kfirst < thr:
+                votes["death"] += 1
+                if vbest / 100.0 >= vs:
+                    vs, vtext, ktext = vbest / 100.0, vt, kt
+            elif not ktext and not vtext:
+                ktext, vtext = kt, vt
+        if not votes["kill"] and not votes["death"]:
+            continue
+        a = "kill" if votes["kill"] >= votes["death"] else "death"
+        row = f"[{ktext or '-'}] gun [{vtext or '-'}]"
+        mine.append({"t": tt, "row": row, "verdict": a, "why": f"R6S {a}: my name on the {'killer' if a == 'kill' else 'victim'} side ({max(ks, vs):.2f}), icon {r.get('tpl', '?')}",
+                     "hits": r["hits"]})
+        if r["hits"] < R6S_BLIP_F and r["last"] < last_f - FPS:
+            rej.append({"t": tt, "reason": f"one-frame blip ({row})", "ks": max(ks, vs)})
+            continue
+        if r["first"] <= 2:
+            rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(ks, vs)})
+            if a == "kill":
+                pre.append({"t": tt, "ks": ks, "row": row, "victim": vtext})
+            continue
+        if a == "kill":
+            vis.append((tt, round(r["last"] / FPS + off + 0.3, 3)))
+            kills.append({"t": tt, "ks": ks, "hs": False, "row": row, "hits": r["hits"], "victim": vtext, "weapon": "gun",
+                          "box": [max(0, r["x"] - 420), max(0, r["y"] - r["h"]), r["x"] + r["w"] + 420, r["y"] + r["h"]],
+                          "t_last": round(r["last"] / FPS + off, 3), "needs_shot": bool(len(r.get("reads", [])) < 2 and ks < 0.9)})
+        else:
+            deaths.append(tt)
+            rej.append({"t": tt, "reason": f"death: my name on the victim side ('{vtext}') - not a kill", "ks": vs})
+    drop_fake_kills(kills, rej, "r6s", pre, [])
+    kills[:] = r6s_sametime_guard(kills, rej)
+    ev = sorted([(r["first"], 1) for r in rows] + [(r["last"] + 1, -1) for r in rows])
+    cur = mx = 0
+    for _f, d in ev:
+        cur += d
+        mx = max(mx, cur)
+    return {"kills": kills, "deaths": sorted(deaths), "revives": [], "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis, "best_k": bk, "best_v": bv,
+            "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(rows), "rows_max": mx, "ocr_calls": sum(len(r.get("reads", [])) for r in rows), "cjk": {}}
+
+
+def r6s_safe_analyse(entry, cfg):
+    """r6s_analyse_entry that can never raise: a broken entry logs one R6S line and counts as 'no kills'."""
+    try:
+        return r6s_analyse_entry(entry, cfg)
+    except Exception as ex:
+        out(f"R6S: analysis failed ({type(ex).__name__}: {ex}) - this clip counts as no kills")
+        return {"kills": [], "deaths": [], "revives": [], "rej": [], "vis": [], "best_k": 0.0, "best_v": 0.0, "mine": [], "rows_n": 0, "rows_max": 0, "ocr_calls": 0, "cjk": {}}
 
 
 # ======================================================================= CS2 RED-BORDER ROW TRACKER (V6.8.1)
@@ -4285,6 +4673,8 @@ def auto_scan_set(cfg, game):
     if not det:
         return []
     cache = load_kills_cache()
+    if game == "r6s":
+        return r6s_auto_scan_set(cfg, det, cache)
     now = time.time()
     new, old = [], []
     for r in scan_clips(cfg):
@@ -4299,6 +4689,27 @@ def auto_scan_set(cfg, game):
     return [p for _, p in new] + [p for _, p in old[:int(cfg.get("auto_old_per_run", 150))]]
 
 
+R6S_AUTO_MAX = 12            # V8.0.0: an R6S Auto / Force New run scans at most this many uncached clips (newest first): the library is never scanned in bulk
+
+
+def r6s_auto_scan_set(cfg, det, cache):
+    """Auto mode for R6S: the newest uncached clips only, at most R6S_AUTO_MAX per run (the Manual list / Random pick scan what you choose)."""
+    c = []
+    for r in scan_clips(cfg):
+        if r.get("game") != "r6s" or r.get("error"):
+            continue
+        if r.get("w") and kills_key(r, "r6s", det) in cache:
+            continue
+        try:
+            c.append((os.path.getmtime(r["path"]), r["path"]))
+        except OSError:
+            continue
+    c.sort(reverse=True)
+    sel = [p for _, p in c[:R6S_AUTO_MAX]]
+    out(f"R6S auto: {len(sel)} of {len(c)} uncached clips are scanned this run (at most {R6S_AUTO_MAX}; the rest wait until they are picked)")
+    return sel
+
+
 @with_job("scan")
 def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False):
     """Scans only what is needed (paths) - or every uncached tagged clip if paths is None. Returns clips scanned."""
@@ -4310,6 +4721,8 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
         dets = {g: d for g, d in dets.items() if g in games}
     if not dets:
         raise RuntimeError("OCR detector unavailable (Troubleshoot > Selfcheck lists what is missing)")
+    if paths is not None:
+        r6s_want(cfg, paths)                               # V8.0.0: only the R6S clips asked for are probed
     recs = [r for r in scan_clips(cfg) if not r.get("error") and r.get("w") and r.get("game") in dets]
     if paths is not None:
         ps = set(paths)
@@ -4331,6 +4744,8 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
         r, g = job
         if CANCEL.is_set():
             return r, g, None, "cancelled"
+        if g == "r6s" and not r6s_load_icons(log=False):   # V8.0.0: no icons = nothing is scanned or cached (a cached 'no kills' would stay after the icons arrive)
+            return r, g, None, R6S_MISSING_MSG
         try:
             res = scan_clip(r["path"], r, dets[g], cfg)
             if CANCEL.is_set():
@@ -4386,6 +4801,8 @@ def game_pool(cfg, game, paths=None):
     except OSError:
         pass
     ps = set(paths) if paths is not None else None
+    if ps is not None:
+        r6s_want(cfg, ps)                                  # V8.0.0
     stats = {"tagged": 0, "scanned": 0, "with_kills": 0}
     ovs = load_clip_overrides() if game == "valorant" else {}          # V6.9.7: per-clip 'allow utility kills' (default OFF: empty = nothing below runs)
     util_adm = {}
@@ -6876,11 +7293,11 @@ def cmd_musicscan(args):
     print(f"(read-only; written to {HERE / 'musicscan.txt'})")
 
 
-FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
+FIGHT_SPLIT_S = {"valorant": 10.0, "r6s": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
 
 
 def fight_gap(cfg, game):
-    return max(float(cfg["gap_s"][game]), FIGHT_SPLIT_S.get(game, 0.0))
+    return max(float((cfg.get("gap_s") or {}).get(game, DEFAULT_CONFIG["gap_s"].get(game, 6.0))), FIGHT_SPLIT_S.get(game, 0.0))
 
 
 def fight_gap_for(gap, items):
@@ -10947,7 +11364,7 @@ def quality_check(plan, outfile, cfg, preview=False):
 
 
 # ======================================================================= ORCHESTRATION
-GAME_DIR = {"valorant": "Valorant", "cs2": "CS2"}
+GAME_DIR = {"valorant": "Valorant", "cs2": "CS2", "r6s": "R6S"}
 LAST_PLAN = {}
 
 
@@ -10956,7 +11373,7 @@ def week_tag(now):
     return f"{y}-W{w:02d}"
 
 
-GAME_CODE = {"valorant": "VAL", "cs2": "CS2"}
+GAME_CODE = {"valorant": "VAL", "cs2": "CS2", "r6s": "R6S"}
 
 
 def song_initials(title):
@@ -11295,6 +11712,8 @@ def pairing_run(cfg, recs, selected_paths, quiet=False, game="cs2", allow_used=F
 def random_companions(cfg, game, paths):
     """V6.9.8.1 Random pick: the companion clips (used or not) of the randomly picked clips, so the ticked list is what renders. Returns
     (extra paths not in `paths`, log lines). Any problem = no companions. Clips the user ticks by hand never go through here."""
+    if game == "r6s":                                         # V8.0.0: R6S has no companion pairing
+        return [], []
     try:
         tagged = [r for r in scan_clips(cfg) if r.get("game") == game]
         res = pairing_run(cfg, tagged, paths, quiet=True, game=game, allow_used=True)
@@ -14527,8 +14946,9 @@ class App:
         unless 'Include used clips'). N = its own number box (never the 'Tick newest' box). Fewer eligible than N: tick all of them and
         say so in the status line. Empty box: the Optimal estimate decides how many (V5.55)."""
         inc = self.m_incl_used.get()
+        g_r6s = self.m_game.get() == "r6s"                          # V8.0.0: R6S clips are scanned only when picked: a never-scanned clip is a candidate too
         cands = [self.byp[i] for i in self.ctree.get_children()
-                 if i in self.byp and self.byp[i].get("kills") and (inc or not self.byp[i].get("used"))]
+                 if i in self.byp and (self.byp[i].get("kills") or (g_r6s and self.byp[i].get("kills") is None)) and (inc or not self.byp[i].get("used"))]
         if not cands:
             messagebox.showinfo("Random pick", "No " + ("" if inc else "unused ") + "clips with kills in the list "
                                 "(the game, folder and date filters apply; tick 'Include used clips' to allow used ones).")
@@ -14537,6 +14957,9 @@ class App:
         sel = self.stree.selection()
         song = next((x for x in self.songs if sel and x["path"] == sel[0]), None)
         style = self.m_style.get()
+
+        if g_r6s and not n:
+            n = 15                                                  # R6S: unscanned clips have no kill times to size the pick with: a fixed N (the number box overrides it)
 
         def work():
             if n:
@@ -14995,7 +15418,8 @@ class App:
             v = tk.StringVar(value=self.cfg.get(k, ""))
             self.sv[k] = v
             folder_row(lab, v, "Browse", lambda v=v: v.set(filedialog.askdirectory(initialdir=v.get() or None) or v.get()))
-        for g, lab in (("valorant", "Valorant clip folders (separated by ;)"), ("cs2", "CS2 clip folders (separated by ;)")):
+        for g, lab in (("valorant", "Valorant clip folders (separated by ;)"), ("cs2", "CS2 clip folders (separated by ;)"),
+                      ("r6s", "R6S clip folders (separated by ;)")):
             v = tk.StringVar(value="; ".join((self.cfg.get("clip_dirs") or {}).get(g, [])))
             self.sl[g] = v
             folder_row(lab, v, "Add folder", lambda v=v: v.set("; ".join([x for x in v.get().split(";") if x.strip()] +

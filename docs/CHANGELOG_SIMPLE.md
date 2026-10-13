@@ -2,12 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
-## V7.7.6 - 2026-10-13: CS2 kills now start at the right moment
+## V7.7.7 - 2026-10-13: CS2 kills now start at the right moment
 - A CS2 kill that was already on the killfeed when a clip started is no longer used as the opening kill.
 - The last kill of a CS2 multikill is no longer cut off: the take now starts when the kill really appears, not a second or two later.
 - Every CS2 take is checked before it is placed, so a take always shows a new kill appearing on the killfeed.
 
-## V7.7.5 - 2026-10-13: Fake CS2 kills and white flashes fixed
+## V7.7.6 - 2026-10-13: Fake CS2 kills and white flashes fixed
 - CS2 clips no longer show kills that never happened: old rows still on the killfeed, and one kill counted twice, are now ignored, so montages stop slowing down on an empty killfeed or ending on slow motion of nothing.
 - The soft dissolve between two clips no longer flashes white or dips dark: it now blends in even steps.
 - More songs are found: an MP3 now matches the playlist by main artist and song title, ignoring featured artists and extras like Remix or Lyrics, and unclear matches are listed instead of guessed.
