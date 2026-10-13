@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.7.1"
+APP_VERSION = "V7.7.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -708,6 +708,91 @@ def _title_core(t):
     return re.sub(r"\s+", " ", t).strip()
 
 
+# V7.7.5: loose song match = primary artist + base title. Supporting artists (", ", "&", "feat.", "ft.", " x ", "with") and bracketed /
+# dash-suffix extras ("(Resauced)", "- DJ Edit", "[Lyrics]", a trailing "[spotify id]") are ignored, both name orders are tried. A pair that is
+# not one-to-one is never matched and is listed in LOOSE_AMBIG.
+LOOSE_AMBIG = []                     # [(tier, [file names], [track names])] of the last match_playlist run
+_LOOSE_SEP = re.compile(r"\s*(?:,|;|&|\bfeat\b\.?|\bft\b\.?|\bfeaturing\b|\s(?:x|with)\s)\s*")
+
+
+def _loose_txt(s):
+    """Letters and digits only (any script), case-folded: 'R.I.O.' == 'R.I.O', "Don't" == 'Dont'."""
+    return re.sub(r"[\W_]+", "", norm_song(s))
+
+
+def _loose_title(t):
+    t = re.sub(r"\(.*?\)|\[.*?\]|\{.*?\}", " ", norm_song(t))
+    t = t.split(" - ")[0]
+    t = re.sub(r"\b(?:feat|ft|featuring)\b\.?.*", " ", t)
+    return _loose_txt(t)
+
+
+def _loose_artists(a):
+    """(primary artist, set of every listed artist), both letters-and-digits only."""
+    a = re.sub(r"\(.*?\)|\[.*?\]|\{.*?\}", " ", norm_song(a))
+    parts = [_loose_txt(x) for x in _LOOSE_SEP.split(" " + a + " ")]
+    parts = [x for x in parts if x]
+    return (parts[0] if parts else ""), set(parts)
+
+
+def _loose_file_keys(a):
+    """Every (base title, primary artist, artist set) a file can mean: each ' - ' split in both orders, plus the tags."""
+    stem = Path(a["path"]).stem
+    parts = [x for x in norm_song(stem).split(" - ") if x.strip()]
+    out_ = []
+    for k in range(1, len(parts)):
+        left, right = " - ".join(parts[:k]), " - ".join(parts[k:])
+        for t, ar in ((left, right), (right, left)):
+            out_.append((_loose_title(t),) + _loose_artists(ar))
+    if a.get("title") and a.get("artist"):
+        out_.append((_loose_title(a["title"]),) + _loose_artists(a["artist"]))
+    return [k for k in out_ if k[0] and k[1]]
+
+
+def loose_match(rows, audio, taken_a, taken_r, skip_a):
+    """Returns ([(file index, track index, score)], ambiguous). Only files / tracks not in taken_* / skip_a take part."""
+    free_j = [j for j in range(len(rows)) if j not in taken_r]
+    tr = {}
+    for j in free_j:
+        bt = _loose_title(rows[j]["title"])
+        pr, ars = _loose_artists(rows[j]["artist"])
+        if bt and pr:
+            tr[j] = (bt, pr, ars)
+    fk = {i: _loose_file_keys(audio[i]) for i in range(len(audio)) if i not in taken_a and i not in skip_a}
+    found, amb = [], []
+    used_i, used_j = set(), set()
+    for tier, score in ((1, 75), (2, 70)):
+        pairs = {}                                               # (i, j) -> True
+        for i, keys in fk.items():
+            if i in used_i:
+                continue
+            for j, (bt, pr, ars) in tr.items():
+                if j in used_j:
+                    continue
+                for fbt, fpr, fars in keys:
+                    if fbt == bt and (fpr == pr if tier == 1 else (fpr in ars or pr in fars)):
+                        pairs[(i, j)] = True
+                        break
+        by_i, by_j = {}, {}
+        for i, j in pairs:
+            by_i.setdefault(i, []).append(j)
+            by_j.setdefault(j, []).append(i)
+        for (i, j) in sorted(pairs):
+            if len(by_i[i]) == 1 and len(by_j[j]) == 1:
+                found.append((i, j, score, tier))
+                used_i.add(i)
+                used_j.add(j)
+            else:
+                amb.append((tier, i, j))
+        amb = [x for x in amb if x[1] not in used_i and x[2] not in used_j]
+    seen, uniq = set(), []                                   # a pair that is ambiguous in tier 1 is not listed again by tier 2
+    for tier, i, j in amb:
+        if (i, j) not in seen:
+            seen.add((i, j))
+            uniq.append((tier, i, j))
+    return found, uniq
+
+
 def _file_size(a):
     try:
         return int(_akey(a).rsplit("|", 2)[1])
@@ -718,7 +803,10 @@ def _file_size(a):
             return 0
 
 
-def match_playlist(rows, audio, cfg):
+LOOSE_NEW = []                       # V7.7.5: [(track row, file, tier)] matched by the loose rule in the last run
+
+
+def match_playlist(rows, audio, cfg, loose=True):
     """V6.5: a file matches a playlist track only when BOTH the title and an artist agree (nothing fuzzy, no leftover assignments).
     ok (100): normalised title identical AND at least one normalised artist identical. CHECK (80): an artist matches and the title is the
     same once bracketed / dash suffixes are removed. Everything else: no match. One file per track: of several files that match a track
@@ -783,6 +871,17 @@ def match_playlist(rows, audio, cfg):
             taken_a.add(i)
             taken_r.add(j)
             matched.append((i, j, 80))
+    LOOSE_AMBIG.clear()
+    LOOSE_NEW.clear()
+    if loose:
+        lf, la = loose_match(rows, audio, taken_a, taken_r, exact_files)
+        for i, j, sc, tier in lf:
+            matched.append((i, j, sc))
+            taken_a.add(i)
+            taken_r.add(j)
+            LOOSE_NEW.append((rows[j], audio[i], tier))
+        for tier, i, j in la:
+            LOOSE_AMBIG.append((tier, os.path.basename(audio[i]["path"]), f"{rows[j]['artist']} - {rows[j]['title']}"))
     matched.sort()
     return [(rows[j], audio[i], sc) for i, j, sc in matched], [r for j, r in enumerate(rows) if j not in taken_r]
 
@@ -1757,6 +1856,9 @@ def _killer_leftover(ktext):
     return _alnum(t)
 
 
+SYNC_SCAN = [False]                  # V7.7.5: True only while the sync report reads a FINISHED MONTAGE: its takes are different clips glued together, so the one-round / one-fight duplicate rules do not apply
+
+
 def drop_fake_kills(kills, rej, game, pre=(), revives=()):
     """V5.43 (Valorant + CS2): a real kill read again with jumbled text must not count as a new kill. Duplicates:
       - 1-2 sightings and the row text (killer leftover + victim side) contains a victim I killed in the last 4 s;
@@ -1783,13 +1885,13 @@ def drop_fake_kills(kills, rej, game, pre=(), revives=()):
                 break
             fight.append(q)
             edge = q["t"]
-        for q in fight:                                        # the same victim killed again = a duplicate, unless a revive came between
+        for q in (() if SYNC_SCAN[0] else fight):              # the same victim killed again = a duplicate, unless a revive came between
             qv = vname(q.get("victim") or "")
             if v and qv and len(qv) >= 3 and (cs2_same_victim(k.get("victim"), q.get("victim")) if cs2 else fuzz.ratio(v, qv) >= 85) and k["t"] > q["t"] and \
                     not any(q["t"] < rv < k["t"] for rv in revives):
                 why = f"'{k.get('victim')}' was already killed {k['t'] - q['t']:.1f} s earlier in this fight, no revive between ({k['row']})"
                 break
-        if why is None and cs2:                                # V6.7: within one round the same victim cannot be killed twice
+        if why is None and cs2 and not SYNC_SCAN[0]:           # V6.7: within one round the same victim cannot be killed twice
             for q in seen:
                 qv = vname(q.get("victim") or "")
                 if v and qv and len(qv) >= 4 and 0 < k["t"] - q["t"] <= CS2_ROUND_S and ocr_ratio(v, qv) >= 85:
@@ -1814,7 +1916,7 @@ def drop_fake_kills(kills, rej, game, pre=(), revives=()):
             rej.append({"t": k["t"], "reason": f"duplicate kill: {why}", "ks": k["ks"]})
             continue
         keep.append(k)
-    if game == "cs2":
+    if game == "cs2" and not SYNC_SCAN[0]:
         weak = lambda k: (k["hits"], k["ks"])
         while True:
             over = next(([x for x in keep if 0 <= x["t"] - a["t"] <= 115.0] for a in keep
@@ -2551,6 +2653,10 @@ def cs2_classify_track(track, cfg=None):
             "vs": float(r.get("vs", 0)), "votes": votes, "sus": sus}
 
 
+CS2_CONT_FRAMES = 3                  # V7.7.5: two fragments this close (frames at 30 fps) in one slot are one row when the victim reads look alike
+CS2_CONT_RATIO = 60
+
+
 def _border_relation(a, b, ca, cb):
     """'same' | 'distinct' for two tracks (a first). V6.8.2 FRAGMENT MERGE: distinct = visible at the same time in different slots, or the first
     row was gone for more than 1.0 s before the second appeared. Same = overlapping in one slot (a twin outline), or a gap of at most 1.0 s with
@@ -2573,6 +2679,10 @@ def _border_relation(a, b, ca, cb):
         return "same"
     if _slot_at(a, a["last"]) == _slot_at(b, b["first"]) and abs((a["x1"] - a["x0"]) - (b["x1"] - b["x0"])) <= 6:
         return "same"
+    if b["first"] - a["last"] <= CS2_CONT_FRAMES and _slot_at(a, a["last"]) == _slot_at(b, b["first"]) and ocr_norm(va) and ocr_norm(vb):
+        from rapidfuzz import fuzz                           # V7.7.5: the row went on in the same slot within a few frames and its victim read still looks alike: one row (OCR noise 18JR48 / T9JR48)
+        if fuzz.ratio(ocr_norm(va), ocr_norm(vb)) >= CS2_CONT_RATIO:
+            return "same"
     return "distinct"
 
 
@@ -2606,6 +2716,46 @@ def border_merge(tracks, cfg):
 
 CS2_STALE_S = 10.0               # V6.9.10: a kill row this early whose victim matches a pre-clip row of the clip is that same row read again (stale)
 CS2_STALE_ON = [True]            # test / impact-scan switch
+
+
+CS2_SAMETIME_ON = [True]
+CS2_SAMETIME_S = 0.2                 # V7.7.5: kills this close share one timestamp (a collateral / wallbang shows several rows at once)
+
+
+def cs2_sametime_guard(kills, rej):
+    """V7.7.5 GUARD: several kills at one timestamp are real only when EACH is a confirmed row of mine (my name read, or a killer side that still
+    looks like my name) with a victim distinct from the others in the group. A 3-frame red flash over a stale feed makes every old row look outlined
+    (CS2 2025.08.16 - 21.10.21.03: three 'kills' at 2.1 s, none mine); a row of another player next to my kill is read as a second kill (2026.02.09).
+    Unconfirmed / duplicate members are rejected (listed in `rej`); a group never loses its best-confirmed member. Single kills are untouched."""
+    from rapidfuzz import fuzz
+    keep = []
+    srt = sorted(kills, key=lambda k: k["t"])
+    groups, cur = [], []
+    for k in srt:
+        if cur and k["t"] - cur[-1]["t"] > CS2_SAMETIME_S:
+            groups.append(cur)
+            cur = []
+        cur.append(k)
+    if cur:
+        groups.append(cur)
+    for g in groups:
+        if len(g) < 2:
+            keep += g
+            continue
+        good = []
+        for k in sorted(g, key=lambda k: -k["hits"]):
+            kt = (k.get("row") or "")[1:].split("]")[0]
+            t_ = ocr_norm(kt)
+            if not (k["name_read"] or cs2_lenient_me(kt) or (len(t_) >= 4 and any(fuzz.partial_ratio(ocr_norm(n), t_) >= 50 for n in names_split("cs2")[0] or [MY_NAME]))):
+                rej.append({"t": k["t"], "reason": f"CS2 same-timestamp kill not confirmed: {len(g)} rows at {k['t']:.1f} s, this one has no readable name of mine ({k['row']}, {k['hits']} frames)", "ks": 0.0})
+                continue
+            vn = ocr_norm(k["victim"])
+            if any(cs2_same_victim(k["victim"], o["victim"]) or (vn and ocr_norm(o["victim"]) and fuzz.ratio(vn, ocr_norm(o["victim"])) >= 80) for o in good):
+                rej.append({"t": k["t"], "reason": f"CS2 same-timestamp kill rejected: same victim as another row of the group ({k['row']})", "ks": 0.0})
+                continue
+            good.append(k)
+        keep += good
+    return sorted(keep, key=lambda k: k["t"])
 
 
 def border_analysis(sc, cfg, deaths=None):
@@ -2668,6 +2818,8 @@ def border_analysis(sc, cfg, deaths=None):
             else:
                 keep_k.append(k)
         kills = keep_k
+    if CS2_SAMETIME_ON[0]:
+        kills = cs2_sametime_guard(kills, rej)
     victims = [ocr_norm(k["victim"]) for k in kills if k["name_read"] and ocr_norm(k["victim"])]
     rep = any(cs2_same_victim(a, b) for i, a in enumerate(victims) for b in victims[i + 1:])
     return {"kills": kills, "deaths": sorted(deaths or []), "revives": [], "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis,
@@ -5360,7 +5512,7 @@ def parse_added(s):
 
 
 MATCH_CACHE = DATA / "match_cache.json"
-MATCH_CACHE_VER = 2                  # V6.5: bump = every automatic match is recomputed once (manual matches live in the config)
+MATCH_CACHE_VER = 3                  # V6.5: bump = every automatic match is recomputed once (manual matches live in the config)
 SONG_STATE = ["none"]                 # V6.1.2: state of the last song_pool call: hit | incremental | full | stale (cached_only) | none (cached_only, no cache)
 
 
@@ -6533,6 +6685,28 @@ def cmd_utilclip(args):
     show()
 
 
+def cmd_songmatch(args):
+    """V7.7.5: python montage.py songmatch. Read-only: matches the songs folder to the newest CSV with and without the loose rule (primary artist +
+    base title), prints both counts and writes montage_data/song_match_v775.txt (every newly matched pair, then the ambiguous ones)."""
+    cfg = load_config()
+    audio = scan_audio(cfg)
+    csvp, rows, _ = read_playlist(cfg)
+    if not rows:
+        print("no playlist CSV")
+        return
+    m0, u0 = match_playlist(rows, audio, cfg, loose=False)
+    m1, u1 = match_playlist(rows, audio, cfg)
+    lines = [f"CSV {csvp.name}: {len(rows)} tracks, {len(audio)} MP3 files",
+             f"before: {len(m0)} matched, {len(u0)} unmatched", f"after:  {len(m1)} matched, {len(u1)} unmatched", "",
+             f"NEWLY MATCHED ({len(LOOSE_NEW)}):  CSV entry -> MP3 file  [tier 1 = primary artist, tier 2 = primary artist found among the other side's artists]"]
+    lines += [f"  [{t}] {r['artist']} - {r['title']}  ->  {os.path.basename(a['path'])}" for r, a, t in LOOSE_NEW]
+    lines += ["", f"AMBIGUOUS, NOT MATCHED ({len(LOOSE_AMBIG)}):"]
+    lines += [f"  [{t}] {tr}  <->  {fn}" for t, fn, tr in LOOSE_AMBIG]
+    txt = "\n".join(lines)
+    (DATA / "song_match_v775.txt").write_text(txt, encoding="utf-8")
+    print(txt)
+
+
 def cmd_ledger(args):
     """V6.9.7: python montage.py ledger. Read-only: reprints the last run's kill ledger from montage_data\\ledger_last.json (written by the run) or, failing
     that, from the log; writes ledger.txt next to montage.py; changes no cache, flag or config file."""
@@ -6957,6 +7131,7 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
           "stitched": len(spans) > 1, "stitch_note": stitch_note.strip(), "lags": [0.0] * len(times),
           "vis": spans[0]["it"].get("vis", []) if len(spans) == 1 else main.get("vis", [])}
     ev["score_pre"] = base_score(ev)
+    ev["verified"] = all(raw[i]["k"].get("name_read", True) for i in keep)       # V7.7.5: CS2 border kills carry name_read (my name was read on the row); every other kill counts as verified
     if any(raw[i]["k"].get("util") for i in keep):          # V7.3: a kill admitted by the per-clip utility override (OVERRIDE_ADMITTED)
         ev["util"] = True
     if led is not None:
@@ -7846,7 +8021,7 @@ def flex_tail(tk, d, fps):
 
 
 def _take_rules(tk):
-    return verify_cutlist({"takes": [dict(tk, f0=0)], "total_frames": tk["nf"]})
+    return verify_cutlist({"takes": [dict(tk, f0=0)], "total_frames": tk["nf"]}, log=False)
 
 
 def _relayout(takes, fps):
@@ -7876,7 +8051,7 @@ def move_kill(plan, ti, kj, target, fps, protected=frozenset()):
     m = int(round((target - impact_time(plan, ti, kj)) * fps))
     if m == 0:
         return copy.deepcopy(takes), "none", ""
-    base_bad = verify_cutlist(plan)
+    base_bad = verify_cutlist(plan, log=False)
     base_dup = plan_duplicate_ranges(plan)
     tk = takes[ti]
     prv = takes[ti - 1] if ti > 0 and not takes[ti - 1].get("util") and not takes[ti - 1].get("ending") else None
@@ -7937,7 +8112,7 @@ def move_kill(plan, ti, kj, target, fps, protected=frozenset()):
             why = "the montage length would change"
             continue
         trial = dict(plan, takes=new)
-        nb = [x for x in verify_cutlist(trial) if x not in base_bad]
+        nb = [x for x in verify_cutlist(trial, log=False) if x not in base_bad]
         nd = [x for x in plan_duplicate_ranges(trial) if x not in base_dup]
         if nb or nd:
             why = (nb + nd)[0].split(":", 1)[-1].strip()[:80]
@@ -7997,7 +8172,7 @@ def reorder_for_drop(plan, t_d, fps, protected):
                     cand.append((0 if kj == len(X["kills"]) - 1 else 1, -len(X["kills"]), round(abs(e), 3), abs(q - xi), xi, q, kj))
     if not cand:
         return None, None, None, f"no movable take has a kill within {REORDER_REACH} s of the drop after being moved"
-    base_bad = verify_cutlist(plan)
+    base_bad = verify_cutlist(plan, log=False)
     base_dup = plan_duplicate_ranges(plan)
     why = "every reordered take broke a cut-list rule"
     for _a, _n, _e, _d, xi, q, kj in sorted(cand)[:REORDER_TRIES]:
@@ -8006,7 +8181,7 @@ def reorder_for_drop(plan, t_d, fps, protected):
         new.insert(q, X)
         _relayout_beats(new, fps, bd)
         trial = dict(plan, takes=new)
-        nb = [x for x in verify_cutlist(trial) if x not in base_bad]
+        nb = [x for x in verify_cutlist(trial, log=False) if x not in base_bad]
         nd = [x for x in plan_duplicate_ranges(trial) if x not in base_dup]
         if nb or nd:
             why = (nb + nd)[0].split(":", 1)[-1].strip()[:80]
@@ -8047,7 +8222,7 @@ def repair_tails(plan, notes):
         tail, lo, hi = take_tail_bounds(t)
         if lo - 1.0 / fps - 1e-9 <= tail <= hi + 1.0 / fps + 1e-9:
             continue
-        base_bad = verify_cutlist(plan)
+        base_bad = verify_cutlist(plan, log=False)
         base_dup = plan_duplicate_ranges(plan)
         if tail > hi:                                      # too long: cut d frames, the next take's run-up grows by d
             want = max(1, int(math.ceil((tail - hi) * fps - 1e-9)))
@@ -8071,7 +8246,7 @@ def repair_tails(plan, notes):
                 why = "the montage length would change"
                 continue
             trial = dict(plan, takes=new)
-            nb = [x for x in verify_cutlist(trial) if x not in base_bad]
+            nb = [x for x in verify_cutlist(trial, log=False) if x not in base_bad]
             nd = [x for x in plan_duplicate_ranges(trial) if x not in base_dup]
             if nb or nd:
                 why = (nb + nd)[0].split(":", 1)[-1].strip()[:90]
@@ -8169,6 +8344,22 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
         notes.append(ln)
         LOGONLY(ln)
     return lines
+
+
+ENDING_MIN_POST = 0.9                # V7.7.5: footage (s) after the last kill the final slow-mo needs so it neither freezes nor runs into my death
+
+
+def ending_safe(e):
+    """V7.7.5: an event may end the montage only when at least ENDING_MIN_POST s of footage follow its last kill BEFORE my death / the clip end."""
+    post = e["post"] if e.get("death_after") is None else min(e["post"], e["death_after"] - 0.05)
+    return post >= ENDING_MIN_POST
+
+
+def ending_rank(e):
+    """V7.7.5: the ending prefers a verified clean multikill (every kill row read as mine, not stitched, no relaxed rule), then the score. With all candidates
+    equal this is exactly the old order (score)."""
+    clean = e.get("verified", True) and not e.get("stitched") and not e.get("_rx")
+    return (0 if clean else 1, -e["score"])
 
 
 def optimal_fit(clips, an, style, song_path=None, rank=0):
@@ -8388,7 +8579,9 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         head_cands = sorted(head_cands[:k_top], key=lambda e: (not e.get("flick"), not (e.get("hs") or 0) > 0)) + head_cands[k_top:]
     head = head_cands[0]
     rest = [e for e in usable if e is not head]
-    ending = next((e for e in sorted(rest, key=lambda e: -e["score"]) if e["post"] >= 0.5 and not e.get("util")), None)
+    ending = next((e for e in sorted(rest, key=ending_rank) if e["post"] >= 0.5 and not e.get("util") and ending_safe(e)), None)      # V7.7.5: verified, clean footage after the last kill first
+    if ending is None:
+        ending = next((e for e in sorted(rest, key=lambda e: -e["score"]) if e["post"] >= 0.5 and not e.get("util")), None)
     if ending is None:                                     # V7.3: a utility take never ends the montage - unless every candidate is one (base behaviour, logged)
         ending = next((e for e in sorted(rest, key=lambda e: -e["score"]) if e["post"] >= 0.5), None)
         if ending is not None and ending.get("util") and len(rest) >= 2:
@@ -9212,7 +9405,27 @@ def _TAKE_SKIP_OK(msg):
     return any(k in msg for k in ("outside its clip", "is not inside the take", "is under the minimum", "speed ", "tail ", "only ", "used twice"))
 
 
-def verify_cutlist(plan):
+def kill_window_audit(t):
+    """V7.7.5 plan-time assertion on one take: (1) every kill time of the event lies inside a source segment that is played (speed > 0) - not only the headline
+    kill; (2) the take starts early enough to show the build-up (>= the run-up the event's rule asks for, LEAD_MIN unless the event was admitted with a
+    shorter one); (3) the kills come out in order and each one before the take ends. Returns [message]; empty = fine."""
+    msgs = []
+    segs = [sg for sg in t.get("segs", []) if sg[2] > 0 and sg[3] > 0]
+    if not segs or not t.get("kills"):
+        return msgs
+    for k, vic in zip(t["kills"], (t.get("victims") or []) + [""] * len(t["kills"])):
+        if not any(sg[0] - 1e-3 <= k <= sg[1] + 1e-3 for sg in segs):
+            msgs.append(f"the kill at {k:.2f}s ({vic or 'kill'}) is not inside the take's footage (the take shows {segs[0][0]:.2f}-{segs[-1][1]:.2f}s)")
+    if len(t["kills"]) != int(t.get("n", len(t["kills"]))):
+        msgs.append(f"the take lists {len(t['kills'])} kills but its event has {t.get('n')} (a kill is missing from the take)")
+    lead = t["kills"][0] - segs[0][0]
+    lead_min = float((t.get("rx") or {}).get("lead_min", LEAD_MIN))
+    if lead < lead_min - 0.06 and not t.get("ramp", 1.0) > 1.0:
+        msgs.append(f"the take starts only {lead:.2f}s before the first kill (build-up needs {lead_min:.2f}s)")
+    return msgs
+
+
+def verify_cutlist(plan, log=True):
     """Final check before rendering: contiguous frames, segments add up, every take >= 2 beats and holds its kills (in order,
     inside its source windows), 1.0x from 1.0 s before the first kill through the last, tails 0.2-0.5 s (ending excepted),
     no clip and no kill used twice."""
@@ -9230,6 +9443,10 @@ def verify_cutlist(plan):
             if not any(sg[0] - 1e-3 <= r <= sg[1] + 1e-3 for sg in t["segs"] if sg[2] > 0):
                 bad.append(f"take {i}: the kill row at {r:.2f}s is not inside the take's footage")
         k0, kl = t["kills"][0], t["kills"][-1]
+        for m_ in kill_window_audit(t):                    # V7.7.5: every kill of the event (not only the headline one) is inside the placed take, and the build-up is shown
+            bad.append(f"take {i}: {m_}")
+            if log:                                        # not for the trial moves of the drop levers (_take_rules): those are meant to fail and are simply not applied
+                out(f"KILL WINDOW CHECK FAILED: take {i} {Path(t['path']).name}: {m_}")
         for sg in t["segs"]:
             a, b, sp = sg[:3]
             if sp != 1.0 and a < kl - 1.0 / OUT_FPS and b > k0 - 1.0 + 1.0 / OUT_FPS:
@@ -9527,6 +9744,34 @@ def assign_soft_cuts(plan, notes=None):
     return soft, why
 
 
+_BLEND_N0 = [None]
+
+
+def blend_n_base():
+    """V7.7.5: the number ffmpeg's blend filter gives its FIRST frame in `N` (the documentation says 0; the build used for the 7.7.1 renders counts from 1: the dissolve
+    weights were 0.3 ... 1.1 instead of 0.1 ... 0.9, so its last frame overshot the take after by 10% of the difference - a white flash into a bright take, a dark dip into a dark one).
+    Measured once per run on two black frames: blend=all_expr='N*10' -> Y = N * 10 on the first frame."""
+    if _BLEND_N0[0] is None:
+        base = 0
+        try:
+            r = run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=16x16:r=60:d=0.2", "-f", "lavfi", "-i", "color=c=black:s=16x16:r=60:d=0.2",
+                     "-filter_complex", "[0:v][1:v]blend=all_expr='N*10+16',format=yuv420p,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+                     "-frames:v", "1", "-f", "null", "-"], timeout=30)
+            m = re.search(r"YAVG=([0-9.]+)", (r.stdout or b"").decode("utf-8", "ignore"))
+            if m:
+                base = int(round((float(m.group(1)) - 16.0) / 10.0))
+        except Exception:
+            base = 0
+        _BLEND_N0[0] = min(1, max(0, base))
+    return _BLEND_N0[0]
+
+
+def soft_blend_expr():
+    """V7.7.5: the per-pixel expression of the 5-frame dissolve: weight of the take after = 0.1, 0.3, 0.5, 0.7, 0.9 on its five frames (never outside 0..1)."""
+    wt = f"clip((N+0.5-{blend_n_base()})/{SOFT_N},0,1)"
+    return f"A*(1-{wt})+B*{wt}"
+
+
 def build_filter(plan, cfg, preview, fx=FX_ALL):
     """ONE filter graph (V4 engine). Effects sit on each take's own output timeline: centred V4 zoom punches on kills (overlaid
     only inside the punch), ramps before kills, V4 slow-mo (frame blending only inside slow-mo segments). V5.2: no flashes, no
@@ -9714,7 +9959,7 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
                 pb = f"t{ti - 1}"
                 chains.append(f"[{pb}tl][h{ti - 1}a]concat=n=2:v=1:a=0[sa{ti}]")
                 chains.append(f"[h{ti}b][{base}hd]concat=n=2:v=1:a=0[sb{ti}]")
-                chains.append(f"[sa{ti}][sb{ti}]blend=all_expr='A*(1-(N+0.5)/{SOFT_N})+B*((N+0.5)/{SOFT_N})',format=yuv420p,setpts=PTS-STARTPTS,fps=60[x{ti}]")
+                chains.append(f"[sa{ti}][sb{ti}]blend=all_expr='{soft_blend_expr()}',format=yuv420p,setpts=PTS-STARTPTS,fps=60[x{ti}]")
                 vparts.append(f"[x{ti}]")
             vparts.append(f"[{base}v]")
         else:
@@ -10458,6 +10703,37 @@ def _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nv
     raise RuntimeError(f"render failed even without effects - see {elog} and {gp}")
 
 
+SPIKE_ABS, SPIKE_REL = 6.0, 0.03      # V7.7.5 transition check: a dissolve frame may leave the range of its two sides by this many luma levels + this share of their difference
+
+
+def luma_series(path, w=160, h=90):
+    """Mean luma (0-255) of every frame of a video, one number per frame (a small decode: scaled to w x h)."""
+    r = run(["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"scale={w}:{h},signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-", "-an", "-f", "null", "-"], timeout=1800)
+    return [float(x) for x in re.findall(r"YAVG=([0-9.]+)", (r.stdout or b"").decode("utf-8", "ignore"))]
+
+
+def transition_spikes(plan, y):
+    """V7.7.5: (soft cuts checked, [(take, time s, spike levels, side)]). A soft cut into take i dissolves the 5 frames f0-2 ... f0+2; the 6 frames before and the 6 frames after are the two sides.
+    A dissolve frame outside the range of those frames (by SPIKE_ABS + SPIKE_REL of the difference between the sides) is a luma spike: a flash (brighter) or a dip (darker)."""
+    n_ok, bad = 0, []
+    for i, t in enumerate(plan["takes"]):
+        if i == 0 or t.get("trans") != "soft":
+            continue
+        f0 = int(t["f0"])
+        if f0 - 3 < 0 or f0 + 3 >= len(y):
+            continue
+        n_ok += 1
+        side = y[max(0, f0 - 8):f0 - 2] + y[f0 + 3:f0 + 9]                 # the frames of both takes around the dissolve (their own brightness drifts a little)
+        a, b = y[f0 - 3], y[f0 + 3]
+        hi_s, lo_s = max(side), min(side)
+        tol = SPIKE_ABS + SPIKE_REL * abs(b - a)
+        win = y[f0 - 2:f0 + 3]
+        up, down = max(win) - hi_s, lo_s - min(win)
+        if up > tol or down > tol:
+            bad.append((i + 1, round(f0 / OUT_FPS, 2), round(max(up, down), 1), "brighter" if up > down else "darker"))
+    return n_ok, bad
+
+
 def sync_report(plan, outfile, cfg):
     """Runs the kill detector on the finished montage; each first kill vs its beat, the drop, effects and tails."""
     import numpy as np
@@ -10469,15 +10745,23 @@ def sync_report(plan, outfile, cfg):
     rec = probe_video(str(outfile))
     rec.update(path=str(outfile), game=game, bars=False)
     entry = scan_clip(str(outfile), rec, det, cfg)
-    seen = [k["t"] for k in analyse_entry(entry, cfg)["kills"]]
+    SYNC_SCAN[0] = True                                    # V7.7.5: a montage is many clips in a row: the one-round / one-fight duplicate rules of a single clip would drop most of its rows
+    try:
+        seen = [k["t"] for k in analyse_entry(entry, cfg, game)["kills"]]        # the same name logic as the main scan (analyse_entry: 火斧 / fireaxe火茶 variants, OCR-normalised names)
+    finally:
+        SYNC_SCAN[0] = False
     beats = np.array(plan["beats_out"]) if plan["beats_out"] else np.zeros(1)
     out(f"SYNC REPORT  recipe {plan['recipe']}  seed {plan['seed']}  placement {plan['placement']}  "
         f"drop at {plan['song'].get('drop_t')}s  drops in the song window: {plan.get('drops_out')}")
+    tot_rows = [0, 0, 0]                                   # planned rows, seen within 0.2 s, seen within 0.5 s (the detector needs a few stable frames: it reports a row up to ~0.4 s after it appears)
     for i, t in enumerate(plan["takes"], 1):
         tp = t["out_start"] + t["kills_out"][0]
         kb = int(np.argmin(np.abs(beats - tp)))
         rows = [t["out_start"] + r for r in t["rows_out"]]
         found = sum(1 for r in rows if any(abs(x - r) <= 0.2 for x in seen))
+        tot_rows[0] += len(rows)
+        tot_rows[1] += found
+        tot_rows[2] += sum(1 for r in rows if any(abs(x - r) <= 0.5 for x in seen))
         out(f"  take {i:2} [{t['role']:8}] first kill {tp:7.3f}s, beat {beats[kb]:7.3f}s, error {(tp - beats[kb]) * 1000:+5.0f} ms | "
             f"kill rows seen by the detector {found}/{len(rows)} | tail {t['dur'] - t['kills_out'][-1]:.2f}s | "
             f"zoom {len(t['pulses'])} flash {'yes' if t['flash'] is not None else 'no'} trans {t['trans']} "
@@ -10495,7 +10779,18 @@ def sync_report(plan, outfile, cfg):
             else "row not seen by the detector"
         out(f"  SYNC DROP {d['drop']:8.3f} [{d.get('source', 'map')}] take {d['take']} kill {d['kill']}/{d.get('n', '?')}: rendered impact {imp:.3f} s, "
             f"error {(imp - d['drop']) * 1000:+.0f} ms, lever {d.get('lever')} | {det}")
-    out(f"SYNC SUMMARY: detector found {len(seen)} kill rows for {sum(t['n'] for t in plan['takes'])} planned kills")
+    out(f"SYNC SUMMARY: detector found {len(seen)} kill rows for {sum(t['n'] for t in plan['takes'])} planned kills; planned rows seen within 0.2 s: {tot_rows[1]} of {tot_rows[0]}, within 0.5 s: {tot_rows[2]} of {tot_rows[0]}")
+    try:                                                   # V7.7.5: every soft transition of the finished video is checked for a luma spike (white flash / dark dip)
+        y = luma_series(outfile)
+        if len(y) >= plan["total_frames"] - 5:
+            n_ok, bad = transition_spikes(plan, y)
+            for tk_, ts_, sp_, kind in bad:
+                out(f"  TRANSITION SPIKE: take {tk_} at {ts_:.2f} s: dissolve frame {sp_:.0f} luma levels {kind} than both sides")
+            out(f"TRANSITION CHECK: {n_ok} soft transitions scanned, {len(bad)} luma spike{'s' * (len(bad) != 1)}")
+        else:
+            out(f"TRANSITION CHECK: not done (read {len(y)} of {plan['total_frames']} frames)")
+    except Exception as ex:
+        out(f"TRANSITION CHECK: not done ({type(ex).__name__}: {ex})")
 
 
 QUALITY_ALIGN = (0, -1, 1, -2, 2, -3, 3)     # V7.6.0: output-frame offsets searched by quality_check
@@ -17431,6 +17726,7 @@ def main():
     ds.add_argument("--list", action="store_true")
     ds.set_defaults(fn=cmd_dropsave)
     sp.add_parser("musicscan", help="V7.7.0: run the music-over-gameplay detector over all cached clips (read-only; writes musicscan.txt only)").set_defaults(fn=cmd_musicscan)
+    sp.add_parser("songmatch", help="V7.7.5: song-to-CSV match counts with / without the loose rule (read-only; writes montage_data/song_match_v775.txt)").set_defaults(fn=cmd_songmatch)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
