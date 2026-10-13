@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.7.5 - 2026-10-13: Fake CS2 kills and white flashes fixed
+- CS2 clips no longer show kills that never happened: old rows still on the killfeed, and one kill counted twice, are now ignored, so montages stop slowing down on an empty killfeed or ending on slow motion of nothing.
+- The soft dissolve between two clips no longer flashes white or dips dark: it now blends in even steps.
+- More songs are found: an MP3 now matches the playlist by main artist and song title, ignoring featured artists and extras like Remix or Lyrics, and unclear matches are listed instead of guessed.
+- The check after each render now counts the CS2 kills correctly and looks for flashes in every transition.
+
 ## V7.7.1 - 2026-10-13: SongMap mode, much better music detection
 - New SongMap mode setting: V2 (the default) always uses the V2 song map for every song; V2 + V1 Fallback keeps the old safety switch to V1.
 - Clips with music already playing are found far more often, and all clips of one fight get the same decision, so a clip never changes volume halfway.
