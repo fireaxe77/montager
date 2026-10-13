@@ -5113,6 +5113,86 @@ def get_songmap(path, csv_bpm=None, version=None):
     return add_repeat_drops(_get_songmap_routed(path, csv_bpm, version), path)
 
 
+SONGMAP_MODES = {"v2_fallback": "V2 + V1 Fallback", "v2": "V2"}    # V7.7.1 Settings > SongMap mode (applies to Songmap V2): the V1 safety rules (current behaviour) or V2 for every song
+
+
+def songmap_mode(cfg=None):
+    v = str((cfg if cfg is not None else load_config()).get("songmap_mode") or "v2_fallback").lower()
+    return "v2" if v == "v2" else "v2_fallback"
+
+
+_V2_RAW = threading.local()
+
+
+def _patch_v2_safety():
+    """V7.7.1: songmap_v2/safety.apply stays untouched (its source is part of the V2 cache key: editing it would invalidate every cached song map). A thread that sets _V2_RAW.on gets the
+    raw V2 map from it; every other thread (the normal analysis) runs the original function unchanged."""
+    import songmap_v2.safety as SF
+    if getattr(SF.apply, "_v771", False):
+        return
+    orig = SF.apply
+
+    def apply(m2, *a, **k):
+        return m2 if getattr(_V2_RAW, "on", False) else orig(m2, *a, **k)
+    apply._v771 = True
+    SF.apply = apply
+
+
+def _songmap_v2_raw(path, csv_bpm, v1_bpm):
+    """V7.7.1: the V2 map of a low-confidence song WITHOUT the switch to V1 values, from its own cache entry (key + '|raw', only written for such songs; the normal
+    entry stays untouched). Returns (map or None, reason when None)."""
+    import songmap_v2
+    cpath = DATA / songmap_v2.CACHE_NAME
+    _patch_v2_safety()
+    key = songmap_v2.cache_key(path, csv_bpm, v1_bpm) + "|raw"
+    hit = load_json(cpath, {}).get(key)
+    if hit and not hit.get("fallback_marker"):
+        return hit, ""
+    if hit:
+        return None, hit["fallback_marker"]
+    box = {}
+    deadline = time.monotonic() + songmap_v2.ANALYSIS_CAP_S
+
+    def work():
+        _V2_RAW.on = True                                  # this worker thread only: safety.apply (patched below) hands back the raw V2 map
+        try:
+            box["m"] = songmap_v2.build_songmap_v2(path, csv_bpm, deadline=deadline, hook=SONGMAP_V2_HOOK[0], v1_bpm=v1_bpm)
+        except BaseException as ex:      # noqa: BLE001 - nothing may escape the worker
+            box["err"] = f"{type(ex).__name__}: {ex}"
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(songmap_v2.ANALYSIS_CAP_S)
+    if th.is_alive() or "m" not in box:
+        return None, ("V2 analysis timeout" if th.is_alive() else f"V2 analysis failed ({box.get('err', 'no result')})")
+    c2 = load_json(cpath, {})
+    c2[key] = box["m"]
+    save_json(cpath, c2)
+    return box["m"], ""
+
+
+def _songmap_low_conf(path, csv_bpm, m, name, v1_bpm):
+    """V7.7.1: the map a V2 song uses, one log line per request. m = the cached map as V7.7.0 returns it. Mode 'V2 + V1 Fallback' (default): m unchanged. Mode 'V2': a song the V1
+    safety rules switched to V1 values gets its own raw V2 map instead (no rule overrides it)."""
+    v2 = m.get("v2") or {}
+    conf = float(v2.get("grid_confidence", 0) or 0)
+    if not v2.get("fallback"):
+        out(f"songmap: {name}: V2 (grid confidence {conf:.2f}); mode {SONGMAP_MODES[songmap_mode()]}")
+        return m
+    why = str(v2.get("fallback_reason") or "low confidence")
+    if songmap_mode() != "v2":
+        out(f"songmap: {name}: V1 beat values (V1 safety fallback: {why}); mode V2 + V1 Fallback")
+        return m
+    try:
+        raw, rwhy = _songmap_v2_raw(path, csv_bpm, v1_bpm)
+    except Exception as ex:                                # noqa: BLE001
+        raw, rwhy = None, f"{type(ex).__name__}: {ex}"
+    if raw is None:
+        out(f"songmap: {name}: V2 could not be built ({rwhy}); the cached map is used")
+        return m
+    out(f"songmap: {name}: V2 (grid confidence {float(raw['v2'].get('grid_confidence', 0) or 0):.2f}), the V1 safety rule ({why}) is not applied; mode V2")
+    return dict(raw, v2=dict(raw["v2"], safety_skipped=why))
+
+
 def _get_songmap_routed(path, csv_bpm=None, version=None):
     """THE routing point for song map requests (V6.9.5): V1 = analyse_song() exactly as before; V2 = the isolated songmap_v2 package with its
     own cache file; V6.9.5.2 'v2auto' = V2 or V1 per song (see _songmap_auto_pick). Any V2 problem (error, timeout, missing module) logs
@@ -5123,8 +5203,9 @@ def _get_songmap_routed(path, csv_bpm=None, version=None):
     name = Path(path).name
     v1m = analyse_song(path, csv_bpm) if v == SONGMAP_AUTO else None          # auto always needs the V1 map; plain V2 only peeks at its cache
     try:
-        m = _songmap_v2_cached(path, csv_bpm, float(v1m["bpm"]) if v1m else _peek_v1_bpm(path, csv_bpm), name)
-        return _songmap_auto_pick(path, csv_bpm, v1m, m, name) if v1m else m
+        v1b = float(v1m["bpm"]) if v1m else _peek_v1_bpm(path, csv_bpm)
+        m = _songmap_v2_cached(path, csv_bpm, v1b, name)
+        return _songmap_auto_pick(path, csv_bpm, v1m, m, name) if v1m else _songmap_low_conf(path, csv_bpm, m, name, v1b)
     except Exception as ex:
         why = str(ex) if isinstance(ex, _V2Fail) else f"{type(ex).__name__}: {ex}"
         out(f"songmap v2 fallback: {name} ({why})")
@@ -12683,6 +12764,7 @@ class App:
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
         cfg["lower_music_clips"] = bool(self.set_music.get())        # V7.7.0
+        cfg["songmap_mode"] = next((k for k, lab in SONGMAP_MODES.items() if lab == self.set_smmode.get()), "v2_fallback")    # V7.7.1
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
         if self.set_names:
             cfg["player_names"] = {g: norm_names(v.get(), g) for g, v in self.set_names.items()}
@@ -14459,6 +14541,10 @@ class App:
         r[0] += 1
         am = self.cfg.get("audio_mode", "auto")
         self.set_audio = tk.StringVar(value=AUDIO_MODES.get(am, AUDIO_MODES["auto"]))
+        self.set_smmode = tk.StringVar(value=SONGMAP_MODES[songmap_mode(self.cfg)])                  # V7.7.1
+        label("SongMap mode")
+        ttk.Combobox(holder(), textvariable=self.set_smmode, values=list(SONGMAP_MODES.values()), width=18, state="readonly").pack(side="left")
+        r[0] += 1
         label("Audio mode")
         h = holder()
         ttk.Combobox(h, textvariable=self.set_audio, values=list(AUDIO_MODES.values()), width=16, state="readonly").pack(side="left")
@@ -14514,7 +14600,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_music, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_music, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
