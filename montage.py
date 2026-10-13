@@ -6467,6 +6467,36 @@ def cmd_ledger(args):
     print(f"(read-only; written to {HERE / 'ledger.txt'}; nothing else was changed)")
 
 
+def cmd_musicscan(args):
+    """V7.7.0: python montage.py musicscan. Read-only: runs the 'music over gameplay' detector over every cached clip of both games (on the audio track the plan would use),
+    prints how many are flagged and their names, and writes musicscan.txt next to montage.py. Results are cached in the loud cache (the same cache the plan uses)."""
+    cfg = load_config()
+    lines, flagged, tot = [], [], 0
+    keep = (out, LOGONLY)
+    globals()["out"] = globals()["LOGONLY"] = lambda *a, **k: None
+    try:
+        for game in ("valorant", "cs2"):
+            pool, _st = game_pool(cfg, game, None)
+            for n_, it in enumerate(pool, 1):
+                rec = it["rec"]
+                if not rec.get("audio"):
+                    continue
+                tot += 1
+                au = resolve_clip_audio(rec, cfg, game, {})
+                m = music_over_gameplay(rec, au)
+                if m["yes"]:
+                    flagged.append((game, Path(rec["path"]).name, m))
+    finally:
+        globals()["out"], globals()["LOGONLY"] = keep
+    lines.append(f"music over gameplay: {len(flagged)} of {tot} clips with sound flagged ({100.0 * len(flagged) / max(1, tot):.1f} %)")
+    for g, nm, m in sorted(flagged):
+        lines.append(f"  {g:9} {nm}  score {m['score']:.2f}  ({m['why']})")
+    text = "\n".join(lines)
+    (HERE / "musicscan.txt").write_text(text + "\n", encoding="utf-8")
+    print(text)
+    print(f"(read-only; written to {HERE / 'musicscan.txt'})")
+
+
 FIGHT_SPLIT_S = {"valorant": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
 
 
@@ -8699,6 +8729,78 @@ def split_parts(segs, ev):
     return out_
 
 
+MUSIC_LOWER_DB = 12.0                # V7.7.0 (Settings > "Lower clips that already have music playing", default OFF): the game audio of such a clip plays this much lower
+MUSIC_MIN_RUN_S = 5.0                # a song is sustained: tonal content lasting at least this long (gaps up to 0.4 s: gunshots) ...
+MUSIC_MIN_TONAL = 0.45               # ... on at least this share of the clip's active frames ...
+MUSIC_MAX_STILL = 0.85               # ... and the pitches CHANGE (a drone / hum / beep holds one chord: chroma similarity above this is not music)
+
+
+def music_features(y, sr=22050):
+    """V7.7.0: (share of active frames whose pitch-class (chroma) profile is concentrated on a few notes, longest run of such frames [s, gaps <= 0.4 s], median
+    similarity of the pitch profile 0.3 s apart [1.0 = one held tone]). Gunshots, abilities and footsteps are broadband (flat profile); ambience is noise or a drone; a song
+    is tonal for seconds AND moves from chord to chord."""
+    import numpy as np
+    import librosa
+    if len(y) < sr * 3 or float(np.sqrt(np.mean(np.square(y)))) < 0.004:
+        return None                                        # too short, or (near) silence: its pitch profile means nothing
+    hop = 1024
+    P = np.abs(librosa.stft(y, n_fft=4096, hop_length=hop)) ** 2
+    fr = librosa.fft_frequencies(sr=sr, n_fft=4096)
+    e = 10 * np.log10(P[(fr >= 100) & (fr <= 4000)].sum(0) + 1e-12)
+    act = e > (e.max() - 35)
+    ch = librosa.feature.chroma_stft(S=P, sr=sr, n_chroma=12, tuning=0.0)
+    chn = ch / (ch.sum(0, keepdims=True) + 1e-9)
+    ent = -(chn * np.log(chn + 1e-9)).sum(0)
+    fps = sr / hop
+    lag = max(1, int(0.3 * fps))
+    a, b = chn[:, :-lag], chn[:, lag:]
+    cs = (a * b).sum(0) / (np.linalg.norm(a, axis=0) * np.linalg.norm(b, axis=0) + 1e-9)
+    both = act[:-lag] & act[lag:]
+    tonal = float(((ent < 2.2) & act).sum() / max(1, act.sum()))
+    mask, g, best, cur, miss = (ent < 2.1) & act, int(0.4 * fps), 0, 0, 0
+    for m_ in mask:
+        if m_:
+            cur += 1 + miss
+            miss = 0
+            best = max(best, cur)
+        else:
+            miss += 1
+            if miss > g:
+                cur = miss = 0
+    return tonal, best / fps, (float(np.median(cs[both])) if both.any() else 1.0)
+
+
+def music_over_gameplay(rec, au):
+    """V7.7.0: is a song playing over this clip's gameplay audio? {'yes', 'score' 0-1, 'why'}. Conservative: only the three gates together say yes. A clip whose chosen track is a
+    game-only track of a multi-track recording ('track 2 of 4') is never analysed. Source files are only read; the result is cached per file and track (loud cache)."""
+    n_tr = max(len(au.get("all") or []), int(au.get("n") or 1))
+    st = int(au.get("stream") or 0)
+    if n_tr > 1 and st > 0:
+        return {"yes": False, "score": 0.0, "why": f"clean game-only track ({st + 1} of {n_tr}), not analysed"}
+    key = file_key(rec["path"]) + f"|music1|{st}"
+    cache = load_json(LOUD_CACHE, {})
+    if key in cache:
+        return cache[key]
+    try:
+        import numpy as np
+        r = run(["ffmpeg", "-v", "error", "-i", rec["path"], "-map", f"0:a:{st}", "-vn", "-ac", "1", "-ar", "22050", "-f", "f32le", "-"], timeout=120)
+        f = music_features(np.frombuffer(r.stdout, np.float32))
+    except Exception as ex:                                # noqa: BLE001
+        f = None
+        LOGONLY(f"music check failed for {Path(rec['path']).name}: {type(ex).__name__}: {ex}")
+    if f is None:
+        res = {"yes": False, "score": 0.0, "why": "too short or unreadable"}
+    else:
+        tonal, run_s, still = f
+        yes = run_s >= MUSIC_MIN_RUN_S and tonal >= MUSIC_MIN_TONAL and 0.3 <= still <= MUSIC_MAX_STILL
+        score = round(min(1.0, run_s / (2 * MUSIC_MIN_RUN_S)) * 0.5 + min(1.0, tonal / 0.9) * 0.5, 2) if still <= MUSIC_MAX_STILL else round(min(0.4, tonal * 0.4), 2)
+        res = {"yes": bool(yes), "score": score, "why": f"tonal {tonal:.2f}, longest run {run_s:.1f} s, pitch stillness {still:.2f}"}
+    cache = load_json(LOUD_CACHE, {})
+    cache[key] = res
+    save_json(LOUD_CACHE, cache)
+    return res
+
+
 def _game_gain(cfg, song_lufs, clip_lufs):
     """V4 balance (game under the music), slightly louder than V4; quiet clips (CS2) lifted by up to +8 dB, never lowered."""
     gv = float(cfg.get("game_audio_level", 0.6))
@@ -8718,6 +8820,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
     sec = an.get("section_of_beat") or []
     song_lufs = an.get("lufs")
     out_takes = []
+    notes_music = []                     # V7.7.0 (only filled when the Settings option is on)
     audio_state = {}                     # V5.57: audio mode used + Auto -> Legacy fallback reasons
     for i, tk in enumerate(takes):
         ev = tk["ev"]
@@ -8775,9 +8878,16 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             r = p["rec"]
             au = resolve_clip_audio(r, cfg, game, audio_state)
             gdb, lift = _game_gain(cfg, song_lufs, au["lufs"])
+            mus = None
+            if cfg.get("lower_music_clips") and r.get("audio"):              # V7.7.0: OFF (default) = this block never runs and nothing below changes
+                mus = music_over_gameplay(r, au)
+                if mus["yes"]:
+                    gdb = round(gdb - MUSIC_LOWER_DB, 2)
+                notes_music.append(f"music over gameplay: {Path(p['path']).name}: {'yes' if mus['yes'] else 'no'} ({mus['score']:.2f}; {mus['why']}) -> {gdb:+.1f} dB"
+                                   + (f" ({MUSIC_LOWER_DB:.0f} dB lower)" if mus["yes"] else ""))
             srcs.append({"path": p["path"], "shift": p.get("shift", 0.0), "rect": content_rect(r, cfg), "wh": [r["w"], r["h"]],
                          "audio": bool(r.get("audio")), "a_stream": au["stream"] or 0, "a_note": au.get("note", ""), "lufs": au["lufs"], "gain_db": gdb,
-                         "lift_db": lift, "dur": r.get("dur", 0)})
+                         "lift_db": lift, "dur": r.get("dur", 0), **({"music_db": -MUSIC_LOWER_DB} if mus and mus["yes"] else {})})
         b0 = (tk["c"] - takes[0]["c"]) / 2
         out_takes.append({"path": ev["path"], "srcs": srcs, "rect": srcs[0]["rect"], "audio": srcs[0]["audio"], "wh": srcs[0]["wh"],
                           "segs": segs, "f0": f_c, "nf": nf, "out_start": round(f_c / OUT_FPS, 4), "dur": round(nf / OUT_FPS, 4),
@@ -8795,6 +8905,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           **({"tail": {"mode": "fit", "v0": round(float(tk["v0"]), 3), "ease": EASE_FR, "ex": int(tk["ex"])}} if tk.get("tailmode") == "fit" else {}),
                           **({"rx": dict(ev["_rx"])} if ev.get("_rx") else {}),
                           **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {}), **({"util": True} if ev.get("util") else {})})
+    notes.extend(notes_music)
     a_mode = audio_state.get("mode") or cfg.get("audio_mode", "auto")
     total_f = out_takes[-1]["f0"] + out_takes[-1]["nf"]
     total_s = total_f / OUT_FPS
@@ -11018,6 +11129,8 @@ def audio_guard(plan, outfile, cfg, redo):
             au = clip_audio_legacy({"path": sd["path"], "audio": sd["audio"]})
             sd["a_stream"], sd["a_note"], sd["lufs"] = au["stream"] or 0, au.get("note", ""), au["lufs"]
             sd["gain_db"], sd["lift_db"] = _game_gain(cfg, plan["song"].get("lufs"), au["lufs"])
+            if sd.get("music_db"):
+                sd["gain_db"] = round(sd["gain_db"] + sd["music_db"], 2)
     plan["audio_mode"] = "legacy"
     plan.setdefault("audio_fallback", []).append(why)
     out(f"Auto audio failed, used Legacy V5.55 ({why})")
@@ -12569,6 +12682,7 @@ class App:
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
+        cfg["lower_music_clips"] = bool(self.set_music.get())        # V7.7.0
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
         if self.set_names:
             cfg["player_names"] = {g: norm_names(v.get(), g) for g, v in self.set_names.items()}
@@ -14359,6 +14473,10 @@ class App:
         label("Low-fps takes")
         ttk.Checkbutton(holder(), text="Interpolate low-fps takes (slow-mo, duplicated frames, VFR)", variable=self.set_interp).pack(side="left")
         r[0] += 1
+        self.set_music = tk.BooleanVar(value=bool(self.cfg.get("lower_music_clips", False)))      # V7.7.0
+        label("Music in clips")
+        ttk.Checkbutton(holder(), text="Lower clips that already have music playing (12 dB, only when sure; off by default)", variable=self.set_music).pack(side="left")
+        r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
         r[0] += 1
@@ -14396,7 +14514,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_music, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
@@ -17045,6 +17163,7 @@ def main():
     ds.add_argument("times", nargs="*", help="m:ss drop times, e.g. 0:34 1:32 2:15")
     ds.add_argument("--list", action="store_true")
     ds.set_defaults(fn=cmd_dropsave)
+    sp.add_parser("musicscan", help="V7.7.0: run the music-over-gameplay detector over all cached clips (read-only; writes musicscan.txt only)").set_defaults(fn=cmd_musicscan)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
     st_ = sp.add_parser("smoketest", help="offline self-checks: GUI buttons + OCR on generated frames")
