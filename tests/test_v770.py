@@ -433,6 +433,132 @@ def part_song_columns(tmp):
         check(real_before == real_after, f"the real song library is untouched ({len(real_after)} files)")
 
 
+# ------------------------------------------------------------------------------------------------ 4) music over gameplay
+def synth_audio(path, kind, dur=14.0, sr=44100, guns=(2.0, 5.3, 8.1, 11.2)):
+    import numpy as np
+    import wave
+    rng = np.random.default_rng(5)
+    n = int(dur * sr)
+    t = np.arange(n) / sr
+    y = 0.004 * rng.standard_normal(n)
+
+    def burst(t0, g=0.8, d=0.25):
+        i0 = int(t0 * sr)
+        m = int(d * sr)
+        k = np.arange(m) / sr
+        seg = g * rng.standard_normal(m) * np.exp(-k / 0.05)
+        y[i0:i0 + m] += seg[:max(0, min(m, n - i0))]
+    if kind in ("song", "song_only", "drone", "sting"):
+        chords = [(261.6, 329.6, 392.0), (220.0, 261.6, 329.6), (174.6, 220.0, 261.6), (196.0, 246.9, 293.7)]
+        for i, tt in enumerate(t):
+            pass
+        step = 3.0 if kind != "drone" else 1e9
+        idx = np.minimum((t // step).astype(int) % 4, 3)
+        for c in range(4):
+            sel = (idx == c)
+            for f in chords[c]:
+                for h, a in ((1, 0.12), (2, 0.05), (3, 0.03)):
+                    y[sel] += a * np.sin(2 * np.pi * f * h * t[sel])
+            if kind != "drone":                                 # a melody that moves every 0.25 s over the chord (real songs do)
+                notes_ = [chords[c][(k * 2) % 3] * (2 if k % 4 > 1 else 1) * (1.5 if k % 5 == 0 else 1.0) for k in range(12)]
+                step_i = ((t // 0.25).astype(int)) % 12
+                for k in range(12):
+                    s2 = sel & (step_i == k)
+                    y[s2] += 0.2 * np.sin(2 * np.pi * notes_[k] * 2 * t[s2])
+        if kind == "sting":
+            y[t > 2.0] = 0.004 * rng.standard_normal(int((t > 2.0).sum()))
+        else:
+            for kk in np.arange(0.0, dur, 0.5):                 # a kick on every half second
+                i0 = int(kk * sr)
+                m = int(0.15 * sr)
+                kt = np.arange(m) / sr
+                y[i0:i0 + m] += 0.3 * np.sin(2 * np.pi * 55 * kt) * np.exp(-kt / 0.06)
+    if kind == "ambience":
+        w = rng.standard_normal(n)
+        k = np.ones(200) / 200
+        y += 0.08 * np.convolve(w, k, mode="same") * (1 + 0.5 * np.sin(2 * np.pi * 0.15 * t)) + 0.05 * np.sin(2 * np.pi * 55 * t)
+    if kind in ("song", "guns", "ambience"):
+        for g in guns:
+            burst(g)
+    y = np.clip(y, -1, 1)
+    with wave.open(str(path), "wb") as w_:
+        w_.setnchannels(1)
+        w_.setsampwidth(2)
+        w_.setframerate(sr)
+        w_.writeframes((y * 32767).astype("<i2").tobytes())
+    return str(path)
+
+
+def part_music(tmp):
+    import copy
+    with section("4) music over gameplay (synthetic clips; the detector only reads files)"):
+        keep = M.use_data_dir(tmp / "d4")
+        try:
+            res = {}
+            for kind in ("song", "song_only", "guns", "ambience", "drone", "sting"):
+                f = synth_audio(tmp / f"m_{kind}.wav", kind)
+                res[kind] = M.music_over_gameplay({"path": f, "audio": True}, {"stream": 0, "n": 1})
+                print(f"   {kind:10} -> {res[kind]['yes']}  score {res[kind]['score']:.2f}  ({res[kind]['why']})")
+            check(res["song"]["yes"] and res["song_only"]["yes"], "a song with gunshots over it, and a song alone: flagged")
+            check(not res["guns"]["yes"], "gunshots only: not flagged")
+            check(not res["ambience"]["yes"], "in-game ambience (wind noise, a 55 Hz hum, gunshots): not flagged")
+            check(not res["drone"]["yes"], "one held chord for 14 s (a drone, a beep): not flagged - the pitches must change")
+            check(not res["sting"]["yes"], "a 2 s music sting: not flagged - a song lasts more than a few seconds")
+            # the clean game-only track of a multi-track recording is never analysed, even when it holds a song
+            f = tmp / "m_song.wav"
+            r_ = M.music_over_gameplay({"path": str(f), "audio": True}, {"stream": 1, "n": 4, "note": "track 2 of 4 (set in Settings)"})
+            check(not r_["yes"] and "not analysed" in r_["why"], f"'track 2 of 4' is never flagged: {r_['why']}")
+            r2 = M.music_over_gameplay({"path": str(f), "audio": True}, {"stream": 0, "all": [-20.0, -25.0]})
+            check(r2["yes"], "track 1 of a 2-track clip (the mix) is analysed")
+            m1 = M.load_json(M.LOUD_CACHE, {})
+            check(any("|music1|" in k for k in m1), "the verdict is cached")
+            # plan level: OFF = identical plan; ON = only the flagged clip's game gain changes (12 dB lower), one log line per take
+            M.OUTRO_TRIM_ON[0] = True
+            ev = T760.pool(tmp, "valorant", n=12, seed=17)
+            an = T760.drops_map(2)
+            real_cfg, real_res = M.load_config, M.resolve_clip_audio
+
+            for e_ in ev:
+                e_["rec"] = dict(e_["rec"], audio=True)
+                for pt in e_.get("parts") or []:
+                    pt["rec"] = dict(pt["rec"], audio=True)
+
+            def run(on, flag_first=False):
+                M.load_config = lambda: dict(real_cfg(), lower_music_clips=on)
+                orig = M.music_over_gameplay
+                M.resolve_clip_audio = lambda rec, cfg, game, state: {"stream": 0, "lufs": -20.0, "note": "test", "n": 1}
+                if on:
+                    first = ev[0]["path"]
+                    M.music_over_gameplay = lambda rec, au: {"yes": rec["path"] == first, "score": 0.9 if rec["path"] == first else 0.1, "why": "test"}
+                try:
+                    return T73.plan_of(M, "valorant", ev, an, 5, style="hype")
+                finally:
+                    M.music_over_gameplay = orig
+                    M.load_config = real_cfg
+                    M.resolve_clip_audio = real_res
+            p_off, p_off2, p_on = run(False), run(False), run(True)
+            check(json.dumps(p_off, sort_keys=True, default=str) == json.dumps(p_off2, sort_keys=True, default=str), "option OFF: the plan is byte-identical run to run")
+            check(not any("music over gameplay" in n for n in p_off["notes"]) and not any("music_db" in s for t in p_off["takes"] for s in t["srcs"]), "option OFF: no music line, no extra field")
+            gains_off = [(t["path"], s["gain_db"]) for t in p_off["takes"] for s in t["srcs"]]
+            gains_on = [(t["path"], s["gain_db"]) for t in p_on["takes"] for s in t["srcs"]]
+            diff = [(a[0], round(b[1] - a[1], 2)) for a, b in zip(gains_off, gains_on) if a != b]
+            check(len(diff) == 1 and diff[0][1] == -12.0, f"option ON: only the flagged clip is lowered, by 12 dB ({diff})")
+            lines = [n for n in p_on["notes"] if n.startswith("music over gameplay:")]
+            check(len(lines) == len(p_on["takes"]) and sum(" yes " in l for l in lines) == 1, f"one log line per take ('{lines[0][:90]}')")
+            strip = lambda p: json.dumps({k: v for k, v in p.items() if k not in ("notes",)}, sort_keys=True, default=str)
+            mask = lambda p: json.loads(strip(p).replace("music_db", "x"))
+            a_, b_ = copy.deepcopy(p_off), copy.deepcopy(p_on)
+            for t_ in b_["takes"]:
+                for s_ in t_["srcs"]:
+                    if s_.pop("music_db", None):
+                        s_["gain_db"] = round(s_["gain_db"] + 12.0, 2)
+            check(strip(a_) == strip(b_), "everything else in the plan (cut list, timing, effects) is identical with the option on")
+            cfg0 = M.load_config()
+            check(cfg0.get("lower_music_clips", False) is False, "default OFF in the config")
+        finally:
+            M.restore_data_dir(keep)
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -463,6 +589,9 @@ def main():
             part_guards_real(tmp)
     if want("3"):
         part_song_columns(tmp)
+    if want("4"):
+        with PB.data_copy(M):
+            part_music(tmp)
     after = snapshot(REAL_DATA)
     if before == after:
         check(True, f"real montage_data byte-identical after the tests ({len(before)} files)")
