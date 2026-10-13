@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.0.0"
+APP_VERSION = "V8.0.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -1465,6 +1465,14 @@ def _relink_or_explain(jobs, dets, cache, cfg, region_ok=False):
         st, (algo, bars) = tail[:11], re.match(r"v(\d+)(.*)$", tail[11:]).groups()
         same = idx.get((os.path.basename(path).lower(), size, mt, g), [])
         hit = next((e for e in same if e[3] == st and e[4] == algo and e[5] == bars), None)
+        err_hit = False
+        if hit is not None and g == "r6s":                 # V8.0.1: an R6S entry that holds an error (icons missing) is never re-linked: the clip is scanned again
+            try:
+                err_hit = bool((json.loads(Path(hit[0]).read_text(encoding="utf-8")).get("e") or {}).get("error"))
+            except Exception:
+                err_hit = False
+            if err_hit:
+                hit = None
         if hit is not None:
             try:
                 cache.put(key, json.loads(Path(hit[0]).read_text(encoding="utf-8"))["e"])
@@ -1472,7 +1480,9 @@ def _relink_or_explain(jobs, dets, cache, cfg, region_ok=False):
                 continue
             except Exception:
                 pass
-        if not same:
+        if err_hit:
+            reason = "earlier R6S scan was an error"
+        elif not same:
             reason = "clip file changed (size / time)" if path.lower() in paths else "new clip, never scanned"
         elif all(e[3] != st for e in same):
             reason = "calibration changed (killfeed region)"
@@ -2298,32 +2308,34 @@ def r6s_read_band(fr, m):
     return sorted(left), sorted(right)
 
 
-def r6s_scan_frames(frames, icons, thr=R6S_MATCH_THR, reader=None):
-    """Template pass over the killfeed crop frames (15 fps): every kill-icon sighting becomes / extends a ROW track (position, or the row's pixels
-    when the list scrolls); each row's names are read a few times for voting. Returns (rows, frames). A row's first frame is dated back through
-    the few frames before its first full match in which the icon was already faintly there (fade-in = the late-read correction)."""
-    import cv2
-    import numpy as np
-    reader = reader or r6s_read_band
-    tracks, buf, n = [], [], 0
-    lock, quiet = None, 0
-    for f, fr in enumerate(frames):
-        n += 1
+class R6STracker:
+    """Template pass over the killfeed crop frames (15 fps), one frame per step(): every kill-icon sighting becomes / extends a ROW track
+    (the row's pixels, so a scrolling list keeps identities); each row's names are read a few times for voting. A row's first frame is dated
+    back through the few frames before its first full match in which the icon was already faintly there (fade-in = the late-read correction)."""
+    def __init__(self, icons, thr=R6S_MATCH_THR, reader=None):
+        self.icons, self.thr, self.reader = icons, thr, reader or r6s_read_band
+        self.tracks, self.buf, self.n, self.lock, self.quiet = [], [], 0, None, 0
+
+    def step(self, f, fr):
+        import cv2
+        import numpy as np
+        icons, thr, reader, tracks, buf = self.icons, self.thr, self.reader, self.tracks, self.buf
+        self.n += 1
         gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
-        scales = R6S_SCALES if lock is None else tuple(R6S_SCALES[i] for i in sorted(lock))
+        scales = R6S_SCALES if self.lock is None else tuple(R6S_SCALES[i] for i in sorted(self.lock))
         try:
             ms = r6s_find_matches(gray, icons, scales, thr)
         except Exception as ex:
             LOGONLY(f"R6S: frame {f}: template match failed: {type(ex).__name__}: {ex}")
             ms = []
         if ms:
-            quiet = 0
+            self.quiet = 0
             bi = ms[0][6]
-            lock = {max(0, bi - 1), bi, min(len(R6S_SCALES) - 1, bi + 1)}
+            self.lock = {max(0, bi - 1), bi, min(len(R6S_SCALES) - 1, bi + 1)}
         else:
-            quiet += 1
-            if quiet > 60:
-                lock = None
+            self.quiet += 1
+            if self.quiet > 60:
+                self.lock = None
         live = [t for t in tracks if f - t["last"] <= R6S_GAP_F]
         used = set()
         for m in ms:
@@ -2371,28 +2383,88 @@ def r6s_scan_frames(frames, icons, thr=R6S_MATCH_THR, reader=None):
         buf.append((f, gray))
         if len(buf) > R6S_BACK_F:
             buf.pop(0)
-    rows = []
-    for t in tracks:
-        rows.append({"first": int(t["first"]), "seen": int(t["seen"]), "last": int(t["last"]), "hits": int(t["hits"]), "x": int(t["m"][0]), "y": int(t["cy"]),
-                     "w": int(t["w"]), "h": int(t["h"]), "sc": round(float(t["sc"]), 3), "tpl": t["tpl"], "reads": t["reads"]})
-    return rows, n
+
+    def rows(self):
+        rows = []
+        for t in self.tracks:
+            rows.append({"first": int(t["first"]), "seen": int(t["seen"]), "last": int(t["last"]), "hits": int(t["hits"]), "x": int(t["m"][0]), "y": int(t["cy"]),
+                         "w": int(t["w"]), "h": int(t["h"]), "sc": round(float(t["sc"]), 3), "tpl": t["tpl"], "reads": t["reads"]})
+        return rows
+
+
+def r6s_scan_frames(frames, icons, thr=R6S_MATCH_THR, reader=None):
+    """Template pass over a frame iterable. Returns (rows, frames)."""
+    tr = R6STracker(icons, thr, reader)
+    for f, fr in enumerate(frames):
+        tr.step(f, fr)
+    return tr.rows(), tr.n
 
 
 def r6s_scan_clip(path, rec, det, cfg):
-    """R6S counterpart of scan_clip(): the icon-template pass. Icons missing -> logs R6S_MISSING_MSG and returns an entry with 'error' (no kills)."""
+    """R6S counterpart of scan_clip(). The killfeed OCR pass always runs (rows split by the weapon icon, names first on the killer side); when icon
+    templates exist they ALSO find rows (template rows are the primary list, OCR rows fill what the templates missed). No icons = OCR only: never an error."""
     t0 = time.time()
-    names = names_for_cache("r6s")
-    base = {"v": CACHE_V, "names": names, "ocr": [], "rows": [], "frames": 0, "size": [det.dw, det.dh], "region": det.d["region"], "v_off": rec.get("v_off", 0.0),
-            "ocr_calls": 0, "game": "r6s", "best_name": 0.0, "best_vic": 0.0}
-    icons = r6s_load_icons()
-    if not icons:
-        out(R6S_MISSING_MSG)
-        return dict(base, error=R6S_MISSING_MSG, secs=0.0)
-    rows, n = r6s_scan_frames(frame_stream(path, rec, det, cfg, FPS), icons)
-    e = dict(base, rows=rows, frames=n, icons=r6s_icons_sig(icons), ocr_calls=sum(len(r["reads"]) for r in rows), secs=round(time.time() - t0, 1))
+    icons = r6s_load_icons(log=False)
+    trk = R6STracker(icons) if icons else None
+
+    def frames():
+        for f, fr in enumerate(frame_stream(path, rec, det, cfg, FPS)):
+            if trk is not None:
+                try:
+                    trk.step(f, fr)
+                except Exception as ex:                       # a failing template step never stops the OCR pass
+                    LOGONLY(f"R6S: frame {f}: template step failed: {type(ex).__name__}: {ex}")
+            yield fr
+    ocr, n = scan_frames(frames())
+    e = {"v": CACHE_V, "names": names_for_cache("r6s"), "ocr": ocr, "rows": trk.rows() if trk else [], "frames": n, "size": [det.dw, det.dh],
+         "region": det.d["region"], "v_off": rec.get("v_off", 0.0), "ocr_calls": len(ocr) + (sum(len(r["reads"]) for r in trk.rows()) if trk else 0),
+         "secs": round(time.time() - t0, 1), "game": "r6s", "icons": r6s_icons_sig(icons) if icons else "", "mode": "templates+ocr" if icons else "ocr-only"}
     a = r6s_analyse_entry(e, cfg)
     e["best_name"], e["best_vic"] = round(a["best_k"], 3), round(a["best_v"], 3)
     return e
+
+
+def r6s_rows_from_ocr(entry):
+    """OCR frames (the generic killfeed OCR cache format) -> R6S rows ({first, last, hits, reads ...}): rows are split by the weapon icon / gap exactly as
+    for the other games, then tracked by their text (killer + victim) so one row on screen is ONE row however often it is read."""
+    from rapidfuzz import fuzz
+    tracks, prev_f = [], -1
+    for f, since, boxes, blobs in entry.get("ocr", []):
+        try:
+            rs = ocr_rows(boxes, blobs, "r6s")
+        except Exception as ex:
+            LOGONLY(f"R6S: OCR frame {f}: rows failed: {type(ex).__name__}: {ex}")
+            continue
+        used = set()
+        for r in rs:
+            if r.get("split") is None or not (r["killer"] and r["victim"]):
+                continue
+            kt, vt = _alnum(r["ktext"]).lower(), _alnum(r["vtext"]).lower()
+            best, bs = None, 0.0
+            for t in tracks:
+                if id(t) in used or f - t["last"] > TRACK_KEEP_S * FPS:
+                    continue
+                sk = fuzz.ratio(t["k"], kt) if (t["k"] and kt) else 100.0
+                sv = fuzz.ratio(t["v"], vt) if (t["v"] and vt) else 100.0
+                same_y = abs(t["y"] - r["y"]) <= 0.5 * max(8.0, r["th"])
+                sc = min(sk, sv) + (15 if t["last"] == prev_f and same_y else 0)
+                if sc >= 80 and sc > bs:
+                    best, bs = t, sc
+            left = [[int(b[0]), int(b[2]), b[4], float(b[5])] for b in r["killer"]]
+            right = [[int(b[0]), int(b[2]), b[4], float(b[5])] for b in r["victim"]]
+            if best is not None:
+                used.add(id(best))
+                best.update(last=f, y=r["y"], hits=best["hits"] + 1)
+                best["reads"].append([f, left, right])
+            else:
+                first = max(prev_f + 1, min(int(r["appear"]), f)) if prev_f >= 0 else f
+                t = {"first": first, "seen": f, "last": f, "y": r["y"], "hits": 1, "k": kt, "v": vt, "h": int(r["th"]), "reads": [[f, left, right]],
+                     "x": int(min(b[0] for b in r["boxes"])), "w": int(max(b[2] for b in r["boxes"]) - min(b[0] for b in r["boxes"]))}
+                tracks.append(t)
+                used.add(id(t))
+        prev_f = f
+    return [{"first": int(t["first"]), "seen": int(t["seen"]), "last": int(t["last"]), "hits": int(t["last"] - t["first"] + 1), "x": t["x"], "y": int(t["y"]), "w": t["w"],
+             "h": t["h"], "sc": 1.0, "tpl": "ocr", "reads": t["reads"][:8]} for t in tracks]
 
 
 def r6s_name_score(text):
@@ -2442,14 +2514,13 @@ def r6s_sametime_guard(kills, rej):
     return sorted(keep, key=lambda k: k["t"])
 
 
-def r6s_analyse_entry(entry, cfg):
+def _r6s_core(rows, entry, cfg):
     """Cached R6S rows -> kills / deaths / rejects, in the same result shape as analyse_entry(). Rules (copied from the CS2 / Valorant row analysis):
     killer side (first name left of the icon) = me -> kill; victim side = me -> death; both sides me -> not a kill; a row already on screen when the
     clip starts = pre-clip (rejected, still counts as a known kill for the duplicate rules); a row seen in under R6S_BLIP_F frames = one-frame blip;
     duplicates / same victim twice in a fight (drop_fake_kills); same-timestamp guard; a single sighting with a weak name needs a gunshot."""
     off = entry.get("v_off", 0.0)
     thr = float((cfg or {}).get("name_match", NAME_MIN))
-    rows = entry.get("rows") or []
     bk = bv = 0.0
     kills, deaths, rej, vis, mine, pre = [], [], [], [], [], []
     last_f = max([r["last"] for r in rows] + [max(0, int(entry.get("frames", 0)) - 1)])
@@ -2503,6 +2574,32 @@ def r6s_analyse_entry(entry, cfg):
         mx = max(mx, cur)
     return {"kills": kills, "deaths": sorted(deaths), "revives": [], "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis, "best_k": bk, "best_v": bv,
             "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(rows), "rows_max": mx, "ocr_calls": sum(len(r.get("reads", [])) for r in rows), "cjk": {}}
+
+
+def r6s_analyse_entry(entry, cfg):
+    """Template rows (when icons were used) + OCR rows (always): the template rows are the primary list, the OCR rows only add kills / deaths the templates
+    did not see (nothing within 1.5 s with the same victim). Without icons this is the OCR row analysis alone."""
+    from rapidfuzz import fuzz
+    tpl = entry.get("rows") or []
+    ocr_r = r6s_rows_from_ocr(entry) if entry.get("ocr") else []
+    b = _r6s_core(ocr_r, entry, cfg)
+    if not tpl:
+        return b
+    a = _r6s_core(tpl, entry, cfg)
+    near = lambda o, k: abs(o["t"] - k["t"]) <= 1.5 and (not o.get("victim") or not k.get("victim") or fuzz.ratio(_alnum(o["victim"]).lower(), _alnum(k["victim"]).lower()) >= 60)
+    add = [o for o in b["kills"] if not any(near(o, k) for k in a["kills"])]
+    res = dict(a)
+    res["kills"] = sorted(a["kills"] + add, key=lambda k: k["t"])
+    res["deaths"] = sorted(a["deaths"] + [d for d in b["deaths"] if not any(abs(d - x) <= 1.5 for x in a["deaths"])])
+    res["rej"] = sorted(a["rej"] + b["rej"], key=lambda r: r["t"])
+    res["vis"] = a["vis"] + [v for v in b["vis"] if any(v[0] == k["t"] for k in add)]
+    res["mine"] = sorted(a["mine"] + b["mine"], key=lambda m: m["t"])
+    for k_ in ("best_k", "best_v"):
+        res[k_] = max(a[k_], b[k_])
+    res["rows_n"], res["ocr_calls"], res["rows_max"] = a["rows_n"] + b["rows_n"], a["ocr_calls"] + b["ocr_calls"], max(a["rows_max"], b["rows_max"])
+    if add:
+        drop_fake_kills(res["kills"], res["rej"], "r6s", [], [])
+    return res
 
 
 def r6s_safe_analyse(entry, cfg):
@@ -4728,7 +4825,8 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
         ps = set(paths)
         recs = [r for r in recs if r["path"] in ps]
     cache = load_kills_cache()
-    jobs = [(r, r["game"]) for r in recs if rescan or kills_key(r, r["game"], dets[r["game"]]) not in cache]
+    jobs = [(r, r["game"]) for r in recs if rescan or kills_key(r, r["game"], dets[r["game"]]) not in cache
+            or (r["game"] == "r6s" and (cache.get(kills_key(r, "r6s", dets["r6s"])) or {}).get("error"))]       # V8.0.1: an R6S entry that holds an error (icons missing) is scanned again
     if jobs and rescan:
         out("rescanning: forced rescan (requested)")
     elif jobs:
@@ -4736,6 +4834,8 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
     if limit:
         jobs = jobs[:limit]
     out(f"cached {len(recs) - len(jobs)}, scanning {len(jobs)}  (of {len(recs)} clips in scope)")
+    if any(g_ == "r6s" for _r, g_ in jobs) and not r6s_load_icons(log=False):
+        out("R6S: no icon templates, using OCR-only row detection")
     if jobs:
         ocr_engine()                                       # load the OCR models once up front (clear error if missing)
     done, errs, t0 = 0, 0, time.time()
@@ -4744,8 +4844,6 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
         r, g = job
         if CANCEL.is_set():
             return r, g, None, "cancelled"
-        if g == "r6s" and not r6s_load_icons(log=False):   # V8.0.0: no icons = nothing is scanned or cached (a cached 'no kills' would stay after the icons arrive)
-            return r, g, None, R6S_MISSING_MSG
         try:
             res = scan_clip(r["path"], r, dets[g], cfg)
             if CANCEL.is_set():
@@ -4780,6 +4878,8 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
                     f" victim-side {a['best_v']:.2f} | rect {content_rect(r, cfg)} crop {'yes' if r.get('bars') else 'no'} | {name} ({res['secs']}s)")
                 for m in a["mine"]:
                     out(f"      my row @ {ts(m['t'])} {m['row']} -> {m['verdict'].upper()}: {m['why']} ({m['hits']} sightings)")
+                if g == "r6s" and not a["kills"]:
+                    out(f"R6S: no kill rows read in {name} (killfeed region {res.get('region')} of the content rect, crop {res.get('size')} px)")
     out(f"scan finished: {done} in {time.time() - t0:.0f}s, errors {errs}")
     return done
 

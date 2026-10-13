@@ -374,16 +374,16 @@ def part8():
     check("run_scan skips R6S jobs without icons before scanning (nothing is cached)", "if g == \"r6s\" and not r6s_load_icons(log=False)" in src)
 
 
-def part9():
+def part9(refs=("V7.7.7-good", "main"), prefix="V7.7"):
     section("9) CS2 / Valorant frozen (V7.7.7 module vs this one, synthetic rows)")
     ref = None
-    for r_ in ("V7.7.7-good", "main"):
+    for r_ in refs:
         if subprocess.run(["git", "rev-parse", "--verify", "-q", r_ + "^{commit}"], cwd=ROOT, capture_output=True).returncode == 0:
             ref = r_
             break
     src = subprocess.run(["git", "show", f"{ref}:montage.py"], cwd=ROOT, capture_output=True).stdout
-    if M.APP_VERSION == "V8.0.0" and ref == "main" and b'APP_VERSION = "V8.0.0"' in src:
-        print("  (main already is V8.0.0 and no V7.7.7-good tag: nothing to compare against)")
+    if ref == "main" and f'APP_VERSION = "{M.APP_VERSION}"'.encode() in src:
+        print("  (main already is this version and no -good tag: nothing to compare against)")
         return
     bd = TMP / "base"
     bd.mkdir()
@@ -392,7 +392,7 @@ def part9():
     B = importlib.util.module_from_spec(spec)
     sys.modules["montage_base800"] = B
     spec.loader.exec_module(B)
-    check(f"base module = {ref} (V7.7.x)", B.APP_VERSION.startswith("V7.7"), B.APP_VERSION)
+    check(f"base module = {ref} ({prefix}.x)", B.APP_VERSION.startswith(prefix), B.APP_VERSION)
 
     def ocr_entry(game):
         def bx(x0, x1, t, col, y=100):
@@ -421,12 +421,11 @@ def part9():
               and B.GAME_DIR[g] == M.GAME_DIR[g] and B.GAME_CODE[g] == M.GAME_CODE[g] and B.DEFAULT_CONFIG["gap_s"][g] == M.DEFAULT_CONFIG["gap_s"][g])
     check("names_split(None) (every game) unchanged", B.names_split(None) == M.names_split(None))
     check("Detector stamps for valorant / cs2 unchanged", all(B.Detector(g).d["stamp"] == M.Detector(g).d["stamp"] for g in ("valorant", "cs2")))
-    check("GAMES differ only by r6s", tuple(M.GAMES) == tuple(B.GAMES) + ("r6s",))
+    check("the base games are still the first games", tuple(M.GAMES)[:len(B.GAMES)] == tuple(B.GAMES))
 
 
-def partp():
+def partp(ref="V7.7.7-good"):
     section("p) CS2 + Valorant dry plans, default settings, same seed (slow, reads the real montage_data)")
-    ref = "V7.7.7-good"
     if subprocess.run(["git", "rev-parse", "--verify", "-q", ref + "^{commit}"], cwd=ROOT, capture_output=True).returncode:
         ref = "main"
     bd = TMP / "basep"
