@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V7.7.1 - 2026-10-13: SongMap mode, much better music detection
+- New SongMap mode setting: V2 (the default) always uses the V2 song map for every song; V2 + V1 Fallback keeps the old safety switch to V1.
+- Clips with music already playing are found far more often, and all clips of one fight get the same decision, so a clip never changes volume halfway.
+- The amount lowered is now a setting (0 to 60 dB, default 12); the highest value mutes the game sound of that clip completely.
+
 ## V7.7.0 - 2026-10-13: Best kill stays on the drop, song lengths
 - A strong multikill is no longer dropped from the montage over a tail that ran a few frames too long: the cut is fixed instead, and any clip that still cannot be placed is listed with the exact reason.
 - The plan header now tells the truth about which kill sits on which drop, and drops line up with the audible hit of the song.

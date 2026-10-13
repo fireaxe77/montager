@@ -22,3 +22,4 @@
 - Tag the previous main `<prev>-good`, normal merge commit (`git merge --no-ff refs/heads/work-vXYZ`), tag the new version, push main and tags, remove extra worktrees, leave main clean.
 - End with the line "done, main = <version>, safe to pull".
 - V7.7.0: `tests/test_v770.py` is the new version's test file (`V770_PARTS=0,1,3,4,g`; point `V7_DATA_SRC`/`MONTAGER_DATA` at a COPY of montage_data). Tail repair (`repair_tails`), audible-onset drop anchors (`refine_drop_anchors`), music-over-gameplay option (default off, `musicscan`).
+- V7.7.1: `tests/test_v771.py` is the new version's test file (`V771_PARTS=0,1,2,3,r,g`; point `V7_DATA_SRC`/`MONTAGER_DATA` at a COPY of montage_data). SongMap mode dropdown (`songmap_mode`: `v2` default | `v2_fallback`); music-over-gameplay detector v2 (`music_verdict`), per-fight-group verdict, `music_lower_db` (60 = mute); `tests/loud771.py` measures per-take game / music levels, `tests/verify771.py` does the final real renders.

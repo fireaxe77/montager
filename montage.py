@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.7.0"
+APP_VERSION = "V7.7.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4986,6 +4986,8 @@ SONGMAP_V2_HOOK = [None]                 # tests only: called at the start of a 
 
 
 def songmap_version(cfg=None):
+    if songmap_mode(cfg) == "v2":                           # V7.7.1: SongMap mode 'V2' = V2 for every song, whatever the old version key says
+        return "v2"
     v = str((cfg if cfg is not None else load_config()).get("songmap_version") or SONGMAP_DEFAULT).lower()
     if v in (SONGMAP_AUTO, "songmap v2 (auto, v1 fallback)"):
         return SONGMAP_AUTO
@@ -5113,6 +5115,93 @@ def get_songmap(path, csv_bpm=None, version=None):
     return add_repeat_drops(_get_songmap_routed(path, csv_bpm, version), path)
 
 
+SONGMAP_MODES = {"v2": "V2", "v2_fallback": "V2 + V1 Fallback"}    # V7.7.1 Settings > SongMap mode (V2 first). 'V2' = every song on its V2 map, no V1 substitution anywhere
+
+
+def songmap_mode(cfg=None):
+    """'v2' (default; also when the key is missing or unknown) or 'v2_fallback' (V7.7.0 behaviour with every V1 safety rule)."""
+    v = str((cfg if cfg is not None else load_config()).get("songmap_mode") or "").lower()
+    return "v2_fallback" if v == "v2_fallback" else "v2"
+
+
+_V2_RAW = threading.local()
+
+
+def _patch_v2_safety():
+    """V7.7.1: songmap_v2/safety.apply stays untouched (its source is part of the V2 cache key: editing it would invalidate every cached song map). A thread that sets _V2_RAW.on gets the
+    raw V2 map from it; every other thread (the normal analysis) runs the original function unchanged."""
+    import songmap_v2.safety as SF
+    if getattr(SF.apply, "_v771", False):
+        return
+    orig = SF.apply
+
+    def apply(m2, *a, **k):
+        return m2 if getattr(_V2_RAW, "on", False) else orig(m2, *a, **k)
+    apply._v771 = True
+    SF.apply = apply
+
+
+def _songmap_v2_raw(path, csv_bpm, v1_bpm):
+    """V7.7.1: the V2 map of a low-confidence song WITHOUT the switch to V1 values, from its own cache entry (key + '|raw', only written for such songs; the normal
+    entry stays untouched). Returns (map or None, reason when None)."""
+    import songmap_v2
+    cpath = DATA / songmap_v2.CACHE_NAME
+    _patch_v2_safety()
+    key = songmap_v2.cache_key(path, csv_bpm, v1_bpm) + "|raw"
+    hit = load_json(cpath, {}).get(key)
+    if hit and not hit.get("fallback_marker"):
+        return hit, ""
+    if hit:
+        return None, hit["fallback_marker"]
+    box = {}
+    deadline = time.monotonic() + songmap_v2.ANALYSIS_CAP_S
+
+    def work():
+        _V2_RAW.on = True                                  # this worker thread only: safety.apply (patched below) hands back the raw V2 map
+        try:
+            box["m"] = songmap_v2.build_songmap_v2(path, csv_bpm, deadline=deadline, hook=SONGMAP_V2_HOOK[0], v1_bpm=v1_bpm)
+        except BaseException as ex:      # noqa: BLE001 - nothing may escape the worker
+            box["err"] = f"{type(ex).__name__}: {ex}"
+    th = threading.Thread(target=work, daemon=True)
+    th.start()
+    th.join(songmap_v2.ANALYSIS_CAP_S)
+    if th.is_alive() or "m" not in box:
+        return None, ("V2 analysis timeout" if th.is_alive() else f"V2 analysis failed ({box.get('err', 'no result')})")
+    c2 = load_json(cpath, {})
+    c2[key] = box["m"]
+    save_json(cpath, c2)
+    return box["m"], ""
+
+
+class SongMapError(RuntimeError):
+    """SongMap mode 'V2': V2 could not give a map for this song (never replaced by V1)."""
+
+
+def _songmap_strict_v2(path, csv_bpm, name):
+    """SongMap mode 'V2' (V7.7.1): the V2 map of the song, always. A cached map the V1 safety rules did not touch is used as it is (it IS the raw V2 map); a song those rules switched to V1
+    values (or that is not cached yet) gets the raw V2 map (own cache entry, built without any safety rule). No V1 map is read or built. Raises SongMapError naming the song when V2 cannot
+    give a map."""
+    import songmap_v2
+    v1b = _peek_v1_bpm(path, csv_bpm)
+    key = songmap_v2.cache_key(path, csv_bpm, v1b)
+    hit = load_json(DATA / songmap_v2.CACHE_NAME, {}).get(key)
+    skipped = ""
+    if hit and not hit.get("fallback_marker") and not (hit.get("v2") or {}).get("fallback"):
+        m = hit
+    else:
+        if hit and not hit.get("fallback_marker"):
+            skipped = str((hit.get("v2") or {}).get("fallback_reason") or "low confidence")
+        try:
+            m, why = _songmap_v2_raw(path, csv_bpm, v1b)
+        except Exception as ex:                            # noqa: BLE001
+            m, why = None, f"{type(ex).__name__}: {ex}"
+        if m is None:
+            raise SongMapError(f"SongMap mode V2: no V2 map for '{name}': {why}")
+    out(f"songmap: {name}: map used V2, beat grid V2, grid confidence {float((m.get('v2') or {}).get('grid_confidence', 0) or 0):.2f}"
+        + (f"; the V1 safety rule ({skipped}) is not applied" if skipped else "") + "; mode V2")
+    return m
+
+
 def _get_songmap_routed(path, csv_bpm=None, version=None):
     """THE routing point for song map requests (V6.9.5): V1 = analyse_song() exactly as before; V2 = the isolated songmap_v2 package with its
     own cache file; V6.9.5.2 'v2auto' = V2 or V1 per song (see _songmap_auto_pick). Any V2 problem (error, timeout, missing module) logs
@@ -5121,9 +5210,14 @@ def _get_songmap_routed(path, csv_bpm=None, version=None):
     if v not in ("v2", SONGMAP_AUTO):
         return analyse_song(path, csv_bpm)
     name = Path(path).name
+    if v == "v2" and songmap_mode() == "v2":               # V7.7.1 SongMap mode 'V2': no V1 map, no safety rule, no fallback
+        return _songmap_strict_v2(path, csv_bpm, name)
     v1m = analyse_song(path, csv_bpm) if v == SONGMAP_AUTO else None          # auto always needs the V1 map; plain V2 only peeks at its cache
     try:
         m = _songmap_v2_cached(path, csv_bpm, float(v1m["bpm"]) if v1m else _peek_v1_bpm(path, csv_bpm), name)
+        if not v1m:
+            out(f"songmap: {name}: " + (f"V1 beat values (V1 safety fallback: {(m.get('v2') or {}).get('fallback_reason')})" if (m.get("v2") or {}).get("fallback")
+                                         else f"V2 (grid confidence {float((m.get('v2') or {}).get('grid_confidence', 0) or 0):.2f})") + "; mode V2 + V1 Fallback")
         return _songmap_auto_pick(path, csv_bpm, v1m, m, name) if v1m else m
     except Exception as ex:
         why = str(ex) if isinstance(ex, _V2Fail) else f"{type(ex).__name__}: {ex}"
@@ -6467,33 +6561,73 @@ def cmd_ledger(args):
     print(f"(read-only; written to {HERE / 'ledger.txt'}; nothing else was changed)")
 
 
+def music_fight_groups(items):
+    """Pool items grouped like _build_events groups them (clips saved right next to each other = one fight; read-only, same save_time_link rule)."""
+    its = [dict(it, ctime=clip_ctime(it["rec"]), anc=clip_anchor(it["rec"]["path"], it["rec"].get("dur"))) for it in items]
+    its.sort(key=lambda i: ((i["anc"] or {}).get("end", i["ctime"]), (i["anc"] or {}).get("start", i["ctime"])))
+    groups, i = [], 0
+    while i < len(its):
+        g, j = [its[i]], i + 1
+        while j < len(its) and len(g) < GROUP_MAX_CLIPS:
+            try:
+                lk, _why = save_time_link(g[-1], its[j])
+            except Exception:                              # noqa: BLE001
+                lk = None
+            if not lk:
+                break
+            g.append(its[j])
+            j += 1
+        groups.append(g)
+        i = j
+    return groups
+
+
 def cmd_musicscan(args):
-    """V7.7.0: python montage.py musicscan. Read-only: runs the 'music over gameplay' detector over every cached clip of both games (on the audio track the plan would use),
-    prints how many are flagged and their names, and writes musicscan.txt next to montage.py. Results are cached in the loud cache (the same cache the plan uses)."""
+    """V7.7.1: python montage.py musicscan. Read-only: runs the 'music over gameplay' detector over every cached clip with sound of both games (on the audio track the plan uses), one verdict per fight
+    group (the highest score of its files), and writes musicscan.txt next to montage.py: old (V7.7.0) vs new score and verdict per clip, grouped by fight, the counts and every newly flagged clip.
+    Results are cached in the loud cache (the same cache the plan uses)."""
     cfg = load_config()
-    lines, flagged, tot = [], [], 0
     keep = (out, LOGONLY)
     globals()["out"] = globals()["LOGONLY"] = lambda *a, **k: None
+    rows = []                                              # (game, group index, name, old score, old yes, new score, new yes, why)
     try:
         for game in ("valorant", "cs2"):
             pool, _st = game_pool(cfg, game, None)
-            for n_, it in enumerate(pool, 1):
-                rec = it["rec"]
-                if not rec.get("audio"):
+            for gi, g in enumerate(music_fight_groups(pool)):
+                recs = []
+                for it in g:
+                    rec = it["rec"]
+                    if not rec.get("audio"):
+                        continue
+                    au = resolve_clip_audio(rec, cfg, game, {})
+                    m = music_over_gameplay(rec, au)
+                    recs.append((Path(rec["path"]).name, m))
+                if not recs:
                     continue
-                tot += 1
-                au = resolve_clip_audio(rec, cfg, game, {})
-                m = music_over_gameplay(rec, au)
-                if m["yes"]:
-                    flagged.append((game, Path(rec["path"]).name, m))
+                top = max(recs, key=lambda x: x[1]["score"])[1]
+                for nm, m in recs:
+                    rows.append((game, f"{game}:{gi}", nm, m.get("old", 0.0), bool(m.get("old_yes", False)), m["score"], bool(top["yes"]), m["why"], bool(m["yes"])))
     finally:
         globals()["out"], globals()["LOGONLY"] = keep
-    lines.append(f"music over gameplay: {len(flagged)} of {tot} clips with sound flagged ({100.0 * len(flagged) / max(1, tot):.1f} %)")
-    for g, nm, m in sorted(flagged):
-        lines.append(f"  {g:9} {nm}  score {m['score']:.2f}  ({m['why']})")
+    tot = len(rows)
+    old_n = sum(1 for r in rows if r[4])
+    new_n = sum(1 for r in rows if r[6])
+    lines = [f"music over gameplay (V7.7.1): {tot} clips with sound analysed (game-only tracks are never analysed)",
+             f"  old detector (V7.7.0): {old_n} flagged ({100.0 * old_n / max(1, tot):.1f} %)",
+             f"  new detector, one verdict per fight group: {new_n} flagged ({100.0 * new_n / max(1, tot):.1f} %)", "", "newly flagged clips (not flagged by the old detector):"]
+    for r in rows:
+        if r[6] and not r[4]:
+            lines.append(f"  {r[0]:9} {r[2]}  old {r[3]:.2f}  new {r[5]:.2f}{'' if r[8] else '  (flagged through its group)'}")
+    lines += ["", "per fight group:   clip | old score, old verdict | new score (own) | group verdict"]
+    cur = None
+    for r in sorted(rows, key=lambda r: (r[0], int(r[1].split(":")[1]), r[2])):
+        if r[1] != cur:
+            cur = r[1]
+            lines.append(f"-- {r[1]}")
+        lines.append(f"  {r[2]}  | old {r[3]:.2f} {'yes' if r[4] else 'no'} | new {r[5]:.2f} | group {'YES' if r[6] else 'no'}   ({r[7]})")
     text = "\n".join(lines)
     (HERE / "musicscan.txt").write_text(text + "\n", encoding="utf-8")
-    print(text)
+    print("\n".join(lines[:4] + [f"  newly flagged: {sum(1 for r in rows if r[6] and not r[4])}"]))
     print(f"(read-only; written to {HERE / 'musicscan.txt'})")
 
 
@@ -6667,6 +6801,8 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
                     if r_ and not r_["gone"] and not r_["unusable"]:
                         r_["unusable"] = "second fight of the same group: one event per clip / group (existing planner rule)"
         if best_ev:
+            if len(g) > 1:
+                best_ev["group"] = [it["rec"] for it, _ in g]            # V7.7.1: every file of the fight group (music-over-gameplay verdict); metadata only
             evs.append(best_ev)
     if LEDGER_TEST_HOOK[0]:
         LEDGER_TEST_HOOK[0](evs, led)
@@ -8729,7 +8865,8 @@ def split_parts(segs, ev):
     return out_
 
 
-MUSIC_LOWER_DB = 12.0                # V7.7.0 (Settings > "Lower clips that already have music playing", default OFF): the game audio of such a clip plays this much lower
+MUSIC_LOWER_DB = 12.0                # V7.7.0 (Settings > "Lower clips that already have music playing", default OFF): the game audio of such a clip plays this much lower (default of the V7.7.1 amount)
+MUSIC_MUTE_DB = 60.0                 # V7.7.1: the amount at which the clip's game audio is silent (true silence in the render); the Settings amount runs from 0 to this value
 MUSIC_MIN_RUN_S = 5.0                # a song is sustained: tonal content lasting at least this long (gaps up to 0.4 s: gunshots) ...
 MUSIC_MIN_TONAL = 0.45               # ... on at least this share of the clip's active frames ...
 MUSIC_MAX_STILL = 0.85               # ... and the pitches CHANGE (a drone / hum / beep holds one chord: chroma similarity above this is not music)
@@ -8770,35 +8907,139 @@ def music_features(y, sr=22050):
     return tonal, best / fps, (float(np.median(cs[both])) if both.any() else 1.0)
 
 
+# V7.7.1: second detector. Ten features of the clip's own audio (sustained harmonic content between gunshots, steady mid band, pitch-class concentration and peakiness of the quiet
+# frames, beat periodicity, vocal / treble floor) and a fixed logistic model (coefficients below), fitted on the 731 cached clips that have sound, labelled by matching the clips
+# against the local song library (a clip is a positive when its audio holds a library song: constellation-hash match, >= 15 aligned votes, 3x the runner-up).
+# A clip is music over gameplay when the model says so OR the V7.7.0 rule does (so nothing the old rule found is lost).
+MUSIC2_NAMES = ("hr_med", "sust", "quiet_peaky", "mid_flux", "quiet_chroma_ent", "mid_sd", "peri", "hi_p25", "vox_p25", "lo_flux")
+MUSIC2_MU = (0.6106, 0.5376, 0.2534, 1.4662, 2.4741, 8.9283, 0.2064, -22.035, -20.5322, 1.5376)
+MUSIC2_SD = (0.2214, 0.1686, 0.1169, 0.4364, 0.0363, 3.6259, 0.1469, 9.1991, 9.7388, 0.4051)
+MUSIC2_COEF = (0.6825, 0.4532, 0.8493, -0.3391, 0.8782, 0.3399, 0.6962, 0.3824, 0.8869, -0.4071)
+MUSIC2_B = -3.1033
+MUSIC2_YES = 0.70
+
+
+def music_features2(y, sr=22050):
+    """V7.7.1: dict of the ten MUSIC2_NAMES features, or None for a clip that is too short (< 3 s) or silent."""
+    import numpy as np
+    import librosa
+    if len(y) < sr * 3 or float(np.sqrt(np.mean(np.square(y)))) < 0.004:
+        return None
+    hop = 512
+    S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop))
+    P = S ** 2
+    fr = librosa.fft_frequencies(sr=sr, n_fft=2048)
+    fps = sr / hop
+    e = 10 * np.log10(P[(fr >= 100) & (fr <= 4000)].sum(0) + 1e-12)
+    act = e > e.max() - 35
+    Hh, Pc = librosa.decompose.hpss(S, margin=2.0)
+    hr = (Hh ** 2).sum(0) / ((Hh ** 2).sum(0) + (Pc ** 2).sum(0) + 1e-12)
+    d = {"hr_med": float(np.median(hr[act])) if act.any() else 0.0, "sust": float(((hr > 0.6) & act).sum() / max(1, act.sum()))}
+    oenv = librosa.onset.onset_strength(S=librosa.power_to_db(P), sr=sr, hop_length=hop)
+    oc = np.minimum(oenv, np.percentile(oenv, 90))
+    ac = librosa.autocorrelate(oc - oc.mean(), max_size=int(fps * 1.5))
+    ac = ac / (ac[0] + 1e-9)
+    lo_, hi_ = int(fps * 60 / 200), int(fps * 60 / 60)
+    d["peri"] = float(ac[lo_:hi_].max()) if hi_ > lo_ and len(ac) > hi_ else 0.0
+    for nm, (a_, b_) in (("lo", (40, 200)), ("mid", (200, 2000)), ("hi", (2000, 8000)), ("vox", (300, 3400))):
+        eb = 10 * np.log10(P[(fr >= a_) & (fr < b_)].sum(0) + 1e-12)
+        if nm == "mid":
+            d["mid_sd"], d["mid_flux"] = float(np.std(eb)), float(np.median(np.abs(np.diff(eb))))
+        elif nm == "lo":
+            d["lo_flux"] = float(np.median(np.abs(np.diff(eb))))
+        else:
+            d[nm + "_p25"] = float(np.percentile(eb, 25) - np.percentile(eb, 95))
+    tot = 10 * np.log10(P.sum(0) + 1e-12)
+    q = tot <= np.percentile(tot, 40)
+    Sq = P[:, q] if q.sum() > 5 else P
+    avg = Sq.mean(1) + 1e-12
+    sm = np.convolve(np.log(avg), np.ones(9) / 9, mode="same")
+    msk = (fr > 100) & (fr < 4000)
+    d["quiet_peaky"] = float(np.std(np.log(avg)[msk] - sm[msk]))
+    cm = librosa.feature.chroma_stft(S=Sq, sr=sr, n_chroma=12, tuning=0.0).mean(1)
+    cm = cm / (cm.sum() + 1e-9)
+    d["quiet_chroma_ent"] = float(-(cm * np.log(cm + 1e-9)).sum())
+    return d
+
+
+def music_prob(d):
+    """Model probability (0-1) from music_features2."""
+    z = sum(c * ((d[n] - m) / s) for n, m, s, c in zip(MUSIC2_NAMES, MUSIC2_MU, MUSIC2_SD, MUSIC2_COEF)) + MUSIC2_B
+    return float(1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z)))))
+
+
+def music_verdict(y):
+    """V7.7.1: {'yes', 'score', 'why', 'old'} for the decoded audio y of the track the montage uses."""
+    import numpy as np
+    if len(y) < 22050 * 3:
+        return {"yes": False, "score": 0.0, "old": 0.0, "why": "clip shorter than 3 s, not analysed"}
+    if float(np.sqrt(np.mean(np.square(y)))) < 0.004:
+        return {"yes": False, "score": 0.0, "old": 0.0, "why": "silent track (nothing to analyse)"}
+    f1 = music_features(y)
+    old_yes, old_score = False, 0.0
+    if f1 is not None:
+        tonal, run_s, still = f1
+        old_yes = run_s >= MUSIC_MIN_RUN_S and tonal >= MUSIC_MIN_TONAL and 0.3 <= still <= MUSIC_MAX_STILL
+        old_score = round(min(1.0, run_s / (2 * MUSIC_MIN_RUN_S)) * 0.5 + min(1.0, tonal / 0.9) * 0.5, 2) if still <= MUSIC_MAX_STILL else round(min(0.4, tonal * 0.4), 2)
+    f2 = music_features2(y)
+    prob = music_prob(f2) if f2 is not None else 0.0
+    yes = prob >= MUSIC2_YES or old_yes
+    score = round(max(prob, old_score if old_yes else 0.0), 2)
+    why = (f"model {prob:.2f}" + (f" (limit {MUSIC2_YES:.2f})" if not old_yes else "") + (f"; sustained tonal run rule: tonal {f1[0]:.2f}, run {f1[1]:.1f} s, stillness {f1[2]:.2f}" if old_yes and f1 else ""))
+    return {"yes": bool(yes), "score": score, "old": old_score, "old_yes": bool(old_yes), "why": why}
+
+
 def music_over_gameplay(rec, au):
-    """V7.7.0: is a song playing over this clip's gameplay audio? {'yes', 'score' 0-1, 'why'}. Conservative: only the three gates together say yes. A clip whose chosen track is a
-    game-only track of a multi-track recording ('track 2 of 4') is never analysed. Source files are only read; the result is cached per file and track (loud cache)."""
+    """V7.7.1 (extends V7.7.0): is a song playing over this clip's gameplay audio? {'yes', 'score' 0-1, 'why', 'old'}. A clip whose chosen track is a game-only track of a multi-track
+    recording ('track 2 of 4') is never analysed. The track analysed is the one the montage uses for that clip (resolve_clip_audio). Source files are only read; the result is
+    cached per file and track (loud cache)."""
     n_tr = max(len(au.get("all") or []), int(au.get("n") or 1))
     st = int(au.get("stream") or 0)
     if n_tr > 1 and st > 0:
         return {"yes": False, "score": 0.0, "why": f"clean game-only track ({st + 1} of {n_tr}), not analysed"}
-    key = file_key(rec["path"]) + f"|music1|{st}"
+    key = file_key(rec["path"]) + f"|music2|{st}"
     cache = load_json(LOUD_CACHE, {})
     if key in cache:
         return cache[key]
     try:
         import numpy as np
         r = run(["ffmpeg", "-v", "error", "-i", rec["path"], "-map", f"0:a:{st}", "-vn", "-ac", "1", "-ar", "22050", "-f", "f32le", "-"], timeout=120)
-        f = music_features(np.frombuffer(r.stdout, np.float32))
+        res = music_verdict(np.frombuffer(r.stdout, np.float32))
     except Exception as ex:                                # noqa: BLE001
-        f = None
+        res = {"yes": False, "score": 0.0, "why": "unreadable"}
         LOGONLY(f"music check failed for {Path(rec['path']).name}: {type(ex).__name__}: {ex}")
-    if f is None:
-        res = {"yes": False, "score": 0.0, "why": "too short or unreadable"}
-    else:
-        tonal, run_s, still = f
-        yes = run_s >= MUSIC_MIN_RUN_S and tonal >= MUSIC_MIN_TONAL and 0.3 <= still <= MUSIC_MAX_STILL
-        score = round(min(1.0, run_s / (2 * MUSIC_MIN_RUN_S)) * 0.5 + min(1.0, tonal / 0.9) * 0.5, 2) if still <= MUSIC_MAX_STILL else round(min(0.4, tonal * 0.4), 2)
-        res = {"yes": bool(yes), "score": score, "why": f"tonal {tonal:.2f}, longest run {run_s:.1f} s, pitch stillness {still:.2f}"}
     cache = load_json(LOUD_CACHE, {})
     cache[key] = res
     save_json(LOUD_CACHE, cache)
     return res
+
+
+def music_lower_db(cfg):
+    """V7.7.1: Settings amount for music-over-gameplay clips, clamped to 0 .. MUSIC_MUTE_DB (default 12)."""
+    try:
+        v = float(cfg.get("music_lower_db", MUSIC_LOWER_DB))
+    except (TypeError, ValueError):
+        v = MUSIC_LOWER_DB
+    return max(0.0, min(MUSIC_MUTE_DB, v))
+
+
+def music_group_verdict(recs, cfg, game, audio_state, cache):
+    """V7.7.1: ONE verdict for every file of a fight / continuation group: the verdict of the highest score in the group (a clip whose chosen track is the clean game-only track is
+    never analysed, so it never scores). cache: dict kept for the plan, keyed by the group's files."""
+    key = tuple(sorted(r["path"] for r in recs))
+    if key in cache:
+        return cache[key], False
+    best, scores = {"yes": False, "score": 0.0, "why": "no clip with sound"}, []
+    for r in recs:
+        if not r.get("audio"):
+            continue
+        m = music_over_gameplay(r, resolve_clip_audio(r, cfg, game, audio_state))
+        scores.append((Path(r["path"]).name, m["score"]))
+        if m["score"] > best["score"] or best["why"] == "no clip with sound":
+            best = dict(m, src=Path(r["path"]).name)
+    res = dict(best, files=scores, key=key)
+    cache[key] = res
+    return res, True
 
 
 def _game_gain(cfg, song_lufs, clip_lufs):
@@ -8821,6 +9062,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
     song_lufs = an.get("lufs")
     out_takes = []
     notes_music = []                     # V7.7.0 (only filled when the Settings option is on)
+    music_groups = {}                    # V7.7.1: one verdict per fight / continuation group
     audio_state = {}                     # V5.57: audio mode used + Auto -> Legacy fallback reasons
     for i, tk in enumerate(takes):
         ev = tk["ev"]
@@ -8874,20 +9116,31 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             o += sg[3]
         parts = ev.get("parts") or [{"path": ev["path"], "shift": 0.0, "rec": ev["rec"]}]
         srcs = []
+        mus = None
+        if cfg.get("lower_music_clips"):                   # V7.7.0: OFF (default) = this block never runs and nothing below changes
+            grp = list(ev.get("group") or [])
+            grp += [p["rec"] for p in parts if p["rec"]["path"] not in {g_["path"] for g_ in grp}]
+            mus, first = music_group_verdict(grp, cfg, game, audio_state, music_groups)
+            amt = music_lower_db(cfg)
+            if first:
+                names = " + ".join(Path(g_["path"]).name for g_ in grp)
+                notes_music.append(f"music over gameplay: {names}: {'yes' if mus['yes'] else 'no'} ({mus['score']:.2f}) -> "
+                                   + (("mute" if amt >= MUSIC_MUTE_DB else f"-{amt:.0f} dB") if mus["yes"] else "0 dB"))
         for p in parts:
             r = p["rec"]
             au = resolve_clip_audio(r, cfg, game, audio_state)
             gdb, lift = _game_gain(cfg, song_lufs, au["lufs"])
-            mus = None
-            if cfg.get("lower_music_clips") and r.get("audio"):              # V7.7.0: OFF (default) = this block never runs and nothing below changes
-                mus = music_over_gameplay(r, au)
-                if mus["yes"]:
-                    gdb = round(gdb - MUSIC_LOWER_DB, 2)
-                notes_music.append(f"music over gameplay: {Path(p['path']).name}: {'yes' if mus['yes'] else 'no'} ({mus['score']:.2f}; {mus['why']}) -> {gdb:+.1f} dB"
-                                   + (f" ({MUSIC_LOWER_DB:.0f} dB lower)" if mus["yes"] else ""))
+            low = {}
+            if mus and mus["yes"] and r.get("audio"):                          # V7.7.1: after the lift, so nothing undoes it; the whole clip, never part of it
+                amt = music_lower_db(cfg)
+                low = {"music_db": -amt}
+                if amt >= MUSIC_MUTE_DB:
+                    low["mute"] = True
+                else:
+                    gdb = round(gdb - amt, 2)
             srcs.append({"path": p["path"], "shift": p.get("shift", 0.0), "rect": content_rect(r, cfg), "wh": [r["w"], r["h"]],
                          "audio": bool(r.get("audio")), "a_stream": au["stream"] or 0, "a_note": au.get("note", ""), "lufs": au["lufs"], "gain_db": gdb,
-                         "lift_db": lift, "dur": r.get("dur", 0), **({"music_db": -MUSIC_LOWER_DB} if mus and mus["yes"] else {})})
+                         "lift_db": lift, "dur": r.get("dur", 0), **low})
         b0 = (tk["c"] - takes[0]["c"]) / 2
         out_takes.append({"path": ev["path"], "srcs": srcs, "rect": srcs[0]["rect"], "audio": srcs[0]["audio"], "wh": srcs[0]["wh"],
                           "segs": segs, "f0": f_c, "nf": nf, "out_start": round(f_c / OUT_FPS, 4), "dur": round(nf / OUT_FPS, 4),
@@ -9068,7 +9321,7 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
         fx = (f"trans:{t['trans']} " if i > 1 and t["trans"] != "hard" else "") + ("slow-mo " if t["slow"] else "") + \
              (f"ramp x{t['ramp']} " if t["ramp"] > 1 else "") + (f"zoom@{','.join(f'{p:.2f}' for p in t['pulses'])} " if t["pulses"] else "") + \
              ("FLASH " if t["flash"] is not None else "") + \
-             " | game " + ", ".join(f"{s_['gain_db']:+.1f} dB" + (f" (lift {s_['lift_db']:+.1f})" if s_.get("lift_db") else "") +
+             " | game " + ", ".join(("MUTED" if s_.get("mute") else f"{s_['gain_db']:+.1f} dB") + (f" (lift {s_['lift_db']:+.1f})" if s_.get("lift_db") else "") +
                                     (f" [{s_['a_note']}]" if s_.get("a_note") else "") for s_ in t["srcs"] if s_["audio"])
         L.append(f"  {i:2}. {t['f0'] / OUT_FPS:6.2f}s {t['nf']:4d}f [{t['role']:8}] first kill @{t['out_start'] + t['kills_out'][0]:6.2f}s"
                  f"{' (downbeat)' if t['kill_down'] else ''} tail {tail:.2f}s  {t['n']}k  {Path(t['path']).name} @ "
@@ -9332,9 +9585,12 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
                 out_len = n / OUT_FPS
                 off = off_f / OUT_FPS
                 vbar = (b0 - a0) / out_len
-                if src["audio"]:
+                if src["audio"] and not src.get("mute"):
                     gain = 10 ** (float(src.get("gain_db", -6.0)) / 20)
                     boost = min(1.0, gain * 1.585)
+                    if src.get("music_db"):                                                 # V7.7.1: the kill boost is the option-off boost lowered by the same amount (not capped again at the lowered level)
+                        f_ = 10 ** (float(src["music_db"]) / 20)
+                        boost = min(1.0, gain / f_ * 1.585) * f_
                     kl_ = (t["kills"][-1] - src["shift"]) if t.get("kills") else None
                     if kl_ is not None and a0 - src["shift"] - 1e-6 <= kl_ <= b0 - src["shift"] + 1e-6:
                         tk_ = src_to_out([[x[0] - src["shift"], x[1] - src["shift"], x[2], x[3]] for x in g], kl_)
@@ -9378,9 +9634,12 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             tv.append(f"[s{k}v]")
             out_len = n / OUT_FPS
             off = off_f / OUT_FPS
-            if src["audio"] and sp > 0:
+            if src["audio"] and sp > 0 and not src.get("mute"):                           # V7.7.1: a muted clip is true silence (the same anullsrc as a clip without sound)
                 gain = 10 ** (float(src.get("gain_db", -6.0)) / 20)
                 boost = min(1.0, gain * 1.585)                                             # V4: about +4 dB around each kill
+                if src.get("music_db"):                                                    # V7.7.1: same boost as option off, lowered by the same amount
+                    f_ = 10 ** (float(src["music_db"]) / 20)
+                    boost = min(1.0, gain / f_ * 1.585) * f_
                 at = f"atempo={min(2.0, max(0.5, sp)):.4f}," if abs(sp - 1.0) > 1e-3 else ""
                 if sp > 2.0:
                     at = f"atempo=2.0,atempo={sp / 2:.4f},"
@@ -11129,7 +11388,7 @@ def audio_guard(plan, outfile, cfg, redo):
             au = clip_audio_legacy({"path": sd["path"], "audio": sd["audio"]})
             sd["a_stream"], sd["a_note"], sd["lufs"] = au["stream"] or 0, au.get("note", ""), au["lufs"]
             sd["gain_db"], sd["lift_db"] = _game_gain(cfg, plan["song"].get("lufs"), au["lufs"])
-            if sd.get("music_db"):
+            if sd.get("music_db") and not sd.get("mute"):
                 sd["gain_db"] = round(sd["gain_db"] + sd["music_db"], 2)
     plan["audio_mode"] = "legacy"
     plan.setdefault("audio_fallback", []).append(why)
@@ -12678,11 +12937,15 @@ class App:
                 pass                                               # half-typed number: keep the old value
         cfg["length_s"] = "optimal" if self.set_opt.get() else max(LEN_MIN_S, min(LEN_MAX_S, int(self.set_len.get())))
         cfg["style"], cfg["placement"] = self.set_style.get(), self.set_place.get()
-        cfg["songmap_version"] = next((k for k, lab in SONGMAP_CHOICES_UI.items() if lab == self.set_songmap.get()), SONGMAP_DEFAULT)
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
         cfg["lower_music_clips"] = bool(self.set_music.get())        # V7.7.0
+        try:
+            cfg["music_lower_db"] = max(0.0, min(MUSIC_MUTE_DB, float(self.set_music_db.get())))      # V7.7.1
+        except ValueError:
+            pass                                                   # half-typed number: keep the old value
+        cfg["songmap_mode"] = next((k for k, lab in SONGMAP_MODES.items() if lab == self.set_smmode.get()), "v2")    # V7.7.1
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
         if self.set_names:
             cfg["player_names"] = {g: norm_names(v.get(), g) for g, v in self.set_names.items()}
@@ -14453,9 +14716,9 @@ class App:
         label("Kill placement (see synccompare)")
         ttk.Combobox(holder(), textvariable=self.set_place, values=["v5", "v4"], width=10, state="readonly").pack(side="left")
         r[0] += 1
-        self.set_songmap = tk.StringVar(value=SONGMAP_CHOICES_UI.get(songmap_version(self.cfg), SONGMAP_CHOICES_UI['v2']))
-        label("Songmap version")
-        ttk.Combobox(holder(), textvariable=self.set_songmap, values=list(SONGMAP_CHOICES_UI.values()), width=28, state="readonly").pack(side="left")
+        self.set_smmode = tk.StringVar(value=SONGMAP_MODES[songmap_mode(self.cfg)])                  # V7.7.1: replaces the V1 / V2 'Songmap version' dropdown
+        label("SongMap mode")
+        ttk.Combobox(holder(), textvariable=self.set_smmode, values=list(SONGMAP_MODES.values()), width=18, state="readonly").pack(side="left")
         r[0] += 1
         am = self.cfg.get("audio_mode", "auto")
         self.set_audio = tk.StringVar(value=AUDIO_MODES.get(am, AUDIO_MODES["auto"]))
@@ -14475,7 +14738,11 @@ class App:
         r[0] += 1
         self.set_music = tk.BooleanVar(value=bool(self.cfg.get("lower_music_clips", False)))      # V7.7.0
         label("Music in clips")
-        ttk.Checkbutton(holder(), text="Lower clips that already have music playing (12 dB, only when sure; off by default)", variable=self.set_music).pack(side="left")
+        h_ = holder()
+        ttk.Checkbutton(h_, text="Lower music-over-gameplay clips by", variable=self.set_music).pack(side="left")
+        self.set_music_db = tk.StringVar(value=f"{music_lower_db(self.cfg):g}")
+        ttk.Spinbox(h_, from_=0, to=MUSIC_MUTE_DB, increment=1, width=5, textvariable=self.set_music_db).pack(side="left", padx=(6, 6))
+        ttk.Label(h_, text=f"dB (mute = {MUSIC_MUTE_DB:g} dB; off by default)").pack(side="left")
         r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
@@ -14514,7 +14781,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_songmap, self.set_sync, self.set_interp, self.set_music, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
