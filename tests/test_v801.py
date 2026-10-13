@@ -123,37 +123,7 @@ def part1():
 
 
 def part2():
-    section("2) icons present: templates first, OCR as the fallback")
-    d = TMP / "d2"
-    (d / "r6s" / "icons").mkdir(parents=True)
-    ia = d / "r6s" / "icons" / "k.png"
-    T.mk_icon(ia, 21)
-    icon = cv2.imdecode(np.fromfile(str(ia), np.uint8), cv2.IMREAD_GRAYSCALE)
-
-    def frames():
-        out_ = synth_frames(45)
-        for f in range(3, 41):
-            T.paste(out_[f], icon, 300, 100, seed=7)
-        return out_
-    reads = {"n": 0}
-
-    def reader(fr_, m):
-        reads["n"] += 1
-        return [[0, 250, "fireaxe0", 0.95]], [[360, 560, "TplVictim", 0.95]]
-    keep = M.r6s_read_band
-    M.r6s_read_band = reader
-    try:
-        e = scan_synth(d, texts=("fireaxeO", "OcrVictim"), frames_fn=frames)
-    finally:
-        M.r6s_read_band = keep
-    check("templates were used", e.get("mode") == "templates+ocr" and len(e["rows"]) >= 1 and reads["n"] >= 1, str(e.get("mode")))
-    a = M.analyse_entry(e, CFG, "r6s")
-    check("the template row is a kill; the same row read by OCR is not counted twice", len(a["kills"]) == 1 and a["kills"][0]["victim"] == "TplVictim", str([k["victim"] for k in a["kills"]]))
-    e["rows"] = []
-    a2 = M.analyse_entry(e, CFG, "r6s")
-    check("no template hit at all: the OCR path still finds the kill", len(a2["kills"]) == 1 and a2["kills"][0]["victim"] == "OcrVictim")
-    ent = {"rows": [T.row(30, 120, 91, T.reads("fireaxe0", "First"))], "ocr": [], "frames": 400, "v_off": 0.0, "game": "r6s"}
-    check("template rows alone (no OCR frames) still analyse", len(M.analyse_entry(ent, CFG, "r6s")["kills"]) == 1)
+    section("2) (removed in V8.0.3: icons no longer confirm normal kills)")
 
 
 def fake_recs(paths):

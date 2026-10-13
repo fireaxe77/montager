@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.0.2"
+APP_VERSION = "V8.0.3"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2229,6 +2229,101 @@ def r6s_load_icons(folder=None, log=True):
     return icons
 
 
+def r6s_util_icon_dir():
+    return DATA / "r6s" / "utility_icons"
+
+
+_R6S_UTIL_CACHE = {}
+
+
+def r6s_load_util_icons(folder=None, log=True):
+    """V8.0.3: the R6S UTILITY (gadget kill) icon templates: every png / jpg in montage_data\\r6s\\utility_icons (any file name, any number). Missing / empty folder = []
+    (no utility detection, nothing else changes). Cached by the folder listing."""
+    d = Path(folder) if folder else r6s_util_icon_dir()
+    try:
+        sig = tuple((p.name, p.stat().st_size, int(p.stat().st_mtime)) for p in sorted(d.iterdir()) if p.is_file() and p.suffix.lower() in R6S_ICON_EXT) if d.is_dir() else ()
+    except OSError:
+        sig = ()
+    if folder is None and _R6S_UTIL_CACHE.get("sig") == (str(d), sig):
+        return _R6S_UTIL_CACHE["icons"]
+    icons = r6s_load_icons(d, log=log) if sig else []
+    if folder is None:
+        _R6S_UTIL_CACHE.update(sig=(str(d), sig), icons=icons)
+    return icons
+
+
+_R6S_OLD_NOTE = [None]
+
+
+def r6s_old_icons_note():
+    """V8.0.3: montage_data\\r6s\\icons (V8.0.2) is no longer used for kills; one log line per process when it still holds images."""
+    try:
+        d = r6s_icon_dir()
+        if d.is_dir() and any(p.suffix.lower() in R6S_ICON_EXT for p in d.iterdir()) and _R6S_OLD_NOTE[0] != str(d):
+            _R6S_OLD_NOTE[0] = str(d)
+            out("R6S: montage_data\\r6s\\icons is unused (utility icons live in utility_icons)")
+    except OSError:
+        pass
+
+
+R6S_UTIL_THR = 0.90                  # template correlation that counts as 'a utility kill icon is here' (real hits score 0.97-0.99; scenery noise stays under 0.89)
+R6S_UTIL_MIN_F = 5                   # a utility hit must stay on screen this many frames (a real row's icon is there as long as the row; noise lasts 1-4 frames)
+
+
+class R6SUtilScan:
+    """Utility-icon pass over the killfeed crop frames (one frame per step): every sighting of a utility template becomes / extends a HIT (first / last frame,
+    position). No OCR here; the analysis decides which killfeed row a hit belongs to (the hit must sit in that row's weapon slot, between killer and victim)."""
+    def __init__(self, icons, thr=R6S_UTIL_THR):
+        self.icons, self.thr, self.hits, self.lock, self.quiet = icons, thr, [], None, 0
+
+    def step(self, f, fr):
+        import cv2
+        gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
+        scales = R6S_SCALES if self.lock is None else tuple(R6S_SCALES[i] for i in sorted(self.lock))
+        try:
+            ms = r6s_find_matches(gray, self.icons, scales, self.thr)
+        except Exception as ex:
+            LOGONLY(f"R6S: frame {f}: utility match failed: {type(ex).__name__}: {ex}")
+            return
+        if ms:
+            self.quiet = 0
+            bi = ms[0][6]
+            self.lock = {max(0, bi - 1), bi, min(len(R6S_SCALES) - 1, bi + 1)}
+        else:
+            self.quiet += 1
+            if self.quiet > 60:
+                self.lock = None
+        for m in ms:
+            cx, cy = m[0] + m[2] / 2.0, m[1] + m[3] / 2.0
+            for h in self.hits:
+                if f - h["last"] <= R6S_GAP_F and abs(cy - h["y"]) <= 0.6 * max(h["h"], 12) and abs(cx - h["x"]) <= 0.8 * max(h["w"], 12):
+                    h.update(last=f, hits=h["hits"] + 1, sc=max(h["sc"], round(m[4], 3)))
+                    break
+            else:
+                self.hits.append({"first": int(f), "last": int(f), "hits": 1, "x": int(cx), "y": int(cy), "w": int(m[2]), "h": int(m[3]), "sc": round(float(m[4]), 3),
+                                  "tpl": self.icons[m[5]]["name"]})
+
+
+def r6s_row_util(r, uhits):
+    """True when a utility-icon hit sits in this row's weapon slot: the hit is on screen while the row is (a few frames of slack), at the row's height, and between
+    the killer side's names and the victim side's names. `r` is an R6S row ({first, last, y, h, reads}); `uhits` = entry['util']."""
+    if not uhits:
+        return False
+    xk = max([b[1] for _f, l, _r in r.get("reads", []) for b in l] or [0])
+    xv = min([b[0] for _f, _l, rr in r.get("reads", []) for b in rr] or [10 ** 6])
+    hh = max(r.get("h") or 0, 14)
+    for h in uhits:
+        if h["hits"] < R6S_UTIL_MIN_F:
+            continue
+        if h["last"] + 3 < r["first"] or h["first"] - 3 > r["last"]:
+            continue
+        if abs(h["y"] - r["y"]) > 0.7 * max(hh, h["h"]):
+            continue
+        if xk - 12 <= h["x"] <= xv + 12:
+            return True
+    return False
+
+
 def r6s_icons_sig(icons):
     h = hashlib.md5()
     for ic in sorted(icons, key=lambda i: i["name"]):
@@ -2400,24 +2495,25 @@ def r6s_scan_frames(frames, icons, thr=R6S_MATCH_THR, reader=None):
 
 
 def r6s_scan_clip(path, rec, det, cfg):
-    """R6S counterpart of scan_clip(). The killfeed OCR pass always runs (rows split by the weapon icon, names first on the killer side); when icon
-    templates exist they ALSO find rows (template rows are the primary list, OCR rows fill what the templates missed). No icons = OCR only: never an error."""
+    """R6S counterpart of scan_clip(): the killfeed OCR pass (rows split by the weapon icon, my name first on the killer side) - normal kills are OCR only.
+    V8.0.3: when utility icon templates exist (montage_data\\r6s\\utility_icons) they are matched in the same pass; the hits are stored with the clip and the
+    analysis rejects the row they sit in as utility. No utility icons = no utility detection, never an error."""
     t0 = time.time()
-    icons = r6s_load_icons(log=False)
-    trk = R6STracker(icons) if icons else None
+    uicons = r6s_load_util_icons(log=False)
+    us = R6SUtilScan(uicons) if uicons else None
 
     def frames():
         for f, fr in enumerate(frame_stream(path, rec, det, cfg, FPS)):
-            if trk is not None:
+            if us is not None:
                 try:
-                    trk.step(f, fr)
-                except Exception as ex:                       # a failing template step never stops the OCR pass
-                    LOGONLY(f"R6S: frame {f}: template step failed: {type(ex).__name__}: {ex}")
+                    us.step(f, fr)
+                except Exception as ex:                       # a failing utility step never stops the OCR pass
+                    LOGONLY(f"R6S: frame {f}: utility step failed: {type(ex).__name__}: {ex}")
             yield fr
     ocr, n = scan_frames(frames())
-    e = {"v": CACHE_V, "names": names_for_cache("r6s"), "ocr": ocr, "rows": trk.rows() if trk else [], "frames": n, "size": [det.dw, det.dh],
-         "region": det.d["region"], "v_off": rec.get("v_off", 0.0), "ocr_calls": len(ocr) + (sum(len(r["reads"]) for r in trk.rows()) if trk else 0),
-         "secs": round(time.time() - t0, 1), "game": "r6s", "icons": r6s_icons_sig(icons) if icons else "", "mode": "templates+ocr" if icons else "ocr-only"}
+    e = {"v": CACHE_V, "names": names_for_cache("r6s"), "ocr": ocr, "rows": [], "frames": n, "size": [det.dw, det.dh],
+         "region": det.d["region"], "v_off": rec.get("v_off", 0.0), "ocr_calls": len(ocr),
+         "secs": round(time.time() - t0, 1), "game": "r6s", "mode": "ocr", "util": us.hits if us else [], "util_sig": r6s_icons_sig(uicons) if uicons else ""}
     a = r6s_analyse_entry(e, cfg)
     e["best_name"], e["best_vic"] = round(a["best_k"], 3), round(a["best_v"], 3)
     return e
@@ -2553,6 +2649,8 @@ def r6s_sametime_guard(kills, rej):
 
 
 def _r6s_core(rows, entry, cfg):
+    uhits = entry.get("util") or []
+    admit = bool(getattr(_UTIL_LOCAL, "on", False))        # the per-clip utility override (utility_kill_rows switches it on for one analysis)
     """Cached R6S rows -> kills / deaths / rejects, in the same result shape as analyse_entry(). Rules (copied from the CS2 / Valorant row analysis):
     killer side (first name left of the icon) = me -> kill; victim side = me -> death; both sides me -> not a kill; a row already on screen when the
     clip starts = pre-clip (rejected, still counts as a known kill for the duplicate rules); a row seen in under R6S_BLIP_F frames = one-frame blip;
@@ -2584,7 +2682,8 @@ def _r6s_core(rows, entry, cfg):
         if not votes["kill"] and not votes["death"]:
             continue
         a = "kill" if votes["kill"] >= votes["death"] else "death"
-        row = f"[{ktext or '-'}] gun [{vtext or '-'}]"
+        is_util = a == "kill" and r6s_row_util(r, uhits)
+        row = f"[{ktext or '-'}] {'util' if is_util else 'gun'} [{vtext or '-'}]"
         mine.append({"t": tt, "row": row, "verdict": a, "why": f"R6S {a}: my name on the {'killer' if a == 'kill' else 'victim'} side ({max(ks, vs):.2f}), icon {r.get('tpl', '?')}",
                      "hits": r["hits"]})
         if r["hits"] < R6S_BLIP_F and r["last"] < last_f - FPS:
@@ -2595,11 +2694,16 @@ def _r6s_core(rows, entry, cfg):
             if a == "kill":
                 pre.append({"t": tt, "ks": ks, "row": row, "victim": vtext})
             continue
+        if a == "kill" and is_util and not admit:           # V8.0.3: copied from Valorant's utility rule: a gadget kill is rejected, never a kill (the override can admit it)
+            vis.append((tt, round(r["last"] / FPS + off + 0.3, 3)))
+            rej.append({"t": tt, "reason": f"utility: gadget kill icon ({row})", "ks": ks})
+            continue
         if a == "kill":
             vis.append((tt, round(r["last"] / FPS + off + 0.3, 3)))
-            kills.append({"t": tt, "ks": ks, "hs": False, "row": row, "hits": r["hits"], "victim": vtext, "weapon": "gun", "y": r["y"], "h": r["h"],
+            kills.append({"t": tt, "ks": ks, "hs": False, "row": row, "hits": r["hits"], "victim": vtext, "weapon": "util" if is_util else "gun", "y": r["y"], "h": r["h"],
                           "box": [max(0, r["x"] - 420), max(0, r["y"] - r["h"]), r["x"] + r["w"] + 420, r["y"] + r["h"]],
-                          "t_last": round(r["last"] / FPS + off, 3), "needs_shot": bool(len(r.get("reads", [])) < 2 and ks < 0.9)})
+                          "t_last": round(r["last"] / FPS + off, 3), "needs_shot": bool(len(r.get("reads", [])) < 2 and ks < 0.9),
+                          **({"util": True} if is_util else {})})
         else:
             deaths.append(tt)
             rej.append({"t": tt, "reason": f"death: my name on the victim side ('{vtext}') - not a kill", "ks": vs})
@@ -2616,26 +2720,11 @@ def _r6s_core(rows, entry, cfg):
 
 
 def r6s_analyse_entry(entry, cfg):
-    """OCR rows are the result. Icon-template rows (when icons were used) only CONFIRM them: a kill both lists have is confirmed; where the two lists disagree
-    (a kill only the icons saw, or only the OCR saw) the difference is listed in result['disagree'] (the scan logs it) and the OCR result is kept. No template
-    hit = the OCR kill stands (OCR-only fallback)."""
-    from rapidfuzz import fuzz
-    tpl = entry.get("rows") or []
-    ocr_r = r6s_rows_from_ocr(entry) if entry.get("ocr") else []
-    b = _r6s_core(ocr_r, entry, cfg)
-    b["disagree"], b["confirmed"] = [], 0
-    if not tpl:
-        return b
-    a = _r6s_core(tpl, entry, cfg)
-    if not entry.get("ocr"):                               # an entry without any OCR frames (never produced by a scan): the icon rows are all there is
-        a["disagree"], a["confirmed"] = [], 0
-        return a
-    near = lambda o, k: abs(o["t"] - k["t"]) <= 1.5 and (not o.get("victim") or not k.get("victim") or fuzz.ratio(_alnum(o["victim"]).lower(), _alnum(k["victim"]).lower()) >= 60)
-    only_icon = [o for o in a["kills"] if not any(near(o, k) for k in b["kills"])]
-    only_ocr = [k for k in b["kills"] if not any(near(k, o) for o in a["kills"])]
-    b["confirmed"] = len(b["kills"]) - len(only_ocr)
-    b["disagree"] = [f"icon rows only: {o['row']} @ {ts(o['t'])}" for o in only_icon] + [f"OCR rows only: {k['row']} @ {ts(k['t'])}" for k in only_ocr]
-    return b
+    """OCR rows are the result (normal kills are OCR only: icon rows stored by V8.0.2 scans are ignored). An entry with no OCR frames at all (never produced by a
+    scan: only hand-made test rows) is analysed from its stored rows."""
+    if entry.get("ocr"):
+        return _r6s_core(r6s_rows_from_ocr(entry), entry, cfg)
+    return _r6s_core(entry.get("rows") or [], entry, cfg)
 
 
 def r6s_safe_analyse(entry, cfg):
@@ -4825,6 +4914,16 @@ def auto_scan_set(cfg, game):
 R6S_AUTO_MAX = 12            # V8.0.0: an R6S Auto / Force New run scans at most this many uncached clips (newest first): the library is never scanned in bulk
 
 
+def r6s_entry_stale(e):
+    """True when a cached R6S entry must be scanned again: it holds an error, or it was scanned with another utility icon set than exists now."""
+    if not e:
+        return False
+    if e.get("error"):
+        return True
+    cur = r6s_load_util_icons(log=False)
+    return (e.get("util_sig") or "") != (r6s_icons_sig(cur) if cur else "")
+
+
 def r6s_auto_scan_set(cfg, det, cache):
     """Auto mode for R6S: the newest uncached clips only, at most R6S_AUTO_MAX per run (the Manual list / Random pick scan what you choose)."""
     c = []
@@ -4862,7 +4961,7 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
         recs = [r for r in recs if r["path"] in ps]
     cache = load_kills_cache()
     jobs = [(r, r["game"]) for r in recs if rescan or kills_key(r, r["game"], dets[r["game"]]) not in cache
-            or (r["game"] == "r6s" and (cache.get(kills_key(r, "r6s", dets["r6s"])) or {}).get("error"))]       # V8.0.1: an R6S entry that holds an error (icons missing) is scanned again
+            or (r["game"] == "r6s" and r6s_entry_stale(cache.get(kills_key(r, "r6s", dets["r6s"]))))]       # V8.0.1: an R6S entry that holds an error (icons missing) is scanned again
     if jobs and rescan:
         out("rescanning: forced rescan (requested)")
     elif jobs:
@@ -4870,8 +4969,8 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
     if limit:
         jobs = jobs[:limit]
     out(f"cached {len(recs) - len(jobs)}, scanning {len(jobs)}  (of {len(recs)} clips in scope)")
-    if any(g_ == "r6s" for _r, g_ in jobs) and not r6s_load_icons(log=False):
-        out("R6S: no icon templates, using OCR-only row detection")
+    if any(g_ == "r6s" for _r, g_ in jobs):
+        r6s_old_icons_note()
     if jobs:
         ocr_engine()                                       # load the OCR models once up front (clear error if missing)
     done, errs, t0 = 0, 0, time.time()
@@ -4914,8 +5013,6 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
                     f" victim-side {a['best_v']:.2f} | rect {content_rect(r, cfg)} crop {'yes' if r.get('bars') else 'no'} | {name} ({res['secs']}s)")
                 for m in a["mine"]:
                     out(f"      my row @ {ts(m['t'])} {m['row']} -> {m['verdict'].upper()}: {m['why']} ({m['hits']} sightings)")
-                if g == "r6s" and a.get("disagree"):
-                    out(f"R6S: icon rows and OCR rows disagree in {name}: " + "; ".join(a["disagree"][:6]) + " - OCR result kept")
                 if g == "r6s" and not a["kills"]:
                     out(f"R6S: no kill rows read in {name} (killfeed region {res.get('region')} of the content rect, crop {res.get('size')} px)")
     out(f"scan finished: {done} in {time.time() - t0:.0f}s, errors {errs}")
@@ -4942,7 +5039,7 @@ def game_pool(cfg, game, paths=None):
     if ps is not None:
         r6s_want(cfg, ps)                                  # V8.0.0
     stats = {"tagged": 0, "scanned": 0, "with_kills": 0}
-    ovs = load_clip_overrides() if game == "valorant" else {}          # V6.9.7: per-clip 'allow utility kills' (default OFF: empty = nothing below runs)
+    ovs = load_clip_overrides() if game in ("valorant", "r6s") else {}          # V6.9.7: per-clip 'allow utility kills' (default OFF: empty = nothing below runs); V8.0.3: R6S too
     util_adm = {}
     pool, allrej, cjk = [], [], {}
     cands = []
@@ -7205,6 +7302,15 @@ def utility_kill_rows(entry, cfg, game="valorant", base=None):
     """The kill-shaped rows the detector rejected with the reason 'utility' in this clip's cached OCR frames: {kills: [...admitted rows...], base: analysis}.
     The rows come from the one analyse_entry(); only rows whose track is a utility track ('util' icon) and that are not kills without the switch are returned."""
     base = base or analyse_entry(entry, cfg, game)
+    if game == "r6s":                                      # V8.0.3: the R6S rule is inside r6s analysis (the same thread-local switch); the admitted rows carry util=True
+        with _UTIL_LOCK:
+            _UTIL_LOCAL.on = True
+            try:
+                a = analyse_entry(entry, cfg, game)
+            finally:
+                _UTIL_LOCAL.on = False
+        have = [(round(k["t"], 3), _alnum((k.get("victim") or "").lower())) for k in base["kills"]]
+        return [dict(k, util=True) for k in a["kills"] if k.get("util") and (round(k["t"], 3), _alnum((k.get("victim") or "").lower())) not in have]
     real = classify_row
 
     def mapped(r, cfg_=None, lg=0.0, game_=None):
@@ -7228,7 +7334,7 @@ def utility_kill_rows(entry, cfg, game="valorant", base=None):
 def apply_utility_override(rec, entry, a, cfg, game, ovs, admitted=None):
     """a = analyse_clip_entry(...) of the clip. When the clip's override is ON (Valorant), its admitted utility rows join its kills (sorted by time) and leave
     its rejected list; otherwise a is returned unchanged (default OFF: nothing changes anywhere)."""
-    if game != "valorant" or not ovs or entry is None or entry.get("error"):
+    if game not in ("valorant", "r6s") or not ovs or entry is None or entry.get("error"):
         return a
     st, why = clip_override_state(rec["path"], ovs)
     if st != "on":
@@ -14677,7 +14783,7 @@ class App:
     def util_targets(self, iid):
         """V6.9.7: (targets, is_on_for_the_first) for the right-click menu, or None (hidden: not a Valorant list). The ticked rows are the selection when the clicked row
         is ticked (the toggle follows the FIRST of them in list order), else only the clicked row."""
-        if self.m_game.get() != "valorant" or iid not in self.byp:
+        if self.m_game.get() not in ("valorant", "r6s") or iid not in self.byp:
             return None
         vis = list(self.ctree.get_children())
         targets = [x for x in vis if x in self.ticked] if iid in self.ticked else [iid]
@@ -14690,7 +14796,8 @@ class App:
         except Exception as ex:                             # noqa: BLE001
             out(f"utility override not saved: {ex}")
             return
-        cfg, det = load_config(), Detector("valorant")
+        g_ = self.m_game.get() if self.m_game.get() in ("valorant", "r6s") else "valorant"
+        cfg, det = load_config(), Detector(g_)
         clips, store, ovs = load_json(CLIPS_CACHE, {}), load_kills_cache(), load_clip_overrides(quiet=True)
         for iid in targets:
             c = self.byp.get(iid)
@@ -14699,10 +14806,10 @@ class App:
             c["util"] = bool(new_state)
             try:                                            # the kill count follows from the CACHED rows (no scan)
                 r = clips.get(file_key(iid))
-                e = store.get(kills_key(dict(r, path=iid, game="valorant"), "valorant", det)) if r else None
+                e = store.get(kills_key(dict(r, path=iid, game=g_), g_, det)) if r else None
                 if e and not e.get("error"):
-                    a_ = analyse_clip_entry(dict(r, path=iid, game="valorant"), e, cfg, "valorant")
-                    a_ = apply_utility_override(dict(r, path=iid), e, a_, cfg, "valorant", ovs)
+                    a_ = analyse_clip_entry(dict(r, path=iid, game=g_), e, cfg, g_)
+                    a_ = apply_utility_override(dict(r, path=iid), e, a_, cfg, g_, ovs)
                     c["ks"], c["kills"] = [k["t"] for k in a_["kills"]], len(a_["kills"])
             except Exception as ex:                         # noqa: BLE001
                 LOGONLY(f"utility override: kill count not refreshed for {c.get('name')}: {ex}")
@@ -14777,7 +14884,7 @@ class App:
         with pstage("load_clips: used_dates"):
             ud = used_info()                                       # V5.55 / V6.7.4: (date, montage title) of the montage each clip was used in
         rows = []
-        ovs = load_clip_overrides() if g == "valorant" else {}      # V6.9.7: clips with 'allow utility kills' ON (default: none)
+        ovs = load_clip_overrides() if g in ("valorant", "r6s") else {}      # V6.9.7: clips with 'allow utility kills' ON (default: none); V8.0.3: R6S too
         with pstage("load_clips: scan_clips (total)"):
             scanned = scan_clips(load_config())
         _t1 = time.perf_counter()

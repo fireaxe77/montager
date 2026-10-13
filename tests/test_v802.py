@@ -70,7 +70,7 @@ def part1():
 
 
 def part2():
-    section("2) icons: loader, OCR kept on disagreement")
+    section("2) icon loader; stored icon rows never decide kills")
     d = TMP / "ic"
     check("0 icons (missing folder)", M.r6s_load_icons(d, log=False) == [])
     d.mkdir()
@@ -79,24 +79,8 @@ def part2():
     T.mk_icon(d / "season10.jpg", 32, 0.7)
     check("2 icons", len(M.r6s_load_icons(d, log=False)) == 2)
     real = ROOT / "montage_data" / "r6s" / "icons"
-    if real.is_dir() and list(real.glob("*.png")):
-        check("the saved kill icons load", len(M.r6s_load_icons(real, log=False)) == len(list(real.glob("*.png"))) or True)
-    ocr_ent = {"rows": [T.row(30, 120, 91, T.reads("fireaxe0", "TplVictim"))], "ocr": [], "frames": 400, "v_off": 0.0, "game": "r6s"}
-    a = M.analyse_entry(ocr_ent, CFG, "r6s")
-    check("icon rows alone: still analysed (no OCR frames)", len(a["kills"]) == 0 or True)
-    # OCR frames with one kill + icon rows with a different kill: OCR result kept, the difference listed
-    def bx(x0, x1, t, col):
-        return [x0, 100, x1, 124, t, 0.95, col, 3]
-    frames = [[f, f, [bx(10, 150, "fireaxeO", "g"), bx(260, 400, "OcrVictim", "r")], [[170, 98, 70, 28, 0.9]]] for f in (30, 36, 42, 50, 60)]
-    ent = {"ocr": frames, "rows": [T.row(200, 260, 60, T.reads("fireaxe0", "IconVictim"))], "frames": 400, "v_off": 0.0, "game": "r6s"}
-    a = M.analyse_entry(ent, CFG, "r6s")
-    check("disagreement: the OCR kill is kept, the icon-only kill is not added", [k["victim"] for k in a["kills"]] == ["OcrVictim"], str([k["victim"] for k in a["kills"]]))
-    check("... and the disagreement is listed for the log", len(a.get("disagree", [])) == 2, str(a.get("disagree")))
-    ent2 = dict(ent, rows=[T.row(30, 120, 91, T.reads("fireaxe0", "OcrVictim"))])
-    a2 = M.analyse_entry(ent2, CFG, "r6s")
-    check("agreement: confirmed, nothing to log", a2.get("disagree") == [] and a2.get("confirmed") == 1, str(a2.get("disagree")))
-    ent3 = dict(ent, rows=[])
-    check("no icon rows (no template hit): the OCR kill stands", len(M.analyse_entry(ent3, CFG, "r6s")["kills"]) == 1)
+    ocr_ent = {"rows": [T.row(30, 120, 91, T.reads("fireaxe0", "TplVictim"))], "ocr": [[0, 0, [], []]], "frames": 400, "v_off": 0.0, "game": "r6s"}
+    check("V8.0.3: icon rows stored by an older scan never confirm or add kills (OCR frames decide)", M.analyse_entry(ocr_ent, CFG, "r6s")["kills"] == [])
 
 
 def item(start, end, kills, deaths=(), name="c"):
@@ -165,9 +149,9 @@ def part4():
     check("valorant ledger report is unchanged (no extra lines)", len(M.ledger_report(ledv)) == 1)
 
 
-def load_base():
+def load_base(refs=("V8.0.1-good", "main")):
     ref = None
-    for r_ in ("V8.0.1-good", "main"):
+    for r_ in refs:
         if subprocess.run(["git", "rev-parse", "--verify", "-q", r_ + "^{commit}"], cwd=ROOT, capture_output=True).returncode == 0:
             ref = r_
             break
@@ -184,9 +168,9 @@ def load_base():
     return B, ref
 
 
-def part5():
+def part5(refs=("V8.0.1-good", "main")):
     section("5) filter graphs + plan text (ramp take + slow-mo ending), no ffmpeg run")
-    B, ref = load_base()
+    B, ref = load_base(refs)
     check(f"base module = {ref} (V8.0.x)", B.APP_VERSION.startswith("V8.0"), B.APP_VERSION)
     sp = TMP / "song.mp3"
     M.synth_song(sp, 128.0)
