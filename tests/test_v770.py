@@ -60,6 +60,7 @@ def part_changelog():
         check(not miss_t, f"every version tag ({len(vt)}) has an entry" + (f" (missing {miss_t})" if miss_t else ""))
         never = ("V5.45", "V5.50", "V5.54", "V6.3", "V6.4")
         check(not any(k in ksu for k in never), "versions that never existed (V5.45-V5.54, V6.3, V6.4) have no entry")
+        check(M.APP_VERSION == "V7.7.0" and ks[0] == "V7.7.0", "title-bar version V7.7.0 and its changelog entry on top")
         bad = re.search(r"KNOWN ISSUE|ABANDON|ON HOLD|on hold", simple)
         check(not bad, "no KNOWN ISSUE / ABANDONED / on-hold text in the readable history")
         for h, blk in zip(hs, re.split(r"(?m)^## .+$", simple)[1:]):

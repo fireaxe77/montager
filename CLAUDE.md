@@ -21,3 +21,4 @@
 - Run only that version's test file plus the guards (50+50 generated clips, 7 real Valorant clips, the 4K).
 - Tag the previous main `<prev>-good`, normal merge commit (`git merge --no-ff refs/heads/work-vXYZ`), tag the new version, push main and tags, remove extra worktrees, leave main clean.
 - End with the line "done, main = <version>, safe to pull".
+- V7.7.0: `tests/test_v770.py` is the new version's test file (`V770_PARTS=0,1,3,4,g`; point `V7_DATA_SRC`/`MONTAGER_DATA` at a COPY of montage_data). Tail repair (`repair_tails`), audible-onset drop anchors (`refine_drop_anchors`), music-over-gameplay option (default off, `musicscan`).
