@@ -101,8 +101,6 @@ def gui_phase(tmp):
         want["style"] = "chill"
         app.set_place.set("v4")
         want["placement"] = "v4"
-        app.set_songmap.set(M.SONGMAP_CHOICES_UI["v1"])
-        want["songmap_version"] = "v1"
         app.set_audio.set(M.AUDIO_MODES["legacy"])
         want["audio_mode"] = "legacy"
         want["quality"] = "nvenc" if cfg0.get("quality") == "max" else "max"
@@ -115,8 +113,10 @@ def gui_phase(tmp):
         want["accent"] = "purple"
         app.set_base.set("Black")
         want["base"] = "black"
-        app.set_smmode.set(M.SONGMAP_MODES["v2"])                    # V7.7.1: default 'V2 + V1 Fallback'
-        want["songmap_mode"] = "v2"
+        app.set_music_db.set("20")
+        want["music_lower_db"] = 20.0
+        app.set_smmode.set(M.SONGMAP_MODES["v2_fallback"])           # V7.7.1: the default is 'V2'; the test picks the other entry
+        want["songmap_mode"] = "v2_fallback"
         for _ in range(8):
             app.root.update()
             time.sleep(0.05)
@@ -132,7 +132,6 @@ def gui_phase(tmp):
             "game_audio_track": {g: v.get() for g, v in app2.set_track.items()},
             "player_names": {g: M.norm_names(v.get(), g) for g, v in app2.set_names.items()},
             "length_s": "optimal" if app2.set_opt.get() else int(app2.set_len.get()), "style": app2.set_style.get(), "placement": app2.set_place.get(),
-            "songmap_version": next((k for k, lab in M.SONGMAP_CHOICES_UI.items() if lab == app2.set_songmap.get()), None),
             "audio_mode": next((k for k, lab in M.AUDIO_MODES.items() if lab == app2.set_audio.get()), None), "quality": app2.set_q.get(),
             "interpolate_low_fps": bool(app2.set_interp.get()), "lower_music_clips": bool(app2.set_music.get()), "sync_report": bool(app2.set_sync.get()),
             "update_on_start": bool(app2.set_upd.get()), "accent": next((k for k, lab in M.ACCENT_NAMES.items() if lab == app2.set_accent.get()), None),
@@ -140,6 +139,7 @@ def gui_phase(tmp):
         for k in nums:
             raw = app2.sn[k].get()
             read[k] = float(raw) if "." in raw else int(raw)
+        read["music_lower_db"] = float(app2.set_music_db.get())
         read["songmap_mode"] = next((k for k, lab in M.SONGMAP_MODES.items() if lab == app2.set_smmode.get()), None)
         res["loaded"] = {k: read.get(k) == v for k, v in want.items()}
         res["want"], res["read"], res["disk"] = want, read, disk
@@ -317,10 +317,13 @@ def part_settings(tmp):
             row("Default length (optimal / 80-150 s)", sv("length_s"), ld("length_s"), "yes" if ok_len else "NO",
                 f"{len(cs2_trio)} CS2 clips: 80 s -> {pl80['duration']:.1f} s, 150 s -> {pl150['duration']:.1f} s, optimal -> {plo['duration']:.1f} s (material limited)")
             # ---------------------------------------------------------------- songmap
-            calls = []
-            kb = {n: getattr(M, n) for n in ("get_songmap",)}
-            vs = {v: M.songmap_version(dict(base_cfg, songmap_version=v)) for v in ("v1", "v2")}
-            row("Songmap version (V1 / V2)", sv("songmap_version"), ld("songmap_version"), "yes" if vs == {"v1": "v1", "v2": "v2"} else "NO", f"songmap_version(cfg) -> {vs}; get_songmap dispatches on it")
+            cfg_nokey = dict(base_cfg)
+            cfg_nokey.pop("songmap_mode", None)
+            vs = {"missing": M.songmap_mode(cfg_nokey), "garbage": M.songmap_mode({"songmap_mode": "banana"}), "fallback": M.songmap_mode({"songmap_mode": "v2_fallback"}),
+                  "routes": [M.songmap_version(dict(base_cfg, songmap_mode="v2", songmap_version=x)) for x in ("v1", "v2auto")]}
+            row("SongMap mode (V2 / V2 + V1 Fallback)", sv("songmap_mode"), ld("songmap_mode"),
+                "yes" if vs["missing"] == "v2" and vs["garbage"] == "v2" and vs["fallback"] == "v2_fallback" and vs["routes"] == ["v2", "v2"] else "NO",
+                f"mode read: missing key -> {vs['missing']}, unknown -> {vs['garbage']}; mode V2 routes an old version key v1 / v2auto to {vs['routes']}; per-song proof in part 2")
             # ---------------------------------------------------------------- interpolation
             kan = M.analyse_takes
             M.analyse_takes = lambda plan, fx=M.FX_ALL: []
@@ -342,8 +345,18 @@ def part_settings(tmp):
             p_off, _ = plan_with(game_v, val7, song, lower_music_clips=False)
             ga_, gb_ = gains(p_off), gains(p_on)
             dd = sorted({round(gb_[k]["gain_db"] - ga_[k]["gain_db"], 2) for k in ga_ if k in gb_ and ga_[k]["audio"]})
-            row("Lower clips that already have music playing", sv("lower_music_clips"), ld("lower_music_clips"), "yes" if dd == [-12.0] else "NO",
-                f"every clip flagged: game gain {dd} dB vs option off (the amount becomes a Settings value in this version)")
+            row("Lower music-over-gameplay clips (on / off)", sv("lower_music_clips"), ld("lower_music_clips"), "yes" if dd == [-12.0] and not any("music over gameplay" in n for n in p_off["notes"]) else "NO",
+                f"every clip flagged: game gain {dd} dB vs option off at the default amount; option off adds nothing to the plan")
+            M.music_over_gameplay = lambda rec, au: {"yes": True, "score": 0.9, "why": "audit"}
+            try:
+                p_20, _ = plan_with(game_v, val7, song, lower_music_clips=True, music_lower_db=20)
+                p_mu, _ = plan_with(game_v, val7, song, lower_music_clips=True, music_lower_db=M.MUSIC_MUTE_DB)
+            finally:
+                M.music_over_gameplay = kmu
+            d20 = sorted({round(gains(p_20)[k]["gain_db"] - ga_[k]["gain_db"], 2) for k in ga_ if k in gains(p_20) and ga_[k]["audio"]})
+            mutes = [s_.get("mute") for s_ in gains(p_mu).values() if s_["audio"]]
+            row("Lower music-over-gameplay clips by [N] dB (mute = 60 dB)", sv("music_lower_db"), ld("music_lower_db"), "yes" if d20 == [-20.0] and all(mutes) and mutes else "NO",
+                f"N = 20: game gain {d20} dB vs off; N = {M.MUSIC_MUTE_DB:g}: {sum(1 for m_ in mutes if m_)} of {len(mutes)} clips muted (true silence in the filter graph)")
             # ---------------------------------------------------------------- update on start
             seen = []
             ksr, kwh = subprocess.run, shutil.which
@@ -394,6 +407,228 @@ def datetime_ago(days):
 
 PARTS = {}
 
+# ------------------------------------------------------------------------------------------------ r) measured render: dB amount and mute
+def part_render(tmp):
+    import loud771
+    with section("r) measured render of a flagged clip: game audio 12 dB under the option-off render, mute below -60 dBFS, music bed unchanged"):
+        with PB.data_copy(M) as dst:
+            B = load_base("V7.7.0", dst, tmp)
+            rep_ = []
+            cands = [("cs2", r"E:\Movies\LEGACY\Counter-strike 2\Counter-strike 2 2025.02.11 - 20.13.01.05.DVR.mp4"), ("valorant", r"E:\Movies\VALORANT\Clips\Replay 2026-09-05 01-22-47.mov"),
+                     ("valorant", r"E:\Movies\VALORANT\Clips\Replay 2026-10-01 15-24-21.mov"), ("valorant", r"E:\Movies\VALORANT\Clips\Replay 2026-09-03 17-12-47.mov"),
+                     ("valorant", r"E:\Movies\LEGACY\Valorant\Valorant 2025.10.20 - 03.58.09.03.DVR.mp4")]
+            done = set()
+            for game, flagged in cands:
+                if game in done:
+                    continue
+                sets = PB.take_sets(M)
+                base_paths = sets["val7"][1] if game == "valorant" else sets["cs2trio"][1] + sets["cs2singles"][1][:6]
+                paths = [flagged] + [p for p in base_paths if p != flagged]
+                song = song_by("Silicon XX", M.song_pool(M.load_config())[0])
+                set_cfg(lower_music_clips=False)
+                p_off, _ = PB.run_plan(M, game, paths, song, "v2")
+                p_off_b, _ = PB.run_plan(B, game, paths, song, "v2")
+                check(jplan(p_off) == jplan(p_off_b), f"{game}: option off: plan identical to V7.7.0")
+                set_cfg(lower_music_clips=True, music_lower_db=12)
+                p_12, l12 = PB.run_plan(M, game, paths, song, "v2")
+                set_cfg(lower_music_clips=True, music_lower_db=M.MUSIC_MUTE_DB)
+                p_mu, lmu = PB.run_plan(M, game, paths, song, "v2")
+                set_cfg(lower_music_clips=False)
+                fl_take = next((i for i, t in enumerate(p_12["takes"]) if any(s["path"] == flagged for s in t["srcs"]) and any(s.get("music_db") for s in t["srcs"])), None)
+                if fl_take is None:
+                    print(f"   {game}: {Path(flagged).name} not placed in the plan or not lowered, trying the next flagged clip")
+                    continue
+                done.add(game)
+                check(True, f"{game}: the real flagged clip {Path(flagged).name} is lowered in the plan")
+                cfg = M.load_config()
+                m_off = loud771.measure(p_off, cfg)
+                m_12 = loud771.measure(p_12, cfg)
+                m_mu = loud771.measure(p_mu, cfg)
+                same = [i for i, t in enumerate(p_off["takes"]) if t["path"] == p_12["takes"][fl_take]["path"]]
+                i_off = same[0] if same else None
+                a, b, c = m_off["takes"][i_off], m_12["takes"][fl_take], m_mu["takes"][fl_take]
+                d12 = b["game_rms"] - a["game_rms"]
+                print(f"   {game}: flagged take {fl_take + 1} ({Path(flagged).name[:40]}): game rms off {a['game_rms']} dBFS, 12 dB {b['game_rms']} ({d12:+.1f}), mute {c['game_rms']}; music bed LUFS off {a['music_lufs']} / 12 dB {b['music_lufs']} / mute {c['music_lufs']}")
+                check(abs(d12 + 12.0) <= 1.0, f"{game}: at 12 dB the clip's game audio measures {d12:+.1f} dB against the option-off render of the same take (12 +-1)")
+                check(c["game_rms"] < -60.0, f"{game}: at mute the take's game audio measures {c['game_rms']} dBFS (< -60)")
+                check(abs(b["music_rms"] - a["music_rms"]) < 0.2 and abs(c["music_rms"] - a["music_rms"]) < 0.2, f"{game}: the music bed is unchanged ({a['music_rms']} / {b['music_rms']} / {c['music_rms']} dBFS)")
+                others = [abs(m_12["takes"][j]["game_rms"] - m_off["takes"][j]["game_rms"]) for j in range(len(p_12["takes"])) if not any(s.get("music_db") for s in p_12["takes"][j]["srcs"]) and p_12["takes"][j]["path"] == p_off["takes"][j]["path"]]
+                check(all(x < 0.5 for x in others), f"{game}: the takes of other fight groups keep their level ({len(others)} compared)")
+            check(done == {"cs2", "valorant"}, f"a flagged real clip was measured for both games ({sorted(done)})")
+
+
+PARTS["r"] = part_render
+
+# ------------------------------------------------------------------------------------------------ g) guards
+def part_guards(tmp):
+    import random
+    import test_v73 as T73
+    import test_v761 as T761
+    with section("g) guards vs V7.7.0 (defaults, music option off): events, kills, takes, cut lists, drops of 50 + 50 generated clips; the 7 real Valorant clips; the 4K"):
+        with PB.data_copy(M) as dst:
+            B = load_base("V7.7.0", dst, tmp)
+            set_cfg(lower_music_clips=False)
+            for game in ("valorant", "cs2"):
+                files = T73.make_files(tmp / f"g50_{game}", 50, "VALORANT" if game == "valorant" else "Replay")
+                rnd = random.Random(7 if game == "valorant" else 8)
+                kills = []
+                for _ in files:
+                    n = rnd.choice([1, 1, 2, 2, 3, 3, 4, 5])
+                    t, ks = rnd.uniform(3.0, 5.0), []
+                    for _k in range(n):
+                        ks.append(round(t, 2))
+                        t += rnd.uniform(0.7, 2.6)
+                    kills.append(ks)
+                its_m, its_b = T73.build_pool(M, game, files, kills, seed=21), T73.build_pool(B, game, files, kills, seed=21)
+                ev_m, _ = T73.events_of(M, game, its_m)
+                ev_b, _ = T73.events_of(B, game, its_b)
+                check(len(ev_m) > 40 and T73.ev_view(ev_m) == T73.ev_view(ev_b), f"{game}: {len(ev_m)} events of the 50 clips identical to V7.7.0 (clips, kills, scores)")
+                for bpm, drop_s, seed in ((128.0, 64.0, 5), (150.0, 40.0, 12)):
+                    an_m, an_b = T73.song_map(M, bpm, 300.0, drop_s), T73.song_map(B, bpm, 300.0, drop_s)
+                    p_new = T73.plan_of(M, game, ev_m, an_m, seed)
+                    p_b = T73.plan_of(B, game, ev_b, an_b, seed)
+                    ks_n, ks_b = T761.kill_set(p_new), T761.kill_set(p_b)
+                    same = json.dumps(p_new, sort_keys=True, default=str) == json.dumps(p_b, sort_keys=True, default=str)
+                    check(ks_n == ks_b and len(p_new["takes"]) == len(p_b["takes"]), f"{game} bpm {bpm:.0f}: kill counts ({len(ks_n)}), takes ({len(p_new['takes'])}) identical to V7.7.0")
+                    check([t["segs"] for t in p_new["takes"]] == [t["segs"] for t in p_b["takes"]] and p_new.get("drop_sync") == p_b.get("drop_sync"), f"{game} bpm {bpm:.0f}: cut lists and drops identical to V7.7.0")
+                    check(same, f"{game} bpm {bpm:.0f}: the whole plan is identical to V7.7.0")
+                    check(not M.verify_cutlist(p_new), f"{game} bpm {bpm:.0f}: cut list valid")
+            game, paths = PB.take_sets(M)["val7"]
+            song = song_by("Silicon XX", M.song_pool(M.load_config())[0])
+            M.HEADLINE_RULES_V73 = True
+            plan_off, l_off = PB.run_plan(M, game, paths, song, "v2")
+            plan_b, _lb = PB.run_plan(B, game, paths, song, "v2")
+            led = next(l for l in l_off if l.startswith("kill ledger:"))
+            check(len(plan_off["takes"]) == 4 and "11 placed" in led and "3 merged" in led and "0 lost" in led, f"7 real Valorant clips, override off: 4 events; '{led[:100]}'")
+            check(jplan(plan_off) == jplan(plan_b), "7 real Valorant clips: the whole plan is identical to V7.7.0")
+            ov = next(p for p in paths if "03-31-20" in str(p))
+            M.set_clip_override([str(ov)], True)
+            try:
+                plan_on, l_on = PB.run_plan(M, game, paths, song, "v2")
+            finally:
+                M.set_clip_override([str(ov)], False)
+            led2 = next(l for l in l_on if l.startswith("kill ledger:"))
+            four = [t for t in plan_on["takes"] if t["n"] == 4]
+            check("12 placed" in led2 and "3 merged" in led2 and "0 lost" in led2 and len(four) == 1 and four[0].get("util"), f"4K with 4 kills (override on): '{led2[:100]}'")
+            check(not M.verify_cutlist(plan_off) and not M.verify_cutlist(plan_on), "both plans: cut list valid")
+
+
+PARTS["g"] = part_guards
+
+# ------------------------------------------------------------------------------------------------ 3) music over gameplay
+def part_music(tmp):
+    import test_v73 as T73
+    import test_v760 as T760
+    from test_v770 import synth_audio
+    with section("3) music over gameplay: detector, one verdict per fight group, dB option, real mute, logs"):
+        with PB.data_copy(M) as dst:
+            if True:
+                res = {}
+                for kind in ("song", "song_only", "guns", "ambience", "drone", "sting"):
+                    f = synth_audio(tmp / f"m_{kind}.wav", kind)
+                    res[kind] = M.music_over_gameplay({"path": f, "audio": True}, {"stream": 0, "n": 1})
+                    print(f"   {kind:10} -> {res[kind]['yes']}  score {res[kind]['score']:.2f}  ({res[kind]['why']})")
+                check(res["song"]["yes"] and res["song_only"]["yes"], "a song with gunshots over it, and a song alone: flagged")
+                check(not res["guns"]["yes"], "gunshots only: not flagged")
+                check(not res["ambience"]["yes"], "in-game ambience (wind noise, a 55 Hz hum, gunshots): not flagged")
+                check(not res["drone"]["yes"], "one held chord for 14 s (a drone, a beep): not flagged")
+                check(not res["sting"]["yes"], "a 2 s music sting: not flagged")
+                f = tmp / "m_song.wav"
+                r_ = M.music_over_gameplay({"path": str(f), "audio": True}, {"stream": 1, "n": 4, "note": "track 2 of 4 (set in Settings)"})
+                check(not r_["yes"] and "not analysed" in r_["why"], f"'track 2 of 4' is never analysed or flagged: {r_['why']}")
+                check(M.music_over_gameplay({"path": str(f), "audio": True}, {"stream": 0, "all": [-20.0, -25.0]})["yes"], "track 1 of a 2-track clip (the mix) is analysed")
+                sil = tmp / "silent.wav"
+                import wave
+                with wave.open(str(sil), "wb") as w_:
+                    w_.setnchannels(1)
+                    w_.setsampwidth(2)
+                    w_.setframerate(22050)
+                    w_.writeframes(b"\0\0" * 22050 * 10)
+                rs = M.music_over_gameplay({"path": str(sil), "audio": True}, {"stream": 0, "n": 1})
+                check(not rs["yes"] and "silent track" in rs["why"], f"a clip whose only track is digital silence is reported as silent, not 'unreadable': {rs['why']}")
+                # ---- group verdict + amount + mute + logs on a real planner run
+                M.OUTRO_TRIM_ON[0] = True
+                ev = T760.pool(tmp, "valorant", n=12, seed=17)
+                an = T760.drops_map(2)
+                real_cfg, real_res, real_mog = M.load_config, M.resolve_clip_audio, M.music_over_gameplay
+                for e_ in ev:
+                    e_["rec"] = dict(e_["rec"], audio=True)
+                    for pt in e_.get("parts") or []:
+                        pt["rec"] = dict(pt["rec"], audio=True)
+                sib = {"path": str(tmp / "sibling.mov"), "audio": True, "w": 1920, "h": 1080, "dur": 10.0}
+                ev[0]["group"] = [ev[0]["rec"], sib]                      # the first event's fight group holds a sibling file that is NOT in the plan
+                first = ev[0]["rec"]["path"]
+                scores = {first: (False, 0.27), sib["path"]: (True, 0.73)}
+
+                def run(on, amount=12.0):
+                    M.load_config = lambda: dict(real_cfg(), lower_music_clips=on, music_lower_db=amount)
+                    M.resolve_clip_audio = lambda rec, cfg, game, state: {"stream": 0, "lufs": -20.0, "note": "test", "n": 1}
+                    M.music_over_gameplay = lambda rec, au: {"yes": scores.get(rec["path"], (False, 0.1))[0], "score": scores.get(rec["path"], (False, 0.1))[1], "why": "test"}
+                    try:
+                        return T73.plan_of(M, "valorant", ev, an, 5, style="hype")
+                    finally:
+                        M.load_config, M.resolve_clip_audio, M.music_over_gameplay = real_cfg, real_res, real_mog
+                p_off, p_12, p_6, p_mute = run(False), run(True, 12.0), run(True, 6.0), run(True, 60.0)
+                g_off, g_12 = gains(p_off), gains(p_12)
+                low = [k for k in g_off if k in g_12 and g_12[k]["gain_db"] != g_off[k]["gain_db"]]
+                check(low == [first], f"the verdict of the group (highest score 0.73, a sibling file) lowers the clip of the plan, nothing else changes ({[Path(k).name for k in low]})")
+                check(round(g_12[first]["gain_db"] - g_off[first]["gain_db"], 2) == -12.0 and g_12[first].get("music_db") == -12.0, "N = 12 dB: game gain exactly 12 dB under the option-off plan (after the lift)")
+                check(round(gains(p_6)[first]["gain_db"] - g_off[first]["gain_db"], 2) == -6.0, "N = 6 dB: exactly 6 dB under")
+                gm = gains(p_mute)[first]
+                check(gm.get("mute") is True and gm["gain_db"] == g_off[first]["gain_db"], "N = mute value (60 dB): the clip is flagged mute")
+                check(all(not s.get("mute") for k, s in gains(p_mute).items() if k != first), "mute never touches other clips")
+                strip = lambda p: json.dumps({k: v for k, v in p.items() if k != "notes"}, sort_keys=True, default=str)
+                a_, b_ = copy.deepcopy(p_off), copy.deepcopy(p_12)
+                for t_ in b_["takes"]:
+                    for s_ in t_["srcs"]:
+                        if s_.pop("music_db", None):
+                            s_["gain_db"] = round(s_["gain_db"] + 12.0, 2)
+                check(strip(a_) == strip(b_), "everything else in the plan (cut list, timing, effects) is identical with the option on")
+                lines = [n for n in p_12["notes"] if n.startswith("music over gameplay:")]
+                check(len(lines) == 12 and sum(": yes (" in l for l in lines) == 1 and any("-12 dB" in l for l in lines), f"one log line per clip group ({len(lines)}): '{[l for l in lines if ': yes (' in l][0][-90:]}'")
+                check(any(l.endswith("-> mute") for l in p_mute["notes"] if l.startswith("music over gameplay:")), "mute: the log line says mute")
+                check(not any("music over gameplay" in n for n in p_off["notes"]) and not any("music_db" in s_ or "mute" in s_ for t_ in p_off["takes"] for s_ in t_["srcs"]), "option OFF: no music line, no extra field")
+                # the filter graph: OFF identical to V7.7.0, mute = silence
+                B = load_base("V7.7.0", dst, tmp)
+                cfg0 = real_cfg()
+                in_n, gr_n = M.build_filter(p_off, cfg0, True)
+                in_b, gr_b = B.build_filter(json.loads(json.dumps(p_off, default=str)), cfg0, True)
+                check(gr_n == gr_b and in_n == in_b, "option OFF: the filter graph of the same plan is byte-identical to V7.7.0")
+                in_m, gr_m = M.build_filter(p_mute, cfg0, True)
+                check(gr_m != gr_n and gr_m.count("anullsrc") > gr_n.count("anullsrc"), "mute: the muted clip's audio is anullsrc (true silence) in the filter graph")
+                # ---- the detector over every cached clip with sound
+                (_o, _l) = quiet(M.cmd_musicscan, None)
+                txt = (ROOT / "musicscan.txt").read_text(encoding="utf-8")
+                m_ = re.search(r"old detector \(V7.7.0\): (\d+) flagged \(([\d.]+) %\)\s+new detector, one verdict per fight group: (\d+) flagged \(([\d.]+) %\)", txt)
+                tot = int(re.search(r"(\d+) clips with sound analysed", txt).group(1))
+                old_n, new_n = int(m_.group(1)), int(m_.group(3))
+                print(f"   {tot} clips with sound: old {old_n} flagged ({m_.group(2)} %), new {new_n} ({m_.group(4)} %)")
+                check(new_n > 2 * old_n and new_n >= old_n, f"far more clips found: {old_n} -> {new_n} of {tot}")
+                for nm in ("2025.02.11 - 20.13.01.05", "2025.08.17 - 01.35.33.08"):
+                    ln = next((l for l in txt.splitlines() if nm in l and "group" in l), "")
+                    check("group YES" in ln, f"known gap clip flagged: {nm}: {ln.strip()[:120]}")
+                for nm in ("Replay 2026-09-11 17-36-12", "Replay 2026-09-17 15-45-39", "Replay 2026-09-21 04-26-30", "Replay 2026-09-11 15-17-36"):
+                    ln = next((l for l in txt.splitlines() if nm in l), "")
+                    check("silent track" in ln, f"legacy Replay clip with an all-silent track is reported as silent (nothing to analyse): {nm}")
+                grp_line = lambda n: next((l for l in txt.splitlines() if n in l and "| old" in l), "")
+
+                def group_of(name):
+                    cur = None
+                    for l in txt.splitlines():
+                        if l.startswith("-- "):
+                            cur = l
+                        elif name in l and "| old" in l:
+                            return cur
+                    return None
+                trio = ("2025.10.30 - 00.42.03.08", "2025.10.30 - 00.42.12.09", "2025.10.30 - 00.42.24.10")
+                check(len({group_of(n) for n in trio}) == 1 and all("group YES" in grp_line(n) for n in trio), "Valorant 2025.10.30 00.42.03 / 12 / 24: one fight group, all three files carry the verdict of the highest score (0.73 -> yes)")
+                cs = ("2025.02.03 - 08.52.26.19", "2025.02.03 - 08.52.30.20")
+                check(len({group_of(n) for n in cs}) == 1 and len({("group YES" in grp_line(n)) for n in cs}) == 1, "CS2 2025.02.03 08.52.26 + 08.52.30 (linked by the existing save-time rule): one group, one verdict")
+                check(group_of("2025.02.03 - 08.52.18.18") != group_of(cs[0]), "CS2 08.52.18 is NOT linked to 08.52.26 by the existing rule (shared victim names, kill times disagree by more than 3 s = a different round): it keeps its own verdict")
+
+
+PARTS["3"] = part_music
+
 # ------------------------------------------------------------------------------------------------ 2) songmap: low-confidence option
 LOWCONF = ["Paparazzi (Dubstep) - Sped Up", "too much (hardtekk)", "prety - Riversmelt", "Congratulations - Post Malone"]
 NORMAL = ["Vertigo - Flerian", "Silicon XX"]
@@ -433,41 +668,144 @@ def is_low(nm):
     return any(k in nm for k in ("Paparazzi", "too much", "prety", "Congratulations"))
 
 
-def map_used(m):
-    v2 = m.get("v2") or {}
-    return "V1 values" if (v2.get("fallback") or m.get("beat_source") == "v1") else "V2 grid"
+class Spy:
+    """What the planner really consumed: wraps get_songmap and records the object it returned to the planner, plus every log line of the plan."""
+    def __init__(self):
+        self.maps, self.lines = [], []
+
+    def __enter__(self):
+        self.k = (M.get_songmap, M.out, M.LOGONLY)
+        orig = M.get_songmap
+
+        def spy(path, csv_bpm=None, version=None):
+            m = orig(path, csv_bpm, version)
+            self.maps.append(m)
+            return m
+        M.get_songmap = spy
+        M.out = M.LOGONLY = lambda *x: self.lines.append(" ".join(map(str, x)))
+        return self
+
+    def __exit__(self, *a):
+        M.get_songmap, M.out, M.LOGONLY = self.k
+
+
+def beats_match(plan, beats):
+    """Share of the plan's own beat times (song time = beats_out + start_t) that sit within 5 ms of a beat of the given grid."""
+    b = np.asarray(beats, float)
+    t = np.asarray(plan["beats_out"], float) + float(plan["song"]["start_t"])
+    if not len(t) or not len(b):
+        return 0.0
+    return float(np.mean([np.min(np.abs(b - x)) < 0.005 for x in t]))
 
 
 def part_songmap(tmp):
-    with section("2) SongMap mode dropdown: 'V2 + V1 Fallback' (= V7.7.0 byte for byte) and 'V2' (every song on its V2 map)"):
+    with section("2) SongMap mode: 'V2' (default, every song on its V2 map) and 'V2 + V1 Fallback' (= V7.7.0 byte for byte); proof from the real plan"):
         with PB.data_copy(M) as dst:
             B = load_base("V7.7.0", dst, tmp)
             cfg = set_cfg(lower_music_clips=False)
             cfg.pop("songmap_mode", None)
             M.save_json(M.CONFIG_PATH, cfg)
-            check(M.songmap_mode(cfg) == "v2_fallback" and list(M.SONGMAP_MODES.values()) == ["V2 + V1 Fallback", "V2"], "default mode is 'V2 + V1 Fallback'; the dropdown offers exactly two entries")
+            check(M.songmap_mode(M.load_config()) == "v2", "config without the key: SongMap mode is 'V2'")
+            check(M.songmap_mode({"songmap_mode": "nonsense"}) == "v2" and M.songmap_mode({"songmap_mode": ""}) == "v2", "an unknown or empty value reads as 'V2'")
+            check(list(M.SONGMAP_MODES.values()) == ["V2", "V2 + V1 Fallback"], "the dropdown has exactly two entries, V2 first")
+            src = (ROOT / "montage.py").read_text(encoding="utf-8")
+            check("songmap_low_conf_v1" not in src and "lowconf" not in src, "the old low-confidence checkbox / config key is gone from the code")
             pool = M.song_pool(M.load_config())[0]
             game_v, val7 = PB.take_sets(M)["val7"]
             songs = [song_by(n, pool) for n in LOWCONF + NORMAL]
+            report = []
             for sp_ in songs:
                 nm = Path(sp_).name
                 set_cfg(songmap_mode="v2_fallback")
-                p_fb, l_fb = PB.run_plan(M, game_v, val7, sp_, "v2")
+                with Spy() as sy_fb:
+                    p_fb, sy_fb.lines = PB.run_plan(M, game_v, val7, sp_, "v2")
                 p_old, _ = PB.run_plan(B, game_v, val7, sp_, "v2")
-                m_fb, _ = quiet(M.get_songmap, sp_, None, "v2")
                 set_cfg(songmap_mode="v2")
-                p_v2, l_v2 = PB.run_plan(M, game_v, val7, sp_, "v2")
-                m_v2, _ = quiet(M.get_songmap, sp_, None, "v2")
+                with Spy() as sy_v2:
+                    p_v2, sy_v2.lines = PB.run_plan(M, game_v, val7, sp_, "v2")
                 set_cfg(songmap_mode="v2_fallback")
-                check(jplan(p_fb) == jplan(p_old), f"{nm[:40]}: mode 'V2 + V1 Fallback' plan byte-identical to V7.7.0")
-                check(map_used(m_v2) == "V2 grid", f"{nm[:40]}: mode 'V2' uses the V2 map (fallback mode used: {map_used(m_fb)}, grid confidence {(m_v2.get('v2') or {}).get('grid_confidence')})")
+                m_fb, m_v2 = sy_fb.maps[-1], sy_v2.maps[-1]
+                l_v2 = [l for l in sy_v2.lines if l.startswith("songmap") and nm in l]
+                l_fb = [l for l in sy_fb.lines if l.startswith("songmap") and nm in l]
+                bm = beats_match(p_v2, m_v2["beats"])
+                src_v2 = "V2" if bm > 0.95 and m_v2.get("beat_source") != "v1" and not (m_v2.get("v2") or {}).get("fallback") else "V1"
+                src_fb = "V1" if (m_fb.get("v2") or {}).get("fallback") else "V2"
+                report.append((nm[:34], (m_v2.get("v2") or {}).get("grid_confidence"), src_fb, src_v2, round(bm, 2), (l_v2 or ["-"])[0][len("songmap: " + nm) + 2:][:110]))
+                check(jplan(p_fb) == jplan(p_old), f"{nm[:36]}: mode 'V2 + V1 Fallback' plan byte-identical to V7.7.0")
+                check(src_v2 == "V2" and bool(l_v2) and "map used V2" in l_v2[0] and "mode V2" in l_v2[0], f"{nm[:36]}: mode 'V2': planner used V2 (plan beat times on the V2 grid: {bm:.2f}); log: {(l_v2 or ['-'])[0][:150]}")
+                check(not any("V1 beat values" in l for l in sy_v2.lines), f"{nm[:36]}: mode 'V2': no 'V1 beat values' line anywhere in the plan log")
                 if is_low(nm):
-                    check(map_used(m_fb) == "V1 values", f"{nm[:40]}: the fallback mode really used V1 values here")
-                    check(jplan(p_fb) != jplan(p_v2) or m_fb["beats"] == m_v2["beats"], f"{nm[:40]}: mode 'V2' gives its own plan / beats")
+                    check(src_fb == "V1" and bool(l_fb) and "V1" in l_fb[0], f"{nm[:36]}: mode 'V2 + V1 Fallback' used V1 values (as V7.7.0); log: {(l_fb or ['-'])[0][:120]}")
+                    check(jplan(p_fb) != jplan(p_v2), f"{nm[:36]}: the two modes give different plans for a low-confidence song")
                 else:
-                    check(jplan(p_fb) == jplan(p_v2), f"{nm[:40]}: normal V2 song: both modes give the same plan")
-                check(any(l.startswith("songmap:") and nm in l for l in l_v2), "the plan log names the map used")
-                check(not M.verify_cutlist(p_v2), f"{nm[:40]}: mode 'V2' plan cut list valid")
+                    check(jplan(p_fb) == jplan(p_v2), f"{nm[:36]}: normal V2 song: both modes give identical plans")
+                check(not M.verify_cutlist(p_v2), f"{nm[:36]}: mode 'V2' plan cut list valid")
+            print("\n   song | V2 grid confidence | map in fallback mode | map in mode V2 (from the plan) | plan beats on the V2 grid | plan log line")
+            for r_ in report:
+                print("   " + " | ".join(str(x) for x in r_))
+            # ---- negative tests: every V1 switch, mode V2 refuses it
+            import songmap_v2
+            import songmap_v2.build as SB  # noqa: F401
+            sp_low = song_by(LOWCONF[0], pool)
+            real_v1, real_build = M.analyse_song, songmap_v2.build_songmap_v2
+
+            def no_v1(*a, **k):
+                raise AssertionError("a V1 map was requested in mode V2")
+            cache_path = M.DATA / songmap_v2.CACHE_NAME
+            shutil.copy(cache_path, tmp / "cache_bak.json")
+            try:
+                M.analyse_song = no_v1
+                for ver in ("v1", "v2auto", "v2"):
+                    set_cfg(songmap_mode="v2", songmap_version=ver)
+                    m_, _l = quiet(M.get_songmap, sp_low, None)
+                    check(not (m_.get("v2") or {}).get("fallback") and m_.get("beat_source") != "v1",
+                          f"switch 'songmap_version={ver}' in the config + the safety rules (low confidence, no kick window, too few kicks, worse than V1): mode V2 returns the V2 map, V1 never requested")
+                fresh = next(x["path"] for x in pool if "Atlantis" in Path(x["path"]).name)
+                c2 = M.load_json(cache_path, {})
+                sig = songmap_v2.build.file_signature(fresh)
+                M.save_json(cache_path, {k: v for k, v in c2.items() if sig not in k})
+                songmap_v2.build_songmap_v2 = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("forced failure"))
+                M.analyse_song = real_v1
+                set_cfg(songmap_mode="v2_fallback", songmap_version="v2")
+                m_fb2, _l = quiet(M.get_songmap, fresh, None, "v2")
+                check(m_fb2.get("songmap_version") == "v1-fallback", "switch 'V2 build error': mode 'V2 + V1 Fallback' substitutes the V1 map (V7.7.0 behaviour)")
+                M.analyse_song = no_v1
+                set_cfg(songmap_mode="v2")
+                try:
+                    quiet(M.get_songmap, fresh, None, "v2")
+                    check(False, "switch 'V2 build error': mode V2 refuses")
+                except M.SongMapError as ex:
+                    check(Path(fresh).name in str(ex), f"switch 'V2 build error': mode V2 raises a clear error naming the song: {str(ex)[:130]}")
+                c3 = M.load_json(cache_path, {})
+                c3[songmap_v2.cache_key(fresh, None, M._peek_v1_bpm(fresh, None))] = {"fallback_marker": "timeout (analysis cap)"}
+                M.save_json(cache_path, c3)
+                M.analyse_song = real_v1
+                set_cfg(songmap_mode="v2_fallback")
+                m_fb3, _l = quiet(M.get_songmap, fresh, None, "v2")
+                check(m_fb3.get("songmap_version") == "v1-fallback", "switch 'cached timeout marker': mode 'V2 + V1 Fallback' substitutes the V1 map")
+                M.analyse_song = no_v1
+                set_cfg(songmap_mode="v2")
+                try:
+                    quiet(M.get_songmap, fresh, None, "v2")
+                    check(False, "switch 'cached timeout marker': mode V2 refuses")
+                except M.SongMapError as ex:
+                    check(Path(fresh).name in str(ex), "switch 'cached timeout marker': mode V2 raises a clear error naming the song")
+                M.analyse_song = real_v1
+                songmap_v2.build_songmap_v2 = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("forced failure"))
+                _e, lg = quiet(lambda: _try(M.pick_song, M.load_config(), "valorant", [dict(x) for x in pool if x["path"] == fresh]))
+                check(any(Path(fresh).name in l and "skip" in l for l in lg), "mode V2 in the song picker: the song V2 cannot map is skipped with its name in the log, not replaced by V1")
+            finally:
+                songmap_v2.build_songmap_v2 = real_build
+                M.analyse_song = real_v1
+                shutil.copy(tmp / "cache_bak.json", cache_path)
+                set_cfg(songmap_mode="v2_fallback", songmap_version="v2")
+
+
+def _try(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as ex:                                  # noqa: BLE001
+        return ex
 
 
 PARTS["2"] = part_songmap
@@ -484,7 +822,7 @@ def main():
     want = lambda k: not only or k in only
     if want("1"):
         part_settings(tmp)
-    for key in ("2", "3", "g"):
+    for key in ("2", "3", "r", "g"):
         if want(key) and key in PARTS:
             PARTS[key](tmp)
     after = snapshot(REAL_DATA)
