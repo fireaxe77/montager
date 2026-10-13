@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V7.7.5"
+APP_VERSION = "V7.7.6"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2716,6 +2716,8 @@ def border_merge(tracks, cfg):
 
 CS2_STALE_S = 10.0               # V6.9.10: a kill row this early whose victim matches a pre-clip row of the clip is that same row read again (stale)
 CS2_STALE_ON = [True]            # test / impact-scan switch
+CS2_EARLY_S = 1.5                # V7.7.6: rows seen in the first this many seconds of a clip are "early rows" (stale-row matching, plan-time check)
+CS2_EARLY_LOOSE = 70             # V7.7.6: looser name match for the gunshot check of a kill that looks like an early row
 
 
 CS2_SAMETIME_ON = [True]
@@ -2769,6 +2771,7 @@ def border_analysis(sc, cfg, deaths=None):
     rows_t, blob_t = border_shape_filter(sc.get("tracks", []), n)
     kills, rej, vis, mine, det_rows, sus, others, merges = [], [], [], [], [], [], [], []
     pre_victims = []
+    early = []                       # V7.7.6: (time, victim, track id) of rows on screen in the first CS2_EARLY_S s that are not kills of this list (pre-clip rows, unshaped tracks)
     blobs_n = len(blob_t) + int(sc.get("blobs", 0))
     tok = hashlib.md5((sc.get("key") or "").encode()).hexdigest()[:4]       # an unreadable victim gets a name unique to this clip and row
     for t, c, ids in sorted(border_merge(rows_t, cfg), key=lambda x: x[0]["first"]):
@@ -2800,6 +2803,7 @@ def border_analysis(sc, cfg, deaths=None):
             rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(c["ks"], c["vs"]) / 100})
             if c["vtext"]:
                 pre_victims.append(c["vtext"])
+                early.append((tt, c["vtext"], t["id"], True))
         elif v == "kill":
             vis.append((tt, round(last + 0.3, 3)))
             kills.append({"t": tt, "ks": (c["ks"] / 100) if c["name_read"] else 0.6, "hs": bool(c["hs"]), "row": row, "hits": t["hits"],
@@ -2810,13 +2814,42 @@ def border_analysis(sc, cfg, deaths=None):
         else:
             vis.append((tt, round(last + 0.3, 3)))
             rej.append({"t": tt, "reason": c["why"], "ks": c["ks"] / 100})
-    if CS2_STALE_ON[0] and pre_victims:                      # V6.9.10: the row of a pre-clip kill read again a few seconds in (tracker lost it / re-found it) is not a new kill
-        keep_k = []
+    if CS2_STALE_ON[0]:                                      # V7.7.6: rows that came up in the first CS2_EARLY_S s but never became a shaped row (the tracker lost the outline) count as early rows too
+        for t in blob_t:
+            if t["first"] / fps <= CS2_EARLY_S:
+                try:
+                    c = cs2_classify_track(t, cfg)
+                except Exception:
+                    continue
+                if c["verdict"] != "none" and len(_alnum(c["vtext"] or "")) >= 4:
+                    early.append((round(t["first"] / fps + off, 3), c["vtext"], t["id"], False))
+    if CS2_STALE_ON[0] and early:                            # V6.9.10: the row of a pre-clip kill read again a few seconds in (tracker lost it / re-found it) is not a new kill
+        keep_k = []                                          # V7.7.6: ... also across feed positions: a row that was seen early and shifted up when the rows above it expired is the same row
         for k in kills:
-            if k["name_read"] and k["t"] <= CS2_STALE_S + off and any(cs2_same_victim(k["victim"], pv) for pv in pre_victims):
-                rej.append({"t": k["t"], "reason": f"CS2 stale feed row: already on screen at clip start ([{k['victim']}] matches a pre-clip row)", "ks": k["ks"]})
-            else:
-                keep_k.append(k)
+            vic = k["victim"]
+            real = len(_alnum(vic)) >= 4 and not vic.startswith("(unread")
+            why = None
+            for ef, ev_, eid, pre in early:
+                if pre and k["name_read"] and k["t"] <= CS2_STALE_S + off and cs2_same_victim(vic, ev_):
+                    why = f"already on screen at clip start ([{vic}] matches a pre-clip row)"
+                elif (not pre) and real and k.get("track") != eid and ef + 0.3 < k["t"] <= ef + CS2_STALE_S and cs2_same_victim(vic, ev_):
+                    why = f"the same row as one on screen at {ef:.1f} s ([{vic}] matches [{ev_}], shifted up in the feed)"
+                elif pre and real and k["t"] <= CS2_STALE_S + off and cs2_same_victim(vic, ev_):
+                    why = f"already on screen at clip start ([{vic}] matches a pre-clip row, shifted)"
+                if why:
+                    break
+            if why:
+                rej.append({"t": k["t"], "reason": "CS2 stale feed row: " + why, "ks": k["ks"]})
+                continue
+            if real:                                         # looser name match: only used with the gunshot check (verified_kills)
+                for ef, ev_, eid, pre in early:
+                    if k.get("track") != eid and ef < k["t"] <= ef + 2 * CS2_STALE_S and (cs2_same_victim(vic, ev_) or ocr_ratio(vic, ev_) >= CS2_EARLY_LOOSE):
+                        k["early_vic"] = True
+                        k["seen_first"] = ef
+                        if cs2_same_victim(vic, ev_):
+                            k["seen_strict"] = True
+                        break
+            keep_k.append(k)
         kills = keep_k
     if CS2_SAMETIME_ON[0]:
         kills = cs2_sametime_guard(kills, rej)
@@ -2879,7 +2912,9 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
 
 CS2_DATING_ON = [True]               # V7.5.1.1: ON (V7.5.1 shipped it OFF); test / scan switch
 CS2_GATE_S = [0.15]                # V7.5.1.2: the frames before a proposed first appearance (this many seconds, at least 3 frames) must show no row
-CS2_DATING_MAX_S = 2.0               # never more than this far before the cached time
+CS2_DATING_MAX_S = 4.0               # never more than this far before the cached time (V7.7.6: 2.0 -> 4.0, a late read can be 2+ s late)
+CS2_LATE_MIN_S = 0.7                # V7.7.6: a first appearance proven only by the looser slot test is used when the cached time was at least this late
+CS2_DATING_SOFT = 0.7                # V7.7.6: the same row also counts as still there at this correlation when its outline is in the slot
 CS2_DATING_MIN_MOVE = 0.1            # smaller moves are noise and are ignored
 CS2_DATING_MEMO = {}                 # (sidecar key, track id) -> first visible frame or None
 _DATING_LOGGED = set()
@@ -2887,7 +2922,7 @@ CS2_GATE_REJECT = -1                 # cs2_dating_walk / cs2_row_first_frame: a 
 
 
 def _dating_file():
-    return DATA / "cs2_dating_v6.json"
+    return DATA / "cs2_dating_v7.json"
 
 
 def _dating_memo_load():
@@ -2915,7 +2950,7 @@ def _dating_patch(g, rc):
     return g[rc["y0"] + 4:rc["y1"] - 3, rc["x0"] + 6:rc["x1"] - 6]
 
 
-def cs2_dating_walk(frames, rc, j1, fps, others=()):
+def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None):
     """Walk back from frame j1 over BGR frames (killfeed region): index of the first frame of the SAME row, or None (see cs2_row_first_frame for the rules).
     others = [(first, last, [(frame, y), ...])] of the OTHER tracked rows (window-relative frames): a match that sits where another tracked row stood is that row, not ours."""
     import cv2
@@ -2960,6 +2995,13 @@ def cs2_dating_walk(frames, rc, j1, fps, others=()):
         return False
     def pstd(j):
         return float(_dating_patch(gray[j], rc).std())
+    hrow = rc["y1"] - rc["y0"]
+    dms = {}
+
+    def outl(j, y):
+        if j not in dms:
+            dms[j] = border_dm(frames[j])[0]
+        return int(dms[j][max(0, y - 3):y + hrow + 4, xa:xb].sum())
     j, fade, gap = j1, 0, False
     while j - 1 >= 0 and ref >= 30:
         c, y_at = corr(j - 1)
@@ -2968,6 +3010,8 @@ def cs2_dating_walk(frames, rc, j1, fps, others=()):
             break
         if c >= 0.9:
             fade = 0
+        elif c >= CS2_DATING_SOFT and outl(j - 1, y_at) >= 0.5 * ref:
+            fade = 0                                           # V7.7.6: the row is still there, only the picture behind it changed (dark / bright scene, smoke): same row, same slot
         elif fade < int(0.5 * fps) and c >= 0.3 and cnt[j - 1] >= 0.3 * ref and pstd(j - 1) < 0.97 * pstd(j):
             fade += 1                                          # faint fade-in frame: fainter than the frame after it (a row that is just as sharp is another row), previous frame accepted
         else:
@@ -2983,12 +3027,17 @@ def cs2_dating_walk(frames, rc, j1, fps, others=()):
     ng = max(3, int(math.ceil(CS2_GATE_S[0] * fps - 1e-9)))          # V7.5.1.2 gate: the first appearance must be PROVEN by empty frames before it
     if j - ng < 0:
         return CS2_GATE_REJECT
-    yb0, yb1 = max(0, rc["y0"] - 40), min(dh, rc["y1"] + 40)
+    y_first = corr(j)[1]                                       # V7.7.6: the slot the row first appeared in (not the slot it ended in, not the rows next to it)
+    yb0, yb1 = max(0, y_first - 3), min(dh, y_first + hrow + 4)
     for q in range(j - ng, j):
         c, _y = corr(q)
         oc = int(border_dm(frames[q])[0][yb0:yb1, xa:xb].sum())
         if c >= 0.6 or oc >= 0.3 * ref:
             return CS2_GATE_REJECT                                     # the row (or an outline in its slot) is still there before the proposed time
+    if info is not None:
+        info["y"] = y_first
+        yb0s, yb1s = max(0, rc["y0"] - 40), min(dh, rc["y1"] + 40)                 # the V7.5.1.2 gate (rows next to the slot count too): did the row pass it?
+        info["strict"] = not any(corr(q)[0] >= 0.6 or int(border_dm(frames[q])[0][yb0s:yb1s, xa:xb].sum()) >= 0.3 * ref for q in range(j - ng, j))
     return j
 
 
@@ -3008,6 +3057,7 @@ def cs2_row_first_frame(rec, det, cfg, sc, tr):
     if key in CS2_DATING_MEMO:
         return CS2_DATING_MEMO[key]
     res = None
+    loose = False
     try:
         fs = max(0, f1 - int(round(CS2_DATING_MAX_S * fps)) - 1)
         n = f1 - fs + 8
@@ -3021,19 +3071,26 @@ def cs2_row_first_frame(rec, det, cfg, sc, tr):
         j1 = f1 - fs
         if len(frames) > j1 + 4:
             oth = [(t2["first"] - fs, t2["last"] - fs, [(sl[0] - fs, sl[1]) for sl in t2["slots"]]) for t2 in sc.get("tracks", []) if t2["id"] != tr["id"]]
-            j = cs2_dating_walk(frames, rc, j1, fps, oth)
+            winfo = {}
+            j = cs2_dating_walk(frames, rc, j1, fps, oth, winfo)
             if j == CS2_GATE_REJECT:
                 res = CS2_GATE_REJECT
             elif j is not None:
                 res = fs + j
+                loose = not winfo.get("strict", True)
+                y_res = winfo.get("y", y0)                     # V7.7.6: the slot the row first appeared in (the old test used the slot it ended in: a row sliding past there is not in OUR slot)
                 for t2 in sc.get("tracks", []):                # another tracked row that stood in this slot before: it was that row's outline, not ours
-                    if t2["id"] != tr["id"] and t2["first"] < f1 and any(abs(sl[1] - y0) <= 8 for sl in t2["slots"]) and t2["last"] >= res:
-                        res = max(res, t2["last"] + 1) if t2["last"] < f1 else f1
+                    if t2["id"] != tr["id"] and t2["first"] < f1 and t2["last"] >= res and t2["first"] <= res + 2:
+                        y2 = [sl[1] for sl in t2["slots"] if sl[0] <= res]
+                        y2 = y2[-1] if y2 else t2["slots"][0][1]
+                        if abs(y2 - y_res) <= 8:
+                            res = max(res, t2["last"] + 1) if t2["last"] < f1 else f1
                 if res >= f1:
                     res = None
     except Exception:
         res = None
     CS2_DATING_MEMO[key] = res
+    CS2_DATING_MEMO[(key[0], key[1] + "~loose")] = bool(loose and res is not None)
     _dating_memo_save()
     return res
 
@@ -3059,6 +3116,11 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
                 if kk not in _DATING_LOGGED:
                     _DATING_LOGGED.add(kk)
                     LOGONLY(f"CS2 kill time kept (no proven first appearance): {clip} {k['t']:.2f}")
+            elif f is not None and CS2_DATING_MEMO.get((str(sc.get("key", "")), str(tr["id"]) + "~loose")) and k["t"] - round(f / fps + off, 3) < CS2_LATE_MIN_S:
+                kk = (clip, round(k["t"], 2), "kept")          # V7.7.6: proven only by the looser slot test and a small move (the fade-in frames): the cached time stays (neither a move nor a failure)
+                if kk not in _DATING_LOGGED:
+                    _DATING_LOGGED.add(kk)
+                    LOGONLY(f"CS2 kill time kept (no proven first appearance): {clip} {k['t']:.2f}")
             elif f is not None:
                 nt = round(f / fps + off, 3)
                 lo = max(0.0, k["t"] - CS2_DATING_MAX_S, (prev + 0.3) if prev is not None else 0.0)
@@ -3080,6 +3142,8 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
                 if kk not in _DATING_LOGGED:
                     _DATING_LOGGED.add(kk)
                     LOGONLY(f"CS2 kill time moved earlier: {clip} {t:.2f} -> {k['t']:.2f}")
+                    if t - k["t"] > 0.7:
+                        LOGONLY(f"late read corrected: {t:.1f} s -> {k['t']:.1f} s ({clip}, row first on screen at {k['t']:.2f} s)")
     b["kills"].sort(key=lambda k: k["t"])
 
 
@@ -3118,6 +3182,9 @@ def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
             cs2_kill_times_earlier(rec, Detector("cs2"), cfg, sc, b, Path(rec.get("path", "")).name)
         except Exception:
             pass
+        for k in b["kills"]:                                 # V7.7.6: how long a row of this victim had been on screen before the (dated) kill time: the plan-time check compares it with the take start
+            if k.get("seen_strict"):
+                k["seen_lead"] = round(max(0.0, k["t"] - k["seen_first"]), 3)
     return b
 
 
@@ -3390,6 +3457,10 @@ def verified_kills(pool_items, cfg):
                 cand = [o for o in ons if k["t"] - 0.6 <= o[0] <= k["t"] + 0.05]
                 if cand:
                     shot = max(cand, key=lambda o: o[0])[0]
+            if shot is None and k.get("early_vic") and not no_shots and not any(k["t"] - 1.0 <= o[0] <= k["t"] + 0.05 for o in (ons or [])):    # V7.7.6: no shot within ~1 s before the row AND its victim is a row seen in the first 1.5 s: the same row, not a new kill
+                it["rej"].append({"t": k["t"], "reason": f"CS2 stale feed row: no gunshot heard and the victim [{k.get('victim')}] matches a row on screen at {k.get('seen_first', 0.0):.1f} s", "ks": k["ks"]})
+                st["stale"] = st.get("stale", 0) + 1
+                continue
             if shot is None:
                 st["no_shot"] += 1
                 if k.get("needs_shot") and not (no_shots and len(_alnum(k.get("victim"))) >= 3):      # V6.7: CS2 clip without any gunshot: nothing to confirm with
@@ -7130,6 +7201,9 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
                      "rec": s_["it"]["rec"]} for s_ in spans],
           "stitched": len(spans) > 1, "stitch_note": stitch_note.strip(), "lags": [0.0] * len(times),
           "vis": spans[0]["it"].get("vis", []) if len(spans) == 1 else main.get("vis", [])}
+    sl_ = [float(raw[i]["k"].get("seen_lead", 0.0)) for i in keep]
+    if any(x > 0.5 for x in sl_):                           # V7.7.6 (CS2 only): a row of this victim was already on screen this long before the kill time
+        ev["seen_lead"] = [round(x, 3) for x in sl_]
     ev["score_pre"] = base_score(ev)
     ev["verified"] = all(raw[i]["k"].get("name_read", True) for i in keep)       # V7.7.5: CS2 border kills carry name_read (my name was read on the row); every other kill counts as verified
     if any(raw[i]["k"].get("util") for i in keep):          # V7.3: a kill admitted by the per-clip utility override (OVERRIDE_ADMITTED)
@@ -9350,6 +9424,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           "death_after": ev.get("death_after"), "lag": ev.get("lag", 0.1), "level": int(lv[min(kb // 2, len(lv) - 1)]),
                           **({"tail": {"mode": "fit", "v0": round(float(tk["v0"]), 3), "ease": EASE_FR, "ex": int(tk["ex"])}} if tk.get("tailmode") == "fit" else {}),
                           **({"rx": dict(ev["_rx"])} if ev.get("_rx") else {}),
+                          **({"seen_lead": list(ev["seen_lead"])} if ev.get("seen_lead") else {}),
                           **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {}), **({"util": True} if ev.get("util") else {})})
     notes.extend(notes_music)
     a_mode = audio_state.get("mode") or cfg.get("audio_mode", "auto")
@@ -9416,6 +9491,9 @@ def kill_window_audit(t):
     for k, vic in zip(t["kills"], (t.get("victims") or []) + [""] * len(t["kills"])):
         if not any(sg[0] - 1e-3 <= k <= sg[1] + 1e-3 for sg in segs):
             msgs.append(f"the kill at {k:.2f}s ({vic or 'kill'}) is not inside the take's footage (the take shows {segs[0][0]:.2f}-{segs[-1][1]:.2f}s)")
+    for k, sl in zip(t["kills"], t.get("seen_lead") or []):          # V7.7.6 (CS2): a kill row must APPEAR inside the take: a row of this victim already on screen at the take start is a stale read
+        if sl > 0.5 and k - sl < segs[0][0] - 0.2:
+            msgs.append(f"no kill row appears inside the take: the row of the kill at {k:.2f}s was already on screen {sl:.1f} s before it, i.e. at {k - sl:.2f}s, before the take starts ({segs[0][0]:.2f}s)")
     if len(t["kills"]) != int(t.get("n", len(t["kills"]))):
         msgs.append(f"the take lists {len(t['kills'])} kills but its event has {t.get('n')} (a kill is missing from the take)")
     lead = t["kills"][0] - segs[0][0]
