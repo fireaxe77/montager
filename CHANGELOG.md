@@ -5,6 +5,12 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V8.0.2 (branch work-v802, merged to main, APP_VERSION = V8.0.2) - 2026-10-14
+- Half-read names on the killfeed (a name that slides in and is first read as only its first letters) no longer turn one R6S kill into two.
+- R6S clips saved up to 30 seconds apart can now join into one fight, also chains of three or more, and a later clip never continues a round you died in.
+- Every R6S kill of a joined fight is either in the montage or listed with the reason it was left out.
+- The two R6S kill icons are supported as an optional extra check; the killfeed text stays the main source.
+
 ## V8.0.1 (branch work-v801, merged to main, APP_VERSION = V8.0.1) - 2026-10-14
 - Rainbow Six Siege is the third game next to CS2 and Valorant: it has its own circle in the Manual list, its own row in Settings and its own output folder.
 - Your R6S clips are only read when you tick or pick them, never all at once.
