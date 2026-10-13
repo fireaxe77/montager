@@ -407,6 +407,20 @@ def datetime_ago(days):
 
 PARTS = {}
 
+# ------------------------------------------------------------------------------------------------ 0) version + changelogs
+def part_version(tmp):
+    with section("0) title-bar version V7.7.1, one entry on top of both changelogs, readable history rules"):
+        simple = (ROOT / "docs" / "CHANGELOG_SIMPLE.md").read_text(encoding="utf-8")
+        tech = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        hs, ht = re.findall(r"(?m)^## (.+)$", simple), re.findall(r"(?m)^## (.+)$", tech)
+        check(M.APP_VERSION == "V7.7.1" and hs[0].startswith("V7.7.1") and ht[0].startswith("V7.7.1"), "APP_VERSION V7.7.1 and the entry on top of both files")
+        blk = re.split(r"(?m)^## .+$", simple)[1]
+        pts = [x for x in blk.splitlines() if x.startswith("- ")]
+        check(1 <= len(pts) <= 4 and not re.search(r"KNOWN ISSUE|on hold|ABANDON", simple), f"readable entry: {len(pts)} plain points, no known-issue lines")
+        check(len(hs[0].split(":", 1)[1].split()) in range(3, 9), "one headline of 3 to 8 words: " + hs[0].split(":", 1)[1].strip())
+        check(sum(1 for h in hs if h.startswith("V7.7.1")) == 1 and sum(1 for h in ht if h.startswith("V7.7.1")) == 1, "one entry per version")
+
+
 # ------------------------------------------------------------------------------------------------ r) measured render: dB amount and mute
 def part_render(tmp):
     import loud771
@@ -820,6 +834,8 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="t771_"))
     only = set(filter(None, os.environ.get("V771_PARTS", "").split(",")))
     want = lambda k: not only or k in only
+    if want("0"):
+        part_version(tmp)
     if want("1"):
         part_settings(tmp)
     for key in ("2", "3", "r", "g"):
