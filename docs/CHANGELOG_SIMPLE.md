@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.0.4 - 2026-10-14: Scan all new clips button
+- New button in Settings (Killfeed region): "Scan all new clips (current region)" scans every clip that has not been scanned yet, for all games, with the killfeed region you have saved.
+- Clips that were already scanned are left alone, so the clip counts in Auto, Manual and Random pick update afterwards.
+
 ## V8.0.3 - 2026-10-14: R6S utility kills
 - Rainbow Six Siege gadget kills (drone, claymore, impact grenade and similar) are now recognised and left out of your montages, like utility kills in Valorant.
 - A per-clip switch (right-click a clip in the Manual list) lets you include the gadget kills of that clip.
