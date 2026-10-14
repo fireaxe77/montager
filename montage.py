@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.1.1"
+APP_VERSION = "V8.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -464,7 +464,50 @@ def r6s_want(cfg, paths):
         LOGONLY(f"R6S: could not mark clips for probing: {type(ex).__name__}: {ex}")
 
 
+_SCAN_MEMO = {}
+SCAN_MEMO_S = 120.0                  # V8.2: a folder scan is reused for this long while no clip folder changed (it was repeated 10+ times per session)
+
+
+def _scan_signature(cfg, roots):
+    """V8.2: what the folder scan result depends on: the settings + every directory under the clip roots with its modified time (no per-file stat) + the R6S probe set."""
+    try:
+        dirs = []
+        skip_out = norm(cfg["output_root"])
+        for root in roots:
+            stack = [root]
+            while stack:
+                d = stack.pop()
+                try:
+                    dirs.append((d, os.stat(d).st_mtime_ns))
+                    with os.scandir(d) as it:
+                        for e in it:
+                            if e.is_dir(follow_symlinks=False) and e.name.lower() not in SKIP_DIR_NAMES and not (norm(e.path) == skip_out or norm(e.path).startswith(skip_out + os.sep)):
+                                stack.append(e.path)
+                except OSError:
+                    continue
+        return json.dumps([cfg, sorted(dirs), sorted(R6S_PROBE), os.stat(CLIPS_CACHE).st_mtime_ns if os.path.exists(CLIPS_CACHE) else 0], sort_keys=True, default=str)
+    except Exception:
+        return None
+
+
 def scan_clips(cfg, rescan=False):
+    """Folder scan with a short memo (V8.2): the same result is returned while nothing it depends on changed (see _scan_signature); a rescan or any change runs the real scan."""
+    roots = clip_roots(cfg)
+    sig = None if rescan else _scan_signature(cfg, roots)
+    m = _SCAN_MEMO.get("m")
+    if sig and m and m[0] == sig and time.time() - m[1] < SCAN_MEMO_S:
+        LOGONLY(f"Scanning: unchanged since {time.time() - m[1]:.0f} s ago - {len(m[2])} clips reused")
+        return [dict(r) for r in m[2]]
+    res = _scan_clips_run(cfg, rescan)
+    if not rescan:
+        sig2 = _scan_signature(cfg, roots)             # taken after the scan (the scan itself writes the clips cache)
+        _SCAN_MEMO["m"] = (sig2, time.time(), [dict(r) for r in res]) if sig2 else None
+    else:
+        _SCAN_MEMO["m"] = None
+    return res
+
+
+def _scan_clips_run(cfg, rescan=False):
     roots = clip_roots(cfg)
     out(f"Scanning {'; '.join(roots) or '(no clip folder found - check Settings)'} ...")
     max_b = int(cfg.get("max_mb", 60)) * 1024 * 1024
@@ -7606,7 +7649,8 @@ def cmd_utilclip(args):
     """V6.9.7: python montage.py utilclip <name fragment | --list> [on|off]. --list prints the clips that are ON and how many utility rows each has (from the kill
     cache, no scan). With on / off it switches every Valorant clip whose file name contains the fragment; writes only clip_overrides.json."""
     cfg = load_config()
-    det = Detector("valorant")
+    g_ = (getattr(args, "game", None) or "valorant")
+    det = Detector(g_)
     store = load_kills_cache()
     clips = load_json(CLIPS_CACHE, {})
     recs = {}
@@ -7615,15 +7659,15 @@ def cmd_utilclip(args):
             p = key.rsplit("|", 2)[0]
         except ValueError:
             continue
-        if rec and not rec.get("error") and tag_game(p, cfg)[0] == "valorant":
-            recs[_pkey(p)] = dict(rec, path=p, game="valorant")
+        if rec and not rec.get("error") and tag_game(p, cfg)[0] == g_:
+            recs[_pkey(p)] = dict(rec, path=p, game=g_)
 
     def util_count(path):
         r = recs.get(_pkey(path))
-        e = store.get(kills_key(r, "valorant", det)) if r else None
+        e = store.get(kills_key(r, g_, det)) if r else None
         if not e or e.get("error"):
             return None
-        return len(utility_kill_rows(e, cfg, "valorant"))
+        return len(utility_kill_rows(e, cfg, g_))
 
     def show():
         ovs = load_clip_overrides()
@@ -7643,7 +7687,7 @@ def cmd_utilclip(args):
         raise SystemExit("utilclip: say on or off, e.g.  python montage.py utilclip 03-40 on   (or --list)")
     hits = sorted(p["path"] for p in recs.values() if t.lower() in Path(p["path"]).name.lower())
     if not hits:
-        raise SystemExit(f"utilclip: no Valorant clip in the clip cache has '{t}' in its name (scan the clips first; CS2 clips have no utility rows)")
+        raise SystemExit(f"utilclip: no {g_} clip in the clip cache has '{t}' in its name (scan the clips first; CS2 clips have no utility rows)")
     set_clip_override(hits, st == "on")
     for p in hits:
         n = util_count(p)
@@ -10222,6 +10266,18 @@ def music_group_verdict(recs, cfg, game, audio_state, cache):
     return res, True
 
 
+GAME_LEVEL_RANGE = (-20.0, 12.0)     # V8.2: Settings range (dB) of the per-game level under the music
+
+
+def game_level_db(cfg, game):
+    """V8.2: the per-game offset (dB) of the game audio under the music, on top of the automatic leveling. Missing / unreadable = 0 (exactly the old output)."""
+    try:
+        v = float(((cfg or {}).get("game_level_db") or {}).get(game, 0.0) or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        v = 0.0
+    return max(GAME_LEVEL_RANGE[0], min(GAME_LEVEL_RANGE[1], v))
+
+
 def _game_gain(cfg, song_lufs, clip_lufs):
     """V4 balance (game under the music), slightly louder than V4; quiet clips (CS2) lifted by up to +8 dB, never lowered."""
     gv = float(cfg.get("game_audio_level", 0.6))
@@ -10312,6 +10368,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             r = p["rec"]
             au = resolve_clip_audio(r, cfg, game, audio_state)
             gdb, lift = _game_gain(cfg, song_lufs, au["lufs"])
+            gdb = round(gdb + game_level_db(cfg, game), 2)                     # V8.2: per-game level (0 = unchanged)
             low = {}
             if mus and mus["yes"] and r.get("audio"):                          # V7.7.1: after the lift, so nothing undoes it; the whole clip, never part of it
                 amt = music_lower_db(cfg)
@@ -10765,7 +10822,35 @@ def soft_blend_expr():
     return f"A*(1-{wt})+B*{wt}"
 
 
-CS2_SMOOTH_SLOW = [True]             # V8.1.1: CS2 slow-mo pieces are motion-interpolated instead of frame-blended (normal-speed pieces untouched)
+CS2_SMOOTH_SLOW = [True]             # V8.1.1: slow-mo pieces are motion-interpolated instead of frame-blended (normal-speed pieces untouched); V8.2: every game, not only CS2
+_FPS60_CACHE = {}
+
+
+def src_is_60(path):
+    """V8.2: True when the clip's frames are nominally 60 fps (avg and effective rate within 0.15 of 60). Such a clip is retimed by FRAME NUMBER (jitter-free
+    timestamps, see _jf): the recorder's per-frame timestamp jitter (+-2 ms) no longer makes the fps filter duplicate / drop frames at a cut that lands near half a frame.
+    Other rates (30 / 120 / 144 / true VFR) keep the old timestamp retime. Never raises (False = old path)."""
+    k = str(path)
+    if k not in _FPS60_CACHE:
+        ok = False
+        try:
+            pf = probe_fps(path)
+            ok = bool(pf.get("avg") and abs(pf["avg"] - 60.0) <= 0.15 and abs((pf.get("eff") or pf["avg"]) - 60.0) <= 0.15 and not pf.get("vfr"))
+        except Exception:
+            ok = False
+        _FPS60_CACHE[k] = ok
+    return _FPS60_CACHE[k]
+
+
+def _jf(path, div=1.0):
+    """The setpts expression of a jitter-free retime: the first frame keeps its real timestamp, frame N sits N / 60 s later (divided by the speed). Empty when the clip is not
+    a 60 fps clip or JITTER_FREE is off: the caller then keeps its old expression."""
+    if not JITTER_FREE[0] or not src_is_60(path):
+        return ""
+    return f"(STARTPTS+N/(60*TB))/{div:.4f}" if abs(div - 1.0) > 1e-9 else "STARTPTS+N/(60*TB)"
+
+
+JITTER_FREE = [True]                 # V8.2: retime 60 fps clips by frame number (switch for the A/B proof)
 CS2_SLOW_INTERP = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=8"
 
 
@@ -10778,7 +10863,7 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
     takes = plan["takes"]
     exact = plan.get("placement", "v5") != "v4"
     vl = []
-    slow_ip = CS2_SLOW_INTERP if plan.get("game") == "cs2" and CS2_SMOOTH_SLOW[0] else "framerate=fps=60:scene=100"      # V8.1.1 (CS2 only): slowed pieces only
+    slow_ip = CS2_SLOW_INTERP if CS2_SMOOTH_SLOW[0] else "framerate=fps=60:scene=100"      # V8.1.1 (CS2) / V8.2 (all games): slowed pieces only
     soft = [False] + [bool("transition" in fx and takes[i].get("trans") == "soft" and soft_cut_ok(plan, i)[0]) for i in range(1, len(takes))] + [False]       # soft[i]: the cut INTO take i is a dissolve (V7.6.1)
     vparts = []                                                                         # video pieces in order when any cut is soft
     for ti, t in enumerate(takes):
@@ -10817,7 +10902,8 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
                 for x in g:
                     kn.append((x[0] - a0, tau, (x[3] / OUT_FPS) / max(1e-9, x[1] - x[0])))
                     tau += x[3] / OUT_FPS
-                T = "(PTS*TB)"
+                jf_ = _jf(src["path"])
+                T = f"(({jf_})*TB)" if jf_ else "(PTS*TB)"                      # V8.2: jitter-free source time for 60 fps clips
                 ex_ = f"{kn[-1][1]:.6f}+({T}-{kn[-1][0]:.6f})*{kn[-1][2]:.6f}"
                 for m_ in range(len(kn) - 2, -1, -1):
                     ex_ = f"if(lt({T},{kn[m_ + 1][0]:.6f}),{kn[m_][1]:.6f}+({T}-{kn[m_][0]:.6f})*{kn[m_][2]:.6f},{ex_})"
@@ -10867,9 +10953,10 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             if sp == 0.0:
                 v += f"trim=end_frame=1,setpts=PTS-STARTPTS,fps=60,tpad=stop_mode=clone:stop_duration={n / OUT_FPS + 0.1:.4f}"
             elif sp < 1:
-                v += f"setpts=(PTS-STARTPTS)/{sp:.4f},{slow_ip}"          # V4 slow-mo (blend only here; V8.1.1 CS2: motion interpolation)
+                v += f"setpts=(PTS-STARTPTS)/{sp:.4f},{slow_ip}"          # V4 slow-mo (blend only here; V8.1.1 CS2 / V8.2 all games: motion interpolation)
             elif exact:
-                v += f"setpts=PTS/{sp:.4f},fps=60:start_time=0"                            # real timestamps: frame-exact kills
+                jf_ = _jf(src["path"], sp)
+                v += (f"setpts={jf_},fps=60:start_time=0" if jf_ else f"setpts=PTS/{sp:.4f},fps=60:start_time=0")      # real timestamps: frame-exact kills; V8.2: 60 fps clips by frame number
             else:
                 v += f"setpts=(PTS-STARTPTS)/{sp:.4f},fps=60"                              # V4 timing
             v += f",tpad=stop_mode=clone:stop_duration=0.3,trim=end_frame={n},setpts=PTS-STARTPTS[s{k}v]"
@@ -10914,7 +11001,8 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             if hsp < 1:
                 hv += f"setpts=(PTS-STARTPTS)/{hsp:.4f},{slow_ip}"
             elif exact:
-                hv += f"setpts=PTS/{hsp:.4f},fps=60:start_time=0"
+                jf_ = _jf(hsrc["path"], hsp)
+                hv += f"setpts={jf_},fps=60:start_time=0" if jf_ else f"setpts=PTS/{hsp:.4f},fps=60:start_time=0"
             else:
                 hv += f"setpts=(PTS-STARTPTS)/{hsp:.4f},fps=60"
             hv += f",tpad=stop_mode=clone:stop_duration=0.3,trim=end_frame={hn},setpts=PTS-STARTPTS,format=yuv420p[h{ti}{hside}]"
@@ -12689,6 +12777,7 @@ def audio_guard(plan, outfile, cfg, redo):
             au = clip_audio_legacy({"path": sd["path"], "audio": sd["audio"]})
             sd["a_stream"], sd["a_note"], sd["lufs"] = au["stream"] or 0, au.get("note", ""), au["lufs"]
             sd["gain_db"], sd["lift_db"] = _game_gain(cfg, plan["song"].get("lufs"), au["lufs"])
+            sd["gain_db"] = round(sd["gain_db"] + game_level_db(cfg, plan.get("game")), 2)
             if sd.get("music_db") and not sd.get("mute"):
                 sd["gain_db"] = round(sd["gain_db"] + sd["music_db"], 2)
     plan["audio_mode"] = "legacy"
@@ -12727,6 +12816,18 @@ def plan_summary_text(plan, n_clips):
     return txt
 
 
+VIDEO_READY = [None]                 # V8.2: callback(path) set by the window: called the moment a montage mp4 is complete (before the checks)
+
+
+def video_ready(path):
+    cb = VIDEO_READY[0]
+    if cb:
+        try:
+            cb(Path(path))
+        except Exception as ex:                        # noqa: BLE001
+            LOGONLY(f"video-ready callback failed: {ex}")
+
+
 def run_job(game, mode="render", force=False, paths=None, song_path=None, target=None, style=None,
             seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True, pin=None):
     """mode: dry | preview | render. weekly=True is Auto. Always prints a plan or a plain-language reason.
@@ -12742,6 +12843,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
                 out(f"{game}: this week's montage already exists ({ex[0].name}). Use 'Force new' to make another.")
                 return None
         out(f"== {game} / {mode} ==")
+        T0_JOB = time.time()
         if pin and pin.get("plan") is not None and pin.get("ok") and paths is not None:
             plan, text = pin["plan"], pin["text"]          # V7.6.1: the summary was made from this very plan (same clips, song, style, length, seed, settings, everything scanned): it is rendered as it is
             LAST_PLAN[game] = plan
@@ -12761,6 +12863,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             out(f"Manual (this plan): {now_sum}")
             if pin and pin.get("summary") and pin["summary"] != now_sum:
                 out(f"NOTE: the summary shown at {pin.get('at', '?')} differs from this plan (inputs changed since: {pin['summary'][:160]} -> {now_sum[:160]})")
+        T_JOB = {"plan": time.time() - T0_JOB}
         out(f"PICK  song: {plan['pick']['title']}  style: {plan['pick']['style']}  (picked by {plan['pick']['by']})")
         plans = DATA / "plans"
         plans.mkdir(parents=True, exist_ok=True)
@@ -12777,16 +12880,14 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             return pv
         odir.mkdir(parents=True, exist_ok=True)
         outfile = Path(outfile) if outfile else odir / (montage_name(odir, plan, now) + ".mp4")
+        t_r0 = time.time()
         render_plan(plan, outfile, cfg, maxq, False, encoder, effects)
+        T_JOB["render"] = time.time() - t_r0
         try:
             if audio_guard(plan, outfile, cfg, lambda: render_plan(plan, outfile, cfg, maxq, False, encoder, effects)):
                 text = fmt_plan_audio(text, plan)
         except Exception as ex:
             out(f"Audio check skipped: {ex}")
-        try:
-            quality_check(plan, outfile, cfg)
-        except Exception as ex:
-            out(f"quality check skipped: {ex}")
         logs = outfile.parent / "logs"                     # only the video stays in the output folder
         logs.mkdir(parents=True, exist_ok=True)
         (logs / (outfile.stem + ".plan.txt")).write_text(text, encoding="utf-8")
@@ -12796,11 +12897,25 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             mark_used({t["path"] for t in plan["takes"]} | {x["path"] for t in plan["takes"] for x in t.get("srcs", [])}, title=outfile.stem)
         except Exception as ex:
             out(f"Used flags not saved: {ex}")
+        T_JOB["after render"] = time.time() - t_r0 - T_JOB["render"]
+        t_c0 = time.time()
+        video_ready(outfile)                               # V8.2: the mp4 is complete: Open video works now, the checks below run after it
+        out("video ready - running the quality / sync / transition checks")
+        try:
+            quality_check(plan, outfile, cfg)
+        except Exception as ex:
+            out(f"quality check skipped: {ex}")
         if cfg.get("sync_report", True):
             try:
                 sync_report(plan, outfile, cfg)
             except Exception as ex:
                 out(f"sync report skipped: {ex}")
+        T_JOB["checks"] = time.time() - t_c0
+        out("TIMING: " + " | ".join(f"{k} {v:.1f} s" for k, v in T_JOB.items()))
+        try:                                               # the checks add their numbers to the plan (ssim ...): saved again
+            save_json(logs / (outfile.stem + ".plan.json"), plan)
+        except Exception as ex:
+            LOGONLY(f"plan not re-saved: {ex}")
         return outfile
     except RuntimeError as ex:
         out(f"CANNOT {mode.upper()} ({game}): {ex}")
@@ -13877,6 +13992,7 @@ class App:
         self.root.minsize(920, 640)
         self._resizing, self._rs_after, self._last_size, self._save_after, self._loading = False, None, None, None, False
         self.q, self.busy, self.buttons, self._imgs, self.pending = queue.Queue(), False, [], [], []
+        VIDEO_READY[0] = self.set_video_async                  # V8.2: Open video is enabled the moment the mp4 is complete
         REGION_PROMPT[0] = self.region_prompt                        # V6.7.6: a Valorant "calibration changed" rescan asks first
         self.named = {}                   # button registry (smoketest checks every required button)
         self._busy_btn, self._result = None, None
@@ -14246,6 +14362,10 @@ class App:
             cfg["music_lower_db"] = max(0.0, min(MUSIC_MUTE_DB, float(self.set_music_db.get())))      # V7.7.1
         except ValueError:
             pass                                                   # half-typed number: keep the old value
+        try:                                                       # V8.2: per-game level under the music (dB, 0 = as before)
+            cfg["game_level_db"] = {g_: max(GAME_LEVEL_RANGE[0], min(GAME_LEVEL_RANGE[1], float(self.set_glv[g_].get()))) for g_ in GAMES}
+        except ValueError:
+            pass
         cfg["songmap_mode"] = next((k for k, lab in SONGMAP_MODES.items() if lab == self.set_smmode.get()), "v2")    # V7.7.1
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
         if self.set_names:
@@ -14504,6 +14624,10 @@ class App:
             os.startfile(str(p))
         else:
             out(f"(on Windows this opens) {p}")
+
+    def set_video_async(self, path):
+        """V8.2: called from the render thread the moment the mp4 is complete."""
+        self.q.put(("call", lambda: self.set_video(path)))
 
     def set_video(self, path):
         self.last_video = Path(path)
@@ -15339,9 +15463,12 @@ class App:
         """V6.1.5: the full Manual summary (clips that didn't fit, clips that can't form a take and why, song section, usable events) as
         normal log lines each time it changes; an identical summary is not written twice in a row."""
         full = head if not msg else f"{head}, {msg}"
-        if full == getattr(self, "_last_summary", None):
+        seen = self.__dict__.setdefault("_seen_summ", [])      # V8.2: not written again while it is one of the last few summaries (it was repeated identically)
+        if full == getattr(self, "_last_summary", None) or full in seen:
             return
         self._last_summary = full
+        seen.append(full)
+        del seen[:-6]
         parts = re.split(r"  \|  |; (?=\d+ can't form|fixed length)", msg) if msg else []
         out("Manual: " + head)
         for p_ in parts:
@@ -15865,7 +15992,11 @@ class App:
         self.save_status = tk.StringVar(value="All changes saved")
         self.save_label = ttk.Label(fi, textvariable=self.save_status, style="Dim.TLabel")
         self.save_label.pack(side="right", padx=(0, 12))
-        self.btn(fi, "Changelog", self.show_changelog, name="Changelog").pack(side="left")     # always visible, next to Save
+        self.btn(fi, "Changelog", self.show_changelog, name="Changelog").pack(side="left")
+        try:                                                           # V8.2: the changelog window never waits for a running task
+            self.buttons.remove(self.named["Changelog"])
+        except ValueError:
+            pass     # always visible, next to Save
         body = ttk.Frame(host)
         body.pack(side="top", fill="both", expand=True)
         self.set_canvas = cv = self.reg(tk.Canvas(body, bg=self.pal["bg"], highlightthickness=0, bd=0), "window")
@@ -16051,6 +16182,15 @@ class App:
         self.set_music_db = tk.StringVar(value=f"{music_lower_db(self.cfg):g}")
         ttk.Spinbox(h_, from_=0, to=MUSIC_MUTE_DB, increment=1, width=5, textvariable=self.set_music_db).pack(side="left", padx=(6, 6))
         ttk.Label(h_, text=f"dB (mute = {MUSIC_MUTE_DB:g} dB; off by default)").pack(side="left")
+        r[0] += 1
+        label("Game audio level")
+        h_ = holder()
+        self.set_glv = {}
+        for g_ in GAMES:
+            self.set_glv[g_] = tk.StringVar(value=f"{game_level_db(self.cfg, g_):g}")
+            ttk.Label(h_, text=GAME_DIR[g_]).pack(side="left")
+            ttk.Spinbox(h_, from_=GAME_LEVEL_RANGE[0], to=GAME_LEVEL_RANGE[1], increment=1, width=5, textvariable=self.set_glv[g_]).pack(side="left", padx=(4, 10))
+        ttk.Label(h_, text="dB under the music, on top of the automatic leveling (0 = as before)").pack(side="left")
         r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
@@ -18738,6 +18878,7 @@ def main():
     pu.add_argument("target", nargs="?", default="", help="part of the clip file name, or --list")
     pu.add_argument("state", nargs="?", default="", help="on | off")
     pu.add_argument("--list", action="store_true", help="the clips that are ON and how many utility rows each has")
+    pu.add_argument("--game", choices=("valorant", "r6s"), default="valorant", help="V8.2: valorant (default) or r6s")
     pu.set_defaults(fn=cmd_utilclip)
     dc = sp.add_parser("dropcheck", help="V7.3: the two layers behind a drop-sync complaint (song map, planner drop source) + a verdict; read-only, writes dropcheck.txt")
     dc.add_argument("target", nargs="?", help="a montage .mp4 (its saved plan) or a plan .json; default: the newest saved plan")

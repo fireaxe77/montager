@@ -2,6 +2,15 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.2 - 2026-10-15: Smoother cuts, utility kills filtered, faster rendering
+- R6S montages no longer show Razorbloom shell, grenade and Caustic gas kills
+- Smooth slow-motion now in Valorant and R6S too
+- Clips look smooth throughout, not just on the first kill
+- The Open video button works as soon as the video is finished
+- You can use the rest of the program while rendering
+- Faster rendering and scanning
+- New per-game audio level under the music
+
 ## V8.1.1 - 2026-10-15: CS2 cuts land on the real kills, smoother slow-mo
 - Takes no longer start on grenade rows or skip the first real kill
 - No more long empty stretches after the last kill
