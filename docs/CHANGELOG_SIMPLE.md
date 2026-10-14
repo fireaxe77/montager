@@ -2,6 +2,13 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.1 - 2026-10-14: CS2 kills now found by the red border
+- Every CS2 kill is now detected by the red border around your row in the killfeed
+- Misread names no longer create phantom kills or lose real ones
+- Multikills and almost-aces show all their kills
+- Assists are no longer counted as kills
+- Valorant and R6S unchanged
+
 ## V8.0.5 - 2026-10-14: Scan button uses the selected game
 - The "Scan all new clips (current region)" button now scans only the game you have selected in the killfeed region section.
 

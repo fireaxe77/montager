@@ -5,6 +5,13 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V8.1 (branch work-v81, merged to main, APP_VERSION = V8.1) - 2026-10-14
+- CS2 only: one physical killfeed row = one event. `_cs2_row_relation` (used by `border_merge` when `CS2_ROWID_ON`) joins tracker fragments of one red-outlined row across gaps of any length inside a row's life (`CS2_ROW_LIFE_S` 8.5 s; rows of mine measured 7.5-8.0 s): the later fragment must not sit lower than the row was (new rows enter at the bottom, rows only move up), and the victim reads must match (`_cs2_vic_match`) or be unread with the same outline width. Two tracks born in one place at one frame, or standing in one place at one time (`CS2_ROW_YTOL`, `CS2_ROW_WTOL` or same victim), are one row (also a copy that hops to the next row); a short stray copy not at the bottom of the feed (`CS2_ROW_SPUR_HITS`) is one row; another player's row never joins a row that names me.
+- CS2 only: `cs2_classify_track` - my name on the victim side (`cs2_victim_is_me`, whole word or CJK, not 'SkyFire') = a death, never a kill; a killer side that does not look like my name (`cs2_me_jumbled`: lenient match or vowel/look-alike folded word ratio >= 64 with an r or x) = another player's row, but only with >= `CS2_OTHER_READS` reads and no read that shows my name; clear reads decide first; the victim of a merged row is the one most clear reads agree on. `border_analysis`: an outlined row whose name never read must last `CS2_UNNAMED_MIN_S` (0.5 s) or reach the clip end.
+- CS2 only planner: the kills of one clip / fight group are one fight (`gap_g` = `FIGHT_GAP_LONG_CLIP`; a split dropped the second half, one event per clip), and `make_event` stitches clips of one fight group up to `pair_gap("cs2")` apart (the unsaved seconds are closed by the V6.9.9 gap closing) instead of `STITCH_GAP_S`.
+- Measured on all 527 cached CS2 clips (existing sidecars, no rebuild): 741 -> 704 kills, 41 clips changed, every change in the 21 ground-truth clips and the 18 others checked on the footage. Known, not tuned: 2025.01.06 23.13 (deathmatch) has a 4th kill below the killfeed region; the last kill of 2025.01.06 23.32.19 and 2026.02.12 19.24 is dated 0.5-1 s late (deep feed row).
+- Valorant and R6S pools + events byte-identical to V8.0.5 (`tests/test_v810.py` part g). New test file `tests/test_v810.py` (`V810_PARTS=0,1,2,3,4,r,g`).
+
 ## V8.0.5 (branch work-v805, merged to main, APP_VERSION = V8.0.5) - 2026-10-14
 - The "Scan all new clips (current region)" button now scans only the game you have selected in the killfeed region section.
 
