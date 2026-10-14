@@ -2,6 +2,9 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.0.5 - 2026-10-14: Scan button uses the selected game
+- The "Scan all new clips (current region)" button now scans only the game you have selected in the killfeed region section.
+
 ## V8.0.4 - 2026-10-14: Scan all new clips button
 - New button in Settings (Killfeed region): "Scan all new clips (current region)" scans every clip that has not been scanned yet, for all games, with the killfeed region you have saved.
 - Clips that were already scanned are left alone, so the clip counts in Auto, Manual and Random pick update afterwards.
