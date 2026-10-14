@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.0.4"
+APP_VERSION = "V8.0.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5042,26 +5042,27 @@ def new_clip_paths(cfg, game, recs=None, det=None, cache=None):
     return new, err
 
 
-def scan_all_new(cfg=None, games=None):
-    """V8.0.4 (Settings > Killfeed region > 'Scan all new clips (current region)'): per game, scan every clip that has no cache entry yet plus the clips whose entry holds an error,
-    with the CURRENT saved region and the normal scan path (run_scan: same log lines, same cancel, results into the normal cache). No cap. Already cached clips are left alone;
-    nothing new = 'No new clips to scan for <game>'. A game that fails logs one line and the next game goes on."""
+def scan_all_new(game, cfg=None):
+    """Settings > Killfeed region > 'Scan all new clips (current region)': scans ONE game - the game of the killfeed region being edited - never the others: every clip of that game's
+    scan folders that has no cache entry yet plus the clips whose entry holds an error, with the CURRENT saved region of that game and the normal scan path (run_scan: same log
+    lines, same cancel, results into the normal cache). No cap. Already cached clips are left alone; nothing new = 'No new clips to scan for <game>'."""
     cfg = cfg or load_config()
-    for g in (games or GAMES):
-        if CANCEL.is_set():
-            break
-        try:
-            new, err = new_clip_paths(cfg, g)
-            if not new and not err:
-                out(f"No new clips to scan for {g}")
-                continue
-            out(f"{g}: {len(new)} never scanned + {len(err)} with an error entry: scanning them with the current killfeed region")
-            if new:
-                run_scan(cfg, [g], new)
-            if err and not CANCEL.is_set():
-                run_scan(cfg, [g], err, 0, True)
-        except Exception as ex:                            # noqa: BLE001
-            out(f"{g}: scanning new clips failed: {type(ex).__name__}: {ex} - going on with the next game")
+    if game not in GAMES:
+        out(f"Scan all new clips: unknown game '{game}'")
+        return
+    try:
+        det = load_dets(game).get(game)
+        new, err = new_clip_paths(cfg, game, det=det)
+        if not new and not err:
+            out(f"No new clips to scan for {game}")
+            return
+        out(f"Scan all new clips: {game}, {len(new) + len(err)} new, region {det.d['region']}")
+        if new:
+            run_scan(cfg, [game], new)
+        if err and not CANCEL.is_set():
+            run_scan(cfg, [game], err, 0, True)
+    except Exception as ex:                                # noqa: BLE001
+        out(f"{game}: scanning new clips failed: {type(ex).__name__}: {ex}")
 
 
 def cmd_scan(args):
@@ -15973,9 +15974,12 @@ class App:
         self.run_task("rescan", lambda: (rescan_group(g, row["hash"], load_config(), info), self.q.put(("call", self.rp_refresh))))
 
     def rp_scan_new(self):
-        """V8.0.4: queued background job (like every scan): every game's never-scanned / errored clips, current region, no cap; the lists and counts refresh afterwards."""
+        """Queued background job (like every scan): the never-scanned / errored clips of the game selected in this region section (self.rp_game, read here on the UI thread),
+        current region, no cap; the lists and counts refresh afterwards."""
+        g = self.rp_game.get()
+
         def work():
-            scan_all_new(load_config())
+            scan_all_new(g, load_config())
             self.q.put(("call", lambda: self.run_task("clips", self.load_clips)))
             self.q.put(("call", self.refresh_auto))
         self.run_task("scan new clips", work)
