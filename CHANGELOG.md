@@ -5,6 +5,9 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V8.0.5 (branch work-v805, merged to main, APP_VERSION = V8.0.5) - 2026-10-14
+- The "Scan all new clips (current region)" button now scans only the game you have selected in the killfeed region section.
+
 ## V8.0.4 (branch work-v804, merged to main, APP_VERSION = V8.0.4) - 2026-10-14
 - New button in Settings (Killfeed region): "Scan all new clips (current region)" scans every clip that has not been scanned yet, for all games, with the killfeed region you have saved.
 - Clips that were already scanned are left alone, so the clip counts in Auto, Manual and Random pick update afterwards.
