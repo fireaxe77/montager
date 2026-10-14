@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.0.3"
+APP_VERSION = "V8.0.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5017,6 +5017,51 @@ def run_scan(cfg, games=None, paths=None, limit=0, rescan=False, region_ok=False
                     out(f"R6S: no kill rows read in {name} (killfeed region {res.get('region')} of the content rect, crop {res.get('size')} px)")
     out(f"scan finished: {done} in {time.time() - t0:.0f}s, errors {errs}")
     return done
+
+
+def new_clip_paths(cfg, game, recs=None, det=None, cache=None):
+    """V8.0.4: ([never scanned paths], [paths whose cache entry holds an error]) of the clips in the game's scan folders. Cached clips are not listed. An R6S clip that was
+    never probed (an unprobed stub) has no entry by definition. Reads the caches only."""
+    det = det or load_dets(game).get(game)
+    if det is None:
+        return [], []
+    cache = cache if cache is not None else load_kills_cache()
+    new, err = [], []
+    for r in (recs if recs is not None else scan_clips(cfg)):
+        if r.get("game") != game or r.get("error"):
+            continue
+        if not r.get("w"):
+            if r.get("unprobed"):
+                new.append(r["path"])
+            continue
+        key = kills_key(r, game, det)
+        if key not in cache:
+            new.append(r["path"])
+        elif (cache.get(key) or {}).get("error"):
+            err.append(r["path"])
+    return new, err
+
+
+def scan_all_new(cfg=None, games=None):
+    """V8.0.4 (Settings > Killfeed region > 'Scan all new clips (current region)'): per game, scan every clip that has no cache entry yet plus the clips whose entry holds an error,
+    with the CURRENT saved region and the normal scan path (run_scan: same log lines, same cancel, results into the normal cache). No cap. Already cached clips are left alone;
+    nothing new = 'No new clips to scan for <game>'. A game that fails logs one line and the next game goes on."""
+    cfg = cfg or load_config()
+    for g in (games or GAMES):
+        if CANCEL.is_set():
+            break
+        try:
+            new, err = new_clip_paths(cfg, g)
+            if not new and not err:
+                out(f"No new clips to scan for {g}")
+                continue
+            out(f"{g}: {len(new)} never scanned + {len(err)} with an error entry: scanning them with the current killfeed region")
+            if new:
+                run_scan(cfg, [g], new)
+            if err and not CANCEL.is_set():
+                run_scan(cfg, [g], err, 0, True)
+        except Exception as ex:                            # noqa: BLE001
+            out(f"{g}: scanning new clips failed: {type(ex).__name__}: {ex} - going on with the next game")
 
 
 def cmd_scan(args):
@@ -15725,7 +15770,8 @@ class App:
         self.b_rp_def.pack(side="left", padx=(0, PX))
         self.b_rp_resc = self.btn(h, "Rescan this group to the current region", self.rp_rescan, name="region:rescan")
         self.b_rp_resc.pack(side="left", padx=(0, PX))
-        self.btn(h, "Refresh", self.rp_refresh, name="region:refresh").pack(side="left")
+        self.btn(h, "Refresh", self.rp_refresh, name="region:refresh").pack(side="left", padx=(0, PX))
+        self.btn(h, "Scan all new clips (current region)", self.rp_scan_new, name="region:scannew").pack(side="left")
         r[0] += 1
         self.rp_rows, self._rp_loaded = {}, False
         self.rp_tree.bind("<Map>", lambda e: None if self._rp_loaded else (setattr(self, "_rp_loaded", True), self.root.after_idle(self.rp_refresh)))   # read the cache index when first shown, not at startup
@@ -15925,6 +15971,14 @@ class App:
                                    + ("\nValorant: each old entry is first copied into valorant_cache_backup.json." if g == "valorant" else "")):
             return
         self.run_task("rescan", lambda: (rescan_group(g, row["hash"], load_config(), info), self.q.put(("call", self.rp_refresh))))
+
+    def rp_scan_new(self):
+        """V8.0.4: queued background job (like every scan): every game's never-scanned / errored clips, current region, no cap; the lists and counts refresh afterwards."""
+        def work():
+            scan_all_new(load_config())
+            self.q.put(("call", lambda: self.run_task("clips", self.load_clips)))
+            self.q.put(("call", self.refresh_auto))
+        self.run_task("scan new clips", work)
 
     def rp_use(self):
         """Same code path as 'regionrestore --use' (region_apply). Never starts a scan."""
