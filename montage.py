@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.1"
+APP_VERSION = "V8.1.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -3257,7 +3257,8 @@ def cs2_classify_track(track, cfg=None):
         if CS2_ROWID_ON[0] and ver == "death" and cs2_victim_is_me(r.get("vtext")) and not cs2_me_jumbled((r.get("ktext") or "").split("+")[0]):
             sus.append(why)                                        # V8.1: my name on the victim side (and not on the killer side) = my death, never a kill
             ver, w, why = "death", 1, f"death: my name on the victim side ('{r.get('vtext', '')}'), not a kill"
-        elif CS2_ROWID_ON[0] and ver == "kill?" and _alnum(r.get("ktext") or "") and not cs2_me_jumbled((r.get("ktext") or "").split("+")[0]):
+        elif CS2_ROWID_ON[0] and ver == "kill?" and _alnum((r.get("ktext") or "").split("+")[0] if CS2_ROWID_V811[0] else (r.get("ktext") or "")) \
+                and not cs2_me_jumbled((r.get("ktext") or "").split("+")[0]):          # V8.1.1: '+ sashadidntwakeup' = the killer before the '+' is unread, not another player
             ver, w, why = "other", 1, f"not mine: the killer side '{r.get('ktext') or '-'}' does not look like my name"      # V8.1
         elif ver == "death":                                       # my name on the victim side of an outlined row: a misread
             sus.append(why)
@@ -3389,7 +3390,14 @@ def _cs2_row_is_new(t, rows):
     return not any(c is not t and c["first"] < f - 2 and c["last"] >= f and _y_at(c, f) > y + CS2_ROW_YTOL for c in rows)
 
 
-CS2_ROW_WTOL = 40                # px: outline widths of one row (its left end is found less reliably than its right end)
+def _cs2_names_me(c):
+    """A clear read of my name, or (V8.1.1) a killer-side read that still looks like my name ('firoaxo'): kill? reads that do not look
+    like my name were already turned into 'other' by cs2_classify_track."""
+    return bool(c["name_read"] or (CS2_ROWID_V811[0] and any(v[0] == "kill?" and _alnum(v[3] or "") for v in c.get("votes", []))))
+
+
+CS2_ROWID_V811 = [True]          # V8.1.1 switch (tests)
+CS2_ROW_WTOL = 40               # px: outline widths of one row (its left end is found less reliably than its right end)
 
 
 def _cs2_row_relation(a, b, ca, cb, rows):
@@ -3399,7 +3407,7 @@ def _cs2_row_relation(a, b, ca, cb, rows):
     place), a stray short copy elsewhere (CS2_ROW_SPUR_HITS frames, not at the bottom of the feed) with the same victim, or - after a
     gap of any length inside one row's lifetime - the same victim (or an unread victim and the same outline / the V6.8.2 short-gap rule)."""
     oa, ob = ca["verdict"] == "other", cb["verdict"] == "other"
-    if oa != ob and (cb if oa else ca)["name_read"]:
+    if oa != ob and _cs2_names_me(cb if oa else ca):
         return "distinct"                                         # another player's row never joins a row that names me
     wd = abs((a["x1"] - a["x0"]) - (b["x1"] - b["x0"]))
     if abs(a["first"] - b["first"]) <= 2 and abs(_y_at(a, a["first"]) - _y_at(b, b["first"])) <= CS2_ROW_YTOL and wd <= CS2_ROW_WTOL:
@@ -3422,6 +3430,9 @@ def _cs2_row_relation(a, b, ca, cb, rows):
         return "distinct"                                         # lower than the row was: a newer row
     if vm is True:
         return "same"
+    if CS2_ROWID_V811[0] and b["first"] - a["last"] <= int(round(BORDER_GAP_S * fps)) and wd <= CS2_ROW_WTOL \
+            and abs(_y_at(b, b["first"]) - _y_at(a, a["last"])) <= CS2_ROW_YTOL:
+        return "same"                                             # V8.1.1: lost for under a second and back in the same place
     if wd <= 6 or _border_relation(a, b, ca, cb) == "same":
         return "same"
     return None
@@ -3668,8 +3679,14 @@ _DATING_LOGGED = set()
 CS2_GATE_REJECT = -1                 # cs2_dating_walk / cs2_row_first_frame: a move was proposed but its first appearance is not proven
 
 
+CS2_EDGE_DATING = [True]             # V8.1.1: rows cut by the region's lower edge are matched by their top part (CS2 dating only)
+CS2_EDGE_PART = 0.55                 # share of the row's name patch (from the top) that must be visible
+CS2_UNSURE_EDGE = 8                  # px: a row first seen this close to the region's lower edge may have been there (cut off) earlier
+CS2_UNSURE_LEAD = 1.5                # s: extra footage shown before a kill whose time is uncertain (no slow-mo / zoom on it)
+
+
 def _dating_file():
-    return DATA / "cs2_dating_v7.json"
+    return DATA / ("cs2_dating_v8.json" if CS2_EDGE_DATING[0] else "cs2_dating_v7.json")     # V8.1.1: new memo (old entries were dated without the edge match)
 
 
 def _dating_memo_load():
@@ -3697,14 +3714,14 @@ def _dating_patch(g, rc):
     return g[rc["y0"] + 4:rc["y1"] - 3, rc["x0"] + 6:rc["x1"] - 6]
 
 
-def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None):
+def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
     """Walk back from frame j1 over BGR frames (killfeed region): index of the first frame of the SAME row, or None (see cs2_row_first_frame for the rules).
     others = [(first, last, [(frame, y), ...])] of the OTHER tracked rows (window-relative frames): a match that sits where another tracked row stood is that row, not ours."""
     import cv2
     import numpy as np
     dh, dw = frames[0].shape[:2]
     gray = [cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY) for fr in frames]
-    tpl = _dating_patch(gray[j1 + 3], rc)
+    tpl = _dating_patch(gray[j1 + 3], rc if y3 is None else dict(rc, y0=int(y3), y1=int(y3) + rc["y1"] - rc["y0"]))   # V8.1.1: where the row IS 3 frames on (it may be scrolling)
     if tpl.shape[0] < 8 or tpl.shape[1] < 40 or float(tpl.std()) <= 4.0:
         return None
     ya, yb = max(0, rc["y0"] - 3), rc["y1"] + 4
@@ -3724,6 +3741,20 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None):
         m = cv2.matchTemplate(reg, tpl, cv2.TM_CCOEFF_NORMED)
         whole = float(m.max())
         yy = r0 + int(np.unravel_index(int(m.argmax()), m.shape)[0]) - 4
+        if CS2_EDGE_DATING[0] and r1 >= dh and whole < 0.9:      # V8.1.1: a row entering at the bottom of a full feed is cut by the region's lower edge
+            kt = int(math.ceil(CS2_EDGE_PART * th))               # (its outline cannot close, the tracker sees it only when the list scrolls up): match its top part there
+            tt = tpl[:kt]
+            if float(tt.std()) > 4.0:
+                mt = cv2.matchTemplate(reg, tt, cv2.TM_CCOEFF_NORMED)
+                yt = r0 + int(np.unravel_index(int(mt.argmax()), mt.shape)[0])
+                sc_ = float(mt.max())
+                if yt + th > dh and sc_ > whole:                  # only where the whole row does not fit any more
+                    if tpl_v is not None:                         # the victim name alone (rows of one multikill differ only there)
+                        tv = tpl_v[:kt]
+                        rv = gray[j][r0:r1, c0 + tw - tv.shape[1] - 6:min(dw, c0 + tw + 6) + 6]
+                        if float(tv.std()) > 4.0 and rv.shape[0] >= kt and rv.shape[1] >= tv.shape[1]:
+                            sc_ = min(sc_, float(cv2.matchTemplate(rv, tv, cv2.TM_CCOEFF_NORMED).max()))
+                    return sc_, yt - 4
         if tpl_v is None or whole < 0.3:
             return whole, yy
         vw = tpl_v.shape[1]                                    # the victim name alone: rows of one multikill share killer, weapon and outline, only the victim differs
@@ -3771,14 +3802,23 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None):
     while j - 1 >= 0 and ext < int(0.2 * fps) and corr(j - 1)[0] >= 0.6 and not other_row_at(j - 1, corr(j - 1)[1]):
         j -= 1
         ext += 1
+    if CS2_EDGE_DATING[0]:                                             # V8.1.1: the outline fades in a frame or two before the text matches: those frames are the row's own start
+        y_f = corr(j)[1]
+        back = 0
+        while j - 1 >= 0 and back < int(0.2 * fps) and corr(j - 1)[0] >= 0.3 and \
+                int(border_dm(frames[j - 1])[0][max(0, y_f - 3):min(dh, y_f + hrow + 4), xa:xb].sum()) >= 0.3 * ref and not other_row_at(j - 1, y_f):
+            j -= 1
+            back += 1
     ng = max(3, int(math.ceil(CS2_GATE_S[0] * fps - 1e-9)))          # V7.5.1.2 gate: the first appearance must be PROVEN by empty frames before it
     if j - ng < 0:
         return CS2_GATE_REJECT
-    y_first = corr(j)[1]                                       # V7.7.6: the slot the row first appeared in (not the slot it ended in, not the rows next to it)
+    y_first = y_f if CS2_EDGE_DATING[0] and back else corr(j)[1]      # V7.7.6: the slot the row first appeared in (V8.1.1: as matched before the faint fade-in frames)
     yb0, yb1 = max(0, y_first - 3), min(dh, y_first + hrow + 4)
     for q in range(j - ng, j):
         c, _y = corr(q)
         oc = int(border_dm(frames[q])[0][yb0:yb1, xa:xb].sum())
+        if info is not None and "trace" in info:
+            info["trace"].append((j, q, round(c, 3), oc, ref))
         if c >= 0.6 or oc >= 0.3 * ref:
             return CS2_GATE_REJECT                                     # the row (or an outline in its slot) is still there before the proposed time
     if info is not None:
@@ -3819,7 +3859,8 @@ def cs2_row_first_frame(rec, det, cfg, sc, tr):
         if len(frames) > j1 + 4:
             oth = [(t2["first"] - fs, t2["last"] - fs, [(sl[0] - fs, sl[1]) for sl in t2["slots"]]) for t2 in sc.get("tracks", []) if t2["id"] != tr["id"]]
             winfo = {}
-            j = cs2_dating_walk(frames, rc, j1, fps, oth, winfo)
+            y3 = _y_at(tr, f1 + 3) if CS2_EDGE_DATING[0] else None
+            j = cs2_dating_walk(frames, rc, j1, fps, oth, winfo, None if y3 is None or y3 == y0 else y3)
             if j == CS2_GATE_REJECT:
                 res = CS2_GATE_REJECT
             elif j is not None:
@@ -3859,6 +3900,9 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
             if f == CS2_GATE_REJECT:
                 proposed += 1
                 failed += 1
+                if CS2_EDGE_DATING[0] and tr["first"] > int(CS2_EARLY_S * fps) and \
+                        _y_at(tr, tr["first"]) + (tr["y1"] - tr["y0"]) >= int((sc.get("size") or [0, 1080])[1]) - CS2_UNSURE_EDGE:
+                    k["t_unsure"] = True                       # V8.1.1: first seen at the region's lower edge of a full feed and not datable: the real kill may be earlier
                 kk = (clip, round(k["t"], 2), "kept")
                 if kk not in _DATING_LOGGED:
                     _DATING_LOGGED.add(kk)
@@ -8063,6 +8107,9 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
     sl_ = [float(raw[i]["k"].get("seen_lead", 0.0)) for i in keep]
     if any(x > 0.5 for x in sl_):                           # V7.7.6 (CS2 only): a row of this victim was already on screen this long before the kill time
         ev["seen_lead"] = [round(x, 3) for x in sl_]
+    un_ = [bool(raw[i]["k"].get("t_unsure")) for i in keep]
+    if any(un_):                                            # V8.1.1 (CS2 only): kills whose time may be late (see cs2_kill_times_earlier): no slow-mo / zoom on them, more run-in
+        ev["unsure"] = un_
     ev["score_pre"] = base_score(ev)
     ev["verified"] = all(raw[i]["k"].get("name_read", True) for i in keep)       # V7.7.5: CS2 border kills carry name_read (my name was read on the row); every other kill counts as verified
     if any(raw[i]["k"].get("util") for i in keep):          # V7.3: a kill admitted by the per-clip utility override (OVERRIDE_ADMITTED)
@@ -8347,6 +8394,8 @@ def dead_air_cuts(ev, U, kb, t0=None, lead_override=None):
             lead = min(nxt, key=lambda x: abs(x - 1.0))
         if lead_override is not None and lead_override[0] == len(cuts):
             lead = min(float(lead_override[1]), g - (float(U[cj]) - (T0 + o)) - 0.05)
+        elif (ev.get("unsure") or [False] * len(times))[i + 1]:          # V8.1.1 (CS2 only): resume earlier before a kill whose time may be late
+            lead = max(lead, min(lead + CS2_UNSURE_LEAD, g - (float(U[cj]) - (T0 + o)) - 0.05))
         cuts.append((dc, b - lead))
         o = dc + lead
     return cuts, (o if cuts else span)
@@ -8396,7 +8445,10 @@ def last_anchor_solve(ev, U, kb):
 
 
 def _lead_min(ev):
-    return float((ev.get("_rx") or {}).get("lead_min", LEAD_MIN))
+    base = float((ev.get("_rx") or {}).get("lead_min", LEAD_MIN))
+    if (ev.get("unsure") or [False])[0]:                   # V8.1.1 (CS2 only): the first kill's time may be late: show more footage before it
+        return min(base + CS2_UNSURE_LEAD, max(base, float(ev.get("pre", base))))
+    return base
 
 
 def _fit_tail(ev, lead_t, span, D):
@@ -8460,6 +8512,8 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first", 
         return None
     dmax = (ev["death_after"] - 0.05) if ev.get("death_after") is not None else 99.0
     post = min(ev["post"], dmax)
+    if (slow or ending) and (ev.get("unsure") or [False])[-1]:
+        return None                                        # V8.1.1 (CS2 only): no slow-mo on a kill whose time may be late (it could run over empty footage)
     if ending:
         if post < 0.1:
             return None
@@ -8470,8 +8524,8 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first", 
     D = float(U[end] - U[c])
     if tailmode == "fit":                                  # V7.6.1: footage-limited tail (see _fit_tail)
         ft = _fit_tail(ev, lead_t, span, D)
-        if ft is None or slow or end - c < 2 * MIN_TAKE_BEATS or D < _min_take_s(ev):
-            return None
+        if ft is None or slow or end - c < 2 * MIN_TAKE_BEATS or D < _min_take_s(ev) or (ev.get("unsure") or [False])[-1]:
+            return None                                    # (V8.1.1: no slowed tail after a kill whose time may be late)
         return {"ev": ev, "c": c, "kb": kb, "end": end, "lead_t": lead_t, "ramp": r, "slow": False, "ending": False, "dur": D, "tailmode": "fit", "v0": ft[0], "ex": ft[1],
                 **({"cuts": cuts, "ospan": span} if cuts else {})}
     tail = D - (lead_t + span)
@@ -9285,7 +9339,7 @@ ENDING_MIN_POST = 0.9                # V7.7.5: footage (s) after the last kill t
 def ending_safe(e):
     """V7.7.5: an event may end the montage only when at least ENDING_MIN_POST s of footage follow its last kill BEFORE my death / the clip end."""
     post = e["post"] if e.get("death_after") is None else min(e["post"], e["death_after"] - 0.05)
-    return post >= ENDING_MIN_POST
+    return post >= ENDING_MIN_POST and not (e.get("unsure") or [False])[-1]          # V8.1.1: never a slow-mo ending on an uncertain kill time
 
 
 def ending_rank(e):
@@ -10225,12 +10279,14 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         frq = lambda x: round(x * OUT_FPS) / OUT_FPS
         pulses = []
         last_anc = tk.get("anchor") == "last"
+        uns = ev.get("unsure") or [False] * len(ko)      # V8.1.1 (CS2 only): no zoom punch on a kill whose time may be late (the rng draws stay the same)
         if role == "headline" or (strong and rng.random() < rp["zoom_p"]):                   # V4 zoom punch frequency
-            pulses.append(frq(ko[-1] if last_anc else ko[0]))             # V7.3: the zoom punches the kill that lands on the drop
-        for k2 in (ko[:-1] if last_anc else ko[1:]):
+            if not (uns[-1] if last_anc else uns[0]):
+                pulses.append(frq(ko[-1] if last_anc else ko[0]))             # V7.3: the zoom punches the kill that lands on the drop
+        for k2, u2 in zip(ko[:-1] if last_anc else ko[1:], uns[:-1] if last_anc else uns[1:]):
             j = int(np.argmin(np.abs(bt - (U[tk["c"]] + k2))))
             if abs(bt[j] - (U[tk["c"]] + k2)) < 0.06 and (j in down or en[min(j, len(en) - 1)] >= 0.6) and len(pulses) < 3 \
-                    and rng.random() < rp["zoom_p"] * 0.6:
+                    and rng.random() < rp["zoom_p"] * 0.6 and not u2:
                 pulses.append(frq(k2))
         trans = "hard"                                     # V5.2: no flash / zoom cuts - every take starts on a hard cut
         slow_at = None
@@ -10709,6 +10765,10 @@ def soft_blend_expr():
     return f"A*(1-{wt})+B*{wt}"
 
 
+CS2_SMOOTH_SLOW = [True]             # V8.1.1: CS2 slow-mo pieces are motion-interpolated instead of frame-blended (normal-speed pieces untouched)
+CS2_SLOW_INTERP = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=8"
+
+
 def build_filter(plan, cfg, preview, fx=FX_ALL):
     """ONE filter graph (V4 engine). Effects sit on each take's own output timeline: centred V4 zoom punches on kills (overlaid
     only inside the punch), ramps before kills, V4 slow-mo (frame blending only inside slow-mo segments). V5.2: no flashes, no
@@ -10718,6 +10778,7 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
     takes = plan["takes"]
     exact = plan.get("placement", "v5") != "v4"
     vl = []
+    slow_ip = CS2_SLOW_INTERP if plan.get("game") == "cs2" and CS2_SMOOTH_SLOW[0] else "framerate=fps=60:scene=100"      # V8.1.1 (CS2 only): slowed pieces only
     soft = [False] + [bool("transition" in fx and takes[i].get("trans") == "soft" and soft_cut_ok(plan, i)[0]) for i in range(1, len(takes))] + [False]       # soft[i]: the cut INTO take i is a dissolve (V7.6.1)
     vparts = []                                                                         # video pieces in order when any cut is soft
     for ti, t in enumerate(takes):
@@ -10760,7 +10821,7 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
                 ex_ = f"{kn[-1][1]:.6f}+({T}-{kn[-1][0]:.6f})*{kn[-1][2]:.6f}"
                 for m_ in range(len(kn) - 2, -1, -1):
                     ex_ = f"if(lt({T},{kn[m_ + 1][0]:.6f}),{kn[m_][1]:.6f}+({T}-{kn[m_][0]:.6f})*{kn[m_][2]:.6f},{ex_})"
-                v = f"[{k}:v:0]{crop}{scl}setsar=1,setpts='({ex_})/TB',framerate=fps=60:scene=100,fps=60:start_time=0"
+                v = f"[{k}:v:0]{crop}{scl}setsar=1,setpts='({ex_})/TB',{slow_ip},fps=60:start_time=0"
                 v += f",tpad=stop_mode=clone:stop_duration=0.3,trim=end_frame={n},setpts=PTS-STARTPTS[s{k0_}v]"
                 chains.append(v)
                 tv.append(f"[s{k0_}v]")
@@ -10806,7 +10867,7 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             if sp == 0.0:
                 v += f"trim=end_frame=1,setpts=PTS-STARTPTS,fps=60,tpad=stop_mode=clone:stop_duration={n / OUT_FPS + 0.1:.4f}"
             elif sp < 1:
-                v += f"setpts=(PTS-STARTPTS)/{sp:.4f},framerate=fps=60:scene=100"          # V4 slow-mo (blend only here)
+                v += f"setpts=(PTS-STARTPTS)/{sp:.4f},{slow_ip}"          # V4 slow-mo (blend only here; V8.1.1 CS2: motion interpolation)
             elif exact:
                 v += f"setpts=PTS/{sp:.4f},fps=60:start_time=0"                            # real timestamps: frame-exact kills
             else:
@@ -10851,7 +10912,7 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             hscl = "scale=1920:1080:flags=lanczos," if (hcrop or list(hsrc["wh"]) != [1920, 1080]) else ""
             hv = f"[{k}:v:0]{hcrop}{hscl}setsar=1,"
             if hsp < 1:
-                hv += f"setpts=(PTS-STARTPTS)/{hsp:.4f},framerate=fps=60:scene=100"
+                hv += f"setpts=(PTS-STARTPTS)/{hsp:.4f},{slow_ip}"
             elif exact:
                 hv += f"setpts=PTS/{hsp:.4f},fps=60:start_time=0"
             else:
