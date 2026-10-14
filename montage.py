@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.0.5"
+APP_VERSION = "V8.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -3100,6 +3100,32 @@ def cs2_lenient_me(text):
     return len(t) >= 3 and any(len(ocr_norm(n)) >= 4 and fuzz.partial_ratio(ocr_norm(n), t) >= 62 for n in names_split("cs2")[0])
 
 
+CS2_OTHER_READS = 2              # V8.1: reads of another player's name first that make an outlined row 'not mine'
+CS2_UNNAMED_MIN_S = 0.5          # V8.1: an outlined row whose name never read must be on screen this long (or run to the clip end)
+CS2_JUMBLE_RATIO = 64           # V8.1: a word this alike to my name once vowels and OCR look-alikes are folded ('Tiroaxo', 'lraxo') is my name
+
+
+def cs2_me_jumbled(text):
+    """V8.1: True when the killer side looks like my name however badly OCR read it: cs2_lenient_me(), or one of its words (or the whole
+    text) is CS2_JUMBLE_RATIO alike to my name after folding vowels and look-alikes. Other players measured on the real clips stay under 60."""
+    from rapidfuzz import fuzz
+    if cs2_lenient_me(text):
+        return True
+    fold = lambda t: ocr_norm(t).replace("l", "i").translate(_CORE_MAP).translate(_VOWELS)      # OCR reads the i of 'fireaxe' as l ('Tlrea')
+    me = [fold(n) for n in names_split("cs2")[0] or [MY_NAME]]
+    words = [w for w in (text or "").split() if len(ocr_norm(w)) >= 4] + ([text] if len(ocr_norm(text or "")) >= 4 else [])
+    words = [w for w in words if set(ocr_norm(w)) & set("rx")]              # the consonants of 'fireaxe' that survive OCR ('fufel', 'halla' are other players)
+    return any(fuzz.ratio(m, fold(w)) >= CS2_JUMBLE_RATIO for m in me for w in words)
+
+
+def cs2_victim_is_me(vtext):
+    """V8.1: the victim side is my name as a whole word (or a CJK name character), not a name that merely contains part of it ('SkyFire')."""
+    from rapidfuzz import fuzz
+    if any(c in (vtext or "") for n in names_split("cs2")[1] for c in n):
+        return True
+    return any(fuzz.ratio(ocr_norm(n), ocr_norm(w)) >= 75 for n in names_split("cs2")[0] or [MY_NAME] for w in (vtext or "").split() + [vtext or ""])
+
+
 def cs2_vote_verdict(r, cfg=None):
     """One OCR read of a bordered row -> (verdict, weight, why). Verdicts: kill, assist, death, utility, none, nosplit, kill?
     (kill, name unreadable). weight 3 = my name was found, 1 = decided without a readable name."""
@@ -3228,7 +3254,12 @@ def cs2_classify_track(track, cfg=None):
             votes.append(("empty", 0, "OCR found nothing", "", ""))
             continue
         ver, w, why = cs2_vote_verdict(r, cfg)
-        if ver == "death":                                         # my name on the victim side of an outlined row: a misread
+        if CS2_ROWID_ON[0] and ver == "death" and cs2_victim_is_me(r.get("vtext")) and not cs2_me_jumbled((r.get("ktext") or "").split("+")[0]):
+            sus.append(why)                                        # V8.1: my name on the victim side (and not on the killer side) = my death, never a kill
+            ver, w, why = "death", 1, f"death: my name on the victim side ('{r.get('vtext', '')}'), not a kill"
+        elif CS2_ROWID_ON[0] and ver == "kill?" and _alnum(r.get("ktext") or "") and not cs2_me_jumbled((r.get("ktext") or "").split("+")[0]):
+            ver, w, why = "other", 1, f"not mine: the killer side '{r.get('ktext') or '-'}' does not look like my name"      # V8.1
+        elif ver == "death":                                       # my name on the victim side of an outlined row: a misread
             sus.append(why)
             if _clear_other(r.get("ktext", "")):
                 ver, w, why = "none", 0, f"suspicious side read ({why}); the killer side is another readable name: not a kill"
@@ -3242,11 +3273,18 @@ def cs2_classify_track(track, cfg=None):
         if ver in ("nosplit", "empty") or (ver == "none" and not w):
             continue
         key = "kill" if ver == "kill?" else ver
-        t = tally.setdefault(key, [0, 0, why, r])
+        t = tally.setdefault(key, [0, 0, why, r, []])
         t[0] += w
         t[1] += 1 if w >= 3 else 0
         if w >= 3 or t[1] == 0:
             t[2], t[3] = why, r
+        if w >= 3:
+            t[4].append((why, r))
+    if CS2_ROWID_ON[0]:                                            # V8.1: the read whose victim most of the clear reads agree on speaks for the row
+        for t in tally.values():
+            if len(t[4]) > 2:
+                vic = lambda x: x[1].get("vtext", "")
+                t[2], t[3] = max(t[4], key=lambda x: sum(1 for y in t[4] if ocr_norm(vic(x)) == ocr_norm(vic(y)) or cs2_same_victim(vic(x), vic(y))))
     from rapidfuzz import fuzz
     if len(others) >= 3 and not any(k in tally and tally[k][1] for k in ("kill", "assist", "utility")) and \
             all(fuzz.ratio(others[0], o) >= 90 for o in others):
@@ -3256,8 +3294,13 @@ def cs2_classify_track(track, cfg=None):
     if not tally:
         return {"verdict": "none", "name_read": False, "why": "border row, but its text could not be split into killer / weapon / victim",
                 "ktext": "", "vtext": "", "gun": False, "hs": False, "ks": 0.0, "vs": 0.0, "votes": votes, "sus": sus}
-    top = max(tally, key=lambda k: (tally[k][0], tally[k][1]))
-    wsum, definite, why, r = tally[top]
+    top = max(tally, key=lambda k: (tally[k][1], tally[k][0]) if CS2_ROWID_ON[0] else (tally[k][0], tally[k][1]))     # V8.1: reads that name me decide first
+    hint = sum(1 for v in votes if v[0] == "kill?" and _alnum(v[3] or ""))           # reads whose killer side looks like my name
+    if CS2_ROWID_ON[0] and top == "other" and (tally["other"][0] < CS2_OTHER_READS or hint):
+        ro = tally["other"][3]                                     # V8.1: one stray read of another name does not overrule the red outline
+        tally["kill"] = tally.get("kill") or [1, 0, f"kill (name unreadable, border confirmed; '{ro.get('ktext') or '-'}' -> '{ro.get('vtext') or '-'}')", ro, []]
+        top = "kill"
+    wsum, definite, why, r = tally[top][:4]
     return {"verdict": top, "name_read": definite > 0, "why": why, "ktext": r.get("ktext", ""), "vtext": r.get("vtext", ""),
             "gun": bool(r.get("gun")), "hs": any(x.get("hs") for _, x in rows_ if x), "ks": float(r.get("ks", 0)),
             "vs": float(r.get("vs", 0)), "votes": votes, "sus": sus}
@@ -3296,14 +3339,106 @@ def _border_relation(a, b, ca, cb):
     return "distinct"
 
 
+# ---- V8.1 ROW IDENTITY ------------------------------------------------------------------------------------------------------
+# One physical killfeed row = one event. The outline of a row can drop out for a second or more (bright / red / smoky background,
+# compression), so the tracker loses the row and finds it again as a new track; every such fragment used to become a new kill
+# ('Wieozoooor' / 'Wioozoooor', an ace shown as 2 kills ...). Rows of mine stay on screen about 7.5-8 s, a new row always enters
+# BELOW the rows already there and rows only ever move UP (when the oldest one expires). A later fragment is the same row when it fits
+# that physics and its victim reads match (or its victim is unread and the outline has the same width).
+CS2_ROWID_ON = [True]
+CS2_ROW_LIFE_S = 8.5             # first appearance to last frame of one row of mine (measured 7.5-8.0 s) + slack
+CS2_ROW_YTOL = 10                # px (1920x1080 space): the same place / never lower than before
+CS2_ROW_SPUR_HITS = 10           # a track this short that overlaps a matching row elsewhere and is not at the bottom of the feed is a stray copy
+CS2_ROW_VIC_RATIO = 75           # victim reads this alike = one victim
+CS2_ROW_VIC_DIFF = 55            # every pair of victim reads below this = two different victims
+
+
+def _y_at(t, f):
+    sl = t.get("slots") or [[t["first"], t["y0"]]]
+    cur = sl[0]
+    for s in sl:
+        if s[0] > f:
+            break
+        cur = s
+    return float(cur[1])
+
+
+def _cs2_vic_match(ca, cb):
+    """True when any pair of victim reads of the two rows is alike, False when every pair is clearly different (similarity under
+    CS2_ROW_VIC_DIFF), None otherwise (one victim unread, or short garbled reads that are neither)."""
+    from rapidfuzz import fuzz
+    va = {v[4] for v in ca.get("votes", []) if len(ocr_norm(v[4] or "")) >= 3} | ({ca["vtext"]} if len(ocr_norm(ca.get("vtext") or "")) >= 3 else set())
+    vb = {v[4] for v in cb.get("votes", []) if len(ocr_norm(v[4] or "")) >= 3} | ({cb["vtext"]} if len(ocr_norm(cb.get("vtext") or "")) >= 3 else set())
+    if not va or not vb:
+        return None
+    best = 0.0
+    for x in va:
+        for y in vb:
+            nx, ny = ocr_norm(x), ocr_norm(y)
+            if nx == ny or cs2_same_victim(x, y) or (min(len(nx), len(ny)) >= 4 and fuzz.ratio(nx, ny) >= CS2_ROW_VIC_RATIO):
+                return True
+            best = max(best, float(fuzz.ratio(nx, ny)))
+    return False if best < CS2_ROW_VIC_DIFF else None
+
+
+def _cs2_row_is_new(t, rows):
+    """False when an older row is still on screen BELOW `t` when `t` is first seen: a new row enters below every row already there,
+    so `t` is a row that was there before (found again), not a new one."""
+    f = t["first"]
+    y = _y_at(t, f)
+    return not any(c is not t and c["first"] < f - 2 and c["last"] >= f and _y_at(c, f) > y + CS2_ROW_YTOL for c in rows)
+
+
+CS2_ROW_WTOL = 40                # px: outline widths of one row (its left end is found less reliably than its right end)
+
+
+def _cs2_row_relation(a, b, ca, cb, rows):
+    """V8.1: 'same' | 'distinct' | None (no evidence either way) for two tracks (a first seen first). Distinct: another player's row
+    against a row that names me, victims that read clearly different, two places at one time, b lower than a was (rows never move
+    down) or longer apart than one row lives. Same: born in one place at one frame, in one place at one time (two rows never share a
+    place), a stray short copy elsewhere (CS2_ROW_SPUR_HITS frames, not at the bottom of the feed) with the same victim, or - after a
+    gap of any length inside one row's lifetime - the same victim (or an unread victim and the same outline / the V6.8.2 short-gap rule)."""
+    oa, ob = ca["verdict"] == "other", cb["verdict"] == "other"
+    if oa != ob and (cb if oa else ca)["name_read"]:
+        return "distinct"                                         # another player's row never joins a row that names me
+    wd = abs((a["x1"] - a["x0"]) - (b["x1"] - b["x0"]))
+    if abs(a["first"] - b["first"]) <= 2 and abs(_y_at(a, a["first"]) - _y_at(b, b["first"])) <= CS2_ROW_YTOL and wd <= CS2_ROW_WTOL:
+        return "same"                                             # born in the same place at the same frame: one row (one copy may later hop to a neighbour)
+    vm = _cs2_vic_match(ca, cb)
+    fps = BORDER_FPS
+    if max(a["first"], b["first"]) <= min(a["last"], b["last"]):
+        f = max(a["first"], b["first"])
+        if abs(_y_at(a, f) - _y_at(b, f)) <= CS2_ROW_YTOL and (wd <= CS2_ROW_WTOL or vm is True):
+            return "same"                                         # two rows never stand in one place at the same time (a copy that later hops to the next row still started as this one)
+        s = a if a["hits"] <= b["hits"] else b
+        if s["hits"] <= CS2_ROW_SPUR_HITS and vm is True and not _cs2_row_is_new(s, rows):
+            return "same"
+        return "distinct"
+    if vm is False:
+        return "distinct"
+    if b["last"] - a["first"] > CS2_ROW_LIFE_S * fps:
+        return "distinct"
+    if _y_at(b, b["first"]) > _y_at(a, a["last"]) + CS2_ROW_YTOL:
+        return "distinct"                                         # lower than the row was: a newer row
+    if vm is True:
+        return "same"
+    if wd <= 6 or _border_relation(a, b, ca, cb) == "same":
+        return "same"
+    return None
+
+
 def border_merge(tracks, cfg):
     """Fragments of one row (the tracker lost it and found it again) become ONE track. Returns [(merged track, classification, [member ids])]."""
     cls = {t["id"]: cs2_classify_track(t, cfg) for t in tracks}
+    if CS2_ROWID_ON[0]:
+        rel_fn = lambda a, b, ca, cb: _cs2_row_relation(a, b, ca, cb, tracks)
+    else:
+        rel_fn = _border_relation
     groups = []
     for t in sorted(tracks, key=lambda t: t["first"]):
         hit = None
         for g in groups:
-            rel = [_border_relation(m, t, cls[m["id"]], cls[t["id"]]) if m["first"] <= t["first"] else _border_relation(t, m, cls[t["id"]], cls[m["id"]]) for m in g]
+            rel = [rel_fn(m, t, cls[m["id"]], cls[t["id"]]) if m["first"] <= t["first"] else rel_fn(t, m, cls[t["id"]], cls[m["id"]]) for m in g]
             if "same" in rel and "distinct" not in rel:
                 hit = g
                 break
@@ -3414,6 +3549,8 @@ def border_analysis(sc, cfg, deaths=None):
             if c["vtext"]:
                 pre_victims.append(c["vtext"])
                 early.append((tt, c["vtext"], t["id"], True))
+        elif CS2_ROWID_ON[0] and v == "kill" and not c["name_read"] and t["hits"] < CS2_UNNAMED_MIN_S * fps and t["last"] < n - 3:
+            rej.append({"t": tt, "reason": f"outlined row seen only {t['hits']} frames and my name never read ({row}): not a kill row", "ks": 0.0})
         elif v == "kill":
             vis.append((tt, round(last + 0.3, 3)))
             kills.append({"t": tt, "ks": (c["ks"] / 100) if c["name_read"] else 0.6, "hs": bool(c["hs"]), "row": row, "hits": t["hits"],
@@ -7725,6 +7862,8 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
         gap_g = fight_gap_for(gap, [it for it, _ in g])    # V6.9.7.1: a group with a clip of LONG_CLIP_S or more splits only on FIGHT_GAP_LONG_CLIP
         if len(g) > 1:                                     # clips saved right next to each other are one fight: the continuation window also bounds the kill gap
             gap_g = max(gap_g, pair_gap())
+        if game == "cs2" and CS2_ROWID_ON[0]:              # V8.1 (CS2 only): the kills of one clip / fight group are one fight (a split dropped the second half: one event per clip)
+            gap_g = max(gap_g, FIGHT_GAP_LONG_CLIP)
         clusters, cur = [], [allk[0]]
         for k in allk[1:]:                                 # one fight = one event: split only on a long gap with no revive in it
             if k["tt"] - cur[-1]["tt"] <= gap_g or any(cur[-1]["tt"] < rv < k["tt"] for rv in revs):
@@ -7840,6 +7979,8 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
         # (spans sorted by the aligned start). The frame match is ADVISORY only: it is logged, never a veto and never moves a clip.
         chain = [spans[0]]
         sgap = R6S_PAIR_GAP if getattr(PAIR_CTX, "game", None) == "r6s" else STITCH_GAP_S      # V8.0.2: R6S rounds are long: clips up to R6S_PAIR_GAP apart join the take (the missing footage is closed below)
+        if getattr(PAIR_CTX, "game", None) == "cs2" and CS2_ROWID_ON[0]:
+            sgap = pair_gap("cs2")                         # V8.1 (CS2 only): clips of one fight group join the take (a few seconds unsaved between them: closed below), not only back to back
         for s_ in spans[1:]:
             if s_["start"] <= chain[-1]["end"] + sgap and s_["end"] > chain[-1]["end"]:        # overlapping, or back to back (saved one right after the other)
                 chain.append(s_)
