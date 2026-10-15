@@ -1,71 +1,60 @@
 # Reference montage: "Fiverr 48 (2)" (CSGO, someone else's edit)
 
-Measured for V8.4 (notes for future versions). Source file: `E:\Movies\Montages\Fiverr 48 (2).mp4`.
-Nobody watched it; everything below comes from decoded frames, ffmpeg scene scores, optical flow, the montager's own killfeed
-border tracker and librosa / ffmpeg audio analysis. Each statement is tagged **[measured]** (a number from the file),
-**[seen]** (looked at extracted frame strips) or **[guess]** (an interpretation the numbers allow but do not prove).
-The per-frame measuring script is `tests/ref84_measure.py`.
+Corrected analysis for V8.4.1 (it replaces the V8.4 notes). Source: `E:\Movies\Montages\Fiverr 48 (2).mp4`, 2720x1530, 60 fps h264, AAC 48 kHz stereo, 202.9 s.
+Nobody watched it; everything comes from decoded frames, ffmpeg scene scores, optical flow, audio analysis (librosa, ffmpeg ebur128) and frame strips that were looked at.
+Tags: **[measured]** = a number from the file, **[seen]** = looked at extracted frame strips, **[guess]** = an interpretation the data allows but does not prove.
 
-## File
-- 2720x1530, 60 fps, h264; AAC stereo 48 kHz; 202.9 s (3:23). **[measured]**
-- The game HUD is kept in full (radar, money, health, killfeed, chat). Nothing is cropped or covered. **[seen]**
+## CORRECTED: what the V8.4 notes got wrong
+- **CORRECTED:** "33 kill rows (found with the montager's CS2 border tracker)". The tracker does not work on a CSGO killfeed; the number was wrong and is discarded.
+- **CORRECTED:** "the effects belong to the cuts, not the kills". Wrong. It came from those wrong kill times (event averages around times that were not kills show nothing). The frame strips show colour effects on the shots / kills (below).
+- **CORRECTED:** "no flash / colour effect tied to kills", "no zoom pulse on kills": the colour effects are there; the zoom numbers still cannot separate an added zoom from in-game camera movement ([guess] below).
+- Still true: the file facts, the intro, the music facts, the outro fade, and the mirror-edge zoom-out at cuts.
 
-## Structure / pacing
-- **0 to ~14 s: free-camera fly-through of a map** with hand-lettered title cards ("... Network presents", then a channel / series name)
-  while the picture fades in from black (luma 11 -> 91 over about 2.5 s) and the music starts very quiet (about -19 dB RMS). **[seen] [measured]**
-- First HUD gameplay at about 14 s; the first red-outlined kill row (the montager's CS2 border tracker, 33 distinct rows of 0.4 s or more) is at 38 s. **[measured]**
-  The first kills land exactly where the music has built up to full level (loudness climbs from -19 dB to -7 dB RMS between 17 s and 40 s). **[measured]**
-- 33 kill rows in 203 s: after the intro one every ~5 s; clips are long gameplay stretches, not kill-only snippets. **[measured]**
-- Cut rhythm: 48 hard cuts with ffmpeg scene score > 0.25 (median 2.7 s apart; 113 above 0.2, 195 above 0.15 because fast aiming also scores). **[measured]**
-  "Big" transitions (below) are 24, median 7.6 s apart (10 / 90 percent: 1.7 s / 13 s). **[measured]**
-- From a big transition to the next kill row: median 4.4 s (quartiles 1.4 / 8.1 s); from a kill row to the next big transition: median 5.2 s
-  (quartiles 2.5 / 9.4 s). The kill is not held for a fixed tail; many clips contain 2 to 5 kills (kill rows per clip: 9 clips with 1, 4 with 2, 2 with 3, 2 with 5; 7 clips without a visible row). **[measured]**
-- Outro: video fades to black over the last ~4 s (luma 72 -> 11) while the music fades out over the last 5 s (-6 dB -> -59 dB). **[measured]**
+## What is solid (and what is not)
+- **Kills** can be found in this video: the CSGO killfeed marks the player's own kill rows with a **red outline** [seen: crop of the top-right at 40.5, 41.5, 54.8, 68.4 s]. A detector for thin red horizontal lines in a native-resolution crop of the killfeed (rows = lines / 2, persisting >= 25 frames) finds **66 row appearances after 14 s** [measured]. Not every one is verified against the footage, and a row appears slightly after the shot: use them as kill times to about +-0.1 s, not as shot times.
+- **Beat grid** of the music: period **0.5882 s = 102.0 BPM**, phase stable within +-10 ms across the whole file [measured: grid fit on onset strength, checked per 20 s window]. (The tracker's 103.4 BPM was an average of a drifting estimate.)
+- **Beat relation of the kills: NOT confirmed.** Against that grid the 66 row appearances are spread evenly (circular concentration R = 0.12 at one per beat, chance level 0.12; at 4 per beat 0.14, 6 per beat 0.19, chance 0.12 to 0.14) [measured]. Muzzle-flash detectors (luma rise in the weapon area, yellow pixels) also show no concentration on the beat, on the beat, 1/2, 1/3, 1/4, 1/6 or 1/8 subdivisions [measured]. So I cannot back up "every kill / every bullet lands on a beat" with numbers. Possible reasons: the row appears a variable time after the shot; my shot detector is too crude; or the claim holds for some clips only. **I will not show a number I cannot back up. To measure it I need timestamps from you (below).**
+- **Spray timing** [seen]: automatic fire shows a muzzle flash about every 0.09 to 0.10 s (2 frames at 20 fps strips). One sixth of a beat is 0.098 s, so a spray could sit on 1/6-beat triplets [guess]. Not measurable without shot times.
 
-## Cuts, kills and the beat
-- Music tempo about 103 BPM (beat interval 0.58 s; the tracker may also be counting half time). **[measured]**
-- **The edit is not beat-locked.** Kill rows within +-0.1 beat of a beat: 18 % (chance is 20 %); cuts within +-0.1 beat: 15 %; big transitions: 12 % (46 % within +-0.2, chance 40 %). **[measured]**
-  Our montages are the opposite (every first kill on a beat), so the reference's "feel" does not come from beat-locking. **[guess]**
-- Music structure: loudness jumps > 3 dB in 1 s at 17.8, 25.1, 29.6, 37.2 and 78.7 s; clear dips (> 4 dB under the local level, a breakdown before a drop) at 25.1 and 78.6 s. The second drop (78.7 s) has a gameplay kill row at 80.0 s two seconds later; there is no cut or effect measured exactly on either drop. **[measured]**
-
-## Transitions and effects (video)
-| Effect | What the frames show | How often | Tied to kills? | Tied to beats? |
+## Kill-tied effects (seen in frame strips, 20 fps, around kill rows at 40.9, 57.3, 98.4 s)
+| Effect | What the frames show | Length | Strength | Relation to the kill / beat |
 |---|---|---|---|---|
-| **Mirror-edge zoom-out at a cut** | 1 to 3 frames in which the picture is shrunk to 50 to 80 % and the empty border is filled with mirrored copies of the picture (a 4-way kaleidoscope look of the HUD), then the new clip. Single-frame scale ratio < 0.82 or > 1.3 in the optical-flow fit. **[seen] [measured]** | 24 in 203 s (about every 8 s) | No: 5 of 32 kill rows (after 25 s) are within 1 s of one (16 %; random times: 23 %) | No (12 % within 0.1 beat) |
-| **Zoom pulse around a cut** | Frame-to-frame scale ratios such as 1.03, 1.06, 1.12, 1.18 into the cut (accelerating zoom-in) and 1.12, 1.06, 1.03 after it (decelerating): about 8 frames (0.13 s), up to +20 to +50 % scale. 114 groups with a > 4 % single-frame scale change = one every 1.8 s. **[measured]** Ordinary forward movement in the game also scales, so some of these are not an effect. **[guess]** | about every cut | No | No |
-| **Brightness jump at the cut** | Mean luma +17 on the first frame of the new clip, frame difference 31 versus a 5 to 10 baseline. **[measured]** Probably just a different clip, not an effect. **[guess]** | every cut | No | No |
-| **Zoom / flash / shake on the kill** | Event-triggered averages around the kill row (frame difference, sharpness, global motion, luma) show nothing above the noise. **[measured]** | n/a | **Not found** | n/a |
-| **Slow-mo, speed ramps, freezes** | Only 1.8 % of frames have no change at all and the 16 still runs of 0.4 s or more are title cards / black. No sustained low-motion stretch around kills. **[measured]** | none found | no | no |
-| **Colour grade / overlays on kills** | Saturation stays about 70 (+-5 around cuts); no tint or vignette change near kills. **[measured]** Title cards in the intro and a few subtitle-style captions ("Show me how it's done fire" at about 24 s). **[seen]** | intro only | no | no |
+| **Colour glow / bloom flash** [seen] | A large yellow-white (most often), sometimes red or orange wash over the picture, strongest on the right / bright part, with a green-cyan fringe at the peak (a lens-flare / glow look). Peak after 1 frame, then fades. Red glow right on the target at the first shot, yellow wash while the burst fires. | about 0.15 to 0.3 s (3 to 6 frames at 20 fps), fast attack, exponential-looking decay | very strong at the peak: the whole frame goes yellow, the killfeed region tinted too (frame at 41.5 s) | at the shots of a burst; repeated every shot of a spray (every ~0.1 s) [seen] |
+| **Luma rise at kills** [measured] | Mean picture brightness rises 5 to 7 levels on average around kill rows (median rise 19.8 vs 12.4 around random times); 26 of 66 kill rows have a rise > 25 within -0.1 to +0.5 s. Part of this is the in-game muzzle light [guess]. | | | |
+| **Warm colour wash on the sky area** [measured] | Upper-left picture (sky) moves toward yellow / orange / red by > 35 levels: 21 events after 14 s, hue 4 to 65 degrees (yellow, orange, red), half-width 0.03 to 0.7 s (median 0.25 s); 17 % of kill rows have one within 0.5 s (random times 8 %) | median 0.25 s | up to +124 levels | related to kills but not on all of them |
+| **Zoom punch on kills** | The numbers cannot separate a punch from the camera moving [guess: there is none or it is small]. No event-average zoom around kill rows [measured]. | | | |
+| **Shake on kills** | No kill-aligned jump in global motion [measured]. | | | |
+| **Slow-mo / speed ramps / freezes** | Only 1.8 % of frames repeat the previous frame; no stretch near kills with a sustained drop in motion [measured]. Frame strips around the kills show a normal flowing movement [seen]. **No slow-mo, ramp or freeze found around the kills I looked at.** Between the kills of a multikill the gaps are 0.4 to 1.4 beats [measured], not whole beats, so the gaps are not retimed to the beat [guess: this is the natural spacing]. | | | |
 
-So **in the reference the effects belong to the cuts, not to the kills.** The kills are shown as they happen, at 1.0x, with the full HUD.
-Our current style puts every effect on the kill. **[guess]** that adding the cut-side effects (settle zoom, mirror frames) is what makes the reference feel "edited".
+## Sky colour effect
+- **Seen:** at 41.5 s the whole upper picture and the killfeed rows go yellow-orange (kill 2 of a 3-kill burst). In other frames the glow is red or orange. The killfeed text and its red outline stay readable, tinted by the same colour [seen].
+- **Measured:** 21 warm washes of the sky region (see the table), hues in the yellow / orange / red range only (no blue or green wash found), median length 0.25 s.
+- **Not established:** that the colour follows the song's feel (red for a red-feeling song). I cannot judge the song's feel from the numbers. **I cannot tell a deliberate sky recolour from a glow flash and from in-game muzzle light with these data** [guess: the yellow wash at 41.5 s is the colour effect you describe].
 
-## Audio
-- Integrated loudness -4.8 LUFS, loudness range 6.9 LU, true peak +1.1 dBFS (it clips slightly): a very loud master. **[measured]**
-- RMS per 10 s after the build-up: -6 to -8 dB, steady. Short-term variation std 5.5 dB. **[measured]**
-- **No game audio tied to kills:** the event-triggered RMS / low-band / high-band (> 4 kHz) / onset curves around the 33 kill rows are flat (within +-0.5 dB) and no louder than around random times. Gunshots are not audible in the mix. **[measured]** Most likely game audio is muted or far below the music. **[guess]**
-- No ducking of the music around kills (RMS flat). A small dip of about 0.5 dB just before the big transitions. **[measured]**
-- The music has a quiet intro (about 38 s of build-up) before it opens up. Our montages start the music at full level (0.3 s fade-in). **[measured]**
+## Drops
+- Music loudness jumps > 3 dB in 1 s at 17.8, 25.1, 29.6, 37.2 and 78.7 s; clear dips (a breakdown before a drop) at 25.1 and 78.6 s [measured]. The first red-outlined kill row is at 39.7 s, just after the 37.2 s step; the next burst of kills (57.6 to 58.9 s, 66 to 80 s) has no extra effect that I can measure on the drops themselves. **I have no per-drop effect numbers.** Timestamps of the drops from you would settle it.
 
-## Ideas for our montages (not built yet)
-1. Cut-side effects instead of (or besides) kill effects: a short zoom-settle after every cut, a mirror-edge zoom-out on some cuts. (V8.4 EXTRA EFFECTS builds these.)
-2. A quiet intro (picture fade-in with a title and the music building), with the first kill on the full-volume entry. Needs a song map "build up" detection and an intro clip: not possible in the current planner without touching beat / song planning.
-3. Longer clips with 2 to 5 kills and room before the first kill (median 4.4 s run-up): our takes use 1 to 2 s run-ups.
-4. Less than one beat-locked first kill per take: the reference never locks kills to beats yet still feels tight because cuts are short (2.7 s median).
-5. A very loud, limited master (-5 LUFS): our mix keeps 2 dB headroom, measure how loud our renders are before changing.
-6. Title / caption overlays: not built (text rendering and fonts are not part of the pipeline).
+## Cuts and transitions (unchanged from V8.4)
+- 48 hard cuts with scene score > 0.25 (median 2.7 s apart). **[measured]**
+- **Mirror-edge zoom-out at some cuts:** 1 to 3 frames shrink the picture to 50 to 80 % and the border is filled with mirrored copies; 24 times in 203 s (about every 8 s). **[seen] [measured]**
+- Zoom pulse around cuts (frame-to-frame scale 1.03 / 1.06 / 1.12 / 1.18 into the cut, decelerating after it): 114 groups, about every 1.8 s; ordinary forward movement also scales, so some are not an effect. **[measured] [guess]**
 
-## What V8.4 could and could not copy
-- Built (EXTRA EFFECTS): zoom-settle after cuts, mirror-edge zoom-out frames at some cuts (strong beats first), kill flash and kill shake on strong kills that keep the killfeed row untouched, beat-strength-scaled zoom punch.
-- Not built, with reasons:
-  - **True zoom-through transition across the cut** (outgoing clip zooming in on its last frames): the last 0.4 s of every take must show the kill row unchanged (tail rule), so the outgoing side cannot be scaled.
-  - **Title cards / captions / fly-through intro:** no text rendering and no free-camera footage in the pipeline.
-  - **Quiet music build-up intro:** the song start and the first-kill-on-a-beat plan are fixed by the planner (frozen).
-  - **Per-kill colour grading:** the reference has none; nothing to copy.
-  - **Slow-mo / speed ramps like the reference:** the reference has none.
+## Intro, outro, music, pacing (unchanged)
+- 0 to ~14 s: free-camera fly-through of a map with hand-lettered title cards; picture fades in from black (luma 11 -> 91 over 2.5 s) while the music starts very quiet (about -19 dB RMS) and builds to full level by ~40 s. **[seen] [measured]**
+- Outro: picture fades to black over the last ~4 s, music fades over the last 5 s (-6 -> -59 dB). **[measured]**
+- Loudness -4.8 LUFS integrated, LRA 6.9 LU, true peak +1.1 dBFS: a very loud master. **[measured]**
+- Game audio: no audio events at the kill-row times (flat RMS / low / high band curves), so the game sound is very quiet or absent in the mix. **[measured]** (This used the *wrong* kill times in V8.4 and is therefore re-stated as "not seen at the 66 row times"; shots may still be audible; not re-checked per shot.)
+- Pacing: 33 to 66 kill appearances in 203 s depending on the detector (the real number of kills is probably about 40 to 50). Clips are long gameplay stretches with several kills. **[guess]**
 
-## Raw numbers
-- 12,176 frames analysed at 320x180; flow fit reliable on 99 % of frames.
-- Scene scores: 438 frames above 0.1, 195 above 0.15, 113 above 0.2, 48 above 0.3, 23 above 0.4, 17 above 0.5.
-- Kill rows used: border tracks of 12 or more frames at 30 fps (0.4 s), merged within 0.8 s: 33.
+## What I need from you to measure the rest
+Please give me, for **five clips** of the reference, the times (mm:ss.s) of:
+1. the **killing shot** of 5 kills (2 of them in a multikill where every bullet is on the beat; for those, the time of every bullet),
+2. 3 kills that carry a **visible effect** (with a word for it: zoom / flash / shake / colour / speed),
+3. 1 kill where the **sky colour changes** (start and end of the colour),
+4. the **drops** (start time) and what the picture does there,
+5. one place with **slow-mo or a speed ramp**, if there is any.
+With those I can measure the effect lengths, strength, the beat fraction of each shot and the speed changes properly.
+
+## What V8.4.1 builds from this (see the changelog)
+- Colour glow flash and white flash on every kill (the song's feel colour; stronger on the beat and the drop), colour split, zoom punch, build-up and afterglow on the drop kill, sky recolour attempt, settle and mirror cut. All of it is an educated copy of the *seen* effects, not a measured copy.
+- **Not built (and why):** speed changes between the kills of a multikill (the reference does not seem to have them; the kills stay at 1.0x anyway); slow-mo in new places (changes the take lengths and the tail fit, planner is frozen); title cards / fly-through intro; the quiet music build-up intro; a zoom-through transition across a cut (the last 0.4 s of every take must show the kill row unchanged).
