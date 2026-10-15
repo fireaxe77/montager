@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.4 - 2026-10-15: Extra effects mode
+- New Effects setting with Default and Extra effects (Default stays the way it was)
+- Extra effects adds smoother cuts, flashes and shakes on strong kills, stronger on the beat and the drops
+- Kills, their timing and the beat sync are never changed by it, and the kill row always stays visible
+
 ## V8.23.1 - 2026-10-15: R6S grenade and gadget kills filtered
 - R6S montages now skip grenade and gadget kills, also for clips that were scanned before
 - Normal gun kills are not affected
