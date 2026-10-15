@@ -2,6 +2,13 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.4.1 - 2026-10-15: Much more extra effects, per game
+- Effects can now be set for each game: CS2, Valorant and R6S (CS2 starts on Extra effects, the others on Default)
+- Extra effects now puts a colour flash, zoom and glitch on every kill, stronger on the beat and the drops, with a build-up and afterglow on the drop kill
+- Sky recolour on selected kills: the sky takes the colour of the song's feel (red for an aggressive song); it is skipped when there is no clear sky
+- Faster run-ups into the kills; the kill itself stays at normal speed and the kill row always stays visible
+- Montages can now be up to 180 seconds long
+
 ## V8.4 - 2026-10-15: Extra effects mode
 - New Effects setting with Default and Extra effects (Default stays the way it was)
 - Extra effects adds smoother cuts, flashes and shakes on strong kills, stronger on the beat and the drops
