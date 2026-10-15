@@ -5,6 +5,11 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V8.23 (branch work-v823, merged to main, APP_VERSION = V8.23) - 2026-10-15
+- R6S only: one more utility (gadget kill) icon template, `kill_gadget4.png` (28x18 crop of the supplied screenshot: killfeed row `fireaxeO [icon] Lomopoly`), added to `montage_data\r6s\utility_icons` (the existing template-matching rejection: same "utility: gadget kill icon" reject line). A copy of the template and of the screenshot row are in `fixtures/` (`r6s_kill_gadget4.png`, `r6s_gadget4_row.png`) for the test. No code path, threshold or other filter changed; Valorant / CS2 untouched.
+- Because the utility icon set changed, R6S cache entries scanned with the old set count as stale (`r6s_entry_stale`) and are scanned again only when a future R6S run / pick uses them; nothing was rebuilt or deleted now, rendered montages are untouched.
+- Tests: `tests/test_v823.py`.
+
 ## V8.22 (branch work-v822, merged to main, APP_VERSION = V8.22) - 2026-10-15
 - Manual tab, Step 2: "Random pick" button (`random_song`) selects one song of the list as shown (search filter and sort); it never plays or renders.
 - New setting `post_checks` (Settings > Checks after render, default off): off = `run_job` prints `rendered <path>` and returns right after `video_ready`; on = quality check, sync report (incl. transition check) as before. Nothing before the video is written changed.
