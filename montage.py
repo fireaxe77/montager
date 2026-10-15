@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.21"
+APP_VERSION = "V8.22"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -100,6 +100,7 @@ DEFAULT_CONFIG = {
     "name_match": 80,               # V4 OCR: rapidfuzz partial_ratio needed for FIREAXE (killer side = kill, victim side = death)
     "death_lock_s": 8.0,            # no kills counted this long after my own death
     "sync_report": True,
+    "post_checks": False,           # V8.22: SSIM quality check + sync report + transition check after the video is written (off by default)
     "gap_s": {"valorant": 6.0, "cs2": 5.0, "r6s": 6.0},
     "game_overrides": {},           # path prefix -> game
     "match_threshold": 85,
@@ -10594,9 +10595,6 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
         L.append(f"  {i:2}. {t['f0'] / OUT_FPS:6.2f}s {t['nf']:4d}f [{t['role']:8}] first kill @{t['out_start'] + t['kills_out'][0]:6.2f}s"
                  f"{' (downbeat)' if t['kill_down'] else ''} tail {tail:.2f}s  {t['n']}k  {Path(t['path']).name} @ "
                  f"{', '.join(ts(k) for k in t['kills'])}{' (stitched)' if t['stitched'] else ''}  {fx}")
-    L.append(f"\nPLAYLIST tracks with no MP3 yet: {len(unmatched)}" + (f" (CSV {csvname})" if csvname else ""))
-    for r in unmatched[:15]:
-        L.append(f"   {r['artist']} - {r['title']}")
     return "\n".join(L)
 
 
@@ -12900,6 +12898,11 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
         T_JOB["after render"] = time.time() - t_r0 - T_JOB["render"]
         t_c0 = time.time()
         video_ready(outfile)                               # V8.2: the mp4 is complete: Open video works now, the checks below run after it
+        if not cfg.get("post_checks", False):              # V8.22: the checks after the video is written are off by default
+            out(f"rendered {outfile}")
+            T_JOB["checks"] = time.time() - t_c0
+            out("TIMING: " + " | ".join(f"{k} {v:.1f} s" for k, v in T_JOB.items()))
+            return outfile
         out("video ready - running the quality / sync / transition checks")
         try:
             quality_check(plan, outfile, cfg)
@@ -14355,6 +14358,7 @@ class App:
         cfg["length_s"] = "optimal" if self.set_opt.get() else max(LEN_MIN_S, min(LEN_MAX_S, int(self.set_len.get())))
         cfg["style"], cfg["placement"] = self.set_style.get(), self.set_place.get()
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
+        cfg["post_checks"] = bool(self.set_post.get())               # V8.22
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
         cfg["lower_music_clips"] = bool(self.set_music.get())        # V7.7.0
@@ -14873,6 +14877,7 @@ class App:
         ttk.Entry(r2, textvariable=self.m_search, width=30).pack(side="left", padx=4)
         self.btn(r2, "Play selected song", self.play_song).pack(side="left", padx=8)
         self.btn(r2, "Song map", self.map_song, name="Song map (Manual)").pack(side="left")
+        self.btn(r2, "Random pick", self.random_song, name="songs:random_pick").pack(side="left", padx=8)
         fr2, self.stree = make_tree(s2, ("bpm", "len", "added", "trash"), height=2, selectmode="browse")
         fr2.pack(fill="both", expand=True)
         self.stree.column("#0", width=520)
@@ -15421,6 +15426,17 @@ class App:
                 self.q.put(("call", lambda p=s["path"], b=an["bpm"]: self.stree.exists(p) and self.stree.set(p, "bpm", f"{float(b):.0f}")))
             except Exception:
                 pass
+
+    def random_song(self):
+        """V8.22: select one random song from the list as shown now (search filter and sort applied); only selects, never plays or renders."""
+        kids = [k for k in self.stree.get_children() if k != "auto"]
+        if not kids:
+            self._result = "No songs"
+            return
+        k = random.choice(kids)
+        self.stree.selection_set(k)
+        self.stree.focus(k)
+        self.stree.see(k)
 
     def play_song(self):
         sel = self.stree.selection()
@@ -16165,6 +16181,7 @@ class App:
         ttk.Combobox(h, textvariable=self.set_audio, values=list(AUDIO_MODES.values()), width=16, state="readonly").pack(side="left")
         r[0] += 1
         self.set_sync = tk.BooleanVar(value=self.cfg.get("sync_report", True))
+        self.set_post = tk.BooleanVar(value=bool(self.cfg.get("post_checks", False)))      # V8.22
         label("Quality")
         h = holder()
         ttk.Radiobutton(h, text="NVENC p7 cq18 (fast)", variable=self.set_q, value="nvenc").pack(side="left", padx=(0, PX))
@@ -16184,6 +16201,9 @@ class App:
         r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
+        r[0] += 1
+        label("Checks after render")
+        ttk.Checkbutton(holder(), text="Run the quality, sync and transition checks after the video is written (off = finish at once)", variable=self.set_post).pack(side="left")
         r[0] += 1
         section("Appearance")
         self.set_accent = tk.StringVar(value=ACCENT_NAMES.get(self.cfg.get("accent", "lime"), "Lime green"))
@@ -16219,7 +16239,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_post, self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):

@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.22 - 2026-10-15: Random song pick, faster finish after rendering
+- New Random pick button next to the song search: selects one random song from the list shown
+- Rendering now finishes as soon as the video is written; the extra quality and sync checks are an optional Settings switch (off by default)
+- The plan text no longer lists playlist tracks that have no MP3
+
 ## V8.21 - 2026-10-15: CS2 clutch kills no longer cut short
 - CS2 montages show the last kill of a clutch
 - Game audio level is back as a simple 0 to 1 setting for each game
