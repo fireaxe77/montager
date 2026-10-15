@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.23.1 - 2026-10-15: R6S grenade and gadget kills filtered
+- R6S montages now skip grenade and gadget kills, also for clips that were scanned before
+- Normal gun kills are not affected
+
 ## V8.23 - 2026-10-15: One more R6S gadget kill filtered
 - R6S montages no longer show kills made with one more gadget (the one with the small flame-like icon)
 - Montages that are already rendered are not affected
