@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.4.3 - 2026-10-16: Extra effects render fix, calmer look
+- Montages whose clip has a gap in its sound now finish instead of failing; that part is simply silent
+- If a render fails, it now tries at most three times: full effects, fewer effects, then the plain version
+- The red and blue colour flashes are gone: no effect covers the picture in a colour any more
+- Sky recolour is tried on more kills and still only used where the sky is clear
+
 ## V8.4.2 - 2026-10-15: Smarter extra effects, safer renders
 - Extra effects are now chosen for each montage from the song and the clips: not every kill gets effects, calm parts stay clean, and beat kills, drops and headline kills get the most
 - Two montages with different songs or clips now look different
