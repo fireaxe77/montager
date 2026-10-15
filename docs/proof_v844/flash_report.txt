@@ -1,0 +1,3 @@
+Counter-strike_2_2026.01.23_-_23.02.45.0 (cs2): white share R 0.439 G 0.445 B 0.439 (cast 0.006); mean change RGB +68.6 +74.5 +78.7; colourfulness 36.1 -> 20.1; NEUTRAL WHITE
+Valorant_2025.10.11_-_23.55.02.07.DVR (valorant): white share R 0.439 G 0.445 B 0.439 (cast 0.006); mean change RGB +63.9 +76.9 +80.6; colourfulness 45.0 -> 25.0; NEUTRAL WHITE
+Tom_Clancy's_Rainbow_Six__Siege_2025.08. (r6s): white share R 0.443 G 0.447 B 0.441 (cast 0.006); mean change RGB +89.8 +94.3 +95.3; colourfulness 15.2 -> 8.8; NEUTRAL WHITE

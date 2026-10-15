@@ -59,7 +59,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.4.3"
+APP_VERSION = "V8.4.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -10861,12 +10861,12 @@ def xfx_strength(t):
 
 
 XFX_FX = ("split", "grade", "sky")     # V8.4.3: the extra effects that switch on in the render (glow / flash are gone: no effect washes the picture in a colour); transition = mirror, zoom = settle / punch
-FEEL_PROFILES = {                    # V8.4.3: how a style's montage is dressed: weight of each kill effect (colour split / zoom punch: the only ones that do not cover the picture), how many a montage keeps, share of kills dressed, cut effects, sky
-    "aggressive": {"w": {"punch": 0.9, "split": 0.6}, "k": (1, 2), "share": 0.52, "settle": 0.7, "mirror": 0.5, "sky": 3},
-    "hype": {"w": {"punch": 0.8, "split": 0.3}, "k": (1, 2), "share": 0.46, "settle": 0.6, "mirror": 0.3, "sky": 2},
-    "cinematic": {"w": {"punch": 0.4, "split": 0.15}, "k": (1, 2), "share": 0.38, "settle": 0.4, "mirror": 0.15, "sky": 3},
-    "smooth": {"w": {"punch": 0.35, "split": 0.1}, "k": (1, 2), "share": 0.3, "settle": 0.5, "mirror": 0.0, "sky": 1},
-    "chill": {"w": {"punch": 0.25, "split": 0.05}, "k": (1, 1), "share": 0.22, "settle": 0.4, "mirror": 0.0, "sky": 1}}
+FEEL_PROFILES = {                    # V8.4.4: how a style's montage is dressed: weight of each kill effect (white flash / colour split / zoom punch), how many a montage keeps, share of kills dressed, cut effects, sky
+    "aggressive": {"w": {"punch": 0.9, "flash": 0.8, "split": 0.6}, "k": (2, 3), "share": 0.52, "settle": 0.7, "mirror": 0.5, "sky": 3},
+    "hype": {"w": {"punch": 0.8, "flash": 0.5, "split": 0.3}, "k": (1, 2), "share": 0.46, "settle": 0.6, "mirror": 0.3, "sky": 2},
+    "cinematic": {"w": {"punch": 0.4, "flash": 0.3, "split": 0.15}, "k": (1, 2), "share": 0.38, "settle": 0.4, "mirror": 0.15, "sky": 3},
+    "smooth": {"w": {"punch": 0.35, "flash": 0.2, "split": 0.1}, "k": (1, 2), "share": 0.3, "settle": 0.5, "mirror": 0.0, "sky": 1},
+    "chill": {"w": {"punch": 0.25, "flash": 0.1, "split": 0.05}, "k": (1, 1), "share": 0.22, "settle": 0.4, "mirror": 0.0, "sky": 1}}
 FEEL_PROFILES["mix"] = FEEL_PROFILES["hype"]
 XFX_SKY_SPACING = 25.0               # seconds between two sky recolours in one montage
 XFX_SKY_CANDS = 12                   # kills that are looked at for a clear sky (the render keeps at most the profile's number of them)
@@ -10904,8 +10904,8 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
         en = float(energy)
     except (TypeError, ValueError):
         en = 0.6
-    for t_ in plan["takes"]:                                # V8.4.3: what the take was before the extra effects touched it (the render's fall-back attempts restore it)
-        t_["xfx0"] = {"amp": t_.get("amp"), "segs": [list(x_) for x_ in t_["segs"]], "ramp": t_.get("ramp"), "has_ramp": "ramp" in t_}
+    sky_name, sky_rgb, sky_why = sky_pick(recipe, energy, (plan.get("song") or {}).get("bpm"), seed, title)      # V8.4.4: ONE sky colour per montage, from the song's feel
+    plan["xfx_sky_hue"] = {"name": sky_name, "rgb": sky_rgb, "why": sky_why}
     plan["effects"] = "extra"
     plan["xfx_zone"] = [round(float(v), 4) for v in zone]
     plan["xfx_feel"] = {"name": fname, "hue": fhue, "rgb": frgb, "why": fwhy}
@@ -10956,7 +10956,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
             continue
         chosen.append(c)
     chosen_ix = {(c["ti"], c["i"]): c for c in chosen}
-    cnt = {"settle": 0, "mirror": 0, "rgb": 0, "punch": 0, "burst": 0, "rise": 0, "after": 0, "sky": 0, "kills": 0, "clean": 0}
+    cnt = {"settle": 0, "mirror": 0, "flash": 0, "rgb": 0, "punch": 0, "burst": 0, "rise": 0, "after": 0, "sky": 0, "kills": 0, "clean": 0}
     prev_first = None
     last_mirror = -9
     per_take = {ti: [] for ti in range(len(takes))}
@@ -10966,7 +10966,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
         lag = ((t.get("rows_out") or t["kills_out"])[c["i"]] - p) if c["i"] < len(t.get("rows_out") or t["kills_out"]) else 0.15
         fx = per_take[c["ti"]]
         if c["drop"]:
-            kinds = ["split", "punch"]
+            kinds = ["flash", "split", "punch"]
         else:
             n_e = 3 if sc >= 1.6 else 2 if sc >= 1.05 else 1
             kinds = []
@@ -10978,6 +10978,9 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
             if not kinds:
                 kinds = [sig[0]]
             prev_first = kinds[0]
+        if "flash" in kinds:                                     # V8.4.4: a neutral white flash on the chosen kills only (never a colour: see _xfx_chains)
+            fx.append({"k": "flash", "p": round(p, 4), "a": round(min(0.6, 0.3 * sc * par["f"] * (1.3 if c["drop"] else 1.0)), 3), "t1": XFX_FLASH_S})
+            cnt["flash"] += 1
         if "split" in kinds:
             fx.append({"k": "rgb", "p": round(p, 4), "px": int(max(2, min(10, round(par["px"] * sc * (1.35 if c["drop"] else 1.0) / 1.0)))), "t1": XFX_RGB_S})
             cnt["rgb"] += 1
@@ -11023,7 +11026,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
         t = takes[c["ti"]]
         dur = float(t.get("dur") or 0)
         per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": round(max(0.0, c["p"] - XFX_SKY_IN), 4), "t1": round(min(dur, c["p"] + XFX_SKY_OUT), 4),
-                                  "hue": fhue, "ok": None, "gp": round(c["gp"], 3)})
+                                  "hue": sky_name, "ok": None, "gp": round(c["gp"], 3)})
     plan["xfx_sky_max"] = sky_max
     for ti, fx in per_take.items():
         if fx:
@@ -11033,13 +11036,14 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
         xfx_speed(plan, rng, cnt)
     on_n = sum(1 for c in chosen if c["on"])
     summary = {"feel": fname, "why": fwhy, "recipe": recipe, "signature": sig, "share": round(share, 2), "kills": len(cands), "dressed": cnt["kills"], "dressed_on_beat": on_n,
-               "split": cnt["rgb"], "punch": cnt["punch"], "burst": cnt["burst"], "settle": cnt["settle"], "mirror": cnt["mirror"],
+               "flash": cnt["flash"], "split": cnt["rgb"], "punch": cnt["punch"], "sky_colour": sky_name, "burst": cnt["burst"], "settle": cnt["settle"], "mirror": cnt["mirror"],
                "speed": cnt["speed"], "sky_max": sky_max, "sky_candidates": len(sky_c)}
     plan["xfx_plan"] = summary
     lines = [f"EFFECT PLAN (extra): song feel {fname} - {fwhy}; this montage's signature: {' + '.join(sig)} (kill effects not in it only on the drop kill)",
              f"EFFECT PLAN: {cnt['kills']} of {len(cands)} kills dressed ({share * 100:.0f}% share by style / energy, {on_n} on a beat; the rest stay clean): "
-             f"colour split {cnt['rgb']}, punch {cnt['punch']}; {cnt['burst']} drop burst(s) with build-up and afterglow; cuts: {cnt['settle']} settles, {cnt['mirror']} mirror cuts; "
-             f"{cnt['speed']} faster run-ups; sky recolour: up to {sky_max} (clear sky only, {len(sky_c)} candidate kills, at least {XFX_SKY_SPACING:.0f} s apart)"]
+             f"white flash {cnt['flash']}, colour split {cnt['rgb']}, punch {cnt['punch']}; {cnt['burst']} drop burst(s) with build-up and afterglow; cuts: {cnt['settle']} settles, {cnt['mirror']} mirror cuts; "
+             f"{cnt['speed']} faster run-ups; sky recolour: up to {sky_max} (clear sky only, {len(sky_c)} candidate kills, at least {XFX_SKY_SPACING:.0f} s apart)",
+             f"EFFECT PLAN: sky colour {sky_name} (0x{sky_rgb:06X}) - {sky_why}, seed {seed}"]
     for ln in lines:
         if notes is not None:
             notes.append(ln)
@@ -11217,8 +11221,7 @@ CS2_SLOW_INTERP = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:v
 
 
 def sky_mask_np(rgb):
-    """V8.4.3: the sky rule on a small RGB picture (HxWx3 uint8): the SKY-BLUE colour family only (chroma ratio V/U between -1.9 and -0.5: not teal walls, not purple lights, not white / grey walls or
-    lights), bright enough, upper 55 % only, never the radar (top left). The render's geq mask is the same rule."""
+    """V8.4.3 colour-family rule (kept for the older tests; the render uses sky_segment since V8.4.4)."""
     import numpy as np
     r, g, b = (rgb[..., i].astype(np.float32) for i in (0, 1, 2))
     y = 16 + 0.1826 * r + 0.6142 * g + 0.0620 * b
@@ -11230,49 +11233,284 @@ def sky_mask_np(rgb):
     return m
 
 
-XFX_SKY_U, XFX_SKY_R0, XFX_SKY_R1, XFX_SKY_Y = 9.0, 0.3, 1.9, 90.0       # V8.4.3 sky colour family: U above this, V between -R0 x U and -R1 x U
+XFX_SKY_U, XFX_SKY_R0, XFX_SKY_R1, XFX_SKY_Y = 9.0, 0.3, 1.9, 90.0       # V8.4.3 sky colour family (old rule)
+SKY_W, SKY_H = 384, 216              # V8.4.4: the sky mask is made and stored at this size (the render scales it up to 1920 x 1080)
+SKY_FEATHER = 1.4                    # sigma (mask pixels = 5 output pixels each) of the edge feather
+SKY_EASE_IN, SKY_EASE_OUT = 0.20, 0.50   # seconds the recolour takes to come in / go out inside the effect window
+SKY_FLAT = 0.35                      # how much of the sky's own brightness variation stays (0 = one flat tone, 1 = untouched)
+SKY_PALETTE = {                      # V8.4.4: deep colours the sky can turn into (name: 0xRRGGBB)
+    "red": 0xB3121A, "orange": 0xD4520C, "gold": 0xC99A10, "magenta": 0xB0147E,
+    "purple": 0x5B22A6, "deep blue": 0x1536B8, "teal": 0x0E8C8C, "green": 0x1E8E3A}
+SKY_STYLE_W = {                      # the song's style -> weight of each colour
+    "aggressive": {"red": 3, "orange": 2, "magenta": 1.5, "purple": 1},
+    "hype": {"orange": 2.5, "gold": 2, "red": 1.5, "magenta": 1.5, "green": 0.5},
+    "cinematic": {"teal": 2.5, "deep blue": 2, "purple": 1.5, "orange": 1, "gold": 0.5},
+    "smooth": {"purple": 2.5, "magenta": 1.5, "deep blue": 2, "teal": 1},
+    "chill": {"deep blue": 2.5, "teal": 2, "green": 1.5, "purple": 1.5},
+    "mix": {k_: 1.0 for k_ in SKY_PALETTE}}
 
 
-def xfx_probe_sky(plan):
-    """V8.4.2: before a render: every sky candidate kill is looked at (the real frame at the kill: how much of the upper picture looks like sky). Only kills with a clear sky qualify (not enough =
-    indoors / a wall, too much = a bright wall everywhere: skipped); of those the clearest are kept, at most the montage's number (plan['xfx_sky_max'], from the song's feel), at least
-    XFX_SKY_SPACING seconds apart, so the sky recolour is used a few times per montage and never on most clips. No clear sky anywhere = no sky recolour at all. One log line per candidate."""
+def sky_pick(recipe, energy, bpm, seed, title):
+    """V8.4.4: the sky colour of ONE montage from the song's feel: the style gives the weights, a fast / intense song pushes towards red / orange / magenta / gold, a slow / calm one towards
+    blue / teal / purple / green, and the seed + song title pick among them (so different songs, BPMs and seeds get different colours). Returns (name, 0xRRGGBB, why)."""
+    w = dict(SKY_STYLE_W.get(recipe, SKY_STYLE_W["hype"]))
+    why = f"style {recipe}"
+    try:
+        e, b = float(energy), float(bpm)
+    except (TypeError, ValueError):
+        e = b = None
+    if e is not None and b is not None:
+        why += f", energy {e:.2f}, {b:.0f} BPM"
+        warm = e * 0.8 + min(1.0, max(0.0, (b - 80.0) / 80.0)) * 0.6        # 0 (slow, calm) .. 1.4 (fast, intense)
+        for k_ in list(w):
+            if k_ in ("red", "orange", "magenta", "gold"):
+                w[k_] *= 0.4 + 1.3 * warm / 1.4
+            else:
+                w[k_] *= 1.7 - 1.3 * warm / 1.4
+        for k_ in ("red", "orange", "deep blue", "teal"):                   # a colour outside the style stays possible when the feel points to it
+            if k_ not in w and ((warm >= 1.0 and k_ in ("red", "orange")) or (warm <= 0.5 and k_ in ("deep blue", "teal"))):
+                w[k_] = 0.6
+    rng = random.Random(f"{seed}|{title}|sky844")
+    names = sorted(w)
+    tot = sum(w[n_] for n_ in names)
+    r, acc = rng.random() * tot, 0.0
+    pick = names[-1]
+    for n_ in names:
+        acc += w[n_]
+        if r <= acc:
+            pick = n_
+            break
+    return pick, SKY_PALETTE[pick], why
+
+
+def _rgb_to_yuv(rgb):
+    """BT.709 limited-range Y, U, V of an 0xRRGGBB colour."""
+    r, g, b = (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255
+    return 16 + 0.1826 * r + 0.6142 * g + 0.0620 * b, 128 - 0.1006 * r - 0.3385 * g + 0.4392 * b, 128 + 0.4392 * r - 0.3989 * g - 0.0403 * b
+
+
+def sky_segment(rgb, zone=None, model=None):
+    """V8.4.4: the SKY REGION of a picture (HxWx3 uint8 RGB, any size): not pixel by pixel but as one connected region. Smooth pixels of the sky's own colour (a colour model taken from the top
+    of the picture: median Lab chroma and brightness; or `model` from an earlier frame, so the colour does not change from frame to frame) -> only the pieces that touch the top edge ->
+    closing (gaps) and hole filling (a cloud, a wire, an antenna inside the sky is sky) -> in the killfeed zone only the sky-coloured pixels themselves (the rows stay readable); the
+    radar corner is not sky. Sky kind: blue (sky blue / cyan); grey / white / brown / orange (walls, smoke) is not a clear sky.
+    Returns (mask bool, info {cov, top, kind, model}). Without a clear sky mask is all False."""
+    import cv2
     import numpy as np
+    H, W = rgb.shape[:2]
+    info = {"cov": 0.0, "top": 0.0, "kind": "none", "model": None}
+    bl = cv2.GaussianBlur(rgb, (0, 0), 1.2)
+    lab = cv2.cvtColor(bl, cv2.COLOR_RGB2LAB).astype(np.float32)
+    L, A, B = lab[..., 0], lab[..., 1] - 128, lab[..., 2] - 128
+    g0 = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gb = cv2.GaussianBlur(g0, (0, 0), 1.0)
+    grad = cv2.GaussianBlur(np.hypot(cv2.Sobel(gb, cv2.CV_32F, 1, 0), cv2.Sobel(gb, cv2.CV_32F, 0, 1)), (0, 0), 1.5)
+    noise = cv2.GaussianBlur(np.abs(g0 - cv2.GaussianBlur(g0, (0, 0), 2.0)), (0, 0), 2.0)
+    smooth = (grad < 30) & (noise < 4.0)
+    if model is None:
+        band = np.zeros((H, W), bool)
+        band[:max(2, int(H * 0.14))] = True
+        band[:int(H * 0.30), :int(W * 0.22)] = False
+        seed = band & smooth & (L > 70)
+        if seed.sum() < 0.04 * band.sum():
+            return np.zeros((H, W), bool), info
+        ab = np.stack([A[seed], B[seed]], 1)
+        med = np.median(ab, 0)
+        for _ in range(3):
+            keep = np.hypot(ab[:, 0] - med[0], ab[:, 1] - med[1]) < 14
+            if keep.sum() < 20:
+                break
+            med = np.median(ab[keep], 0)
+        Lm = float(np.median(L[seed]))
+        chroma = float(np.hypot(*med))
+        kind = "blue" if (med[1] <= -12 and -14 <= med[0] <= 6 and Lm >= 115) else "none"          # sky blue / cyan only: a sunset sky cannot be told from an orange wall in one picture, and a wall must never be recoloured
+        if kind == "none":
+            return np.zeros((H, W), bool), info
+        model = {"a": float(med[0]), "b": float(med[1]), "L": Lm, "kind": kind}
+    info["kind"], info["model"] = model["kind"], model
+    dab = np.hypot(A - model["a"], B - model["b"])
+    cloud = smooth & (L > model["L"] + 8) & (np.hypot(A, B) < 14)
+    cand = smooth & (((dab < 11.0) & (L > max(55.0, model["L"] - 50.0))) | cloud)
+    cand[int(H * 0.66):] = False
+    cand = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, lbl = cv2.connectedComponents(cand, connectivity=8)
+    top_ids = np.unique(lbl[:max(2, int(H * 0.04))])
+    raw = np.isin(lbl, top_ids[top_ids > 0])
+    smooth2 = (grad < 48) & (noise < 7.0)
+    loose = smooth2 & (((dab < 24.0) & (np.hypot(A, B) >= 4.0)) | ((np.hypot(A, B) < 14.0) & (L > model["L"] + 4.0))) & (L > max(55.0, model["L"] - 70.0))         # the sky's soft edges and its gradient towards the horizon: paler / darker, same hue family
+    loose[int(H * 0.66):] = False
+    cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+    cur = raw.astype(np.uint8)
+    for _ in range(40):                                                                                      # grow the sky through the loose pixels that touch it (not further than 40 px)
+        nxt = cv2.dilate(cur, cross) & (loose | raw).astype(np.uint8)
+        if np.array_equal(nxt, cur):
+            break
+        cur = nxt
+    raw = cur.astype(bool)
+    closed = cv2.morphologyEx(raw.astype(np.uint8), cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    pad = np.pad(closed, 1)
+    inv = (1 - pad).astype(np.uint8)
+    ff = inv.copy()
+    cv2.floodFill(ff, np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8), (0, 0), 2)
+    filled = (pad.astype(bool) | ((inv == 1) & (ff != 2)))[1:-1, 1:-1]
+    filled = cv2.dilate(filled.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(bool)         # the soft sky edge pixels belong to the sky too (a little spill onto the neighbour is fine)
+    if zone is not None:
+        x0, y0, x1, y1 = zone
+        zm = np.zeros((H, W), bool)
+        zm[int(y0 * H):int(y1 * H) + 1, int(x0 * W):int(x1 * W) + 1] = True
+        filled = np.where(zm, raw, filled)
+    info["cov"] = float(filled[:int(H * 0.55)].mean())
+    info["top"] = float(filled[:int(H * 0.15)].mean())
+    return filled, info
+
+
+def sky_src_frames(t, f0, f1):
+    """V8.4.4: for the output frames f0 .. f1 - 1 of a take: [(source index, time in that clip's own timeline)] from the cut list (linear inside each segment, a freeze stays on its frame)."""
+    srcs = t.get("srcs") or [{"shift": 0.0}]
+    res = []
+    f = 0
+    for sg in t["segs"]:
+        a, b, sp, n = sg[:4]
+        si = sg[4] if len(sg) > 4 and sg[4] < len(srcs) else 0
+        for j in range(int(n)):
+            if f0 <= f < f1:
+                st = a if sp == 0.0 else a + (j + 0.5) / max(1, n) * (b - a)
+                res.append((si, st - srcs[si].get("shift", 0.0)))
+            f += 1
+    return res
+
+
+def sky_grab_frames(path, t0, t1, rect, wh, size=(SKY_W, SKY_H), fps=120):
+    """V8.4.4: the picture of a clip between t0 and t1 (seconds, clip timeline) at `size`, `fps` frames a second, as a list of RGB arrays; cropped to the game picture (rect). Raises with ffmpeg's
+    message when nothing could be read (never returns silent black frames)."""
+    import numpy as np
+    cx, cy, cw, ch = rect
+    crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, wh[0], wh[1]] else ""
+    w, h = size
+    r = run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t0):.3f}", "-t", f"{max(0.05, t1 - t0):.3f}", "-i", str(path), "-vf", f"{crop}scale={w}:{h}:flags=area,fps={fps}",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], timeout=300)
+    buf = r.stdout or b""
+    n = len(buf) // (w * h * 3)
+    if n < 1:
+        raise RuntimeError(f"could not read frames of {path} at {t0:.2f}-{t1:.2f} s: " + (r.stderr or b"").decode("utf-8", "ignore")[-300:])
+    return [np.frombuffer(buf[i * w * h * 3:(i + 1) * w * h * 3], np.uint8).reshape(h, w, 3) for i in range(n)]
+
+
+def sky_take_mask(t, x, zone, path):
+    """V8.4.4: writes the sky mask of one take for the render: a raw grey video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take, 0..255; ffmpeg's alphamerge turns it into the alpha of the graded copy). The mask is made from the take's own pictures (the source frames its output frames come from, so slow-mo and speed-ups are followed) with
+    the colour model fixed from the kill frame (same sky colour in every frame); every frame's mask is averaged with its neighbours (+-2 frames: no flicker), feathered a little and eased
+    in / out; outside the effect window it is 0. Returns {'mean_y': mean luma of the sky (video levels, for the flattening), 'frames': n, 'cov': mean coverage in the window}."""
+    import cv2
+    import numpy as np
+    nf = int(t["nf"])
+    f0, f1 = max(0, int(round(x["t0"] * OUT_FPS))), min(nf, int(round(x["t1"] * OUT_FPS)) + 1)
+    fr_src = sky_src_frames(t, f0, f1)
+    srcs = t.get("srcs") or [{"path": t["path"], "rect": t["rect"], "wh": t["wh"]}]
+    tmin, tmax = {}, {}
+    for si, st in fr_src:
+        tmin[si] = min(tmin.get(si, st), st)
+        tmax[si] = max(tmax.get(si, st), st)
+    grabbed = {si: (tmin[si] - 0.03, sky_grab_frames(srcs[si]["path"], tmin[si] - 0.03, tmax[si] + 0.06, srcs[si]["rect"], srcs[si]["wh"])) for si in tmin}
+    segm, ys = [], []
+    for si, st in fr_src:
+        base, frs = grabbed[si]
+        img = frs[min(len(frs) - 1, max(0, int(round((st - base) * 120))))]
+        m, inf = sky_segment(img, zone, model=x.get("model"))
+        if x.get("model") is None and inf.get("model"):
+            x["model"] = inf["model"]
+        segm.append(m.astype(np.float32))
+        if m.any():
+            ys.append(float(np.mean(img[m] @ np.array([0.1826, 0.6142, 0.0620], np.float32)) + 16))
+    ymean = float(np.mean(ys)) if ys else 120.0
+    k = len(segm)
+    sm = [np.mean(segm[max(0, i - 2):i + 3], axis=0) for i in range(k)]
+    w, h = SKY_W, SKY_H
+    with open(path, "wb") as fh:
+        zero = np.zeros((h * w,), np.uint8).tobytes()
+        for f in range(nf):
+            if f0 <= f < f1 and k:
+                tt = f / OUT_FPS
+                a = min(1.0, max(0.0, (tt - x["t0"]) / SKY_EASE_IN))
+                b_ = min(1.0, max(0.0, (x["t1"] - tt) / SKY_EASE_OUT))
+                ease = (a * a * (3 - 2 * a)) * (b_ * b_ * (3 - 2 * b_))
+                m = cv2.GaussianBlur(sm[f - f0], (0, 0), SKY_FEATHER) * ease
+                fh.write(np.clip(m * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes())
+            else:
+                fh.write(zero)
+    cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm])) if segm else 0.0
+    return {"mean_y": ymean, "frames": nf, "cov": cov}
+
+
+def sky_mask_input(x):
+    """The ffmpeg input arguments of a take's sky mask file (raw gray, SKY_W x SKY_H, 60 fps)."""
+    return ["-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{SKY_W}x{SKY_H}", "-framerate", "60", "-i", str(x["mask"])]
+
+
+def xfx_sky_chain(chains, base, lab, x, kin):
+    """V8.4.4 render chain of the sky recolour on a take's label `lab` (1920 x 1080): the whole picture graded to the deep colour (one lutyuv: chroma set, brightness flattened), then merged
+    back over the original with the mask as its alpha (input `kin`, scaled up with a soft bicubic edge; alphamerge + overlay): only the masked sky changes, everything else is the untouched
+    picture, bit for bit. Returns the new label."""
+    gr = x["grade"]
+    chains.append(f"{lab}format=yuv420p,split=2[{base}ka][{base}kb]")
+    chains.append(f"[{base}kb]lutyuv=y='clip(val*{gr['y_mul']:.3f}+{gr['y_add']:.2f},16,235)':u={gr['u']:.1f}:v={gr['v']:.1f}[{base}kg]")
+    chains.append(f"[{kin}:v:0]setpts=N/(60*TB),scale=1920:1080:flags=bicubic,format=gray[{base}km]")
+    chains.append(f"[{base}kg][{base}km]alphamerge[{base}kga]")
+    chains.append(f"[{base}ka][{base}kga]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}ks]")
+    return f"[{base}ks]"
+
+
+def sky_grade(rgb, mean_y):
+    """V8.4.4: the lutyuv constants that turn the sky into ONE deep colour: chroma = the colour's U / V, brightness = the colour's own tone with only SKY_FLAT of the sky's own variation left."""
+    yt, ut, vt = _rgb_to_yuv(rgb)
+    return {"y_mul": SKY_FLAT, "y_add": yt - SKY_FLAT * mean_y, "u": ut, "v": vt}
+
+
+def xfx_probe_sky(plan, tmpdir=None):
+    """V8.4.4: before a render: every sky candidate kill is looked at (the real frame at the kill: how much of the upper picture is sky, by sky_segment). Only kills with a clear sky qualify (the
+    sky reaches the top edge and covers XFX_SKY_MIN_COV .. XFX_SKY_MAX_COV of the upper picture); of those the clearest are kept, at most the montage's number (plan['xfx_sky_max']), at least
+    XFX_SKY_SPACING seconds apart. For every kept one the take's sky mask is written (sky_take_mask) into `tmpdir` and the colour (plan['xfx_sky_hue']) fixed. No clear sky = no effect.
+    One log line per candidate; a candidate whose frame / mask cannot be made is skipped with the reason (never a silent black frame)."""
     cands = []
+    zone = plan.get("xfx_zone")
     for ti, t in enumerate(plan.get("takes") or []):
         for x in t.get("xfx") or []:
             if x.get("k") != "sky" or x.get("ok") is not None:
                 continue
             cov, why = None, ""
             try:
-                srcs = t["srcs"]
+                srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"]}]
                 ks = float(t["kills"][-1])
                 src = next((s_ for s_ in reversed(srcs) if 0 <= ks - s_["shift"] <= (s_.get("dur") or 1e9)), srcs[0])
-                cx, cy, cw, ch = src["rect"]
-                crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, src["wh"][0], src["wh"][1]] else ""
-                r = run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, ks - src['shift']):.3f}", "-i", src["path"], "-frames:v", "1", "-vf", f"{crop}scale=480:270:flags=area",
-                         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], timeout=60)
-                if len(r.stdout) >= 480 * 270 * 3:
-                    img = np.frombuffer(r.stdout[:480 * 270 * 3], np.uint8).reshape(270, 480, 3)
-                    mk_ = sky_mask_np(img)
-                    cov = float(mk_[:int(270 * 0.55)].mean())
-                    if float(mk_[:int(270 * 0.15)].mean()) < XFX_SKY_MIN_TOP:           # real sky reaches the top edge; blue / white walls and lights do not
-                        cov = min(cov, XFX_SKY_MIN_COV - 0.01)
+                img = sky_grab_frames(src["path"], ks - src["shift"], ks - src["shift"] + 0.04, src["rect"], src["wh"], fps=60)[0]
+                mk_, info = sky_segment(img, zone)
+                cov = float(info["cov"])
+                if info["top"] < XFX_SKY_MIN_TOP or info["kind"] == "none":                 # real sky reaches the top edge; walls, smoke and lights do not
+                    cov = min(cov, XFX_SKY_MIN_COV - 0.01)
+                x["model"] = info.get("model")
             except Exception as ex:                       # noqa: BLE001
-                why = f" ({type(ex).__name__})"
+                why = f" ({type(ex).__name__}: {ex})"
             x["cov"] = None if cov is None else round(cov, 3)
             x["ok"] = False
             cands.append((ti, x, cov, why))
-    fe = plan.get("xfx_feel") or {}
+    hue = plan.get("xfx_sky_hue") or {"name": "orange", "rgb": SKY_PALETTE["orange"], "why": "default"}
     mx = int(plan.get("xfx_sky_max", 1))
     kept = []
     for ti, x, cov, why in sorted(cands, key=lambda c: -(c[2] or 0)):
         good = cov is not None and XFX_SKY_MIN_COV <= cov <= XFX_SKY_MAX_COV
         gp = float(x.get("gp", 0.0))
         if good and len(kept) < mx and all(abs(gp - g_) >= XFX_SKY_SPACING for g_ in kept):
-            x["ok"] = True
-            kept.append(gp)
-            msg = f"sky covers {cov * 100:.0f}% of the upper picture -> recoloured {fe.get('name', '?')} ({fe.get('hue', '?')} deg)"
+            try:
+                if tmpdir is None:
+                    raise RuntimeError("no temp folder for the mask")
+                Path(tmpdir).mkdir(parents=True, exist_ok=True)
+                mp = Path(tmpdir) / f"sky_take{ti + 1}.yuv"
+                st = sky_take_mask(plan["takes"][ti], x, zone, mp)
+                x.update({"ok": True, "mask": str(mp), "hue": hue["name"], "grade": sky_grade(hue["rgb"], st["mean_y"]), "mask_cov": round(st["cov"], 3)})
+                kept.append(gp)
+                msg = f"sky covers {cov * 100:.0f}% of the upper picture -> recoloured {hue['name']} (mask made from {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%)"
+            except Exception as ex:                        # noqa: BLE001
+                x["ok"] = False
+                msg = f"sky covers {cov * 100:.0f}% but the mask could not be made ({type(ex).__name__}: {ex}), skipped"
         elif cov is None:
             msg = f"frame not readable{why}, skipped"
         elif not good:
@@ -11280,7 +11518,7 @@ def xfx_probe_sky(plan):
         else:
             msg = f"sky covers {cov * 100:.0f}% -> clear sky, but not chosen (at most {mx} per montage, {XFX_SKY_SPACING:.0f} s apart)"
         out(f"SKY recolour take {ti + 1}: {msg}")
-    out(f"SKY recolour: {len(kept)} of {len(cands)} candidate kills recoloured (at most {mx} per montage)" if cands else "SKY recolour: no candidate kill")
+    out(f"SKY recolour: {len(kept)} of {len(cands)} candidate kills recoloured {hue['name']} (at most {mx} per montage)" if cands else "SKY recolour: no candidate kill")
 
 
 def _zone_weight(zone, f=0.012):
@@ -11332,6 +11570,15 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
         chains.append(f"{lab}chromashift=cbh={px}:crh=-{px}:enable='between(t,{l0 - 0.005:.4f},{l0 + e['t1'] / 2:.4f})',"
                       f"chromashift=cbh={max(1, px // 2)}:crh=-{max(1, px // 2)}:enable='between(t,{l0 + e['t1'] / 2:.4f},{l0 + e['t1']:.4f})'[{o}]")
         lab = f"[{o}]"
+    fl = [e for e in xs if e["k"] == "flash"] if "flash" in fx else []
+    if fl:                                                        # V8.4.4: neutral WHITE flash, made per plane in YUV: luma moves towards white, both chroma planes move towards 128 (grey) by the same
+        # share, so the flash can only add white, never a colour (nothing is blended in from a colour layer). It is weaker over the killfeed zone (30 %), the rows stay readable.
+        kx = "+".join(f"if(between(T,{e['p']:.4f},{e['p'] + e['t1']:.4f}),{e['a']:.3f}*exp(-22*(T-{e['p']:.4f})),0)" for e in fl)
+        en = "+".join(f"between(t,{e['p'] - 0.005:.4f},{e['p'] + e['t1']:.4f})" for e in fl)
+        kk = f"min(0.9,({kx})*(0.3+0.7*({zw})))"
+        o = nxt("f")
+        chains.append(f"{lab}format=yuv420p,geq=lum='lum(X,Y)+(235-lum(X,Y))*{kk}':cb='cb(X,Y)+(128-cb(X,Y))*{kk}':cr='cr(X,Y)+(128-cr(X,Y))*{kk}':enable='{en}'[{o}]")
+        lab = f"[{o}]"
     for e in xs:
         if e["k"] == "rise" and "grade" in fx:
             t0, p = e["t0"], e["p"]
@@ -11344,15 +11591,6 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
             ex_ = f"exp(-3*(t-{p:.4f}))"
             o = nxt("a")
             chains.append(f"{lab}eq=contrast='1+0.07*{ex_}':saturation='1+0.35*{ex_}':eval=frame:enable='between(t,{p:.4f},{p + l1:.4f})'[{o}]")
-            lab = f"[{o}]"
-        elif e["k"] == "sky" and e.get("ok") and "sky" in fx:
-            t0, t1 = e["t0"], e["t1"]
-            ut, vt = _rgb_to_uv(FEEL_RGB_BY_HUE.get(int(e.get("hue", 0)), rgb))
-            ke = f"max(0,min(1,min((T-{t0:.4f})/{XFX_SKY_IN * 0.8:.3f},({t1:.4f}-T)/{XFX_SKY_OUT * 0.5:.3f})))"
-            yl, uc, vc = "lum(X*SW,Y*SH)", "cb(X,Y)", "cr(X,Y)"
-            m = (f"if(lt(Y,H*0.55)*(1-lt(X,W*0.22)*lt(Y,H*0.30)),gt({uc},{128 + XFX_SKY_U})*lt({vc}-128,-{XFX_SKY_R0}*({uc}-128))*gt({vc}-128,-{XFX_SKY_R1}*({uc}-128))*gt({yl},{XFX_SKY_Y:g})*{ke},0)")
-            o = nxt("k")
-            chains.append(f"{lab}geq=lum='lum(X,Y)':cb='{uc}+({ut:.1f}-{uc})*0.85*{m}':cr='{vc}+({vt:.1f}-{vc})*0.85*{m}':enable='between(t,{t0:.4f},{t1:.4f})'[{o}]")
             lab = f"[{o}]"
     return lab
 
@@ -11533,11 +11771,17 @@ def build_filter(plan, cfg, preview, fx=None):
                 elif x_["k"] == "punch":                                                   # V8.4.1: a zoom punch on every kill, scaled by the beat strength
                     zt.append(f"between({tt},{x_['p']:.4f},{x_['p'] + 0.45:.4f})*{x_['a']:.4f}*exp(-9*({tt}-{x_['p']:.4f}))")
                     wins.append((x_["p"], x_["p"] + 0.45))
-        lab = f"[{base}c]"
+        csrc = f"[{base}c]"
+        for x_ in (t.get("xfx") or []):                                                    # V8.4.4: the sky recolour sits BEFORE the zoom (the mask follows the take's own pictures): the sky turns into one deep colour through a mask made from the real frames
+            if x_["k"] == "sky" and x_.get("ok") and x_.get("mask") and "sky" in fx:
+                inputs += sky_mask_input(x_)
+                csrc = xfx_sky_chain(chains, base, csrc, x_, k)
+                k += 1
+        lab = csrc
         if zt:
             en_ = "+".join(f"between(t,{a_:.4f},{b_:.4f})" for a_, b_ in wins)
             m_ = f"(1-1/(1+{_sum_expr(zt)}))/2"                                            # inset of the sampled quad (fraction)
-            chains.append(f"[{base}c]split=2[{base}m][{base}f]")
+            chains.append(f"{csrc}split=2[{base}m][{base}f]")
             chains.append(f"[{base}f]perspective=x0='W*{m_}':y0='H*{m_}':x1='W-W*{m_}':y1='H*{m_}':x2='W*{m_}':y2='H-H*{m_}':"
                           f"x3='W-W*{m_}':y3='H-H*{m_}':interpolation=cubic:eval=frame,format=yuv420p[{base}e]")
             chains.append(f"[{base}m]format=yuv420p[{base}m2]")
@@ -12250,15 +12494,16 @@ def render_tmpdir(outfile):
 
 
 def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, effects=True):
-    """Encode with all effects; if ffmpeg fails, retry without the failing effect, then without all effects. NVENC -> x264.
+    """Encode the plan in ONE attempt (V8.4.4: no retry, no effect dropped, no fallback render; a failure prints the failing filter, take and ffmpeg error).
     The finished file must last exactly as long as the plan (else it is reported as a failure, never silently kept)."""
     outfile = Path(outfile)
     outfile.parent.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = slice_plan(plan) if preview else plan
+    itmp = render_tmpdir(outfile)
     if p.get("effects") == "extra":
         try:
-            xfx_probe_sky(p)                                   # V8.4.1: the sky recolour only where the real frame has sky
+            xfx_probe_sky(p, itmp)                             # V8.4.1: the sky recolour only where the real frame has sky (V8.4.4: its masks are made here, in the render's temp folder)
         except Exception as ex_:                               # noqa: BLE001
             out(f"sky check skipped: {type(ex_).__name__}: {ex_}")
     bad = verify_cutlist(p)
@@ -12266,14 +12511,13 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         out("WARNING (render continues): " + b_)
     bad = [x for x in bad if "kill row" not in x]
     if bad:
+        shutil.rmtree(itmp, ignore_errors=True)
         raise RuntimeError("cut list problem, not rendering: " + "; ".join(bad))
     D = p["duration"]
     nvenc = ff_has("encoders", "h264_nvenc") if encoder is None else encoder == "nvenc"
     tmp = outfile.with_name(outfile.stem + ".part.mp4")
     elog = LOG_DIR / "last_render_stderr.txt"
-    gp = LOG_DIR / "last_filter.txt"
-    fx, failed = (set(FX_ALL) | (set(XFX_FX) if p.get("effects") == "extra" else set()) if effects else {"slow"}), []
-    itmp = render_tmpdir(outfile)
+    fx = set(FX_ALL) | (set(XFX_FX) if p.get("effects") == "extra" else set()) if effects else {"slow"}
     try:                                                   # V6.9.3: low-fps clips are interpolated first (only the ranges the plan uses)
         pr_ = interp_prepare(p, cfg, itmp, fx)
     except Exception as ex:
@@ -12283,51 +12527,9 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         out(f"interpolation skipped: {type(ex).__name__}: {ex}")
         pr_ = p
     try:
-        if p.get("effects") == "extra" and effects:                # V8.4.3: EXTRA has three attempts at most (full, without the risky effects, the plain DEFAULT render)
-            return _render_extra(plan, p, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, D)
-        return _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nvenc, tmp, elog, gp, fx, failed, D)
+        return _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, fx, D)
     finally:
         shutil.rmtree(itmp, ignore_errors=True)
-
-
-XFX_LITE_KEEP = ("mirror",)           # V8.4.3 attempt 2 keeps only the 2-frame mirror cut of the extra effects (no sky / split / grade / glow / punch / settle / run-up speed)
-
-
-def extra_variant(plan, level):
-    """V8.4.3: the plan of render attempt `level`: 0 = the full EXTRA plan; 1 = EXTRA without sky / split / grade / punch / settle / ramp (run-up speed) - the takes are restored to what they were before
-    the extra effects (segments, ramp, kill punch size); 2 = the exact DEFAULT render of the same plan (no extra data at all, effects = default)."""
-    if level <= 0:
-        return plan
-    q = dict(plan)
-    q["takes"] = []
-    for t in plan["takes"]:
-        u = dict(t)
-        o = t.get("xfx0")
-        if o:
-            u["segs"] = [list(x) for x in o["segs"]]
-            if o.get("amp") is not None:
-                u["amp"] = o["amp"]
-            if o.get("has_ramp"):
-                u["ramp"] = o["ramp"]
-            else:
-                u.pop("ramp", None)
-        keep = [x for x in (t.get("xfx") or []) if level == 1 and x["k"] in XFX_LITE_KEEP]
-        if keep:
-            u["xfx"] = keep
-        else:
-            u.pop("xfx", None)
-        u.pop("xfx0", None)
-        q["takes"].append(u)
-    if level >= 2:
-        q["effects"] = "default"
-        for k_ in ("xfx_zone", "xfx_feel", "xfx_plan", "xfx_sky_max"):
-            q.pop(k_, None)
-    return q
-
-
-EXTRA_ATTEMPTS = (("the full EXTRA plan", []),
-                  ("EXTRA without sky / split / grade / glow / punch / settle / ramp", ["sky", "split", "grade", "glow", "punch", "settle", "ramp"]),
-                  ("the plain DEFAULT render of the same plan", ["all extra effects"]))
 
 
 def failing_take_text(plan, graph, out_t):
@@ -12352,129 +12554,52 @@ def failing_take_text(plan, graph, out_t):
             if any(x.endswith(f"[{f}]") for f in feeds):
                 keep.add(i)
         srcs = sorted({str(sr.get("path")) for sr in (t.get("srcs") or [{"path": t.get("path")}])})
-        txt = "\n".join(parts[i] for i in sorted(keep))
+        txt = "\n".join(parts[i] for i in sorted(keep)) or graph             # nothing named this take (e.g. the graph itself did not parse): the whole graph
         return (f"take {ti + 1} of {len(takes)} (output {t['out_start']:.2f}-{t['out_start'] + t['dur']:.2f} s, ffmpeg stopped at {out_t:.2f} s), clips: {'; '.join(srcs)}\n"
                 f"segments {t.get('segs')}\nFILTER TEXT of this take:\n{txt[:6000]}")
     except Exception as ex:                                                  # noqa: BLE001
         return f"(could not name the failing take: {type(ex).__name__}: {ex})"
 
 
-def _render_extra(plan, p, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, D):
-    """V8.4.3: EXTRA renders in at most three attempts - (1) the full plan, (2) without the risky effects, (3) the exact DEFAULT render of the same plan. Every failed attempt keeps its own stderr,
-    filter graph and command in logs\\<name>.fail<N>.* (later attempts never overwrite them). When the last one fails too, the failing take and its filter text are printed and the render stops."""
+def _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, fx, D):
+    """V8.4.4: a render is exactly ONE attempt (DEFAULT and EXTRA alike): one filter graph, one ffmpeg run, one encoder. No second or third attempt, no effect dropped, no fallback render, no
+    encoder switch. When ffmpeg fails the render stops and says where: the failing filter text, the take (from ffmpeg's last output time) and ffmpeg's error; stderr, filter graph and
+    command are kept in logs\\<name>.fail.stderr.txt / .fail.filter.txt / .fail.cmd.txt (every failure in its own files, overwritten only by the next failure of the same name)."""
     stem = outfile.stem
-    last_txt, last_diag = "", ""
-    failed = []
-    for n, (name, dropped) in enumerate(EXTRA_ATTEMPTS):
-        pv = extra_variant(pr_, n)
-        fx = set(FX_ALL) | (set(XFX_FX) if n < 2 else set())
-        inputs, graph = build_filter(pv, cfg, preview, fx)
-        gp = LOG_DIR / f"{stem}.attempt{n + 1}.filter.txt"
-        gp.write_text(graph, encoding="utf-8")
-        (LOG_DIR / "last_filter.txt").write_text(graph, encoding="utf-8")
-        out(f"render attempt {n + 1} of {len(EXTRA_ATTEMPTS)}: {name}")
-        txt = ""
-        for use_nv in ((nvenc, False) if nvenc else (False,)):
-            cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"] + inputs +
-                   ["-filter_complex_script", str(gp), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.4f}"] +
-                   enc_args(maxq, preview, use_nv) + (["-preset", "veryfast"] if encoder == "fast" else []) + [str(tmp)])
-            rc = _run_ffmpeg(cmd, D, elog)
-            if CANCEL.is_set():
-                raise RuntimeError("cancelled")
-            if rc == 0 and tmp.exists():
-                got = probe_duration(tmp)
-                if abs(got - D) > 0.1:
-                    txt = elog.read_text(encoding="utf-8", errors="replace")
-                    out(f"rendered file lasts {got:.2f} s but the plan is {D:.2f} s - treating as a failure")
-                    rc = 1
-                else:
-                    os.replace(tmp, outfile)
-                    out(f"rendered {outfile} ({got:.2f} s = plan {D:.2f} s), attempt {n + 1}: {name}" + (f"   (effects dropped: {', '.join(failed)})" if failed else "   (no effect dropped)"))
-                    plan["fx_failed"] = failed
-                    plan["fx"] = sorted(fx)
-                    plan["render_attempt"] = n + 1
-                    return outfile
-            txt = txt or elog.read_text(encoding="utf-8", errors="replace")
-            diag = failing_take_text(pv, graph, RUN_PROG["t"])
-            (LOG_DIR / f"{stem}.fail{n + 1}.stderr.txt").write_text(txt, encoding="utf-8")
-            (LOG_DIR / f"{stem}.fail{n + 1}.filter.txt").write_text(graph, encoding="utf-8")
-            (LOG_DIR / f"{stem}.fail{n + 1}.cmd.txt").write_text(" ".join(f'"{c}"' for c in cmd) + "\n\n" + diag, encoding="utf-8")
-            out(f"ffmpeg failed ({'NVENC' if use_nv else 'x264'}) in attempt {n + 1}: {txt[-500:]}")
-            last_txt, last_diag = txt, diag
-            if not (use_nv and any(w in txt.lower() for w in ("nvenc", "cuda", "encoder", "driver"))):
-                break
-            out("retrying with libx264")
-        mf = RUN_MEM.get("min_free")
-        if mf is not None:
-            LOGONLY(f"memory during attempt {n + 1}: lowest free {mf:.1f} GB of {RUN_MEM.get('total') or 0:.1f} GB")
-        if n + 1 < len(EXTRA_ATTEMPTS):
-            failed = list(EXTRA_ATTEMPTS[n + 1][1])
-            out(f"attempt {n + 1} failed ({name}); next: {EXTRA_ATTEMPTS[n + 1][0]}")
-    out("ALL THREE RENDER ATTEMPTS FAILED. The last one (plain DEFAULT) died here:\n" + last_diag + "\nffmpeg said: " + last_txt[-800:])
-    raise RuntimeError(f"render failed in all 3 attempts (EXTRA, EXTRA without the risky effects, plain DEFAULT); the failing take and its filter text are in the log; stderr / filter / command of every attempt: {LOG_DIR}\\{stem}.fail1-3.*")
-
-
-FX_DROP_ORDER = ("sky", "split", "grade", "glow", "transition", "zoom", "flash", "slow")       # V8.4.2: when ffmpeg's message does not name the effect, the newest / riskiest goes first
-
-
-def fx_culprit(low, fx):
-    """The effect to drop after a failed render attempt: the one the error text names, else the next of FX_DROP_ORDER that is still on (the extra effects first, each on its own).
-    Without any extra effect left this is exactly the old rule (DEFAULT is unchanged)."""
-    if not (set(XFX_FX) & set(fx)):
-        return next((n for key, n in (("overlay", "zoom"), ("drawbox", "flash"), ("framerate", "slow"), ("atempo", "slow"), ("blend", "transition"), ("tpad", "slow")) if key in low and n in fx), None) or             next(n for n in ("transition", "zoom", "flash", "slow") if n in fx)
-    return next((n for key, n in (("geq", "sky"), ("chromashift", "split"), ("drawbox", "glow"), ("blend", "glow"), ("overlay", "zoom"), ("framerate", "slow"), ("atempo", "slow"),
-                                  ("tpad", "slow")) if key in low and n in fx), None) or next(n for n in FX_DROP_ORDER if n in fx)
-
-
-def _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nvenc, tmp, elog, gp, fx, failed, D):
-    mem_waits = [0]
-    while True:
-        inputs, graph = build_filter(pr_, cfg, preview, fx)
-        gp.write_text(graph, encoding="utf-8")
-        txt = ""
-        for use_nv in ((nvenc, False) if nvenc else (False,)):
-            cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"] + inputs +
-                   ["-filter_complex_script", str(gp), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.4f}"] +
-                   enc_args(maxq, preview, use_nv) + (["-preset", "veryfast"] if encoder == "fast" else []) + [str(tmp)])
-            rc = _run_ffmpeg(cmd, D, elog)
-            if CANCEL.is_set():
-                raise RuntimeError("cancelled")
-            if rc == 0 and tmp.exists():
-                got = probe_duration(tmp)
-                if abs(got - D) > 0.1:
-                    txt = elog.read_text(encoding="utf-8", errors="replace")
-                    out(f"rendered file lasts {got:.2f} s but the plan is {D:.2f} s - treating as a failure")
-                    rc = 1
-                else:
-                    os.replace(tmp, outfile)
-                    out(f"rendered {outfile} ({got:.2f} s = plan {D:.2f} s)" +
-                        (f"   (effects that failed and were skipped: {', '.join(failed)})" if failed else ""))
-                    plan["fx_failed"] = failed
-                    plan["fx"] = sorted(fx)
-                    return outfile
-            txt = txt or elog.read_text(encoding="utf-8", errors="replace")
-            out(f"ffmpeg failed ({'NVENC' if use_nv else 'x264'}): {txt[-500:]}")
-            if not (use_nv and any(w in txt.lower() for w in ("nvenc", "cuda", "encoder", "driver"))):
-                break
-            out("retrying with libx264")
-        mf = RUN_MEM.get("min_free")
-        if mf is not None:
-            LOGONLY(f"memory during this attempt: lowest free {mf:.1f} GB of {RUN_MEM.get('total') or 0:.1f} GB")
-        if mf is not None and mf < LOW_MEM_GB and mem_waits[0] < 2 and not CANCEL.is_set():       # V8.4.2: ffmpeg stopped while the computer was nearly out of memory: not an effect's fault
-            mem_waits[0] += 1
-            out(f"ffmpeg stopped while only {mf:.1f} GB of memory were free (a render of many clips needs ~10 GB; close other programs / renders): waiting 30 s and trying again with the same effects")
-            for _ in range(30):
-                if CANCEL.is_set():
-                    break
-                time.sleep(1)
-            continue
-        if not fx:
-            break
-        culprit = fx_culprit(txt.lower(), fx)
-        failed.append(culprit)
-        fx.discard(culprit)
-        LOGONLY(txt[-600:]); out(f"effect '{culprit}' failed - retrying without it" + ("" if fx else " (no effects left)"))
-    raise RuntimeError(f"render failed even without effects - see {elog} and {gp}")
+    inputs, graph = build_filter(pr_, cfg, preview, fx)
+    gp = LOG_DIR / f"{stem}.filter.txt"
+    gp.write_text(graph, encoding="utf-8")
+    (LOG_DIR / "last_filter.txt").write_text(graph, encoding="utf-8")
+    cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"] + inputs +
+           ["-filter_complex_script", str(gp), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.4f}"] +
+           enc_args(maxq, preview, nvenc) + (["-preset", "veryfast"] if encoder == "fast" else []) + [str(tmp)])
+    rc = _run_ffmpeg(cmd, D, elog)
+    if CANCEL.is_set():
+        raise RuntimeError("cancelled")
+    txt = ""
+    if rc == 0 and tmp.exists():
+        got = probe_duration(tmp)
+        if abs(got - D) <= 0.1:
+            os.replace(tmp, outfile)
+            out(f"rendered {outfile} ({got:.2f} s = plan {D:.2f} s)")
+            plan["fx_failed"] = []
+            plan["fx"] = sorted(fx)
+            return outfile
+        txt = f"rendered file lasts {got:.2f} s but the plan is {D:.2f} s\n"
+    txt += elog.read_text(encoding="utf-8", errors="replace")
+    diag = failing_take_text(pr_, graph, RUN_PROG["t"])
+    (LOG_DIR / f"{stem}.fail.stderr.txt").write_text(txt, encoding="utf-8")
+    (LOG_DIR / f"{stem}.fail.filter.txt").write_text(graph, encoding="utf-8")
+    (LOG_DIR / f"{stem}.fail.cmd.txt").write_text(" ".join(f'"{c}"' for c in cmd) + "\n\n" + diag, encoding="utf-8")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    mf = RUN_MEM.get("min_free")
+    if mf is not None:
+        LOGONLY(f"memory during the render: lowest free {mf:.1f} GB of {RUN_MEM.get('total') or 0:.1f} GB")
+    out("RENDER FAILED (one attempt, nothing retried)."+"\n" + diag + "\nffmpeg said: " + txt[-800:])
+    raise RuntimeError(f"render failed (one attempt, no retry); the failing take, its filter text and ffmpeg's error are in the log; stderr / filter / command: {LOG_DIR}\\{stem}.fail.*")
 
 
 SPIKE_ABS, SPIKE_REL = 6.0, 0.03      # V7.7.5 transition check: a dissolve frame may leave the range of its two sides by this many luma levels + this share of their difference
