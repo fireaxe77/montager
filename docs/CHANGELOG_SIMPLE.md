@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.23 - 2026-10-15: One more R6S gadget kill filtered
+- R6S montages no longer show kills made with one more gadget (the one with the small flame-like icon)
+- Montages that are already rendered are not affected
+
 ## V8.22 - 2026-10-15: Random song pick, faster finish after rendering
 - New Random pick button next to the song search: selects one random song from the list shown
 - Rendering now finishes as soon as the video is written; the extra quality and sync checks are an optional Settings switch (off by default)
