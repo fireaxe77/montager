@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.4.4 - 2026-10-16: White flashes and even sky colours
+- A render now runs once; if it fails it stops and tells you where, instead of trying again with fewer effects
+- The kill flash is back, and it is a clean white flash only
+- The sky now turns into one even deep colour, with no blotches, and the rest of the picture stays as it is
+- The sky colour is chosen for each montage from the song, so different songs get different colours
+
 ## V8.4.3 - 2026-10-16: Extra effects render fix, calmer look
 - Montages whose clip has a gap in its sound now finish instead of failing; that part is simply silent
 - If a render fails, it now tries at most three times: full effects, fewer effects, then the plain version

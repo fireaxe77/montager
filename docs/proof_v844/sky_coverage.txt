@@ -1,0 +1,16 @@
+Replay_2026-08-11_12-31-04_15: sky coverage 15% of the upper picture (top strip 32%, kind blue) -> the render would RECOLOUR the sky
+  mask: mean coverage in the window 12% of the upper picture, sky brightness 205; colour red 0xB3121A
+Counter-strike_2_2026.03.04_-_20.02.58.0_13: sky coverage 25% of the upper picture (top strip 48%, kind blue) -> the render would RECOLOUR the sky
+  mask: mean coverage in the window 21% of the upper picture, sky brightness 199; colour teal 0x0E8C8C
+Counter-strike_2_2026.02.05_-_22.57.32.1_10: sky coverage 25% of the upper picture (top strip 52%, kind blue) -> the render would RECOLOUR the sky
+  mask: mean coverage in the window 27% of the upper picture, sky brightness 187; colour orange 0xD4520C
+Counter-strike_2_2025.02.11_-_20.21.22.0_12: sky coverage 25% of the upper picture (top strip 45%, kind blue) -> the render would RECOLOUR the sky
+  mask: mean coverage in the window 20% of the upper picture, sky brightness 172; colour magenta 0xB0147E
+Valorant_2025.10.16_-_03.29.05.29.DVR_4: sky coverage 35% of the upper picture (top strip 52%, kind blue) -> the render would RECOLOUR the sky
+  mask: mean coverage in the window 36% of the upper picture, sky brightness 187; colour purple 0x5B22A6
+Valorant_2025.10.15_-_22.08.31.07.DVR_4: sky coverage 18% of the upper picture (top strip 25%, kind blue) -> the render would RECOLOUR the sky
+  mask: mean coverage in the window 19% of the upper picture, sky brightness 203; colour gold 0xC99A10
+Valorant_2025.10.11_-_23.55.02.07.DVR_9: sky coverage 29% of the upper picture (top strip 48%, kind blue) -> the render would RECOLOUR the sky
+  mask: mean coverage in the window 28% of the upper picture, sky brightness 191; colour green 0x1E8E3A
+Valorant_2025.10.28_-_01.04.20.12.DVR_13: sky coverage 15% of the upper picture (top strip 28%, kind blue) -> the render would RECOLOUR the sky
+  mask: mean coverage in the window 14% of the upper picture, sky brightness 189; colour deep blue 0x1536B8
