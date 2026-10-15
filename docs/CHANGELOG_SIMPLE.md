@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.21 - 2026-10-15: CS2 clutch kills no longer cut short
+- CS2 montages show the last kill of a clutch
+- Game audio level is back as a simple 0 to 1 setting for each game
+
 ## V8.2 - 2026-10-15: Smoother cuts, utility kills filtered, faster rendering
 - R6S montages no longer show Razorbloom shell, grenade and Caustic gas kills
 - Smooth slow-motion now in Valorant and R6S too
