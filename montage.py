@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.2"
+APP_VERSION = "V8.21"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -3569,6 +3569,7 @@ def border_analysis(sc, cfg, deaths=None):
     legacy = sc.get("ext", 1) < 2
     rows_t, blob_t = border_shape_filter(sc.get("tracks", []), n)
     kills, rej, vis, mine, det_rows, sus, others, merges = [], [], [], [], [], [], [], []
+    unread = []                      # V8.21: outlined, row-shaped tracks whose text never split into killer / weapon / victim: (time, frames) - no verdict, but a row WAS there
     pre_victims = []
     early = []                       # V7.7.6: (time, victim, track id) of rows on screen in the first CS2_EARLY_S s that are not kills of this list (pre-clip rows, unshaped tracks)
     blobs_n = len(blob_t) + int(sc.get("blobs", 0))
@@ -3584,6 +3585,7 @@ def border_analysis(sc, cfg, deaths=None):
                 det_rows.append({"track": t, "cls": c, "t": tt, "merged": ids})
             else:
                 blobs_n += 1                                       # outlined, but nothing that reads as a killfeed row
+                unread.append((tt, int(t["hits"])))
             continue
         row = f"[{c['ktext'] or '-'}] {'gun' if c['gun'] else 'util'} [{c['vtext'] or '-'}]"
         v = c["verdict"]
@@ -3660,13 +3662,14 @@ def border_analysis(sc, cfg, deaths=None):
             "best_k": max([d["cls"]["ks"] for d in det_rows], default=0.0) / 100, "best_v": max([d["cls"]["vs"] for d in det_rows], default=0.0) / 100,
             "mine": sorted(mine, key=lambda m: m["t"]), "rows_n": len(det_rows), "rows_max": len(det_rows),
             "ocr_calls": sum(len(t.get("votes", [])) for t in sc.get("tracks", [])), "cjk": {}, "border": True, "rows": det_rows,
-            "blobs": blobs_n, "sus": sus, "others": others, "merges": merges, "legacy": legacy,
+            "blobs": blobs_n, "sus": sus, "others": others, "merges": merges, "legacy": legacy, "unread": unread,
             "dm": len(kills) > 6 or rep}
 
 
 CS2_NAMEKEEP_ON = [True]
 CS2_NAMEKEEP_KS = 0.75               # V7.4.9: the name read of the victim row must be this stable ...
 CS2_NAMEKEEP_HITS = 2                # ... over at least this many reads
+CS2_UNREAD_MIN_F = 10                # V8.21: an outlined row-shaped track of at least this many frames (30 fps) whose text never split backs a single read of my name
 _NAMEKEEP_LOGGED = set()
 
 
@@ -3688,6 +3691,7 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
         h, w = r["y1"] - r["y0"], r["x1"] - r["x0"]
         if BORDER_H[0] <= h <= BORDER_H[1] and w >= BORDER_ASPECT * h and t["hits"] >= 3:
             shaped.append(round(t["first"] / fps + off, 3))
+    shaped += [tt for tt, hh in b.get("unread", []) if hh >= 3]       # V8.21: a row-shaped outlined track the OCR could not split (a short row at the very end of a clip: 3 reads, 2 unsplittable) is the same evidence
     seen_rows = [d["t"] for d in b.get("rows", [])] + [r["t"] for r in b.get("rej", [])]
     kept = []
     for nk in sorted(a["kills"], key=lambda k: k["t"]):
@@ -3696,7 +3700,8 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
             break
         if any(abs(t - k["t"]) < 1.0 for k in b["kills"] + kept):
             continue
-        if len(_alnum(nk.get("victim") or "")) < 3 or nk.get("ks", 0.0) < CS2_NAMEKEEP_KS or nk.get("hits", 0) < CS2_NAMEKEEP_HITS:
+        hits_min = 1 if any(abs(t - tt) <= 0.6 and hh >= CS2_UNREAD_MIN_F for tt, hh in b.get("unread", [])) else CS2_NAMEKEEP_HITS     # V8.21: one read of my name is enough when a settled outlined row (>= CS2_UNREAD_MIN_F frames) stands there
+        if len(_alnum(nk.get("victim") or "")) < 3 or nk.get("ks", 0.0) < CS2_NAMEKEEP_KS or nk.get("hits", 0) < hits_min:
             continue
         pre_rows = [r for r in b.get("rej", []) if str(r.get("reason", "")).startswith(("pre-clip", "CS2 stale"))]
         if t < BORDER_PRE_S + 1.0 + off or (t < CS2_STALE_S + off and pre_rows) or any(abs(t - x) < 1.0 for x in seen_rows):
@@ -10266,21 +10271,18 @@ def music_group_verdict(recs, cfg, game, audio_state, cache):
     return res, True
 
 
-GAME_LEVEL_RANGE = (-20.0, 12.0)     # V8.2: Settings range (dB) of the per-game level under the music
-
-
-def game_level_db(cfg, game):
-    """V8.2: the per-game offset (dB) of the game audio under the music, on top of the automatic leveling. Missing / unreadable = 0 (exactly the old output)."""
+def game_level(cfg, game=None):
+    """V8.21: the game-audio level (0-1, linear) of a game: its own key game_audio_level_<game> when set, else the one game_audio_level (default 0.6 = as before)."""
+    v = (cfg or {}).get(f"game_audio_level_{game}") if game else None
     try:
-        v = float(((cfg or {}).get("game_level_db") or {}).get(game, 0.0) or 0.0)
-    except (TypeError, ValueError, AttributeError):
-        v = 0.0
-    return max(GAME_LEVEL_RANGE[0], min(GAME_LEVEL_RANGE[1], v))
+        return float(v) if v not in (None, "") else float((cfg or {}).get("game_audio_level", 0.6))
+    except (TypeError, ValueError):
+        return float((cfg or {}).get("game_audio_level", 0.6))
 
 
-def _game_gain(cfg, song_lufs, clip_lufs):
+def _game_gain(cfg, song_lufs, clip_lufs, game=None):
     """V4 balance (game under the music), slightly louder than V4; quiet clips (CS2) lifted by up to +8 dB, never lowered."""
-    gv = float(cfg.get("game_audio_level", 0.6))
+    gv = game_level(cfg, game)
     base = 20 * math.log10(max(gv, 1e-3))
     lift = 0.0
     if clip_lufs is not None and song_lufs is not None:
@@ -10367,8 +10369,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
         for p in parts:
             r = p["rec"]
             au = resolve_clip_audio(r, cfg, game, audio_state)
-            gdb, lift = _game_gain(cfg, song_lufs, au["lufs"])
-            gdb = round(gdb + game_level_db(cfg, game), 2)                     # V8.2: per-game level (0 = unchanged)
+            gdb, lift = _game_gain(cfg, song_lufs, au["lufs"], game)
             low = {}
             if mus and mus["yes"] and r.get("audio"):                          # V7.7.1: after the lift, so nothing undoes it; the whole clip, never part of it
                 amt = music_lower_db(cfg)
@@ -12776,8 +12777,7 @@ def audio_guard(plan, outfile, cfg, redo):
         for sd in tk["srcs"]:
             au = clip_audio_legacy({"path": sd["path"], "audio": sd["audio"]})
             sd["a_stream"], sd["a_note"], sd["lufs"] = au["stream"] or 0, au.get("note", ""), au["lufs"]
-            sd["gain_db"], sd["lift_db"] = _game_gain(cfg, plan["song"].get("lufs"), au["lufs"])
-            sd["gain_db"] = round(sd["gain_db"] + game_level_db(cfg, plan.get("game")), 2)
+            sd["gain_db"], sd["lift_db"] = _game_gain(cfg, plan["song"].get("lufs"), au["lufs"], plan.get("game"))
             if sd.get("music_db") and not sd.get("mute"):
                 sd["gain_db"] = round(sd["gain_db"] + sd["music_db"], 2)
     plan["audio_mode"] = "legacy"
@@ -14362,10 +14362,6 @@ class App:
             cfg["music_lower_db"] = max(0.0, min(MUSIC_MUTE_DB, float(self.set_music_db.get())))      # V7.7.1
         except ValueError:
             pass                                                   # half-typed number: keep the old value
-        try:                                                       # V8.2: per-game level under the music (dB, 0 = as before)
-            cfg["game_level_db"] = {g_: max(GAME_LEVEL_RANGE[0], min(GAME_LEVEL_RANGE[1], float(self.set_glv[g_].get()))) for g_ in GAMES}
-        except ValueError:
-            pass
         cfg["songmap_mode"] = next((k for k, lab in SONGMAP_MODES.items() if lab == self.set_smmode.get()), "v2")    # V7.7.1
         cfg["game_audio_track"] = {g: v.get() for g, v in self.set_track.items()}
         if self.set_names:
@@ -16110,10 +16106,13 @@ class App:
         self.rp_rows, self._rp_loaded = {}, False
         self.rp_tree.bind("<Map>", lambda e: None if self._rp_loaded else (setattr(self, "_rp_loaded", True), self.root.after_idle(self.rp_refresh)))   # read the cache index when first shown, not at startup
         section("Game audio")
-        label("Game audio level under the music (0-1)")
-        v = tk.StringVar(value=str(self.cfg.get("game_audio_level", "")))
-        self.sn["game_audio_level"] = v
-        ttk.Entry(f, textvariable=v, width=10).grid(row=r[0], column=1, sticky="w", padx=(0, PX), pady=PY)
+        for g_ in GAMES:                                                    # V8.21: one 0-1 entry per game (the old single entry, three times)
+            if g_ != GAMES[0]:
+                r[0] += 1
+            label(f"{GAME_DIR[g_]} game audio level under the music (0-1)")
+            v = tk.StringVar(value=f"{game_level(self.cfg, g_):g}")
+            self.sn[f"game_audio_level_{g_}"] = v
+            ttk.Entry(f, textvariable=v, width=10).grid(row=r[0], column=1, sticky="w", padx=(0, PX), pady=PY)
         r[0] += 1
         for g in GAMES:
             label(f"Game audio track: {GAME_DIR[g]}")
@@ -16182,15 +16181,6 @@ class App:
         self.set_music_db = tk.StringVar(value=f"{music_lower_db(self.cfg):g}")
         ttk.Spinbox(h_, from_=0, to=MUSIC_MUTE_DB, increment=1, width=5, textvariable=self.set_music_db).pack(side="left", padx=(6, 6))
         ttk.Label(h_, text=f"dB (mute = {MUSIC_MUTE_DB:g} dB; off by default)").pack(side="left")
-        r[0] += 1
-        label("Game audio level")
-        h_ = holder()
-        self.set_glv = {}
-        for g_ in GAMES:
-            self.set_glv[g_] = tk.StringVar(value=f"{game_level_db(self.cfg, g_):g}")
-            ttk.Label(h_, text=GAME_DIR[g_]).pack(side="left")
-            ttk.Spinbox(h_, from_=GAME_LEVEL_RANGE[0], to=GAME_LEVEL_RANGE[1], increment=1, width=5, textvariable=self.set_glv[g_]).pack(side="left", padx=(4, 10))
-        ttk.Label(h_, text="dB under the music, on top of the automatic leveling (0 = as before)").pack(side="left")
         r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
