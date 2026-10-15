@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.23"
+APP_VERSION = "V8.23.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2348,6 +2348,21 @@ class R6SUtilScan:
                                   "tpl": self.icons[m[5]]["name"]})
 
 
+R6S_SHAPE_MIN_READS = 2              # V8.23.1: a row needs this many small / square icon reads to be called utility by shape
+R6S_SHAPE_UTIL = True                # V8.23.1: Valorant's small / square icon rule also applies to R6S rows (decided here, from the stored OCR blobs, at plan time)
+
+
+def r6s_shape_util(r):
+    """V8.23.1: True when most reads of this row had a small / square weapon icon (not wide like a gun) = grenade / gadget / ability, the same rule
+    Valorant and CS2 use (classify_row: icon width < 1.5 x height). Needs at least R6S_SHAPE_MIN_READS such reads and more of them than wide (gun) reads; a tie,
+    a single read or no icon read = a gun (a gun kill is never rejected on weak evidence)."""
+    if not R6S_SHAPE_UTIL:
+        return False
+    v = r.get("gunv") or []
+    ng = sum(1 for g in v if not g)
+    return ng >= R6S_SHAPE_MIN_READS and ng > len(v) - ng
+
+
 def r6s_row_util(r, uhits):
     """True when a utility-icon hit sits in this row's weapon slot: the hit is on screen while the row is (a few frames of slack), at the row's height, and between
     the killer side's names and the victim side's names. `r` is an R6S row ({first, last, y, h, reads}); `uhits` = entry['util']."""
@@ -2595,15 +2610,18 @@ def r6s_rows_from_ocr(entry):
                 used.add(id(best))
                 best.update(last=f, y=r["y"], hits=best["hits"] + 1)
                 best["reads"].append([f, left, right])
+                if r.get("split") == "icon":                           # V8.23.1: the weapon-icon shape of every read (gun = wide), from the stored blobs
+                    best["gunv"].append(int(bool(r["gun"])))
             else:
                 first = max(prev_f + 1, min(int(r["appear"]), f)) if prev_f >= 0 else f
                 t = {"first": first, "seen": f, "last": f, "y": r["y"], "hits": 1, "k": kt, "v": vt, "h": int(r["th"]), "reads": [[f, left, right]],
+                     "gunv": [int(bool(r["gun"]))] if r.get("split") == "icon" else [],
                      "x": int(min(b[0] for b in r["boxes"])), "w": int(max(b[2] for b in r["boxes"]) - min(b[0] for b in r["boxes"]))}
                 tracks.append(t)
                 used.add(id(t))
         prev_f = f
     return [{"first": int(t["first"]), "seen": int(t["seen"]), "last": int(t["last"]), "hits": int(t["last"] - t["first"] + 1), "x": t["x"], "y": int(t["y"]), "w": t["w"],
-             "h": t["h"], "sc": 1.0, "tpl": "ocr", "reads": t["reads"][:8]} for t in tracks]
+             "h": t["h"], "sc": 1.0, "tpl": "ocr", "reads": t["reads"][:8], "gunv": t["gunv"][:40]} for t in tracks]
 
 
 def r6s_name_score(text):
@@ -2726,7 +2744,9 @@ def _r6s_core(rows, entry, cfg):
         if not votes["kill"] and not votes["death"]:
             continue
         a = "kill" if votes["kill"] >= votes["death"] else "death"
-        is_util = a == "kill" and r6s_row_util(r, uhits)
+        by_icon = a == "kill" and r6s_row_util(r, uhits)
+        by_shape = a == "kill" and not by_icon and r6s_shape_util(r)
+        is_util = by_icon or by_shape
         row = f"[{ktext or '-'}] {'util' if is_util else 'gun'} [{vtext or '-'}]"
         mine.append({"t": tt, "row": row, "verdict": a, "why": f"R6S {a}: my name on the {'killer' if a == 'kill' else 'victim'} side ({max(ks, vs):.2f}), icon {r.get('tpl', '?')}",
                      "hits": r["hits"]})
@@ -2740,7 +2760,7 @@ def _r6s_core(rows, entry, cfg):
             continue
         if a == "kill" and is_util and not admit:           # V8.0.3: copied from Valorant's utility rule: a gadget kill is rejected, never a kill (the override can admit it)
             vis.append((tt, round(r["last"] / FPS + off + 0.3, 3)))
-            rej.append({"t": tt, "reason": f"utility: gadget kill icon ({row})", "ks": ks})
+            rej.append({"t": tt, "reason": (f"utility: gadget kill icon ({row})" if by_icon else f"utility: small/square weapon icon (grenade, gadget, ability) ({row})"), "ks": ks})
             continue
         if a == "kill":
             vis.append((tt, round(r["last"] / FPS + off + 0.3, 3)))
