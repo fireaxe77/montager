@@ -2,6 +2,13 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.4.2 - 2026-10-15: Smarter extra effects, safer renders
+- Extra effects are now chosen for each montage from the song and the clips: not every kill gets effects, calm parts stay clean, and beat kills, drops and headline kills get the most
+- Two montages with different songs or clips now look different
+- Sky recolour is used only a few times per montage and only where the sky is clear
+- If one effect ever fails while rendering, only that effect is dropped and the video still finishes
+- The log shows which effects were chosen for the montage and why
+
 ## V8.4.1 - 2026-10-15: Much more extra effects, per game
 - Effects can now be set for each game: CS2, Valorant and R6S (CS2 starts on Extra effects, the others on Default)
 - Extra effects now puts a colour flash, zoom and glitch on every kill, stronger on the beat and the drops, with a build-up and afterglow on the drop kill

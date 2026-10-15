@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.4.1"
+APP_VERSION = "V8.4.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -10815,7 +10815,7 @@ XFX_GLOW_S, XFX_FLASH_S, XFX_RGB_S = 0.26, 0.14, 0.12      # lengths (s) of the 
 XFX_RISE_S, XFX_AFTER_S = 1.0, 1.2   # drop kill: the build-up before it (picture gets more saturated / contrasty) and the afterglow after it
 XFX_SKY_IN, XFX_SKY_OUT = 0.25, 0.75  # sky recolour: starts this long before the kill, ends this long after it (eased in and out)
 XFX_SKY_MIN_TOP = 0.08               # and at least this share of the top 15 % of the picture
-XFX_SKY_MIN_COV, XFX_SKY_MAX_COV = 0.10, 0.85   # share of the upper picture that must look like sky (else the effect is skipped, no sky = no effect)
+XFX_SKY_MIN_COV, XFX_SKY_MAX_COV = 0.10, 0.60   # share of the upper picture that must look like sky (else the effect is skipped, no sky = no effect; a bright wall everywhere is not sky)
 FEEL_HUES = {                        # fixed mapping: the song's feel (style) -> (name, hue in degrees, glow colour 0xRRGGBB)
     "aggressive": ("red", 0, 0xFF2A18), "hype": ("amber", 38, 0xFFB000), "cinematic": ("teal", 185, 0x18C8D8),
     "smooth": ("violet", 275, 0xA050FF), "chill": ("blue", 215, 0x3C78FF), "mix": ("amber", 38, 0xFFB000)}
@@ -10859,104 +10859,198 @@ def xfx_strength(t):
     return 0.65
 
 
+XFX_FX = ("glow", "split", "grade", "sky")     # V8.4.2: the render's retry names of the extra effects (a failing one is dropped on its own); transition = mirror, zoom = settle / punch, flash = white flash
+FEEL_PROFILES = {                    # V8.4.2: how a style's montage is dressed: weight of each kill effect, how many a montage keeps, share of kills dressed, cut effects, sky
+    "aggressive": {"w": {"punch": 0.9, "flash": 0.8, "split": 0.6, "glow": 0.5}, "k": (2, 3), "share": 0.52, "settle": 0.7, "mirror": 0.5, "sky": 3},
+    "hype": {"w": {"glow": 0.9, "punch": 0.8, "flash": 0.5, "split": 0.3}, "k": (2, 3), "share": 0.46, "settle": 0.6, "mirror": 0.3, "sky": 2},
+    "cinematic": {"w": {"glow": 0.9, "punch": 0.4, "flash": 0.3, "split": 0.15}, "k": (1, 2), "share": 0.38, "settle": 0.4, "mirror": 0.15, "sky": 3},
+    "smooth": {"w": {"glow": 0.8, "punch": 0.35, "flash": 0.2, "split": 0.1}, "k": (1, 2), "share": 0.3, "settle": 0.5, "mirror": 0.0, "sky": 1},
+    "chill": {"w": {"glow": 0.8, "punch": 0.25, "flash": 0.1, "split": 0.05}, "k": (1, 1), "share": 0.22, "settle": 0.4, "mirror": 0.0, "sky": 1}}
+FEEL_PROFILES["mix"] = FEEL_PROFILES["hype"]
+XFX_SKY_SPACING = 25.0               # seconds between two sky recolours in one montage
+XFX_SKY_CANDS = 8                    # kills that are looked at for a clear sky (the render keeps at most the profile's number of them)
+
+
+def xfx_kill_score(t, i, is_drop, on_beat, near_drop):
+    """V8.4.2: how much a kill deserves effects: the take's beat strength, on the beat, its place in a multikill (finisher more, the middle less), headline / drop kill most, calm takes less."""
+    s = xfx_strength(t) * (1.0 if on_beat else 0.78)
+    n = len(t.get("kills_out") or [])
+    if n >= 2:
+        s *= 1.1 if i == n - 1 else (1.0 if i == 0 else 0.7)
+    if is_drop:
+        s *= 1.4
+    if t.get("role") == "calm" and not is_drop:
+        s *= 0.75
+    return s * (1.15 if near_drop else 1.0)
+
+
 def assign_extra_fx(plan, game, seed, notes=None, energy=None):
-    """V8.4.1 EXTRA EFFECTS: adds t['xfx'] (effect dicts on the take's own timeline) to the takes. It never changes segments, kill times, cut timing or the default zoom pulses
-    (its own random stream: the planner's draws are untouched). Cut side: settle (the incoming take eases out of a small zoom), mirror (2 frames of a zoom-out with mirrored edges
-    on a hard cut). Kill side, on EVERY kill (also each kill of a multikill): glow (a colour wash in the song's feel colour), flash, rgb (colour-channel split), punch (zoom);
-    the mix follows the beat strength (strong takes get all of them, calm ones one) and a kill that sits on a beat is stronger than one between beats. The drop kill gets a
-    burst (bigger glow / flash / split / punch, a build-up before it and an afterglow after it) and the takes next to it are boosted. Sky: selected frags get the sky recoloured
-    in the song's feel colour (eased in and out; the render skips it where no sky is found). The killfeed zone stays untouched in every effect but the sky recolour."""
-    rng = random.Random(f"{seed}|fx841")
+    """V8.4.2 EXTRA EFFECTS: builds the EFFECT PLAN of this montage and writes t['xfx'] (effect dicts on the take's own timeline). Nothing here changes segments, kill times, cut timing or
+    the default zoom pulses (its own random stream). The plan: (1) the song's feel (style, energy, BPM) fixes the colour and the profile (FEEL_PROFILES: which kill effects weigh how much,
+    how many kills are dressed, which cut effects, how many sky recolours); (2) a seed and the song pick this montage's SIGNATURE (2-3 of glow / flash / split / punch, so two montages
+    differ) and its parameters (glow fall-off, strengths, an accent colour for the drop); (3) every kill gets a score (beat strength, on the beat, multikill position, headline / drop,
+    calm take) and only the best share of kills is dressed: one effect for most, two for strong beat kills, three for the headline / drop kill; calm takes stay mostly clean; no
+    effect on a kill that follows another dressed kill within 0.5 s unless it is the drop; (4) settle / mirror on some cuts; (5) a few kills are named as sky candidates (the render keeps
+    the ones with a clear sky, spaced apart). The killfeed zone stays untouched in every effect but the sky recolour."""
+    title = str((plan.get("song") or {}).get("title") or "")
+    rng = random.Random(f"{seed}|{title}|fx842")
     zone = list(DEFAULT_REGION.get(game, DEFAULT_REGION["cs2"]))
     zone[3] = zone[1] + 0.55 * (zone[3] - zone[1])         # killfeed rows are top-aligned: the upper part of the detection region is the zone that stays untouched
+    recipe = plan.get("recipe") if plan.get("recipe") in FEEL_PROFILES else "hype"
+    prof = FEEL_PROFILES[recipe]
     fname, fhue, frgb, fwhy = feel_hue(plan.get("recipe"), energy, (plan.get("song") or {}).get("bpm"))
+    try:
+        en = float(energy)
+    except (TypeError, ValueError):
+        en = 0.6
     plan["effects"] = "extra"
     plan["xfx_zone"] = [round(float(v), 4) for v in zone]
     plan["xfx_feel"] = {"name": fname, "hue": fhue, "rgb": frgb, "why": fwhy}
+    # (2) signature and parameters
+    k_lo, k_hi = prof["k"]
+    k_n = rng.randint(k_lo, k_hi)
+    pool = dict(prof["w"])
+    sig = []
+    while pool and len(sig) < k_n:
+        tot = sum(pool.values())
+        r, acc = rng.random() * tot, 0.0
+        for name, w in sorted(pool.items()):
+            acc += w
+            if r <= acc:
+                sig.append(name)
+                pool.pop(name)
+                break
+    par = {"fall": round(rng.uniform(6.5, 10.0), 1), "g": round(rng.uniform(0.85, 1.2), 2), "px": rng.choice((4, 5, 6)), "f": round(rng.uniform(0.85, 1.2), 2),
+           "settle": rng.random() < prof["settle"], "mirror": rng.random() < prof["mirror"]}
+    accent_names = [n for n in FEEL_HUES if n not in (recipe, "mix") and FEEL_HUES[n][0] != fname]
+    accent = FEEL_HUES[rng.choice(sorted(accent_names))] if accent_names else FEEL_HUES.get(recipe, FEEL_HUES["hype"])
+    share = max(0.12, min(0.7, prof["share"] * (0.8 + 0.5 * en)))
     beats = [float(b) for b in (plan.get("beats_out") or [])]
     takes = plan["takes"]
     head_ix = [i for i, t in enumerate(takes) if t.get("role") == "headline"]
     near_drop = {j for i in head_ix for j in range(i - 2, i + 3)}
     da = plan.get("drop_anchor") or {}
-    cnt = {"settle": 0, "mirror": 0, "glow": 0, "flash": 0, "rgb": 0, "punch": 0, "burst": 0, "rise": 0, "after": 0, "sky": 0, "kills": 0}
-    last_mirror, last_sky, prev_mix = -9, -99.0, None
+    # (3) score every kill
+    cands = []
     for ti, t in enumerate(takes):
-        s0 = xfx_strength(t) * (1.2 if (ti in near_drop and ti not in head_ix) else 1.0)
         kills = list(t.get("kills_out") or [])
-        rows = list(t.get("rows_out") or kills)
         uns = list(t.get("unsure") or [False] * len(kills))
-        dur = float(t.get("dur") or 0)
-        first = kills[0] if kills else 9.0
-        fx = []
-        if t.get("amp"):
-            t["amp"] = round(min(0.14, float(t["amp"]) * (0.8 + 0.4 * min(1.45, s0))), 3)       # the default kill punch grows with the beat strength
-        if ti > 0 and first >= XFX_MIN_LEAD:
-            fx.append({"k": "settle", "a": round(0.045 * min(1.45, s0), 4), "t0": 0.0, "t1": XFX_SETTLE_S})
-            cnt["settle"] += 1
-            if s0 >= 1.0 and t.get("trans") == "hard" and ti - last_mirror >= 2 and rng.random() < (0.4 if s0 < 1.4 else 0.7):     # a mirror frame never sits in a dissolve
-                fx.append({"k": "mirror", "z": round(0.84 - 0.08 * (min(1.45, s0) - 1.0), 3), "t0": 0.0, "t1": round(XFX_MIRROR_F / OUT_FPS, 4)})
-                last_mirror = ti
-                cnt["mirror"] += 1
         drop_k = (int(da.get("kill", 1)) - 1) if ti in head_ix else None
         for i, p in enumerate(kills):
-            if uns[i] if i < len(uns) else False:           # a kill whose time may be late (CS2): no effect on it
+            if uns[i] if i < len(uns) else False:
                 continue
             gp = float(t.get("out_start") or 0) + p
             dt = min((abs(gp - b) for b in beats), default=1.0)
-            s = s0 * (1.0 if dt <= 0.04 else 0.78)           # on the beat = stronger
             is_drop = drop_k is not None and i == drop_k
-            lag = (rows[i] - p) if i < len(rows) else 0.15
-            kinds = ["glow", "punch"]
-            if s >= 1.25 or is_drop:
-                kinds = ["glow", "flash", "rgb", "punch"]
-            elif s >= 0.85:
-                kinds += [rng.choice(["flash", "rgb"])] if rng.random() < 0.7 else []
-            elif prev_mix == "glow":
-                kinds = ["punch"]
-            else:
-                kinds = [rng.choice(["glow", "punch"])]
-            prev_mix = "glow" if kinds == ["glow", "punch"] or kinds == ["glow"] else "other"
-            big = 1.35 if is_drop else 1.0
-            if "glow" in kinds:
-                fx.append({"k": "glow", "p": round(p, 4), "a": round(min(0.62, 0.20 * s * big), 3), "t1": XFX_GLOW_S})
-                cnt["glow"] += 1
-            if "flash" in kinds:
-                fx.append({"k": "flash", "p": round(p, 4), "a": round(min(0.24, 0.085 * s * big), 3), "t1": XFX_FLASH_S})
-                cnt["flash"] += 1
-            if "rgb" in kinds:
-                fx.append({"k": "rgb", "p": round(p, 4), "px": int(max(2, min(10, round(4.5 * s * big)))), "t1": XFX_RGB_S})
-                cnt["rgb"] += 1
-            if "punch" in kinds and not any(abs(p - q) < 0.02 for q in t.get("pulses", [])):
-                a_ = min(0.12, 0.05 * s * big) * (1.0 if lag >= 0.12 else 0.7)
-                fx.append({"k": "punch", "p": round(p, 4), "a": round(a_, 4)})
-                cnt["punch"] += 1
-            cnt["kills"] += 1
-            if is_drop:
-                cnt["burst"] += 1
-                if p - XFX_RISE_S >= 0.0:
-                    fx.append({"k": "rise", "p": round(p, 4), "t0": round(p - XFX_RISE_S, 4)})
-                    cnt["rise"] += 1
-                fx.append({"k": "after", "p": round(p, 4), "t1": min(XFX_AFTER_S, max(0.3, dur - p))})
-                cnt["after"] += 1
-        if kills and (ti in head_ix or t.get("ending") or (s0 >= 1.0 and rng.random() < 0.35)):
-            gl = float(t.get("out_start") or 0) + kills[-1]
-            ok_k = not (uns[-1] if uns else False)
-            if ok_k and gl - last_sky >= 8.0:
-                fx.append({"k": "sky", "p": round(kills[-1], 4), "t0": round(max(0.0, kills[-1] - XFX_SKY_IN), 4), "t1": round(min(dur, kills[-1] + XFX_SKY_OUT), 4),
-                           "hue": fhue, "ok": None})
-                last_sky = gl
-                cnt["sky"] += 1
+            sc = xfx_kill_score(t, i, is_drop, dt <= 0.04, ti in near_drop) + rng.uniform(-0.12, 0.12)
+            cands.append({"ti": ti, "i": i, "p": p, "gp": gp, "sc": sc, "drop": is_drop, "on": dt <= 0.04})
+    n_dress = int(round(share * len(cands)))
+    chosen, last_gp = [], -9.0
+    for c in sorted(cands, key=lambda c: (not c["drop"], -c["sc"])):
+        if len(chosen) >= n_dress and not c["drop"]:
+            break
+        if not c["drop"] and any(abs(c["gp"] - o["gp"]) < 0.5 for o in chosen):
+            continue
+        chosen.append(c)
+    chosen_ix = {(c["ti"], c["i"]): c for c in chosen}
+    cnt = {"settle": 0, "mirror": 0, "glow": 0, "flash": 0, "rgb": 0, "punch": 0, "burst": 0, "rise": 0, "after": 0, "sky": 0, "kills": 0, "clean": 0}
+    prev_first = None
+    last_mirror = -9
+    per_take = {ti: [] for ti in range(len(takes))}
+    for c in sorted(chosen, key=lambda c: c["gp"]):
+        t = takes[c["ti"]]
+        p, sc = c["p"], c["sc"]
+        lag = ((t.get("rows_out") or t["kills_out"])[c["i"]] - p) if c["i"] < len(t.get("rows_out") or t["kills_out"]) else 0.15
+        fx = per_take[c["ti"]]
+        if c["drop"]:
+            kinds = ["glow", "flash", "split", "punch"]
+        else:
+            n_e = 3 if sc >= 1.6 else 2 if sc >= 1.05 else 1
+            kinds = []
+            opts = [x for x in sig]
+            rng.shuffle(opts)
+            opts.sort(key=lambda x: (x == prev_first, -prof["w"].get(x, 0.1) * rng.uniform(0.6, 1.4)))
+            for x in opts[:n_e]:
+                kinds.append(x)
+            if not kinds:
+                kinds = [sig[0]]
+            prev_first = kinds[0]
+        g = par["g"] * (1.35 if c["drop"] else 1.0)
+        if "glow" in kinds:
+            e = {"k": "glow", "p": round(p, 4), "a": round(min(0.62, 0.2 * sc * g), 3), "t1": XFX_GLOW_S, "fall": par["fall"]}
+            if c["drop"] and accent[2] != frgb:
+                e["rgb"] = accent[2]
+            fx.append(e)
+            cnt["glow"] += 1
+        if "flash" in kinds:
+            fx.append({"k": "flash", "p": round(p, 4), "a": round(min(0.24, 0.085 * sc * par["f"] * (1.35 if c["drop"] else 1.0)), 3), "t1": XFX_FLASH_S})
+            cnt["flash"] += 1
+        if "split" in kinds:
+            fx.append({"k": "rgb", "p": round(p, 4), "px": int(max(2, min(10, round(par["px"] * sc * (1.35 if c["drop"] else 1.0) / 1.0)))), "t1": XFX_RGB_S})
+            cnt["rgb"] += 1
+        if "punch" in kinds and not any(abs(p - q) < 0.02 for q in t.get("pulses", [])):
+            fx.append({"k": "punch", "p": round(p, 4), "a": round(min(0.12, 0.05 * sc * (1.35 if c["drop"] else 1.0)) * (1.0 if lag >= 0.12 else 0.7), 4)})
+            cnt["punch"] += 1
+        cnt["kills"] += 1
+        if c["drop"]:
+            cnt["burst"] += 1
+            if p - XFX_RISE_S >= 0.0:
+                fx.append({"k": "rise", "p": round(p, 4), "t0": round(p - XFX_RISE_S, 4)})
+                cnt["rise"] += 1
+            fx.append({"k": "after", "p": round(p, 4), "t1": min(XFX_AFTER_S, max(0.3, float(t.get("dur") or 0) - p))})
+            cnt["after"] += 1
+    cnt["clean"] = len(cands) - cnt["kills"]
+    # (4) cut side
+    for ti, t in enumerate(takes):
+        first = (t.get("kills_out") or [9.0])[0]
+        s0 = xfx_strength(t)
+        if t.get("amp") and ti in {c["ti"] for c in chosen}:
+            t["amp"] = round(min(0.14, float(t["amp"]) * (0.8 + 0.4 * min(1.45, s0))), 3)
+        if ti > 0 and first >= XFX_MIN_LEAD:
+            if par["settle"] and (s0 >= 1.0 or rng.random() < 0.35):
+                per_take[ti].append({"k": "settle", "a": round(0.045 * min(1.45, s0), 4), "t0": 0.0, "t1": XFX_SETTLE_S})
+                cnt["settle"] += 1
+            if par["mirror"] and s0 >= 1.0 and t.get("trans") == "hard" and ti - last_mirror >= 3 and rng.random() < 0.7:
+                per_take[ti].append({"k": "mirror", "z": round(0.84 - 0.08 * (min(1.45, s0) - 1.0), 3), "t0": 0.0, "t1": round(XFX_MIRROR_F / OUT_FPS, 4)})
+                last_mirror = ti
+                cnt["mirror"] += 1
+    # (5) sky candidates: strong takes only; the render keeps the ones with a clear sky
+    sky_max = 0 if prof["sky"] <= 0 else rng.randint(1, prof["sky"])
+    sky_c = []
+    for c in sorted(cands, key=lambda c: -c["sc"]):
+        t = takes[c["ti"]]
+        if xfx_strength(t) < 1.0 and not t.get("ending"):
+            continue
+        if c["i"] != len(t["kills_out"]) - 1 or any(abs(c["gp"] - o["gp"]) < 8.0 for o in sky_c):
+            continue
+        sky_c.append(c)
+        if len(sky_c) >= XFX_SKY_CANDS:
+            break
+    for c in sky_c:
+        t = takes[c["ti"]]
+        dur = float(t.get("dur") or 0)
+        per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": round(max(0.0, c["p"] - XFX_SKY_IN), 4), "t1": round(min(dur, c["p"] + XFX_SKY_OUT), 4),
+                                  "hue": fhue, "ok": None, "gp": round(c["gp"], 3)})
+    plan["xfx_sky_max"] = sky_max
+    for ti, fx in per_take.items():
         if fx:
-            t["xfx"] = fx
+            takes[ti]["xfx"] = fx
     cnt["speed"] = 0
     if not plan_duplicate_ranges(plan):
         xfx_speed(plan, rng, cnt)
-    ln = (f"EFFECTS extra: {cnt['kills']} kills with effects (glow {cnt['glow']}, flash {cnt['flash']}, colour split {cnt['rgb']}, punch {cnt['punch']}), "
-          f"{cnt['burst']} drop burst(s) ({cnt['rise']} build-up, {cnt['after']} afterglow), {cnt['settle']} cut settles, {cnt['mirror']} mirror cuts, "
-          f"{cnt['speed']} faster run-ups (speed ramps before the kill), {cnt['sky']} sky recolour candidate(s); song feel colour {fname} ({fwhy})")
-    if notes is not None:
-        notes.append(ln)
-    LOGONLY(ln)
+    on_n = sum(1 for c in chosen if c["on"])
+    summary = {"feel": fname, "why": fwhy, "recipe": recipe, "signature": sig, "share": round(share, 2), "kills": len(cands), "dressed": cnt["kills"], "dressed_on_beat": on_n,
+               "glow": cnt["glow"], "flash": cnt["flash"], "split": cnt["rgb"], "punch": cnt["punch"], "burst": cnt["burst"], "settle": cnt["settle"], "mirror": cnt["mirror"],
+               "speed": cnt["speed"], "sky_max": sky_max, "sky_candidates": len(sky_c), "accent": accent[0], "fall": par["fall"]}
+    plan["xfx_plan"] = summary
+    lines = [f"EFFECT PLAN (extra): song feel {fname} - {fwhy}; this montage's signature: {' + '.join(sig)} (kill effects not in it only on the drop kill); glow fall-off {par['fall']:g}, accent colour for the drop {accent[0]}",
+             f"EFFECT PLAN: {cnt['kills']} of {len(cands)} kills dressed ({share * 100:.0f}% share by style / energy, {on_n} on a beat; the rest stay clean): glow {cnt['glow']}, flash {cnt['flash']}, "
+             f"colour split {cnt['rgb']}, punch {cnt['punch']}; {cnt['burst']} drop burst(s) with build-up and afterglow; cuts: {cnt['settle']} settles, {cnt['mirror']} mirror cuts; "
+             f"{cnt['speed']} faster run-ups; sky recolour: up to {sky_max} (clear sky only, {len(sky_c)} candidate kills, at least {XFX_SKY_SPACING:.0f} s apart)"]
+    for ln in lines:
+        if notes is not None:
+            notes.append(ln)
+        LOGONLY(ln)
 
 
 XFX_SPEED_MIN_APP = 6                # frames of run-up before the 1.0 s at 1.0x that a speed-up needs to be worth it
@@ -11116,9 +11210,11 @@ def sky_mask_np(rgb):
 
 
 def xfx_probe_sky(plan):
-    """V8.4.1: before a render: for every planned sky recolour grab the real frame at the kill and measure how much of the upper picture looks like sky. Not enough (indoors,
-    a wall) or too much (a bright wall everywhere) = the effect is skipped for that kill (x['ok'] False): no sky, no effect. Logs one line per candidate."""
+    """V8.4.2: before a render: every sky candidate kill is looked at (the real frame at the kill: how much of the upper picture looks like sky). Only kills with a clear sky qualify (not enough =
+    indoors / a wall, too much = a bright wall everywhere: skipped); of those the clearest are kept, at most the montage's number (plan['xfx_sky_max'], from the song's feel), at least
+    XFX_SKY_SPACING seconds apart, so the sky recolour is used a few times per montage and never on most clips. No clear sky anywhere = no sky recolour at all. One log line per candidate."""
     import numpy as np
+    cands = []
     for ti, t in enumerate(plan.get("takes") or []):
         for x in t.get("xfx") or []:
             if x.get("k") != "sky" or x.get("ok") is not None:
@@ -11141,10 +11237,26 @@ def xfx_probe_sky(plan):
             except Exception as ex:                       # noqa: BLE001
                 why = f" ({type(ex).__name__})"
             x["cov"] = None if cov is None else round(cov, 3)
-            x["ok"] = bool(cov is not None and XFX_SKY_MIN_COV <= cov <= XFX_SKY_MAX_COV)
-            fe = plan.get("xfx_feel") or {}
-            out(f"SKY recolour take {ti + 1}: " + (f"sky covers {cov * 100:.0f}% of the upper picture -> " + (f"recoloured {fe.get('name', '?')} ({fe.get('hue', '?')} deg)" if x["ok"] else "no sky here, skipped")
-                                                     if cov is not None else f"frame not readable{why}, skipped"))
+            x["ok"] = False
+            cands.append((ti, x, cov, why))
+    fe = plan.get("xfx_feel") or {}
+    mx = int(plan.get("xfx_sky_max", 1))
+    kept = []
+    for ti, x, cov, why in sorted(cands, key=lambda c: -(c[2] or 0)):
+        good = cov is not None and XFX_SKY_MIN_COV <= cov <= XFX_SKY_MAX_COV
+        gp = float(x.get("gp", 0.0))
+        if good and len(kept) < mx and all(abs(gp - g_) >= XFX_SKY_SPACING for g_ in kept):
+            x["ok"] = True
+            kept.append(gp)
+            msg = f"sky covers {cov * 100:.0f}% of the upper picture -> recoloured {fe.get('name', '?')} ({fe.get('hue', '?')} deg)"
+        elif cov is None:
+            msg = f"frame not readable{why}, skipped"
+        elif not good:
+            msg = f"sky covers {cov * 100:.0f}% of the upper picture -> no clear sky here, skipped"
+        else:
+            msg = f"sky covers {cov * 100:.0f}% -> clear sky, but not chosen (at most {mx} per montage, {XFX_SKY_SPACING:.0f} s apart)"
+        out(f"SKY recolour take {ti + 1}: {msg}")
+    out(f"SKY recolour: {len(kept)} of {len(cands)} candidate kills recoloured (at most {mx} per montage)" if cands else "SKY recolour: no candidate kill")
 
 
 def _zone_weight(zone, f=0.012):
@@ -11181,8 +11293,6 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
         chains.append(f"[{base}x1]format=yuv420p[{base}x1b]")
         chains.append(f"[{base}x1b][{base}xm]overlay=0:0:eof_action=pass:enable='between(t,{x['t0']:.4f},{x['t1'] - 1e-4:.4f})'[{base}xo]")
         lab = f"[{base}xo]"
-    if "flash" not in fx:
-        return lab
     zw = _zone_weight(zone or DEFAULT_REGION["cs2"])
     rgb = (feel or {}).get("rgb", 0xFFB000)
     n = 0
@@ -11191,13 +11301,17 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
         nonlocal n
         n += 1
         return f"{base}{prefix}{n}"
-    gl = [e for e in xs if e["k"] == "glow"]
-    fl = [e for e in xs if e["k"] == "flash"]
-    rg = [e for e in xs if e["k"] == "rgb"]
-    for items, colour, tag, fall in ((gl, f"0x{rgb:06X}", "g", 8.0), (fl, "white", "f", 22.0)):
+    gl = [e for e in xs if e["k"] == "glow"] if "glow" in fx else []
+    fl = [e for e in xs if e["k"] == "flash"] if "flash" in fx else []
+    rg = [e for e in xs if e["k"] == "rgb"] if "split" in fx else []
+    layers = []
+    for col in sorted({int(e.get("rgb", rgb)) for e in gl}):                     # one glow layer per colour (the drop kill may carry an accent colour)
+        layers.append(([e for e in gl if int(e.get("rgb", rgb)) == col], f"0x{col:06X}", "g", None))
+    layers.append((fl, "white", "f", 22.0))
+    for items, colour, tag, fall in layers:
         if not items:
             continue
-        kx = "+".join(f"if(between(T,{e['p']:.4f},{e['p'] + e['t1']:.4f}),{e['a']:.3f}*exp(-{fall:g}*(T-{e['p']:.4f})),0)" for e in items)
+        kx = "+".join(f"if(between(T,{e['p']:.4f},{e['p'] + e['t1']:.4f}),{e['a']:.3f}*exp(-{(fall or e.get('fall', 8.0)):g}*(T-{e['p']:.4f})),0)" for e in items)
         en = "+".join(f"between(t,{e['p'] - 0.005:.4f},{e['p'] + e['t1']:.4f})" for e in items)
         sa, sb, out_ = nxt(tag + "a"), nxt(tag + "b"), nxt(tag)
         chains.append(f"{lab}split=2[{sa}][{sb}]")                    # the colour layer comes from the take's own frames (a separate source would run ahead of the concat and buffer)
@@ -11211,19 +11325,19 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
                       f"chromashift=cbh={max(1, px // 2)}:crh=-{max(1, px // 2)}:enable='between(t,{l0 + e['t1'] / 2:.4f},{l0 + e['t1']:.4f})'[{o}]")
         lab = f"[{o}]"
     for e in xs:
-        if e["k"] == "rise":
+        if e["k"] == "rise" and "grade" in fx:
             t0, p = e["t0"], e["p"]
             rp = f"min(1,max(0,(t-{t0:.4f})/{max(p - t0, 0.1):.3f}))"
             o = nxt("r")
             chains.append(f"{lab}eq=contrast='1+0.14*{rp}':saturation='1+0.40*{rp}':eval=frame:enable='between(t,{t0:.4f},{p:.4f})'[{o}]")
             lab = f"[{o}]"
-        elif e["k"] == "after":
+        elif e["k"] == "after" and "grade" in fx:
             p, l1 = e["p"], e["t1"]
             ex_ = f"exp(-3*(t-{p:.4f}))"
             o = nxt("a")
             chains.append(f"{lab}eq=contrast='1+0.07*{ex_}':saturation='1+0.35*{ex_}':eval=frame:enable='between(t,{p:.4f},{p + l1:.4f})'[{o}]")
             lab = f"[{o}]"
-        elif e["k"] == "sky" and e.get("ok"):
+        elif e["k"] == "sky" and e.get("ok") and "sky" in fx:
             t0, t1 = e["t0"], e["t1"]
             ut, vt = _rgb_to_uv(FEEL_RGB_BY_HUE.get(int(e.get("hue", 0)), rgb))
             ke = f"max(0,min(1,min((T-{t0:.4f})/{XFX_SKY_IN * 0.8:.3f},({t1:.4f}-T)/{XFX_SKY_OUT * 0.5:.3f})))"
@@ -11235,12 +11349,14 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
     return lab
 
 
-def build_filter(plan, cfg, preview, fx=FX_ALL):
+def build_filter(plan, cfg, preview, fx=None):
     """ONE filter graph (V4 engine). Effects sit on each take's own output timeline: centred V4 zoom punches on kills (overlaid
     only inside the punch), ramps before kills, V4 slow-mo (frame blending only inside slow-mo segments). V5.2: no flashes, no
     zoom / flash cuts - takes join on hard cuts. Music: never ducked, stretched or
     automated - sample-exact start, 0.3 s fade-in, fade-out from the final kill. Game audio: V4 balance + kill boost."""
     inputs, chains, k = [], [], 0
+    if fx is None:
+        fx = tuple(FX_ALL) + (XFX_FX if plan.get("effects") == "extra" else ())          # V8.4.2: the extra effects have their own switches (the render drops a failing one on its own)
     takes = plan["takes"]
     exact = plan.get("placement", "v5") != "v4"
     vl = []
@@ -11484,7 +11600,22 @@ def enc_args(maxq, preview, nvenc):
     return v + ["-pix_fmt", "yuv420p", "-r", "60", "-c:a", "aac", "-b:a", "320k", "-ar", "48000", "-movflags", "+faststart"]
 
 
+RUN_MEM = {"min_free": None, "total": None}        # V8.4.2: the lowest free memory (GB) seen while the last ffmpeg run was going (None = unknown)
+LOW_MEM_GB = 1.5
+
+
+def _free_mem_gb():
+    try:
+        import psutil
+        v = psutil.virtual_memory()
+        return v.available / 2 ** 30, v.total / 2 ** 30
+    except Exception:                                  # noqa: BLE001
+        return None, None
+
+
 def _run_ffmpeg(cmd, D, elog):
+    RUN_MEM["min_free"], RUN_MEM["total"] = _free_mem_gb()
+    tick = 0
     with open(elog, "w", encoding="utf-8") as ef:
         pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, text=True)
         PROCS.append(pr)
@@ -11495,6 +11626,11 @@ def _run_ffmpeg(cmd, D, elog):
                     progress(fr, f"rendering {int(100 * fr)}%")
                 except ValueError:
                     pass
+                tick += 1
+                if tick % 10 == 0:                     # memory check about every second
+                    fm, _t = _free_mem_gb()
+                    if fm is not None and (RUN_MEM["min_free"] is None or fm < RUN_MEM["min_free"]):
+                        RUN_MEM["min_free"] = fm
             if CANCEL.is_set():
                 pr.kill()
         pr.wait()
@@ -12125,7 +12261,7 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     tmp = outfile.with_name(outfile.stem + ".part.mp4")
     elog = LOG_DIR / "last_render_stderr.txt"
     gp = LOG_DIR / "last_filter.txt"
-    fx, failed = (set(FX_ALL) if effects else {"slow"}), []
+    fx, failed = (set(FX_ALL) | (set(XFX_FX) if p.get("effects") == "extra" else set()) if effects else {"slow"}), []
     itmp = render_tmpdir(outfile)
     try:                                                   # V6.9.3: low-fps clips are interpolated first (only the ranges the plan uses)
         pr_ = interp_prepare(p, cfg, itmp, fx)
@@ -12141,7 +12277,20 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         shutil.rmtree(itmp, ignore_errors=True)
 
 
+FX_DROP_ORDER = ("sky", "split", "grade", "glow", "transition", "zoom", "flash", "slow")       # V8.4.2: when ffmpeg's message does not name the effect, the newest / riskiest goes first
+
+
+def fx_culprit(low, fx):
+    """The effect to drop after a failed render attempt: the one the error text names, else the next of FX_DROP_ORDER that is still on (the extra effects first, each on its own).
+    Without any extra effect left this is exactly the old rule (DEFAULT is unchanged)."""
+    if not (set(XFX_FX) & set(fx)):
+        return next((n for key, n in (("overlay", "zoom"), ("drawbox", "flash"), ("framerate", "slow"), ("atempo", "slow"), ("blend", "transition"), ("tpad", "slow")) if key in low and n in fx), None) or             next(n for n in ("transition", "zoom", "flash", "slow") if n in fx)
+    return next((n for key, n in (("geq", "sky"), ("chromashift", "split"), ("drawbox", "glow"), ("blend", "glow"), ("overlay", "zoom"), ("framerate", "slow"), ("atempo", "slow"),
+                                  ("tpad", "slow")) if key in low and n in fx), None) or next(n for n in FX_DROP_ORDER if n in fx)
+
+
 def _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nvenc, tmp, elog, gp, fx, failed, D):
+    mem_waits = [0]
     while True:
         inputs, graph = build_filter(pr_, cfg, preview, fx)
         gp.write_text(graph, encoding="utf-8")
@@ -12171,12 +12320,20 @@ def _render_loop(plan, p, pr_, outfile, cfg, maxq, preview, encoder, effects, nv
             if not (use_nv and any(w in txt.lower() for w in ("nvenc", "cuda", "encoder", "driver"))):
                 break
             out("retrying with libx264")
+        mf = RUN_MEM.get("min_free")
+        if mf is not None:
+            LOGONLY(f"memory during this attempt: lowest free {mf:.1f} GB of {RUN_MEM.get('total') or 0:.1f} GB")
+        if mf is not None and mf < LOW_MEM_GB and mem_waits[0] < 2 and not CANCEL.is_set():       # V8.4.2: ffmpeg stopped while the computer was nearly out of memory: not an effect's fault
+            mem_waits[0] += 1
+            out(f"ffmpeg stopped while only {mf:.1f} GB of memory were free (a render of many clips needs ~10 GB; close other programs / renders): waiting 30 s and trying again with the same effects")
+            for _ in range(30):
+                if CANCEL.is_set():
+                    break
+                time.sleep(1)
+            continue
         if not fx:
             break
-        low = txt.lower()
-        culprit = next((n for key, n in (("overlay", "zoom"), ("drawbox", "flash"), ("framerate", "slow"), ("atempo", "slow"),
-                                         ("blend", "transition"), ("tpad", "slow")) if key in low and n in fx), None) or \
-            next(n for n in ("transition", "zoom", "flash", "slow") if n in fx)
+        culprit = fx_culprit(txt.lower(), fx)
         failed.append(culprit)
         fx.discard(culprit)
         LOGONLY(txt[-600:]); out(f"effect '{culprit}' failed - retrying without it" + ("" if fx else " (no effects left)"))
