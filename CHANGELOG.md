@@ -5,6 +5,13 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V8.22 (branch work-v822, merged to main, APP_VERSION = V8.22) - 2026-10-15
+- Manual tab, Step 2: "Random pick" button (`random_song`) selects one song of the list as shown (search filter and sort); it never plays or renders.
+- New setting `post_checks` (Settings > Checks after render, default off): off = `run_job` prints `rendered <path>` and returns right after `video_ready`; on = quality check, sync report (incl. transition check) as before. Nothing before the video is written changed.
+- Plan text: the "PLAYLIST tracks with no MP3 yet" block is removed (`fmt_plan`).
+- Auto style recheck (analysis only, weights NOT changed): the BPM used is the song map's, which differs from the CSV tempo by >20% for about a third of the songs checked (octave errors, e.g. Les CSV 75 / map 103, Kill Our Way to Heaven CSV 125 / map 71); `hype` has no tempo term and its energy bump covers energy 0.5-1.0, so every mid/high-energy slow song scores hype; `chill` needs energy < 0.5 (CSV energy >= 0.7 never gives chill), a song without CSV energy uses the map mean energy, about 0.1 lower than the CSV scale. Suggested change, not made: a tempo term in `hype`, CSV tempo preferred or octave-reconciled, +0.1 on map-derived energy.
+- Tests: `tests/test_v822.py`.
+
 ## V8.21 (branch work-v821, merged to main, APP_VERSION = V8.21) - 2026-10-15
 - CS2 missing last kill of a clutch: clip `2026.02.11 - 22.15.07` (take 16 of I_CS2_V8.2_2026-10-15; plan kills 2.223 / 8.957 confirmed). Its sidecar holds 4 outlined rows; the 4th (`fireaxe + Makosy -> -P2W-`, 14.7 s to the clip end, 20 frames at 30 fps) was read only 3 times, 2 of them unsplittable (the victim OCR box swallowed the weapon icon) and the third without a weapon icon, so its verdict was `none` and `border_analysis` dropped it with no rejected row (counted as a blob). The V7.4.9 name-kill fallback (`cs2_name_kills_kept`) had the right kill (name list 14.667, my name ks 1.0) but refused it: one read < `CS2_NAMEKEEP_HITS` and the shaped-track evidence only looked at tracks the shape filter dropped, not at shaped tracks with no verdict.
 - Fix (CS2 only): `border_analysis` returns `unread` (outlined row-shaped tracks with no verdict: time, frames); `cs2_name_kills_kept` counts them as the shaped-track evidence and accepts a single read of my name when the unread row has >= `CS2_UNREAD_MIN_F` (10) frames. Border kills are never removed or re-timed; all other fallback conditions (stable name, not pre-clip, death window, 1 s apart, fewer border kills than name kills) unchanged.
