@@ -58,7 +58,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.23.1"
+APP_VERSION = "V8.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -100,6 +100,7 @@ DEFAULT_CONFIG = {
     "name_match": 80,               # V4 OCR: rapidfuzz partial_ratio needed for FIREAXE (killer side = kill, victim side = death)
     "death_lock_s": 8.0,            # no kills counted this long after my own death
     "sync_report": True,
+    "effects": "default",           # V8.4: default (the current minimal effects, the safety net) | extra (more effects and transitions: only look, never kills / timing)
     "post_checks": False,           # V8.22: SSIM quality check + sync report + transition check after the video is written (off by default)
     "gap_s": {"valorant": 6.0, "cs2": 5.0, "r6s": 6.0},
     "game_overrides": {},           # path prefix -> game
@@ -9930,6 +9931,11 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     if OUTRO_TRIM_ON[0]:                                   # V7.6.0: the video ends 0.5 s after the fade to black starts, ~0.5 s after the final kill
         trim_outro(plan, plan["notes"])
     assign_soft_cuts(plan, plan["notes"])                  # V7.6.1: soft dissolves where footage allows it, hard cuts elsewhere
+    if effects_mode(cfg) == "extra":                       # V8.4: EXTRA EFFECTS: only adds look data to the takes (its own random stream); kills, cuts, timing and the default effects' draws stay as they are
+        try:
+            assign_extra_fx(plan, game, seed, plan["notes"])
+        except Exception as ex_:
+            LOGONLY(f"extra effects skipped: {type(ex_).__name__}: {ex_}")
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     win_drops = [float(d_["t"]) for d_ in (an.get("drops") or []) if d_.get("t") is not None and S0 + 0.5 < float(d_["t"]) < S0 + D - 1.0]
@@ -10796,6 +10802,81 @@ def soft_cut_ok(plan, i):
     return True, ""
 
 
+EFFECT_MODES = ("default", "extra")
+EFFECT_LABELS = {"default": "Default (minimal effects)", "extra": "Extra effects (more effects and transitions)"}
+XFX_SETTLE_S = 0.25                  # V8.4: the incoming take eases out of a small zoom for this long (reference: a zoom settle after most cuts)
+XFX_MIRROR_F = 2                     # V8.4: the mirror-edge zoom-out lasts this many frames at the start of a take
+XFX_MIN_LEAD = 0.8                   # V8.4: cut-side effects only when the take's first kill is at least this far in (the kill row is never near them)
+XFX_FLASH_S, XFX_SHAKE_S = 0.16, 0.30
+XFX_SHAKE_PX_MAX = 22                # V8.4: the picture is mirror-padded by this much, so a shake never shows black edges
+
+
+def effects_mode(cfg):
+    m = str((cfg or {}).get("effects", "default")).lower()
+    return m if m in EFFECT_MODES else "default"
+
+
+def xfx_strength(t):
+    """V8.4: how strong a take's effects are: 1.45 headline / drop, 1.0 on a downbeat or build, 0.65 calm. The more beat strength, the stronger the effect."""
+    if t.get("role") in ("headline", "ending") or int(t.get("level", 0)) >= 2:
+        return 1.45
+    if t.get("kill_down") or int(t.get("level", 0)) >= 1:
+        return 1.0
+    return 0.65
+
+
+def assign_extra_fx(plan, game, seed, notes=None):
+    """V8.4 EXTRA EFFECTS: adds t['xfx'] (a list of effect dicts on the take's own timeline) to the takes and scales the zoom punch with the beat strength. It never changes
+    segments, kill times, cut timing or the default zoom pulses (its own random stream: the planner's draws are untouched). Effects:
+    settle = the incoming take eases out of a small zoom (after cuts); mirror = 2 frames of a zoom-out with mirrored edges on a cut (strong takes, never two in a row);
+    flash = a short brightness lift on the punched kill; shake = a decaying picture shake on the punched kill (strong takes). The killfeed zone stays untouched (render)."""
+    rng = random.Random(f"{seed}|fx84")
+    zone = list(DEFAULT_REGION.get(game, DEFAULT_REGION["cs2"]))
+    plan["effects"] = "extra"
+    plan["xfx_zone"] = [round(float(v), 4) for v in zone]
+    n_set = n_mir = n_fl = n_sh = 0
+    last_mirror = -9
+    for ti, t in enumerate(plan["takes"]):
+        s = xfx_strength(t)
+        fx = []
+        first = (t.get("kills_out") or [9.0])[0]
+        if t.get("amp"):
+            t["amp"] = round(min(0.14, float(t["amp"]) * (0.8 + 0.4 * s)), 3)       # the kill punch grows with the beat strength
+        if ti > 0 and first >= XFX_MIN_LEAD:
+            fx.append({"k": "settle", "a": round(0.045 * s, 4), "t0": 0.0, "t1": XFX_SETTLE_S})
+            n_set += 1
+            if s >= 1.0 and t.get("trans") == "hard" and ti - last_mirror >= 2 and rng.random() < (0.35 if s < 1.4 else 0.65):     # a mirror frame never sits in a dissolve
+                fx.append({"k": "mirror", "z": round(0.84 - 0.08 * (s - 1.0), 3), "t0": 0.0, "t1": round(XFX_MIRROR_F / OUT_FPS, 4)})
+                last_mirror = ti
+                n_mir += 1
+        for p in t.get("pulses", []):                                               # only on kills that get the zoom punch (certain kill times)
+            if s >= 1.0 and rng.random() < (0.45 if s < 1.4 else 0.85):
+                fx.append({"k": "flash", "p": p, "a": round(0.10 * s, 3), "t1": XFX_FLASH_S})
+                n_fl += 1
+            if s >= 1.0 and rng.random() < (0.3 if s < 1.4 else 0.6):
+                fx.append({"k": "shake", "p": p, "px": int(min(XFX_SHAKE_PX_MAX, round(9 * s))), "t1": XFX_SHAKE_S})
+                n_sh += 1
+        if fx:
+            t["xfx"] = fx
+    ln = f"EFFECTS extra: {n_set} cut settles, {n_mir} mirror cuts, {n_fl} kill flashes, {n_sh} kill shakes, punch scaled by beat strength"
+    if notes is not None:
+        notes.append(ln)
+    LOGONLY(ln)
+
+
+def xfx_windows(t, ti, soft_in=False):
+    """V8.4: the (start, end) windows of a take's extra effects on its own timeline (read by the render and the checks). A mirror frame never sits in a dissolve (soft_in)."""
+    w = []
+    for x in t.get("xfx") or []:
+        if x["k"] == "settle":
+            w.append((x["t0"], x["t1"]))
+        elif x["k"] == "mirror" and not soft_in:
+            w.append((x["t0"], x["t1"]))
+        elif x["k"] in ("flash", "shake"):
+            w.append((x["p"] - 0.02, x["p"] + x["t1"]))
+    return w
+
+
 def assign_soft_cuts(plan, notes=None):
     """V7.6.1: every cut INTO a take is 'soft' (short dissolve) or 'hard' (the V5.2 hard cut): take['trans']. Returns (soft, {hard reason: count})."""
     soft, why = 0, {}
@@ -10871,6 +10952,52 @@ def _jf(path, div=1.0):
 
 JITTER_FREE = [True]                 # V8.2: retime 60 fps clips by frame number (switch for the A/B proof)
 CS2_SLOW_INTERP = "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=8"
+
+
+def _xfx_chains(chains, base, lab, t, fx, soft_in, zone):
+    """V8.4 EXTRA EFFECTS in the render: the extra effects of one take, each overlaid only inside its own window (outside it every frame is the untouched take).
+    mirror = zoom-out with mirrored edges for 2 frames at the start; flash = brightness lift; shake = decaying shake on a mirror-padded picture (no black edges).
+    flash / shake keep the killfeed zone exactly as it is (the original zone is put back on top), so the kill row is never covered or moved. Returns the new label."""
+    xs = t.get("xfx") or []
+    if not xs:
+        return lab
+    mir = [x for x in xs if x["k"] == "mirror"] if ("transition" in fx and not soft_in) else []
+    fls = [x for x in xs if x["k"] == "flash"] if "flash" in fx else []
+    shk = [x for x in xs if x["k"] == "shake"] if "zoom" in fx else []
+    if mir:
+        x = mir[0]
+        w_, h_ = int(1920 * x["z"]) // 2 * 2, int(1080 * x["z"]) // 2 * 2
+        px_, py_ = (1920 - w_) // 2, (1080 - h_) // 2
+        chains.append(f"{lab}split=2[{base}x1][{base}x2]")
+        chains.append(f"[{base}x2]scale={w_}:{h_}:flags=bicubic,pad=1920:1080:{px_}:{py_},fillborders=left={px_}:right={1920 - w_ - px_}:top={py_}:bottom={1080 - h_ - py_}:mode=mirror,"
+                      f"format=yuv420p[{base}xm]")
+        chains.append(f"[{base}x1]format=yuv420p[{base}x1b]")
+        chains.append(f"[{base}x1b][{base}xm]overlay=0:0:eof_action=pass:enable='between(t,{x['t0']:.4f},{x['t1'] - 1e-4:.4f})'[{base}xo]")
+        lab = f"[{base}xo]"
+    if fls or shk:
+        wins = [(x["p"] - 0.02, x["p"] + x["t1"]) for x in fls + shk]
+        en_ = "+".join(f"between(t,{a:.4f},{b:.4f})" for a, b in wins)
+        m_ = XFX_SHAKE_PX_MAX
+        chains.append(f"{lab}split=3[{base}k1][{base}k2][{base}k3]")
+        cur = f"[{base}k2]"
+        if shk:
+            dx = "+".join(f"between(t,{x['p']:.4f},{x['p'] + x['t1']:.4f})*{x['px']}*exp(-9*(t-{x['p']:.4f}))*sin(80*(t-{x['p']:.4f}))" for x in shk)
+            dy = "+".join(f"between(t,{x['p']:.4f},{x['p'] + x['t1']:.4f})*{x['px'] * 0.6:.1f}*exp(-9*(t-{x['p']:.4f}))*sin(97*(t-{x['p']:.4f}))" for x in shk)
+            chains.append(f"{cur}format=yuv420p,pad=1920+{2 * m_}:1080+{2 * m_}:{m_}:{m_},fillborders=left={m_}:right={m_}:top={m_}:bottom={m_}:mode=mirror,"
+                          f"crop=1920:1080:'{m_}+({dx})':'{m_}+({dy})'[{base}ks]")
+            cur = f"[{base}ks]"
+        if fls:
+            br = "+".join(f"between(t,{x['p']:.4f},{x['p'] + x['t1']:.4f})*{x['a']:.3f}*(1-(t-{x['p']:.4f})/{x['t1']:.3f})" for x in fls)
+            chains.append(f"{cur}eq=brightness='{br}':eval=frame,format=yuv420p[{base}kf]")
+            cur = f"[{base}kf]"
+        x0, y0, x1, y1 = zone or DEFAULT_REGION["cs2"]
+        zx, zy, zw, zh = int(x0 * 1920) & ~1, int(y0 * 1080) & ~1, int((x1 - x0) * 1920) & ~1, int((y1 - y0) * 1080) & ~1
+        chains.append(f"[{base}k1]format=yuv420p[{base}k1b]")
+        chains.append(f"[{base}k3]format=yuv420p,crop={zw}:{zh}:{zx}:{zy}[{base}kz]")
+        chains.append(f"[{base}k1b]{cur}overlay=0:0:eof_action=pass:enable='{en_}'[{base}ko]")
+        chains.append(f"[{base}ko][{base}kz]overlay={zx}:{zy}:eof_action=pass:enable='{en_}'[{base}kr]")
+        lab = f"[{base}kr]"
+    return lab
 
 
 def build_filter(plan, cfg, preview, fx=FX_ALL):
@@ -11040,6 +11167,10 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
                 zt.append(f"between({tt},0,{INTRO_PUNCH[1]})*{INTRO_PUNCH[0]:.3f}*exp(-9*{tt})")
                 wins.append((0.0, INTRO_PUNCH[1]))
                 LOGONLY("intro punch: first take")
+            for x_ in (t.get("xfx") or []):                                                # V8.4 EXTRA EFFECTS: the incoming take eases out of a small zoom (not into a dissolve)
+                if x_["k"] == "settle":
+                    zt.append(f"between({tt},{x_['t0']:.4f},{x_['t1']:.4f})*{x_['a']:.4f}*exp(-9*({tt}-{x_['t0']:.4f}))")
+                    wins.append((x_["t0"], x_["t1"]))
         lab = f"[{base}c]"
         if zt:
             en_ = "+".join(f"between(t,{a_:.4f},{b_:.4f})" for a_, b_ in wins)
@@ -11050,6 +11181,7 @@ def build_filter(plan, cfg, preview, fx=FX_ALL):
             chains.append(f"[{base}m]format=yuv420p[{base}m2]")
             chains.append(f"[{base}m2][{base}e]overlay=0:0:eof_action=pass:enable='{en_}'[{base}o]")
             lab = f"[{base}o]"
+        lab = _xfx_chains(chains, base, lab, t, fx, soft[ti], plan.get("xfx_zone"))
         if soft[ti] or soft[ti + 1]:
             s_ = SOFT_AFTER if soft[ti] else 0
             e_ = SOFT_BEFORE if soft[ti + 1] else 0
@@ -11927,7 +12059,7 @@ def quality_check(plan, outfile, cfg, preview=False):
         for sg in t["segs"]:
             a, b, sp, n = sg[:4]
             if sp == 1.0 and n >= 30:
-                busy = list(t["pulses"]) + ([t["flash"]] if t["flash"] is not None else [])
+                busy = list(t["pulses"]) + ([t["flash"]] if t["flash"] is not None else []) + ([0.0] if t.get("xfx") else [])
                 for start in (off / OUT_FPS + 0.45, off / OUT_FPS + 0.8):
                     if start + 0.5 > (off + n) / OUT_FPS or any(start - 0.5 < x < start + 0.6 for x in busy):
                         continue
@@ -12883,6 +13015,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
                 out(f"NOTE: the summary shown at {pin.get('at', '?')} differs from this plan (inputs changed since: {pin['summary'][:160]} -> {now_sum[:160]})")
         T_JOB = {"plan": time.time() - T0_JOB}
         out(f"PICK  song: {plan['pick']['title']}  style: {plan['pick']['style']}  (picked by {plan['pick']['by']})")
+        out(f"EFFECTS {plan.get('effects', 'default')}")      # V8.4
         plans = DATA / "plans"
         plans.mkdir(parents=True, exist_ok=True)
         base = f"{GAME_DIR[game]}_{week_tag(now)}_{plan['seed']}"
@@ -14379,6 +14512,7 @@ class App:
         cfg["style"], cfg["placement"] = self.set_style.get(), self.set_place.get()
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["post_checks"] = bool(self.set_post.get())               # V8.22
+        cfg["effects"] = {v: k for k, v in EFFECT_LABELS.items()}.get(self.set_fx.get(), "default")      # V8.4
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
         cfg["lower_music_clips"] = bool(self.set_music.get())        # V7.7.0
@@ -16202,6 +16336,7 @@ class App:
         r[0] += 1
         self.set_sync = tk.BooleanVar(value=self.cfg.get("sync_report", True))
         self.set_post = tk.BooleanVar(value=bool(self.cfg.get("post_checks", False)))      # V8.22
+        self.set_fx = tk.StringVar(value=EFFECT_LABELS[effects_mode(self.cfg)])             # V8.4
         label("Quality")
         h = holder()
         ttk.Radiobutton(h, text="NVENC p7 cq18 (fast)", variable=self.set_q, value="nvenc").pack(side="left", padx=(0, PX))
@@ -16221,6 +16356,10 @@ class App:
         r[0] += 1
         label("Reports")
         ttk.Checkbutton(holder(), text="Print a sync report after each render", variable=self.set_sync).pack(side="left")
+        r[0] += 1
+        label("Effects")
+        h_ = holder()
+        ttk.Combobox(h_, textvariable=self.set_fx, values=list(EFFECT_LABELS.values()), width=34, state="readonly").pack(side="left")
         r[0] += 1
         label("Checks after render")
         ttk.Checkbutton(holder(), text="Run the quality, sync and transition checks after the video is written (off = finish at once)", variable=self.set_post).pack(side="left")
@@ -16259,7 +16398,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_post, self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_post, self.set_fx, self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
@@ -16769,6 +16908,8 @@ def _fx_windows(plan):
             w.append((t["flash"] - 0.02, t["flash"] + 0.14))
         if "transition" in used and ti > 0 and t.get("trans") in ("zoom", "flash"):
             w.append((0.0, 0.28))
+        if plan.get("effects") == "extra":                  # V8.4: the extra effects' windows (not the killfeed zone: it stays untouched)
+            w += xfx_windows(t, ti, t.get("trans") == "soft")
         res.append(w)
     return res
 
