@@ -1,0 +1,32 @@
+window   V8.5.1 expression   fixed expression   (a steady tone; its own level when nothing touches it)
+  0-  5 s     -180.0 dB           -21.1 dB   <- silent
+  5- 10 s     -180.0 dB           -21.1 dB   <- silent
+ 10- 15 s     -180.0 dB           -21.1 dB   <- silent
+ 15- 20 s     -180.0 dB           -21.1 dB   <- silent
+ 20- 25 s     -180.0 dB           -21.1 dB   <- silent
+ 25- 30 s      -22.9 dB           -21.1 dB
+ 30- 35 s      -21.1 dB           -21.1 dB
+ 35- 40 s      -21.3 dB           -21.3 dB
+ 40- 45 s      -21.1 dB           -21.1 dB
+ 45- 50 s      -21.1 dB           -21.1 dB
+ 50- 55 s      -21.1 dB           -21.1 dB
+ 55- 60 s      -21.1 dB           -21.1 dB
+ 60- 65 s      -21.1 dB           -21.1 dB
+ 65- 70 s      -21.1 dB           -21.1 dB
+ 70- 75 s      -21.1 dB           -21.1 dB
+ 75- 80 s      -21.1 dB           -21.1 dB
+ 80- 85 s      -21.1 dB           -21.1 dB
+ 85- 90 s      -21.1 dB           -21.1 dB
+ 90- 95 s      -21.1 dB           -21.1 dB
+ 95-100 s      -21.1 dB           -21.1 dB
+100-105 s      -21.1 dB           -21.1 dB
+105-110 s      -21.1 dB           -21.1 dB
+110-115 s      -21.1 dB           -21.1 dB
+115-120 s      -21.1 dB           -21.1 dB
+120-125 s      -21.1 dB           -21.1 dB
+125-130 s      -21.3 dB           -21.3 dB
+130-135 s      -21.1 dB           -21.1 dB
+135-140 s      -21.1 dB           -21.1 dB
+140-145 s      -21.1 dB           -21.1 dB
+145-150 s      -21.1 dB           -21.1 dB
+silent windows (below -60 dB): V8.5.1 5, fixed 0; windows below the steady level (-21.1 dB) by more than 0.1 dB, fixed: 35-40 s, 125-130 s (the two drops only)

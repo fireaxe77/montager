@@ -1,0 +1,2 @@
+take 6 (headline): {'knife_t': 0.7, 'hud_t': 0.4, 'why': 'the take is too short for the ramp: normal slow-mo release'}; rendered frames from the kill to +2 s: 0 frozen / duplicated (identical to the previous frame); speeds min 0.53 max 0.53
+take 8 (ending): {'knife_t': 0.65, 'hud_t': 0.35, 'v_hi': 0.9, 'why': 'knife out at +0.65 s: second slow-down'}; rendered frames from the kill to +2 s: 0 frozen / duplicated (identical to the previous frame); speeds min 0.44 max 0.90

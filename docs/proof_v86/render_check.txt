@@ -1,0 +1,15 @@
+plan: 147.8 s, 42 takes, song Стардаст from 62.6 s, seed 890281
+music (5 s windows): level of the render in dB | share of the song in it (0.79 = the full music at the mix headroom)
+    0s  -12.6 dB |  0.76     5s  -11.6 dB |  0.78    10s  -12.5 dB |  0.80    15s  -12.4 dB |  0.79
+   20s  -12.8 dB |  0.79    25s  -12.0 dB |  0.79    30s  -12.4 dB |  0.79    35s  -13.4 dB |  0.79
+   40s  -12.9 dB |  0.79    45s  -12.4 dB |  0.79    50s  -12.9 dB |  0.79    55s  -13.4 dB |  0.79
+   60s  -14.2 dB |  0.79    65s  -12.2 dB |  0.79    70s  -12.9 dB |  0.79    75s  -12.3 dB |  0.79
+   80s  -18.7 dB |  0.78    85s  -17.3 dB |  0.71    90s  -12.4 dB |  0.79    95s  -11.5 dB |  0.79
+  100s  -12.2 dB |  0.79   105s  -12.4 dB |  0.80   110s  -12.6 dB |  0.79   115s  -11.6 dB |  0.79
+  120s  -12.5 dB |  0.79   125s  -12.5 dB |  0.77   130s  -11.7 dB |  0.79   135s  -12.3 dB |  0.77
+  140s  -12.7 dB |  0.78
+windows with the song missing (share < 0.3): 0
+frames: 8865; runs of 3 or more identical consecutive frames (frozen picture): 0
+
+Stalled source clip of the V8.5.1 render (take 33, 1:58): "Valorant 2024.09.09 - 18.00.09.03.DVR.mp4" - 213 frames in 8.0 s (26.6 fps average), 11 gaps of 0.1 - 0.65 s = 58 % of the clip frozen. Measured in the V8.5.1 render at 116.65 - 121.0 s: 4.3 s of picture that stands still with single jumps
+(frame difference 0.00 on almost every frame, 20 - 58 on the jump frames). It is now left out of the pool (STALL rule), see the "left out" line of the log and docs/proof_v86/stall_report.txt; the re-render above has 0 runs of identical frames.
