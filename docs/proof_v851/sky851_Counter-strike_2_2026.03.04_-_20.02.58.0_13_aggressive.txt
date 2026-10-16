@@ -1,0 +1,7 @@
+Counter-strike_2_2026.03.04_-_20.02.58.0_13: song feel style aggressive, energy 0.90, 150 BPM: colour amber 0xF08A10 (song feel rank 1; sky was 207 deg); gradient dark (fast / intense song: the sky gets deeper and darker towards the top)
+mask coverage (share of the picture): frame before the kill 0.0%, kill frame 9.1%, +1 18.2%, +2 27.3%, +3 27.3%, middle 14.4%, last frame 25.5%; frames 0..59 all zero: True
+edge movement between neighbouring frames (area that changes / mask area): mean 2.3%, worst 23.9%; held dropout frames 0
+lowest mask row: 107 of 216 = 49.5% of the height (limit 50%): OK
+frame 0.98s: sky pixels 0; mean luminance change inside the mask 0.0 levels (colour only: 0 = luminance kept); pixels outside the mask area that differ: 0 (0 = identical)
+frame 1.10s: sky pixels 549075; mean luminance change inside the mask 22.8 levels (colour only: 0 = luminance kept); pixels outside the mask area that differ: 0 (0 = identical)
+frame 2.95s: sky pixels 506950; mean luminance change inside the mask 22.8 levels (colour only: 0 = luminance kept); pixels outside the mask area that differ: 0 (0 = identical)

@@ -59,7 +59,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.5"
+APP_VERSION = "V8.5.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -10842,6 +10842,7 @@ XFX_SETTLE_S = 0.25                  # the incoming take eases out of a small zo
 XFX_MIRROR_F = 2                     # the mirror-edge zoom-out lasts this many frames at the start of a take
 XFX_MIN_LEAD = 0.8                   # cut-side effects only when the take's first kill is at least this far in (the kill row is never near them)
 XFX_GLOW_S, XFX_FLASH_S, XFX_RGB_S = 0.26, 0.12, 0.12      # lengths (s) of the (removed) glow, the white flash pulse and the colour-channel split
+FLASH_PER_S = 10.0                   # V8.5.1: white flash budget = montage length / this (109 s: 11), every style
 FLASH_EVERY_S = 17.5                 # V8.4.5: about one white flash per this many seconds of montage (70 s: 4)
 FLASH_MIN_GAP_S = 3.5                # and at least this far apart (drop / headline kills: 1 s); never on consecutive kills, one per take
 FLASH_A_MIN, FLASH_A_MAX = 0.14, 0.34   # peak strength of the flash (weight towards white at the brightest, outermost pixels): moderate, well below pure white
@@ -11019,7 +11020,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
             is_drop = kind_ is not None
             sc = xfx_kill_score(t, i, is_drop, dt <= 0.04, ti in near_drop) + rng.uniform(-0.12, 0.12)
             cands.append({"ti": ti, "i": i, "p": p, "gp": gp, "sc": sc, "drop": is_drop, "head": kind_ == "headline", "on": dt <= 0.04, "order": order,
-                          "end": ti == end_ix and i == len(kills) - 1, "flick": bool(is_flick_take and i == 0)})
+                          "end": ti == end_ix and i == len(kills) - 1, "multi_last": len(kills) >= 2 and i == len(kills) - 1, "flick": bool(is_flick_take and i == 0)})
     n_dress = int(round(share * len(cands)))
     chosen = []
     for c in sorted(cands, key=lambda c: (not c["drop"], -c["sc"])):
@@ -11051,9 +11052,6 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
             if not kinds:
                 kinds = [sig[0]]
             prev_first = kinds[0]
-        if "flash" in kinds:                                     # V8.5: the white pulse is back on the dressed kills (V8.4.4 density); the look stays the V8.4.5 stylised pulse (peak FLASH_A_MAX)
-            fx.append({"k": "flash", "p": round(p, 4), "a": round(max(FLASH_A_MIN, min(FLASH_A_MAX, 0.10 + 0.10 * sc * par["f"] * (1.25 if c["drop"] else 1.0))), 3), "t1": XFX_FLASH_S})
-            cnt["flash"] += 1
         if "split" in kinds:
             fx.append({"k": "rgb", "p": round(p, 4), "px": int(max(2, min(10, round(par["px"] * sc * (1.35 if c["drop"] else 1.0) / 1.0)))), "t1": XFX_RGB_S})
             cnt["rgb"] += 1
@@ -11076,7 +11074,33 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
                 fx.append({"k": "breath", "p": round(p, 4), "t0": round(p - dm["dip_s"], 4), "a": dm["breath"], "s": round(s_drop, 3)})
                 cnt["breath"] += 1
     cnt["clean"] = len(cands) - cnt["kills"]
-    budget = cnt["flash"]
+    # (3b) the white flash: an emphasis effect, not a flashbang: the drop kills and the headline kill, then a few of the strongest beat-landing kills; about one every FLASH_EVERY_S seconds on average
+    budget = max(1, int(round(dur_all / FLASH_PER_S)))
+    flash_sel = []
+
+    def flash_ok(c, gap):
+        for o in flash_sel:
+            if abs(c["gp"] - o["gp"]) < gap or abs(c["order"] - o["order"]) <= 1 or c["ti"] == o["ti"]:
+                return False                                              # never two close together, never on consecutive kills, one per take (never on every kill of a multikill)
+        return True
+    for c in sorted([c for c in cands if c["drop"]], key=lambda c: (not c["head"], -c["sc"])):
+        if len(flash_sel) < budget and flash_ok(c, FLASH_MIN_GAP_S):
+            flash_sel.append(c)
+    for c in sorted([c for c in cands if not c["drop"] and c["on"] and c["sc"] >= 1.0], key=lambda c: -c["sc"]):
+        if len(flash_sel) >= budget:
+            break
+        if flash_ok(c, FLASH_MIN_GAP_S):
+            flash_sel.append(c)
+    for c in sorted([c for c in cands if c not in flash_sel], key=lambda c: -c["sc"]):      # V8.5.1: then the rest, best score first, still within the budget and the spacing
+        if len(flash_sel) >= budget:
+            break
+        if flash_ok(c, FLASH_MIN_GAP_S):
+            flash_sel.append(c)
+    for c in sorted(flash_sel, key=lambda c: c["gp"]):
+        t = takes[c["ti"]]
+        s_ = xfx_strength(t) * (1.35 if c["head"] else 1.25 if c["drop"] else 1.0)
+        per_take[c["ti"]].append({"k": "flash", "p": round(c["p"], 4), "a": round(max(FLASH_A_MIN, min(FLASH_A_MAX, 0.12 + 0.12 * s_)), 3), "t1": XFX_FLASH_S})
+        cnt["flash"] += 1
     # (4) cut side
     for ti, t in enumerate(takes):
         first = (t.get("kills_out") or [9.0])[0]
@@ -11098,12 +11122,13 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
     plan["xfx_sky_rank"] = {"names": ranked, "why": rank_why, "grad": g_kind, "grad_why": g_why}
     sky_max = 0 if prof["sky"] <= 0 else sky_max_for(dur_all)
     sky_c = []
-    for c in sorted(cands, key=lambda c: (-(3 if c["head"] else 2 if c["drop"] else 1 if c["end"] else 0), -c["sc"])):
+    prio = lambda c: 3 if c["head"] else 2 if c["end"] else 2 if c["multi_last"] else 1
+    for c in sorted(cands, key=lambda c: (-prio(c), -c["sc"])):
         t = takes[c["ti"]]
-        why_ = "headline kill" if c["head"] else "drop kill" if c["drop"] else "ending kill" if c["end"] else "flick kill" if c["flick"] else None
+        nk_ = len(t.get("kills_out") or [])
+        why_ = ("headline kill" if c["head"] else "ending kill" if c["end"] else "last kill of a multikill" if (nk_ >= 2 and c["i"] == nk_ - 1) else
+                "flick kill" if (nk_ == 1 and c["flick"]) else None)         # V8.5.1: never a first, calm or middle kill
         if why_ is None or c["ti"] == 0 or t.get("role") == "calm" or any(c["ti"] == o["ti"] for o in sky_c):
-            continue
-        if why_ == "drop kill" and "role" in t and t["role"] not in ("drop", "headline", "ending", "build", "calm", ""):
             continue
         sky_c.append(dict(c, why=why_))
         if len(sky_c) >= XFX_SKY_CANDS:
@@ -11111,9 +11136,8 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
     for c in sky_c:
         t = takes[c["ti"]]
         dur = float(t.get("dur") or 0)
-        per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": 0.0, "t1": round(dur, 4),                                  # V8.5: the whole take
-                                  
-                                  "ok": None, "gp": round(c["gp"], 3), "why": c["why"], "prio": 3 if c["head"] else 2 if c["drop"] else 1 if c["end"] else 0})
+        per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": round(c["p"], 4), "t1": round(dur, 4),            # V8.5.1: from the kill frame to the end of the take
+                                  "ok": None, "gp": round(c["gp"], 3), "why": c["why"], "prio": prio(c)})
     plan["xfx_sky_max"] = sky_max
     plan["xfx_drop"] = drops_audio
     for ti, fx in per_take.items():
@@ -11131,9 +11155,9 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
              f"EFFECT PLAN: {cnt['kills']} of {len(cands)} kills dressed ({share * 100:.0f}% share by style / energy, {on_n} on a beat; the rest stay clean): "
              f"colour split {cnt['rgb']}, punch {cnt['punch']}; {cnt['burst']} drop kill(s) with build-up, hit and afterglow; cuts: {cnt['settle']} settles, {cnt['mirror']} mirror cuts; "
              f"{cnt['speed']} faster run-ups",
-             f"EFFECT PLAN: white flash on {cnt['flash']} of {len(cands)} kills (the dressed kills of the signature, as in V8.4.4; the stylised pulse, peak at most {FLASH_A_MAX:.2f})",
+             f"EFFECT PLAN: white flash on {cnt['flash']} of {len(cands)} kills (budget {budget} for {dur_all:.0f} s = one per {FLASH_PER_S:.0f} s; headline, drop kills, strong beat kills first; at least {FLASH_MIN_GAP_S:.1f} s apart, never on consecutive kills, one per take; peak at most {FLASH_A_MAX:.2f})",
              f"EFFECT PLAN: drop moments: {len(drops_audio)} (music dip " + ", ".join(f"{d['dip_db']:.1f} dB / {d['dip_s']:.2f} s" for d in drops_audio) + ")" if drops_audio else "EFFECT PLAN: no drop moment (no drop kill)",
-             f"EFFECT PLAN: sky recolour: up to {sky_max} for {dur_all:.0f} s (at least {SKY_SPACING_S:.0f} s apart, clear sky only; {len(sky_c)} candidate kills: drop / headline / ending / flick, never a first, calm or middle take); "
+             f"EFFECT PLAN: sky recolour: up to {sky_max} for {dur_all:.0f} s (at least {SKY_SPACING_S:.0f} s apart, clear sky only; {len(sky_c)} candidate kills: headline / ending / last of a multikill / 1k flick, never a first, calm or middle kill; from the kill frame to the end of its take); "
              f"colour family from the song's feel: {', '.join(ranked[:3])} ({rank_why})"]
     for ln in lines:
         if notes is not None:
@@ -11364,19 +11388,19 @@ def sky_mask_np(rgb):
 XFX_SKY_U, XFX_SKY_R0, XFX_SKY_R1, XFX_SKY_Y = 9.0, 0.3, 1.9, 90.0       # V8.4.3 sky colour family (old rule)
 SKY_W, SKY_H = 384, 216              # V8.4.4: the sky mask is made and stored at this size (the render scales it up to 1920 x 1080)
 SKY_FEATHER = 1.4                    # sigma (mask pixels = 5 output pixels each) of the edge feather
-SKY_EASE_IN, SKY_EASE_OUT = 0.15, 0.08   # V8.5: the sky colours the WHOLE take: it comes in over this many seconds at the take's first frame and stays to its last (the cut ends it)
+SKY_EASE_IN, SKY_EASE_OUT = 3 / 60, 0.0   # V8.5.1: the sky lands on the KILL frame (fade-in of at most 3 frames, a punch) and stays to the take's last frame
 SKY_FLAT = 0.35                      # (V8.4.4 flat grade, kept for the older tests)
 SKY_TILT = 0.70                      # V8.5: how much of the sky's own brightness variation stays (clouds, light): the haze keeps the picture's depth
-SKY_HAZE = 0.90                      # V8.5: share of the sky's colour that becomes the palette colour (the rest is the sky's own tint: a haze, not a paint)
+SKY_HAZE = 0.85                      # V8.5: share of the sky's colour that becomes the palette colour (the rest is the sky's own tint: a haze, not a paint)
 SKY_Y_MAX = 205                      # V8.5: the sky never gets brighter than this (video levels): deep, never glaring
-SKY_OPACITY = 0.88                   # V8.5: the haze lets a little of the sky show through (never a solid paint)
+SKY_OPACITY = 1.0                    # V8.5: the haze lets a little of the sky show through (never a solid paint)
 SKY_MAX_ROW = 0.50                   # V8.5: the sky mask never goes below the vertical middle of the picture (walls lower down are never painted)
 SKY_HOLD_FRAMES = 15                 # V8.5: a frame whose sky region collapses while the frames around it have one (a dropout) takes the nearest good frame's mask
-SKY_PALETTE = {                      # V8.5: deep, hazy colours the sky can turn into (name: 0xRRGGBB = the colour of the finished sky on average): no yellow, no acid green, no neon pink
-    "amber": 0xB58A52, "ember": 0x9A4638, "rose": 0x93566C, "violet": 0x65508F, "deep blue": 0x3A5C9A, "teal": 0x3A7F86}
-SKY_STYLE_W = {                      # the song's style -> weight of each colour
-    "aggressive": {"ember": 3, "amber": 1.5, "rose": 1.5, "violet": 1},
-    "hype": {"amber": 3, "ember": 1.5, "rose": 1.5, "violet": 0.5},
+SKY_PALETTE = {                      # V8.5.1: the colours the sky's CHROMA is set to (luminance is kept, so the sky stays as bright / detailed as it was): deep and saturated, no yellow, no acid green, no neon pink
+    "amber": 0xF08A10, "ember": 0xD02818, "rose": 0xB0305A, "violet": 0x6A2FB0, "deep blue": 0x1A44C0, "teal": 0x0E8C8C}
+SKY_STYLE_W = {                      # the song's style -> weight of each colour (warm / hype / aggressive songs: the deep hazy orange of the reference first)
+    "aggressive": {"amber": 3, "ember": 2.6, "rose": 1.2, "violet": 1},
+    "hype": {"amber": 3, "ember": 1.5, "rose": 1.2, "violet": 0.5},
     "cinematic": {"teal": 2.5, "deep blue": 2, "violet": 1.5, "amber": 1},
     "smooth": {"violet": 2.5, "rose": 1.5, "deep blue": 2, "teal": 1},
     "chill": {"deep blue": 2.5, "teal": 2, "violet": 1.5, "rose": 0.5},
@@ -11429,23 +11453,19 @@ def sky_ranked(recipe, energy, bpm):
 
 
 def sky_colour_for(ranked, sky_rgb, scene_hue=None):
-    """V8.4.5: the colour for ONE sky out of the song's family (the first colours of `ranked`): the best-ranked one whose hue is at least 50 degrees away from the sky's own colour (so the change
-    is plain to see) and 30 degrees from the strongest colour of the scene (so the sky does not melt into the ground / walls); when none qualifies the one that is farthest from the sky.
+    """V8.5.1: the colour for ONE sky out of the song's family: the best-ranked one whose hue is at least 50 degrees away from the sky's own colour (so the change is plain to see). The scene's colours do NOT
+    matter any more (an orange scene keeps the song's orange: the sky is never swapped for another hue because the walls are already orange); when none qualifies the one farthest from the sky.
     Returns (name, 0xRRGGBB, reason)."""
     sh = _hue_deg(sky_rgb) if sky_rgb is not None else None
     best, best_d = None, -1.0
     for n_ in ranked[:5]:
-        c = SKY_PALETTE[n_]
-        h = _hue_deg(c)
+        h = _hue_deg(SKY_PALETTE[n_])
         d_sky = _hue_dist(h, sh) if sh is not None else 180.0
-        d_scene = _hue_dist(h, scene_hue) if scene_hue is not None else 180.0
-        if d_sky >= 50.0 and d_scene >= 30.0:
-            return n_, c, f"song feel rank {ranked.index(n_) + 1}; sky was {sh:.0f} deg" + (f", scene {scene_hue:.0f} deg" if scene_hue is not None else "") if sh is not None else f"song feel rank {ranked.index(n_) + 1}"
-        sc = min(d_sky, d_scene * 1.5)
-        if sc > best_d:
-            best, best_d = n_, sc
-    c = SKY_PALETTE[best]
-    return best, c, f"no colour of the song's family was clear of the sky / scene hue; the farthest one ({best_d:.0f} deg)"
+        if d_sky >= 50.0:
+            return n_, SKY_PALETTE[n_], f"song feel rank {ranked.index(n_) + 1}" + (f"; sky was {sh:.0f} deg" if sh is not None else "")
+        if d_sky > best_d:
+            best, best_d = n_, d_sky
+    return best, SKY_PALETTE[best], f"no colour of the song's family was clear of the sky hue; the farthest one ({best_d:.0f} deg)"
 
 
 def _rgb_to_yuv(rgb):
@@ -11603,13 +11623,61 @@ def sky_grab_frames(path, t0, t1, rect, wh, size=(SKY_W, SKY_H), fps=120):
     return [np.frombuffer(buf[i * w * h * 3:(i + 1) * w * h * 3], np.uint8).reshape(h, w, 3) for i in range(n)]
 
 
+def sky_rule_mask(img, zone=None):
+    """V8.5.1: the sky mask of ONE picture (HxWx3 uint8 RGB): the colour rule of V8.4.1 / V8.4.2 (clearly blue bright pixels, or very bright grey ones; not a precise segmentation: the whole sky and the bright
+    tops of boxes / walls that look like it), upper SKY_MAX_ROW only, never the radar (top left); inside the killfeed zone only the blue rule (the kill rows stay readable). Closed, small specks removed and holes
+    filled, so the region is one solid area. Returns a bool array."""
+    import cv2
+    import numpy as np
+    h, w = img.shape[:2]
+    r, g, b = (img[..., i].astype(np.int16) for i in (0, 1, 2))
+    lum = (r + g + b) / 3.0
+    mx, mn = np.maximum(np.maximum(r, g), b), np.minimum(np.minimum(r, g), b)
+    blue = (b > r + 22) & (b > g + 4) & (lum > 110)
+    grey = (lum > 185) & ((mx - mn) < 22)
+    if zone:
+        zm = np.zeros((h, w), bool)
+        x0, y0, x1, y1 = zone
+        zm[int(y0 * h):int(y1 * h) + 1, int(x0 * w):int(x1 * w) + 1] = True
+        grey &= ~zm
+    m = (blue | grey).astype(np.uint8)
+    m[int(h * SKY_MAX_ROW):] = 0
+    m[:int(h * 0.30), :int(w * 0.22)] = 0
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    m = cv2.medianBlur(m * 255, 5) > 127                   # small specks / holes gone
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m.astype(np.uint8), 8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 0.004 * h * w:
+            m[lab == i] = False
+    inv = (~m).astype(np.uint8)                            # holes (regions of the inverse not touching the border) are filled
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(inv, 4)
+    border = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]])))
+    for i in range(1, n):
+        if i not in border and stats[i, cv2.CC_STAT_AREA] < 0.02 * h * w:
+            m[lab == i] = True
+    cap = int(h * SKY_MAX_ROW)
+    top_cols = m[:3].any(0)                                # a sky reaches the top edge: in those columns everything above the lowest sky pixel is sky too (clouds, haze, mountains, wires, box tops
+    low = np.zeros(w, np.float32)                          # inside the sky area do not leave holes): the whole sky and the upper part of the scene, the reference's look
+    for xx in range(w):
+        if top_cols[xx]:
+            ys_ = np.where(m[:cap, xx])[0]
+            low[xx] = ys_.max() + 1 if len(ys_) else 0
+    low = cv2.blur(low.reshape(1, -1), (15, 1)).reshape(-1)        # a smooth lower edge (no ragged columns)
+    for xx in range(w):
+        if top_cols[xx] and low[xx] > 0:
+            m[:int(min(cap, low[xx])), xx] = True
+    m[:int(h * 0.30), :int(w * 0.22)] = False
+    m[cap:] = False
+    return m
+
+
 def sky_take_mask(t, x, zone, path, ramp=False):
-    """V8.4.4 / V8.5: writes the sky mask of one take for the render: a raw video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take) made from the take's own pictures (the source frames its
-    output frames come from, so slow-mo and speed-ups are followed) with the colour model fixed from the kill frame (same sky colour in every frame). V8.5: the window is the WHOLE take (x['t0'] .. x['t1']);
-    a frame whose sky region collapses while its neighbours (+- SKY_HOLD_FRAMES) have one (a dropout) takes the nearest good frame's mask, so the sky does not blink off; every frame is averaged with its
-    +-2 neighbours, feathered a little, never lower than SKY_MAX_ROW of the picture height (walls below the middle are never painted) and eased in at the take's start. ramp=True writes yuv444p frames:
-    Y = the mask, U = a vertical ramp 0 (top) .. 255 (the take's usual horizon) for the gradient, V = 128 (x['mask_fmt'] = 'yuv444p'); ramp=False the older gray file.
-    Returns {'mean_y': mean luma of the sky (video levels, for the flattening), 'frames': n, 'cov': mean coverage in the window}."""
+    """V8.4.4 / V8.5.1: writes the sky mask of one take for the render: a raw video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take). V8.5.1: the window is x['t0'] .. x['t1'] = the KILL frame to the
+    END of the take (the frames before the kill are 0); every frame's mask is the V8.4.1 colour rule (sky_rule_mask) of the take's own source frame (so slow-mo and speed-ups are followed), a frame whose region
+    collapses while its neighbours (+- SKY_HOLD_FRAMES) have one takes the nearest good frame's mask (dropout: hold the last good mask), the masks are averaged over +-4 frames and cut again at a soft threshold (the edge
+    moves smoothly, no frame-to-frame bounce), then feathered, faded in over at most 3 frames from the kill frame and never lower than SKY_MAX_ROW of the picture height. ramp=True writes yuv444p frames: Y = the mask,
+    U = a vertical ramp 0 (top) .. 255 (the take's usual horizon) for the gradient, V = 128 (x['mask_fmt'] = 'yuv444p'); ramp=False the older gray file.
+    Returns {'mean_y', 'frames', 'cov' (mean coverage in the window), 'held', 'horizon'}."""
     import cv2
     import numpy as np
     nf = int(t["nf"])
@@ -11627,17 +11695,13 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     for si, st in fr_src:
         base, frs = grabbed[si]
         img = frs[min(len(frs) - 1, max(0, int(round((st - base) * 120))))]
-        m, inf = sky_segment(img, zone, model=x.get("model"))
-        if x.get("model") is None and inf.get("model"):
-            x["model"] = inf["model"]
-        m = m.copy()
-        m[cap_row:] = False                                # never below the vertical middle
+        m = sky_rule_mask(img, zone)
         segm.append(m.astype(np.float32))
         if m.any():
             ys.append(float(np.mean(img[m] @ np.array([0.1826, 0.6142, 0.0620], np.float32)) + 16))
     ymean = float(np.mean(ys)) if ys else 120.0
     k = len(segm)
-    cv = [float(m_.mean()) for m_ in segm]                 # dropouts: the sky region collapses for a few frames while the frames around it have one: hold the nearest good mask
+    cv = [float(m_.mean()) for m_ in segm]
     good = []
     for i in range(k):
         win = sorted(cv[max(0, i - SKY_HOLD_FRAMES):i + SKY_HOLD_FRAMES + 1])
@@ -11652,10 +11716,13 @@ def sky_take_mask(t, x, zone, path, ramp=False):
                 if abs(j - i) <= SKY_HOLD_FRAMES:
                     segm[i] = segm[j]
                     held += 1
-    sm = [np.mean(segm[max(0, i - 2):i + 3], axis=0) for i in range(k)]
-    capv = np.ones((h, 1), np.float32)                     # the lower edge fades out over 8 rows above the limit (no hard line, and nothing below it)
-    for r in range(h):
-        capv[r, 0] = 0.0 if r >= cap_row else min(1.0, (cap_row - r) / 8.0)
+    sm = []
+    for i in range(k):                                     # +-4 frames, then a soft threshold: the edge settles where most of the neighbouring frames agree
+        a_ = np.mean(segm[max(0, i - 4):i + 5], axis=0)
+        sm.append(np.clip((a_ - 0.35) / 0.30, 0.0, 1.0))
+    capv = np.ones((h, 1), np.float32)
+    for r_ in range(h):
+        capv[r_, 0] = 0.0 if r_ >= cap_row else min(1.0, (cap_row - r_) / 8.0)
     bottoms = []
     for m_ in sm:
         rows_ = np.where(m_.max(1) > 0.5)[0]
@@ -11671,11 +11738,8 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     with open(path, "wb") as fh:
         for f in range(nf):
             if f0 <= f < f1 and k:
-                tt = f / OUT_FPS
-                a = min(1.0, max(0.0, (tt - x["t0"]) / SKY_EASE_IN)) if SKY_EASE_IN > 0 else 1.0
-                b_ = min(1.0, max(0.0, (x["t1"] - tt) / SKY_EASE_OUT)) if SKY_EASE_OUT > 0 else 1.0
-                ease = (a * a * (3 - 2 * a)) * (b_ * b_ * (3 - 2 * b_))
-                m = cv2.GaussianBlur(sm[f - f0], (0, 0), SKY_FEATHER) * ease
+                a = 1.0 if SKY_EASE_IN <= 0 else min(1.0, ((f - f0 + 1) / OUT_FPS) / SKY_EASE_IN)          # the kill frame itself already shows the first third
+                m = cv2.GaussianBlur(sm[f - f0], (0, 0), SKY_FEATHER) * a
                 if ramp:
                     m = m * capv
                 fh.write(np.clip(m * (255.0 * SKY_OPACITY) + 0.5, 0, 255).astype(np.uint8).tobytes())
@@ -11727,41 +11791,39 @@ def xfx_sky_chain(chains, base, lab, x, kin):
 
 
 def sky_gradient_kind(recipe, energy, bpm):
-    """V8.5: which very subtle gradient the sky gets, from the song's feel: a fast / intense / aggressive song 'dark' (the colour fades to near black towards the top, like red to black), every other one
-    'sunset' (a deeper, cooler top and a warmer, lighter horizon: a hazy sunset). Returns (kind, why)."""
+    """V8.5: which very subtle gradient the sky gets, from the song's feel: a fast / intense / aggressive song 'dark' (the colour goes deeper and darker towards the top, like red to black), every other one
+    'sunset' (a deeper red at the top, a warmer, lighter orange at the horizon: a hazy sunset). Returns (kind, why)."""
     try:
         e, b = float(energy), float(bpm)
     except (TypeError, ValueError):
         e = b = None
     if recipe == "aggressive" or (e is not None and b is not None and e >= 0.8 and b >= 130):
-        return "dark", "fast / intense song: the sky fades to near black at the top"
+        return "dark", "fast / intense song: the sky gets deeper and darker towards the top"
     return "sunset", "hazy sunset: deeper at the top, warmer and lighter at the horizon"
 
 
 def sky_gradient(rgb, kind):
-    """V8.5: the two ends of the gradient for a palette colour (0xRRGGBB): (top, horizon), both kept deep (the mean stays the palette colour). 'dark': top 0.40 x the colour, horizon 1.06 x; 'sunset': the top
-    leans towards a deep plum (35 %), the horizon towards a warm dusk orange (20 %). Subtle on purpose."""
+    """V8.5.1: the two ends of the gradient for a palette colour (0xRRGGBB): (top, horizon) chroma colours. 'dark': the top is the colour at 0.55 (deeper); 'sunset': the top leans towards a deep red (30 %), the
+    horizon towards a warm orange (18 %). Subtle on purpose: the picture's luminance is never touched here (only the 'dark' top is darkened a little, see sky_grade)."""
     c = [(rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255]
     pk = lambda v: int(max(0, min(255, round(v[0]))) << 16 | max(0, min(255, round(v[1]))) << 8 | max(0, min(255, round(v[2]))))
     if kind == "dark":
-        return pk([v * 0.40 for v in c]), pk([v * 1.06 for v in c])
-    plum, dusk = (62, 40, 92), (224, 140, 84)
-    top = [v * 0.65 + p_ * 0.35 for v, p_ in zip(c, plum)]
-    hor = [v * 0.80 + d_ * 0.20 for v, d_ in zip(c, dusk)]
-    return pk([v * 0.92 for v in top]), pk(hor)
+        return pk([v * 0.55 for v in c]), pk(c)
+    red, warm = (150, 24, 30), (240, 130, 40)
+    return pk([v * 0.70 + r_ * 0.30 for v, r_ in zip(c, red)]), pk([v * 0.82 + w_ * 0.18 for v, w_ in zip(c, warm)])
 
 
-def sky_grade(rgb, mean_y, grad=None):
-    """V8.4.4 / V8.5: the lutyuv constants that turn the sky into ONE deep colour. Without `grad` (older): chroma = the colour's U / V, brightness = the colour's own tone with only SKY_FLAT of the sky's own
-    variation left. With grad = (top 0xRRGGBB, horizon 0xRRGGBB) (V8.5): {'top': g, 'hor': g}: each end keeps SKY_TILT of the sky's own brightness variation around its own tone, the chroma is SKY_HAZE of the
-    colour's (the rest the sky's own), the brightness never goes past SKY_Y_MAX."""
+def sky_grade(rgb, mean_y, grad=None, kind="sunset"):
+    """V8.4.4 / V8.5.1: the lutyuv constants of the sky colour. Without `grad` (older): chroma = the colour's U / V, brightness = the colour's own tone with only SKY_FLAT of the sky's own variation left. With
+    grad = (top, horizon) (V8.5.1): {'top': g, 'hor': g}: the chroma becomes SKY_HAZE of the colour's (the rest stays the sky's own), the LUMINANCE IS KEPT exactly (no lifted blacks, no lowered contrast; the
+    'dark' gradient only darkens the top end by 18 %)."""
     if grad is None:
         yt, ut, vt = _rgb_to_yuv(rgb)
         return {"y_mul": SKY_FLAT, "y_add": yt - SKY_FLAT * mean_y, "u": ut, "v": vt}
     out_ = {}
     for key, c in (("top", grad[0]), ("hor", grad[1])):
         yt, ut, vt = _rgb_to_yuv(c)
-        out_[key] = {"y_mul": SKY_TILT, "y_add": yt - SKY_TILT * mean_y, "u": ut, "v": vt, "haze": SKY_HAZE, "y_max": SKY_Y_MAX}
+        out_[key] = {"y_mul": 0.82 if (kind == "dark" and key == "top") else 1.0, "y_add": 0.0, "u": ut, "v": vt, "haze": SKY_HAZE, "y_max": 235}
     return out_
 
 
@@ -11818,7 +11880,7 @@ def xfx_probe_sky(plan, tmpdir=None):
             name, rgb, cwhy = sky_colour_for(ranked, c["info"].get("sky_rgb"), c["info"].get("scene_hue"))
             gk = (plan.get("xfx_sky_rank") or {}).get("grad") or "sunset"
             top_, hor_ = sky_gradient(rgb, gk)
-            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade(rgb, st["mean_y"], (top_, hor_)), "mask_cov": round(st["cov"], 3),
+            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade(rgb, st["mean_y"], (top_, hor_), gk), "mask_cov": round(st["cov"], 3),
                       "grad": gk, "held": st["held"]})
             kept.append(gp)
             c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the upper picture -> recoloured {name} ({cwhy}); mask over the whole take: {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%, {st['held']} dropout frame(s) held, {gk} gradient, horizon at {st['horizon'] * 100:.0f}% of the height"
@@ -16077,7 +16139,6 @@ class App:
         self.m_rand_n = tk.StringVar(value="15")                    # V5.57: 'Random pick' has its own count (never shared with Tick newest)
         self.e_rand = ttk.Spinbox(top2, from_=1, to=500, textvariable=self.m_rand_n, width=5)
         self.e_rand.pack(side="left")
-        self.btn(top2, "Auto", self.auto_fill_ticks, name="manual:auto_fill").pack(side="left", padx=(8, 3))
         self.m_incl_used = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="Include used clips", variable=self.m_incl_used).pack(side="left", padx=(12, 3))
         self.btn(top2, "Unflag all", self.unflag_all, name="manual:unflag_all").pack(side="left", padx=(12, 3))
@@ -16114,6 +16175,7 @@ class App:
         self.btn(r2, "Play selected song", self.play_song).pack(side="left", padx=8)
         self.btn(r2, "Song map", self.map_song, name="Song map (Manual)").pack(side="left")
         self.btn(r2, "Random pick", self.random_song, name="songs:random_pick").pack(side="left", padx=8)
+        self.btn(r2, "Auto", self.auto_fill_ticks, name="manual:auto_fill").pack(side="left", padx=(0, 8))
         fr2, self.stree = make_tree(s2, ("bpm", "len", "added", "trash"), height=2, selectmode="browse")
         fr2.pack(fill="both", expand=True)
         self.stree.column("#0", width=520)
