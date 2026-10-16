@@ -1,0 +1,17 @@
+V8.6.1 (before):
+sky motion on a STILL picture (Counter-strike 2 2026.03.04 - 20.02.58.03.DVR.mp4 at 13.0 s: the source has no motion at all, every change is the animation): style hype, energy 0.8, 140 BPM, palette ember
+frame to frame change inside the sky mask = mean |luma(frame n + 1) - luma(frame n)| averaged over the seconds after the surge (levels of 255, 18 measurements):
+  with the beat pulse (the default): 0.39
+  without the beat pulse (the drifting clouds alone): 0.39
+change over one second = mean |luma(t + 1 s) - luma(t)|: with the pulse 16.4, without 16.4
+set minimum for the frame to frame change: 0.50  ->  TOO WEAK
+
+V8.6.2 (now):
+sky motion on a STILL picture (Counter-strike 2 2026.03.04 - 20.02.58.03.DVR.mp4 at 13.0 s: the source has no motion at all, every change is the animation): style hype, energy 0.8, 140 BPM, palette ember
+frame to frame change inside the sky mask = mean |luma(frame n + 1) - luma(frame n)| averaged over the seconds after the surge (levels of 255, 18 measurements):
+  with the beat pulse (the default): 1.28
+  without the beat pulse (the drifting clouds alone): 0.93
+change over one second = mean |luma(t + 1 s) - luma(t)|: with the pulse 15.1, without 16.5
+set minimum for the frame to frame change: 0.50  ->  OK
+
+The animation (drifting clouds) was already there in V8.6.1 but weak: 0.39 levels of change per frame; it is now 2.4 - 3.3 times stronger (the clouds drift 3 times faster in two layers moving against each other, the breathing swings wider, the beats pulse the density).

@@ -1,0 +1,36 @@
+250 top-scoring CS2 events of 596 clips (139 s)
+footage after the last kill (source seconds):
+   < 0.6 s     :   29 events, knife-out seen in 1
+   0.6 - 1.1 s :  113 events, knife-out seen in 29
+   1.1 - 2 s   :   69 events, knife-out seen in 16
+   2 - 3.5 s   :   18 events, knife-out seen in 7
+   >= 3.5 s    :   21 events, knife-out seen in 11
+knife-out visible in 64 of 250 events; knife seen AND enough footage after it for the second slow-down (ok): 22
+why the others have no knife slow-down: the ammo counter never goes away after the kill: 159; knife seen, not enough footage after it: 42; no steady ammo counter on the HUD before the kill: 27
+
+the 25 best-scored events:
+   score 106.2  footage after the kill 0.40 s  knife-out not seen  ok=False  Counter-strike 2 2025.08.05 - 12.56.37.02.DVR.mp4
+   score  88.1  footage after the kill 0.64 s  knife-out not seen  ok=False  Counter-strike 2 2024.04.01 - 16.10.34.10.DVR.mp4
+   score  87.0  footage after the kill 4.82 s  knife-out at +2.60 s  ok=True  Counter-strike 2 2025.01.13 - 13.18.16.08.DVR.mp4
+   score  86.6  footage after the kill 0.85 s  knife-out at +0.35 s  ok=False  Counter-strike 2 2025.08.07 - 00.52.43.07.DVR.mp4
+   score  86.4  footage after the kill 1.72 s  knife-out not seen  ok=False  Counter-strike 2 2025.01.06 - 23.32.19.07.DVR.mp4
+   score  86.4  footage after the kill 0.68 s  knife-out at +0.20 s  ok=False  Counter-strike 2 2026.01.14 - 23.42.50.07.DVR.mp4
+   score  86.3  footage after the kill 0.38 s  knife-out not seen  ok=False  Counter-strike 2 2025.02.10 - 19.24.27.08.DVR.mp4
+   score  86.0  footage after the kill 0.64 s  knife-out not seen  ok=False  Counter-strike 2 2025.02.04 - 09.46.13.09.DVR.mp4
+   score  85.1  footage after the kill 0.86 s  knife-out not seen  ok=False  Counter-strike 2 2026.01.07 - 22.01.18.02.DVR.mp4
+   score  84.5  footage after the kill 0.57 s  knife-out not seen  ok=False  Counter-strike 2 2024.06.12 - 23.21.25.08.DVR.mp4
+   score  82.6  footage after the kill 1.93 s  knife-out at +0.60 s  ok=True  Counter-strike 2 2024.04.01 - 16.47.06.16.DVR.mp4
+   score  81.5  footage after the kill 0.80 s  knife-out not seen  ok=False  Counter-strike 2 2026.01.30 - 20.03.06.14.DVR.mp4
+   score  68.5  footage after the kill 0.94 s  knife-out not seen  ok=False  Counter-strike 2 2025.05.08 - 20.19.13.09.DVR.mp4
+   score  68.3  footage after the kill 0.68 s  knife-out not seen  ok=False  Counter-strike 2 2026.01.31 - 23.53.06.13.DVR.mp4
+   score  67.9  footage after the kill 1.01 s  knife-out at +0.40 s  ok=False  Counter-strike 2 2024.04.06 - 19.18.43.05.DVR.mp4
+   score  67.8  footage after the kill 0.42 s  knife-out not seen  ok=False  Counter-strike 2 2025.02.08 - 19.48.57.15.DVR.mp4
+   score  67.8  footage after the kill 0.46 s  knife-out not seen  ok=False  Counter-strike 2 2026.02.23 - 21.51.59.08.DVR.mp4
+   score  67.6  footage after the kill 0.48 s  knife-out not seen  ok=False  Counter-strike 2 2026.01.27 - 07.42.36.28.DVR.mp4
+   score  67.5  footage after the kill 0.80 s  knife-out not seen  ok=False  Counter-strike 2 2024.05.03 - 14.23.48.03.DVR.mp4
+   score  67.3  footage after the kill 0.73 s  knife-out not seen  ok=False  Counter-strike 2 2025.02.09 - 11.15.03.05.DVR.mp4
+   score  67.2  footage after the kill 0.92 s  knife-out not seen  ok=False  Counter-strike 2 2026.01.14 - 23.31.36.03.DVR.mp4
+   score  67.2  footage after the kill 1.86 s  knife-out at +0.35 s  ok=True  Counter-strike 2 2026.01.14 - 23.26.05.02.DVR.mp4
+   score  67.1  footage after the kill 1.82 s  knife-out at +0.65 s  ok=False  Counter-strike 2 2024.05.29 - 19.59.25.57.DVR.mp4
+   score  67.1  footage after the kill 0.61 s  knife-out not seen  ok=False  Counter-strike 2 2026.02.02 - 17.48.29.20.DVR.mp4
+   score  67.1  footage after the kill 3.36 s  knife-out not seen  ok=False  Counter-strike 2 2024.05.29 - 19.06.34.50.DVR.mp4

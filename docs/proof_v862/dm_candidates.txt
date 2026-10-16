@@ -1,0 +1,56 @@
+1155 CS2 clips, 1155 measured in 333 s; FLAGGED (>= 2 signals): 19 = 1.6 %; one signal only (never rejected): 0; no signal: 1136
+
+FLAGGED:
+  Counter-strike 2 2023.09.01 - 11.38.36.04.DVR.mp4: a1 log True, a2 bonus weapon False, b top bar True -> 2 signals; read: pointforneutralizinganenemywiththeM4A4 | 11pointsforneutralizinganenemywiththeM4A4 / top bar: 16 numbers under the icons
+  Counter-strike 2 2023.09.01 - 11.42.36.05.DVR.mp4: a1 log True, a2 bonus weapon False, b top bar True -> 2 signals; read: 11pointsforneutralizinganenemywith theM4A4 | 12points forneutralizing an enemywith the Des / top bar: 17 numbers under the icons
+  Counter-strike 2 2023.09.14 - 10.44.49.02.DVR.mp4: a1 log True, a2 bonus weapon False, b top bar True -> 2 signals; read: 11points for neutralizing an enemywith theAK-47 / top bar: 15 numbers under the icons
+  Counter-strike 2 2023.09.14 - 14.58.28.03.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 11pointsforneutralizinganenemywiththeM4A4 | HatredisjoiningtheCounter-Terroristforce | 11p / CTStart | BONUSWEAPON:M4A4 | 27 | +5POINTS / top bar: 11 
+  Counter-strike 2 2023.10.21 - 15.09.53.07.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 11pointsforneutralizinganenemywiththeAK-47 / Pit | BONUSWEAPON:GIoCK-18 | 6 | +6POINTS / top bar: 16 numbers under the icons
+  Counter-strike 2 2023.10.22 - 16.56.58.02.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 12pointsforneutralizinganenemywith theDesertEagle | 12points forneutralizing an enemywith  / Middle | BONUSWEAPON:UMP-45 | 20 | +6POINTS / top bar: 17
+  Counter-strike 2 2024.04.06 - 18.27.09.04.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: Countar-Tanrorisls | 11pointsforneutralizinganenemywiththeM4A1-S | 11pointsforneutralizing / BackAlley | BONUSWEAPON:FAMAS | 28 | +5POINTS / top bar: 
+  Counter-strike 2 2024.04.30 - 15.19.55.03.DVR.mp4: a1 log True, a2 bonus weapon False, b top bar True -> 2 signals; read: T0points forneutralizing anenemywith theAwP | 12points forneutralizing an enemywith the De / top bar: 14 numbers under the icons
+  Counter-strike 2 2024.04.30 - 15.22.44.04.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 6 pointsforassisting in neutralizing ULTADOS / Ruins | BONUSWEAPON:AK-47 | 18 | +5POINTS / top bar: 13 numbers under the icons
+  Counter-strike 2 2024.04.30 - 15.24.18.05.DVR.mp4: a1 log True, a2 bonus weapon False, b top bar True -> 2 signals; read: 11pointsforneutralizinganenemywith theAK-47 / top bar: 12 numbers under the icons
+  Counter-strike 2 2024.05.30 - 22.07.23.02.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 12pointsforneutralizing anenemywith theDesert Eagle / Alley | BONUSWEAPON:FAMAS | 19 | +5POINTS / top bar: 9 numbers under the icons
+  Counter-strike 2 2024.05.30 - 22.07.25.03.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 12pointsforneutralizing anenemywith theDesertEagle | 12pointsforneutralizing anenemywith t / Alley | BONUSWEAPON:FAMAS | 16 | +5POINTS / top bar: 12 n
+  Counter-strike 2 2025.08.05 - 12.56.37.02.DVR.mp4: a1 log True, a2 bonus weapon False, b top bar True -> 2 signals; read: 11pointsforneutralizinganenemywiththeM4A1-S | 11pointsforneutralizinganenemywith theM4A1-S / top bar: 10 numbers under the icons
+  Counter-strike 2 2025.08.07 - 00.33.15.04.DVR.mp4: a1 log True, a2 bonus weapon False, b top bar True -> 2 signals; read: Player foxi left the game [Shutting down game.] | ragenisjoining the Terrorists | 6points  / top bar: 12 numbers under the icons
+  Counter-strike 2 2025.08.07 - 00.39.40.05.DVR.mp4: a1 log True, a2 bonus weapon False, b top bar True -> 2 signals; read: 10pointsforneutralizinganenemywiththeAwP | 12points forneutralizing anenemywith theDesert  / top bar: 15 numbers under the icons
+  Counter-strike 2 2025.01.06 - 23.26.09.06.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 11pointsforneutralizinganenemywiththeAK-47 / TStart | BONUSWEAPON:CZ75-Auto | 5 | +6POINTS / top bar: 17 numbers under the icons
+  Counter-strike 2 2025.01.06 - 23.32.19.07.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 12pointsforneutralizinganenemywith theDesertEagle | 12points forneutralizing an enemy with / Top of MId | BONUS WEAPON | Tec-9 | 19 | +6POINTS / top b
+  Counter-strike 2 2025.01.06 - 23.32.22.08.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 12points forneutralizinganenemywiththe DesertEagle | 12points forneutralizing an enemywith / Top ofMid | BONUS WEAPON.TeC-9 | 15 | +6POINTS / top bar:
+  Counter-strike 2 2025.01.06 - 23.36.09.09.DVR.mp4: a1 log True, a2 bonus weapon True, b top bar True -> 3 signals; read: 12pointsforneutralizing anenemywith theDesertEagle / BombsiteB | BONUSWEAPON:GaliIAR | 2 | +5POINTS / top bar: 17 numbers under the icons
+
+ONE SIGNAL ONLY (kept in the pool, listed so the rule can be checked):
+
+30 CLIPS NOT FLAGGED (signal values):
+  Replay 2026-06-20 02-55-28.mov: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.03.22 - 18.24.37.02.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2025.12.30 - 23.21.57.21.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.01.15 - 19.56.10.06.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.02.03 - 01.14.15.17.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.12.27 - 22.46.21.09.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.02.11 - 00.12.53.20.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2025.02.17 - 20.15.54.09.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.01.21 - 20.23.28.10.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2026.02.12 - 20.19.42.26.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.04.27 - 21.28.34.27.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2023.11.01 - 23.52.33.22.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.02.04 - 02.42.47.29.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2026.01.27 - 04.53.41.17.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2026.01.21 - 03.48.16.23.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.01.28 - 20.12.02.13.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.05.03 - 18.15.53.17.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.02.10 - 23.39.20.13.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2025.01.13 - 23.24.58.65.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2026.01.23 - 22.57.11.02.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.01.25 - 21.37.33.03.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.03.03 - 18.46.21.13.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.04.30 - 19.32.23.10.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.01.27 - 01.57.14.08.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2025.12.30 - 23.55.26.25.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.01.16 - 16.35.48.04.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.04.30 - 15.19.03.02.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.01.15 - 18.31.07.03.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.03.11 - 17.19.45.14.DVR.mp4: a1 False, a2 False, b False -> 0 signals
+  Counter-strike 2 2024.11.18 - 16.19.57.03.DVR.mp4: a1 False, a2 False, b False -> 0 signals
