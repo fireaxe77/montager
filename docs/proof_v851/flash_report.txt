@@ -1,0 +1,8 @@
+N_VAL_V8.5_2026-10-16.plan.json: game valorant, style aggressive, seed 909624, 109 s, 70 kills -> 11 flashes (min gap 4.0 s)
+   EFFECT PLAN: white flash on 11 of 70 kills (budget 11 for 109 s = one per 10 s; headline, drop kills, strong beat kills first; at least 3.5 s apart, never on consecutive kills, one per take; peak at most 0.34)
+PE_CS2_V8.5_2026-10-16.plan.json: game cs2, style chill, seed 799870, 126 s, 72 kills -> 13 flashes (min gap 4.1 s)
+   EFFECT PLAN: white flash on 13 of 72 kills (budget 13 for 126 s = one per 10 s; headline, drop kills, strong beat kills first; at least 3.5 s apart, never on consecutive kills, one per take; peak at most 0.34)
+ITE_VAL_V8.4.5_2026-10-16.plan.json: game valorant, style hype, seed 901366, 85 s, 54 kills -> 8 flashes (min gap 4.0 s)
+   EFFECT PLAN: white flash on 8 of 54 kills (budget 8 for 85 s = one per 10 s; headline, drop kills, strong beat kills first; at least 3.5 s apart, never on consecutive kills, one per take; peak at most 0.34)
+LM_CS2_V8.4_2026-10-15.plan.json: game cs2, style hype, seed 596413, 122 s, 66 kills -> 12 flashes (min gap 3.5 s)
+   EFFECT PLAN: white flash on 12 of 66 kills (budget 12 for 122 s = one per 10 s; headline, drop kills, strong beat kills first; at least 3.5 s apart, never on consecutive kills, one per take; peak at most 0.34)
