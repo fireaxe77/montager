@@ -1,0 +1,8 @@
+Valorant_2025.10.11_-_23.55.02.07.DVR_9: kill frame sky coverage 35% of the upper picture (kind blue); song feel style hype, energy 0.74, 150 BPM: family amber, ember, rose; colour ember 0x9A4638 (song feel rank 2; sky was 205 deg, scene 44 deg); gradient sunset (hazy sunset: deeper at the top, warmer and lighter at the horizon): top 0x70373F, horizon 0xA8543E
+mask coverage per second of the take (share of the whole picture): V8.4.5 window   0.0%   9.6%   3.0%
+                                                                   V8.5 whole take  5.8%  12.8%  14.1%
+lowest mask row over the whole take: 106 of 216 = 49.1% of the height (limit 50%): OK
+mask: mean coverage of the upper picture 23%, 0 dropout frame(s) held, horizon at 40% of the height, mean sky luma 173
+frame 0.03s: sky pixels 0 (0% of the picture); mean sky colour source RGB (0, 0, 0) -> output (0, 0, 0); pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 1.50s: sky pixels 350450 (17% of the picture); mean sky colour source RGB (182, 217, 244) -> output (150, 112, 118); pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 2.95s: sky pixels 302275 (15% of the picture); mean sky colour source RGB (168, 200, 232) -> output (146, 126, 139); pixels outside the mask area that differ from the source: 0 (0 = identical)
