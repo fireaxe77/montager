@@ -2,6 +2,13 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.4.5 - 2026-10-16: Audio in sync, calmer flashes, better sky
+- Game sound no longer drifts early after a clip with a gap in its recording; the same plan now stays in sync to the end
+- A clip with a broken, stuttering recording (about 8 frames a second) is no longer used
+- The kill flash is a short soft pulse on the drop, the headline and a few strong kills, not on every other kill
+- The sky colour follows the song's feel and the clip's colours, and a longer montage can have several recoloured skies
+- The drop kill gets a breath before it, a low hit on it and a stronger build-up (EXTRA effects)
+
 ## V8.4.4 - 2026-10-16: White flashes and even sky colours
 - A render now runs once; if it fails it stops and tells you where, instead of trying again with fewer effects
 - The kill flash is back, and it is a clean white flash only
