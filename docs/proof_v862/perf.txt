@@ -1,0 +1,20 @@
+V8.6.2 performance work (nothing in any output, setting or feature changed)
+
+FOUND (cProfile of one Manual Auto run, Valorant, 3 planning rounds, 53 s): 3,034 calls of load_json = 28.9 s: the loudness cache (clip_audio / music check: 1,850 calls, once per clip per round) and the
+song-map cache (77 MB song_cache_v2.json, read for every song map lookup) were parsed again every time. Other costs seen, not changed: verify_stitch ffmpeg calls 6.4 s, build_events 6.8 s.
+FIX: load_json_ro (read-only, parsed once per file version = path + modified time + size; any write changes the file, so the next call parses again; the part a caller changes is copied).
+
+BEFORE / AFTER, same inputs (MONTAGE_NO_RO=1 = the old loading; tests/perf862.py):
+  Manual Auto, Valorant, song Ride, seed 4242:  42.8 s -> 19.4 s  (10.7 s -> 4.8 s per planning round), the SAME 62 clips selected (identical list), planned 148 s both
+  Plan (automatic, scan=False) Valorant seed 777:  42.3 s -> 22.8 s ; plan text identical (243 lines, 0 differ), same 21 takes at the same times with the same effects
+  Plan CS2 seed 777:                               59.7 s -> 35.9 s ; plan text identical (245 lines, 0 differ), same 19 takes
+  (V8.6.1 measurements of the whole Auto selection, other machine load: Valorant 76 s, CS2 60 s, R6S 180 s; see docs/proof_v861/auto_*.txt)
+RENDER IDENTITY (tests/frames862.py): the Valorant plan seed 777 rendered twice, old loading and new: 2,775 frames each, 20 evenly sampled frames compared: 0 differ (largest pixel difference 0), duration 46.25 s both.
+
+LOG FLOOD: the UI / console now get collapsed blocks (runs of 4 or more lines of the same kind: music over gameplay, dead air, clips saved next to each other, merged continuation, rejected rows, sky candidates,
+pair partners ...: the first 2 lines + "... N more '<kind>' lines (all N in montage.log)"); montage.log keeps every line.
+  the plan text of the last Valorant render: 346 lines -> 144 lines shown; the last CS2 render: 182 lines -> 119 lines shown; the 80 'REJECTED ROWS' lines of a Valorant run are one collapsed block.
+DEATHMATCH CHECK (CS2 only, first run only): about 0.3 s per clip with 4 OCR threads once, cached per clip in dm_cache.json; the first scan of 1,155 clips took 333 s for the changed rule (2,610 s when the first version read more frames); never again for a clip already measured.
+
+NOT MEASURED / NOT CHANGED: a line-by-line audit of every UI-thread handler (the heavy jobs already run in worker threads through run_task; the log is already buffered and flushed every 0.25 s); the repeated sky grabs
+(the probe frame and the mask frames are different frames), gunshot / scene analysis (their results are already cached per clip).
