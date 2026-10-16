@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.5 - 2026-10-16: Full-length montages, new sky look
+- New "Force New Full" button: fills the whole song (up to 2:30) with fitting clips and renders right away
+- New "Auto" button in Manual, next to Random pick: ticks enough clips to fill the selected song, nothing is rendered until you click Render
+- More kill flashes again, like before V8.4.5
+- The recoloured sky now lasts the whole take, in deep hazy colours with a soft gradient, and never goes below the middle of the screen
+
 ## V8.4.5 - 2026-10-16: Audio in sync, calmer flashes, better sky
 - Game sound no longer drifts early after a clip with a gap in its recording; the same plan now stays in sync to the end
 - A clip with a broken, stuttering recording (about 8 frames a second) is no longer used

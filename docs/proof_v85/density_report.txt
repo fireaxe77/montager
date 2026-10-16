@@ -1,0 +1,5 @@
+# V8.5 effect density: same 31 saved plans x 3 seeds, effects re-assigned by each version's assign_extra_fx (tests/density85.py)
+# 'now' = V8.5
+V8.4.4: per 100 s of montage: kill effects 37.0 (flash 10.7), dressed kills 25.4 = 45% of the kills, cut effects 9.5, drop effects 1.9, sky candidates 12.3  (31 plans x 3 seeds)
+V8.5: per 100 s of montage: kill effects 38.8 (flash 11.8), dressed kills 25.4 = 45% of the kills, cut effects 9.6, drop effects 6.5, sky candidates 3.1  (31 plans x 3 seeds)
+V8.4.5 (before this fix): per 100 s of montage: kill effects 40.3 (flash 5.6), dressed kills 25.8 = 46% of the kills, cut effects 8.7, drop effects 6.5, sky candidates 3.1  (31 plans x 3 seeds)
