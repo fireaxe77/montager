@@ -1,0 +1,7 @@
+Valorant_2025.10.11_-_23.55.02.07.DVR_9: song feel style hype, energy 0.74, 150 BPM: colour amber 0xF08A10 (song feel rank 1; sky was 205 deg); gradient sunset (hazy sunset: deeper at the top, warmer and lighter at the horizon)
+mask coverage (share of the picture): frame before the kill 0.0%, kill frame 8.3%, +1 16.8%, +2 25.3%, +3 25.3%, middle 24.2%, last frame 22.9%; frames 0..99 all zero: True
+edge movement between neighbouring frames (area that changes / mask area): mean 0.9%, worst 7.5%; held dropout frames 0
+lowest mask row: 107 of 216 = 49.5% of the height (limit 50%): OK
+frame 1.65s: sky pixels 0; mean luminance change inside the mask 0.0 levels (colour only: 0 = luminance kept); pixels outside the mask area that differ: 0 (0 = identical)
+frame 1.77s: sky pixels 507475; mean luminance change inside the mask 4.8 levels (colour only: 0 = luminance kept); pixels outside the mask area that differ: 0 (0 = identical)
+frame 4.95s: sky pixels 456125; mean luminance change inside the mask 3.5 levels (colour only: 0 = luminance kept); pixels outside the mask area that differ: 0 (0 = identical)

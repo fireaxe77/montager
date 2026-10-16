@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.5.1 - 2026-10-16: Sky back to the orange look
+- The sky recolour is the deep hazy orange again: same picture brightness and detail, only the colour changes, with a soft gradient and a steady edge
+- It lands on the kill and stays until the end of that take, never below the middle of the screen
+- White flashes: about one per 10 seconds of montage in every style, on the headline, drop and strongest kills first
+- The Manual "Auto" button moved next to Song map and Random pick in the song step
+
 ## V8.5 - 2026-10-16: Full-length montages, new sky look
 - New "Force New Full" button: fills the whole song (up to 2:30) with fitting clips and renders right away
 - New "Auto" button in Manual, next to Random pick: ticks enough clips to fill the selected song, nothing is rendered until you click Render
