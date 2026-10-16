@@ -26,6 +26,7 @@ paths = [p for p in recs if any(w in p for w in sys.argv[2:])]
 plan, _ = M.make_plan(cfg, GAME, paths, None, 40, None, 5)
 vid = out / "cs2_ramp_full.mp4"
 M.render_plan(plan, str(vid), cfg, maxq=False, preview=False, encoder=None, effects=True)
+(out / "ramp_plan.json").write_text(json.dumps(plan, default=str), encoding="utf-8")
 rep = []
 cap = cv2.VideoCapture(str(vid))
 for ti, t in enumerate(plan["takes"]):

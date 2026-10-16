@@ -1,0 +1,8 @@
+Valorant_2025.10.11_-_23.55.02.07.DVR_9: palette ember 0xC01818 (song feel only); gradient dark; animation {'drift': 126.0, 'period': 3.2, 'surge': 0.97, 'push': 0.057, 'depth': 0.56}
+kill frame (output) = 100; first frame with a non-zero mask = 100: EQUAL
+mask coverage: before the kill 0.0%, kill frame 6.2%, +3 19.3%, middle 17.0%, last 7.3%; checks: 200 of 200 frames with sky, 0 wall frames, 0 held
+frame 99 (before kill): sky pixels 0; sky brightness output / source = 0%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 112 (surge: the layer is pushed 3 - 6 % and shaken, so the mask area is widened by 40 px): sky pixels 412068; sky brightness output / source = 47%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 200 (middle): sky pixels 370290; sky brightness output / source = 41%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 297 (end of take): sky pixels 150813; sky brightness output / source = 33%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+mean sky brightness, middle and end of the take: 37% of the original (target 35 - 45 %)
