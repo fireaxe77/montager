@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.6 - 2026-10-17: Sky hits on the kill, music and glitch fixes
+- The recoloured sky now hits on the kill: it snaps in, flares for a moment, then settles into deep red with dark clouds drifting through it; calm songs get deep blue, teal or violet instead (cover art colours are blended in)
+- CS2 headline and ending kills get a speed ramp: slow at the kill, back toward normal, then slow again when the knife comes out
+- Fixed: the music was missing in the first part of longer montages
+- Fixed: a glitchy, lagging clip in the Valorant montage; clips that freeze while recording are now left out
+
 ## V8.5.1 - 2026-10-16: Sky back to the orange look
 - The sky recolour is the deep hazy orange again: same picture brightness and detail, only the colour changes, with a soft gradient and a steady edge
 - It lands on the kill and stays until the end of that take, never below the middle of the screen
