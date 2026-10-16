@@ -48,6 +48,7 @@ import traceback
 import csv
 import json
 import os
+import copy
 import re
 import shutil
 import statistics
@@ -214,6 +215,28 @@ def progress(frac, text=""):
 def load_json(p, default):
     try:
         return json.loads(Path(p).read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+_RO_JSON = {}
+
+
+def load_json_ro(p, default):
+    """V8.6.2: READ-ONLY json load, parsed once per file version (path + modified time + size): the big caches (the loudness cache, the song maps) were parsed again for every clip of every planning round
+    (3,000 parses = 29 s of a 53 s Manual Auto run). The returned object must not be changed by the caller (copy.deepcopy the part you change); any write (save_json) changes the file, so the next call parses again.
+    MONTAGE_NO_RO=1 switches the memo off (the old behaviour: for the before / after proof)."""
+    if os.environ.get("MONTAGE_NO_RO") == "1":
+        return load_json(p, default)
+    try:
+        st = os.stat(p)
+        k = (st.st_mtime_ns, st.st_size)
+        hit = _RO_JSON.get(str(p))
+        if hit and hit[0] == k:
+            return hit[1]
+        obj = json.loads(Path(p).read_text(encoding="utf-8"))
+        _RO_JSON[str(p)] = (k, obj)
+        return obj
     except Exception:
         return default
 
@@ -5592,8 +5615,7 @@ def game_pool(cfg, game, paths=None):
     stats["rejected"] = reasons
     if allrej:
         out(f"REJECTED ROWS in {game}: " + ", ".join(f"{k}: {v}" for k, v in sorted(reasons.items(), key=lambda x: -x[1])))
-        for nm, j in allrej[:80]:
-            out(f"   {nm} @ {ts(j['t'])}  name {j['ks']:.2f}  -> {j['reason']}")
+        out("\n".join(f"   {nm} @ {ts(j['t'])}  name {j['ks']:.2f}  -> {j['reason']}" for nm, j in allrej[:80]))      # V8.6.2: ONE message (the UI / console show the collapsed block, montage.log all 80 lines)
         if len(allrej) > 80:
             out(f"   ... {len(allrej) - 80} more (see montage_data\\logs\\montage.log)")
             for nm, j in allrej[80:]:
@@ -6522,7 +6544,8 @@ def _songmap_v2_raw(path, csv_bpm, v1_bpm):
     cpath = DATA / songmap_v2.CACHE_NAME
     _patch_v2_safety()
     key = songmap_v2.cache_key(path, csv_bpm, v1_bpm) + "|raw"
-    hit = load_json(cpath, {}).get(key)
+    hit = load_json_ro(cpath, {}).get(key)
+    hit = copy.deepcopy(hit) if hit else hit
     if hit and not hit.get("fallback_marker"):
         return hit, ""
     if hit:
@@ -6558,7 +6581,8 @@ def _songmap_strict_v2(path, csv_bpm, name):
     import songmap_v2
     v1b = _peek_v1_bpm(path, csv_bpm)
     key = songmap_v2.cache_key(path, csv_bpm, v1b)
-    hit = load_json(DATA / songmap_v2.CACHE_NAME, {}).get(key)
+    hit = load_json_ro(DATA / songmap_v2.CACHE_NAME, {}).get(key)
+    hit = copy.deepcopy(hit) if hit else hit
     skipped = ""
     if hit and not hit.get("fallback_marker") and not (hit.get("v2") or {}).get("fallback"):
         m = hit
@@ -7023,7 +7047,7 @@ def clip_audio(rec, setting="auto"):
     """{'stream': audio track used for the game sound, 'lufs': its loudness, 'n': tracks, 'note': why} - measurements cached."""
     if not rec.get("audio"):
         return {"stream": None, "lufs": None}
-    cache = load_json(LOUD_CACHE, {})
+    cache = load_json_ro(LOUD_CACHE, {})
     key = file_key(rec["path"]) + "|t2"
     m = cache.get(key)
     if not m:
@@ -7056,7 +7080,7 @@ def clip_audio_legacy(rec):
     with the highest integrated loudness; the per-game 'game audio track' setting is ignored. Cached under the V5.55 key."""
     if not rec.get("audio"):
         return {"stream": None, "lufs": None}
-    cache = load_json(LOUD_CACHE, {})
+    cache = load_json_ro(LOUD_CACHE, {})
     key = file_key(rec["path"])
     if key in cache and isinstance(cache[key], dict) and "stream" in cache[key]:
         return {**cache[key], "note": "legacy V5.55: loudest track"}
@@ -10632,9 +10656,9 @@ def music_over_gameplay(rec, au):
     if n_tr > 1 and st > 0:
         return {"yes": False, "score": 0.0, "why": f"clean game-only track ({st + 1} of {n_tr}), not analysed"}
     key = file_key(rec["path"]) + f"|music2|{st}"
-    cache = load_json(LOUD_CACHE, {})
+    cache = load_json_ro(LOUD_CACHE, {})
     if key in cache:
-        return cache[key]
+        return dict(cache[key])
     try:
         import numpy as np
         r = run(["ffmpeg", "-v", "error", "-i", rec["path"], "-map", f"0:a:{st}", "-vn", "-ac", "1", "-ar", "22050", "-f", "f32le", "-"], timeout=120)

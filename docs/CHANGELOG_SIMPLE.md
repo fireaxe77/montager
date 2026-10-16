@@ -2,6 +2,13 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.6.2 - 2026-10-17: Animated sky, CS2 speed ramp, no more deathmatch clips
+- The sky is darker and alive: dark clouds drift and pulse with the beat, and the kill hits with a stronger surge, a push and a shake; a sky that would paint over walls is skipped
+- CS2 headline and ending kills now always go slow, fast, slow, and the knife-out gets its own slow-down when the footage allows it
+- CS2 deathmatch clips are never picked automatically; clips you tick yourself are never touched
+- The music no longer dips at the drop moment
+- Manual Auto and planning run about twice as fast, and the log shows collapsed blocks instead of thousands of lines
+
 ## V8.6.1 - 2026-10-17: Sky that follows the real sky
 - The recoloured sky now follows the real sky shape: rooftops, wires, poles and antennas are cut out cleanly and nothing but sky is coloured
 - It is nearly solid (not see-through) in deep red and black, and more skies are found, with the next-best kill used when one has no sky
