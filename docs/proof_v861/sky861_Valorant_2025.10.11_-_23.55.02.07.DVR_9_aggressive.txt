@@ -1,0 +1,8 @@
+Valorant_2025.10.11_-_23.55.02.07.DVR_9: song feel style aggressive, energy 0.90, 150 BPM: palette ember -> 0xC01818 (song feel rank 1; sky was 208 deg); no song given: palette from the song feel only; gradient dark (fast / intense song: the sky gets deeper and darker towards the top); animation drift 19.3 px/s, breathing 3.2 s, surge 0.91, push 0.0378
+mask coverage (share of the picture): frame before the kill 0.0%, kill frame 6.2%, +1 12.6%, +2 19.1%, +3 19.3%, middle 17.0%, last frame 7.3%; frames 0..99 all zero: True
+surge plane (0..255) from the frame before the kill: 0 232 202 176 153 133 116 101 88 76 66 58 50 44 38 33 29 25 22 19 17 14 13 11 10
+edge movement between neighbouring frames (area that changes / mask area): mean 1.7%, worst 25.3%; held dropout frames 0
+lowest mask row: 243 of 432 = 56.2% of the height (limit 100%): OK
+frame 1.65s (before kill): sky pixels 0; mean luminance change inside +0.0 levels (0% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)
+frame 3.33s (middle): sky pixels 370290; mean luminance change inside -145.7 levels (100% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)
+frame 4.95s (end of take): sky pixels 150813; mean luminance change inside -160.4 levels (100% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)
