@@ -59,7 +59,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.5.1"
+APP_VERSION = "V8.6"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5326,6 +5326,29 @@ def cmd_scan(args):
 
 
 BROKEN_FPS = 20.0                       # V8.4.5: a clip whose video has fewer frames than this per second over its whole length is a broken recording
+STALL_GAP_S, STALL_MAX_SHARE, STALL_CHECK_FPS = 0.12, 0.10, 45.0     # V8.6: a clip whose picture stands still for gaps of >= 0.12 s (the recorder stalled) over more than 10 % of its length freezes / glitches in a montage; only clips under 45 fps on average are measured
+STALL_CACHE = DATA / "stall_cache.json"
+
+
+def clip_stall_share(path):
+    """V8.6: the share of a clip's duration that lies in gaps of >= STALL_GAP_S between two video frames (packet timestamps, no decoding), cached per file. A clip with a steady frame rate gives 0.0;
+    the Valorant clip that froze at 1:58 of the V8.5.1 render (213 frames in 8 s, 11 gaps of 0.1 - 0.65 s) gives 0.58. None when the file cannot be read."""
+    cache = load_json(STALL_CACHE, {})
+    key = file_key(path)
+    if key in cache:
+        return cache[key]
+    try:
+        r = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)], timeout=120)
+        ts = sorted(float(x) for x in (r.stdout or b"").decode("utf-8", "ignore").split() if x.strip() and x.strip() != "N/A")
+    except Exception:                                      # noqa: BLE001
+        return None
+    if len(ts) < 3:
+        return None
+    gaps = [b - a for a, b in zip(ts, ts[1:]) if b - a >= STALL_GAP_S]
+    share = round(sum(gaps) / max(1e-6, ts[-1] - ts[0]), 4)
+    cache[key] = share
+    save_json(STALL_CACHE, cache)
+    return share
 
 
 def game_pool(cfg, game, paths=None):
@@ -5357,13 +5380,18 @@ def game_pool(cfg, game, paths=None):
         if r.get("fps") and float(r["fps"]) < BROKEN_FPS:     # V8.4.5: a broken recording (the recorder stalled: whole seconds without a new picture) cannot make a clip; left out of every pool
             broken.append(Path(r["path"]).name)
             continue
+        if r.get("fps") and float(r["fps"]) < STALL_CHECK_FPS:      # V8.6: a recorder that stalls (frozen picture for fractions of a second, many times) is left out like a broken recording
+            sh_ = clip_stall_share(r["path"])
+            if sh_ is not None and sh_ > STALL_MAX_SHARE:
+                broken.append(f"{Path(r['path']).name} ({sh_ * 100:.0f}% of it frozen)")
+                continue
         stats["tagged"] += 1
         e = cache.get(kills_key(r, game, det))
         if not e or e.get("error"):
             continue
         cands.append((r, e))
     if broken:
-        out(f"{game}: {len(broken)} clip(s) left out - broken recording, the video has under {BROKEN_FPS:.0f} frames a second (the recorder stalled): " + "; ".join(broken))
+        out(f"{game}: {len(broken)} clip(s) left out - broken recording (under {BROKEN_FPS:.0f} frames a second, or frozen for more than {STALL_MAX_SHARE * 100:.0f}% of its length: the recorder stalled): " + "; ".join(broken))
     if game == "cs2" and cands:                            # V6.8.1: red-border row sidecars, built once per clip when missing
         try:
             border_build_many([r for r, _ in cands], cfg, det)
@@ -10050,6 +10078,102 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     return plan
 
 
+# ---- V8.6 CS2 speed ramp on the headline / ending kill: slow at the kill, a ramp back up toward normal after RAMP_HOLD_S, a second slow-down when the knife comes out, then the existing release
+CS2_RAMP_OFF = [False]                  # V8.6: test switch (the plan without the CS2 speed ramp = V8.5.1)
+RAMP_HOLD_S, RAMP_UP_S, RAMP_DOWN_S, RAMP_V_HI = 0.10, 0.20, 0.20, 0.90     # slow hold after the kill, ramp up to V_HI, ramp down into the slow-mo again, the speed it ramps up to
+KNIFE_ANIM_S = 0.30                     # the knife animation starts this long after the weapon HUD switched to it (measured on the reference montage: HUD at kill + 0.05 s, the knife in the hand from kill + 0.4 s)
+KNIFE_REGIONS = ((0.60, 0.91, 0.82, 1.0), (0.80, 0.88, 1.0, 1.0))   # the ammo counter of the CS2 HUD (bottom, right of the middle) and of the older HUD (bottom right corner): share of the game picture
+KNIFE_CACHE = DATA / "knife_cache.json"
+
+
+def cs2_knife_out(path, rect, wh, t_kill, post):
+    """V8.6: the moment the player switches to the knife after a CS2 kill, from the weapon HUD: the ammo counter (bright digits bottom right) is there before the kill and gone for at least 0.3 s
+    after it. Frames of the clip (20 per second, the HUD region only) are measured, nothing is guessed. Returns (seconds after the kill, '') or (None, reason it cannot be told).
+    Reasons: no steady ammo counter before the kill (not enough bright pixels / unsteady), it never goes away, it comes back, or the clip has no footage."""
+    import numpy as np
+    key = f"{file_key(path)}|{t_kill:.3f}|v2"
+    cache = load_json(KNIFE_CACHE, {})
+    if key in cache:
+        v = cache[key]
+        return (v[0], v[1])
+    cx, cy, cw, ch = rect
+    ts = max(0.0, t_kill - 0.6)
+    n_after = min(3.5, max(0.0, post)) + 0.6
+    k0 = int(round((t_kill - ts) * 20))
+    best = None
+    for (x0, y0, x1, y1) in KNIFE_REGIONS:                # the region whose counter is clearest before the kill
+        w_, h_ = int(cw * (x1 - x0)) & ~1, int(ch * (y1 - y0)) & ~1
+        crop = f"crop={w_}:{h_}:{int(cx + cw * x0)}:{int(cy + ch * y0)},scale=176:48:flags=area,format=gray,fps=20"
+        r = run(["ffmpeg", "-v", "error", "-ss", f"{ts:.3f}", "-t", f"{n_after + (t_kill - ts):.3f}", "-i", str(path), "-vf", crop, "-an", "-f", "rawvideo", "-"], timeout=60)
+        buf = r.stdout or b""
+        n = len(buf) // (176 * 48)
+        if n < 10:
+            continue
+        a = np.frombuffer(buf[:n * 176 * 48], np.uint8).reshape(n, 48, 176)
+        cnt = (a > 170).sum(axis=(1, 2)).astype(float)
+        B = float(np.median(cnt[:max(2, k0)]))
+        if best is None or B > best[0]:
+            best = (B, cnt, n)
+    res = (None, "the clip has no readable footage around the kill")
+    if best is not None:
+        B, cnt, n = best
+        base = cnt[:max(2, k0)]
+        if B < 25 or (base.max() - base.min()) > 0.6 * B:
+            res = (None, f"no steady ammo counter on the HUD before the kill ({B:.0f} bright pixels)")
+        else:
+            low = cnt < 0.25 * B
+            res = (None, "the ammo counter never goes away after the kill (no knife-out seen)")
+            for i in range(k0, n - 5):
+                if low[i:i + 6].all():                       # gone for 0.3 s
+                    res = (round((i - k0) / 20.0, 3), "")
+                    break
+    cache[key] = [res[0], res[1]]
+    save_json(KNIFE_CACHE, cache)
+    return res
+
+
+def cs2_ramp_speeds(rem, v0, post, knife_t, margin=0.017):
+    """V8.6: per-frame speeds of the `rem` output frames after the last kill of a CS2 headline / ending take: v0 for RAMP_HOLD_S, a smooth ramp up toward normal (RAMP_V_HI), held until the knife
+    (knife_t = source seconds after the kill when the knife animation starts), a smooth ramp down into v0 around it, then the existing release (v0 held SLOW_HOLD_S, released to 1.0x). Without a knife time
+    (not detected) there is no second slow-down: v0, the ramp up, then straight on to 1.0x. Every speed change is a smooth curve (no frozen / repeated frame from a jump). The footage after the kill
+    (post) must cover it, else v_hi is lowered; Returns (speeds, v_hi, text) or None when it cannot be done."""
+    h, u, d = int(round(RAMP_HOLD_S * OUT_FPS)), int(round(RAMP_UP_S * OUT_FPS)), int(round(RAMP_DOWN_S * OUT_FPS))
+    if rem < h + u + 6:
+        return None
+    for v_hi in (RAMP_V_HI, 0.8, 0.7, 0.6):
+        sp = [v0] * h + [v0 + (v_hi - v0) * _smooth((j + 0.5) / u) for j in range(u)]
+        why = "no knife-out detected: ramp up, then released"
+        if knife_t is not None:
+            src = sum(sp) / OUT_FPS
+            i = len(sp)
+            while i < rem and src < knife_t - RAMP_DOWN_S / 2:          # hold v_hi until the ramp down is centred on the knife
+                sp.append(v_hi)
+                src += v_hi / OUT_FPS
+                i += 1
+            if rem - i >= d + int(0.3 * OUT_FPS):                       # the ramp down + the release of the existing slow-mo ending still fit in this take
+                sp += [v_hi + (v0 - v_hi) * _smooth((j + 0.5) / d) for j in range(d)]
+                rest = release_speeds(rem - len(sp), v0, post - sum(sp) / OUT_FPS)
+                if rest is not None:
+                    sp += rest
+                    why = f"knife out at +{knife_t:.2f} s: second slow-down"
+                else:
+                    sp = None
+            else:
+                sp = None
+                why = "the take ends before the knife slow-down fits"
+        else:
+            sp = None
+        if sp is None:                                                  # no (usable) knife: ramp up, then the normal release to 1.0x
+            sp = [v0] * h + [v0 + (v_hi - v0) * _smooth((j + 0.5) / u) for j in range(u)]
+            rest = [v_hi + (1.0 - v_hi) * _smooth((j + 0.5) / max(1, rem - len(sp))) for j in range(rem - len(sp))]
+            sp += rest
+            if knife_t is not None:
+                why = why or "second slow-down skipped"
+        if len(sp) == rem and sum(sp) / OUT_FPS <= post - margin:
+            return sp, v_hi, why
+    return None
+
+
 def take_segments(tk, f_c, f_k, f_x):
     """Source segments with EXACT frame counts: the first kill shows on output frame f_k. 1.0x from 1.0 s before the first kill
     through the last; ramp only before that; slow-mo (or the ending's slow-mo) starts on the last kill frame."""
@@ -10108,7 +10232,16 @@ def take_segments(tk, f_c, f_k, f_x):
         segs += es
         rem = (f_x - f_c) - nr - n_to_last
         post = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
-        spd_ = release_speeds(rem, SLOW_V0, post)
+        spd_ = None
+        if tk.get("cs2ramp"):                              # V8.6: CS2 headline / ending kill: slow, ramp up, knife slow-down (see cs2_ramp_speeds); None = the take cannot hold it: the existing release below
+            rr_ = cs2_ramp_speeds(rem, SLOW_V0, post, (tk["cs2ramp"] or {}).get("knife_t"))
+            if rr_ is not None:
+                spd_ = rr_[0]
+                tk["cs2ramp"]["v_hi"], tk["cs2ramp"]["why"] = rr_[1], rr_[2]
+            else:
+                tk["cs2ramp"]["why"] = "the take is too short for the ramp: normal slow-mo release"
+        if spd_ is None:
+            spd_ = release_speeds(rem, SLOW_V0, post)
         if spd_ is not None:
             segs += speeds_to_segments(kl2, spd_)
         else:                                              # not enough footage even at the slowest speed: slow-mo as long as it lasts, then hold the frame (as before)
@@ -10381,6 +10514,19 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             f_x = fr(U[tk["end"]])
         if i + 1 < len(takes) and f_x != fr(U[takes[i + 1]["c"]]):
             f_x = fr(U[takes[i + 1]["c"]])
+        if game == "cs2" and tk.get("slow") and not tk.get("tailmode") and (tk is head_take or tk.get("ending")) and not CS2_RAMP_OFF[0]:      # V8.6: CS2 headline / ending kills only
+            try:
+                part_ = (ev.get("parts") or [{"path": ev["path"], "shift": 0.0, "rec": ev["rec"]}])[-1]
+                rec_ = part_["rec"]
+                tkl_ = float(ev["times"][-1]) - float(part_.get("shift", 0.0))
+                post_ = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
+                kt_, kwhy_ = cs2_knife_out(part_["path"], content_rect(rec_, cfg), [rec_["w"], rec_["h"]], tkl_, post_)
+                tk["cs2ramp"] = {"knife_t": None if kt_ is None else round(kt_ + KNIFE_ANIM_S, 3), "hud_t": kt_}
+                notes.append(f"CS2 speed ramp: {Path(ev['path']).name} ({'ending' if tk.get('ending') else 'headline'}): " +
+                             (f"weapon HUD switched to the knife {kt_:.2f} s after the kill, knife animation at +{kt_ + KNIFE_ANIM_S:.2f} s" if kt_ is not None else f"knife-out not used: {kwhy_}"))
+            except Exception as ex_:                       # noqa: BLE001
+                tk["cs2ramp"] = {"knife_t": None}
+                notes.append(f"CS2 speed ramp: {Path(ev['path']).name}: knife-out not used: {type(ex_).__name__}: {ex_}")
         segs = split_parts(take_segments(tk, f_c, f_k, f_x), ev)
         if tk.get("cuts"):
             notes.append(f"dead air: {Path(ev['path']).name} jump-cut over {len(tk['cuts'])} empty stretch"
@@ -10442,6 +10588,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                          "lift_db": lift, "dur": r.get("dur", 0), **low})
         b0 = (tk["c"] - takes[0]["c"]) / 2
         out_takes.append({"path": ev["path"], "srcs": srcs, "rect": srcs[0]["rect"], "audio": srcs[0]["audio"], "wh": srcs[0]["wh"],
+                          "cs2ramp": tk.get("cs2ramp"),
                           "segs": segs, "f0": f_c, "nf": nf, "out_start": round(f_c / OUT_FPS, 4), "dur": round(nf / OUT_FPS, 4),
                           "role": role, "section": sec[min(kb // 2, len(sec) - 1)] if sec else "",
                           "pulses": [round(p, 4) for p in pulses], "amp": round(rp["zoom_amp"], 3),
@@ -11119,6 +11266,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
     # as many as fit the montage's length (sky_max_for) and SKY_SPACING_S apart, best role first
     ranked, rank_why = sky_ranked(recipe, energy, (plan.get("song") or {}).get("bpm"))
     g_kind, g_why = sky_gradient_kind(recipe, energy, (plan.get("song") or {}).get("bpm"))
+    plan["xfx_energy"] = en
     plan["xfx_sky_rank"] = {"names": ranked, "why": rank_why, "grad": g_kind, "grad_why": g_why}
     sky_max = 0 if prof["sky"] <= 0 else sky_max_for(dur_all)
     sky_c = []
@@ -11396,15 +11544,18 @@ SKY_Y_MAX = 205                      # V8.5: the sky never gets brighter than th
 SKY_OPACITY = 1.0                    # V8.5: the haze lets a little of the sky show through (never a solid paint)
 SKY_MAX_ROW = 0.50                   # V8.5: the sky mask never goes below the vertical middle of the picture (walls lower down are never painted)
 SKY_HOLD_FRAMES = 15                 # V8.5: a frame whose sky region collapses while the frames around it have one (a dropout) takes the nearest good frame's mask
-SKY_PALETTE = {                      # V8.5.1: the colours the sky's CHROMA is set to (luminance is kept, so the sky stays as bright / detailed as it was): deep and saturated, no yellow, no acid green, no neon pink
-    "amber": 0xF08A10, "ember": 0xD02818, "rose": 0xB0305A, "violet": 0x6A2FB0, "deep blue": 0x1A44C0, "teal": 0x0E8C8C}
-SKY_STYLE_W = {                      # the song's style -> weight of each colour (warm / hype / aggressive songs: the deep hazy orange of the reference first)
-    "aggressive": {"amber": 3, "ember": 2.6, "rose": 1.2, "violet": 1},
-    "hype": {"amber": 3, "ember": 1.5, "rose": 1.2, "violet": 0.5},
-    "cinematic": {"teal": 2.5, "deep blue": 2, "violet": 1.5, "amber": 1},
+SKY_PALETTE = {                      # V8.6: the colour the sky's CHROMA is set to (luminance is kept, the dark clouds darken it multiplicatively): deep red first, then the cool songs' deep blue / teal / violet; no yellow, no acid green, no neon pink
+    "ember": 0xC01818, "amber": 0xC4581A, "rose": 0x9A2850, "violet": 0x5A2AA0, "deep blue": 0x1A3AA8, "teal": 0x0E7C80}
+SKY_STYLE_W = {                      # the song's style -> weight of each colour (warm / hype / aggressive songs: deep red and black)
+    "aggressive": {"ember": 4, "rose": 1, "amber": 0.8, "violet": 0.6},
+    "hype": {"ember": 3.5, "amber": 1.2, "rose": 1.2, "violet": 0.5},
+    "cinematic": {"teal": 2.5, "deep blue": 2, "violet": 1.5, "ember": 0.8},
     "smooth": {"violet": 2.5, "rose": 1.5, "deep blue": 2, "teal": 1},
     "chill": {"deep blue": 2.5, "teal": 2, "violet": 1.5, "rose": 0.5},
     "mix": {k_: 1.0 for k_ in SKY_PALETTE}}
+SKY_IMPACT_F = 3                     # V8.6: the sky snaps in within 3 frames on the kill frame (a punch, no fade)
+SKY_SURGE_S = 0.30                   # the surge after the impact (brighter, more saturated, a slight push) lasts about this long
+SKY_CLOUD_MAX = 0.88                 # how much of its brightness a dark cloud's core takes away (multiplicative: blacks stay black, nothing is lifted)
 
 
 SKY_WARM = [False]                   # V8.4.5: dusk (orange / yellow) skies: OFF. Measured on 3,900 Valorant frames and 493 kill frames: every warm "sky" found was an orange wall (Bind, Haven, Dust); a wall must never be recoloured
@@ -11623,6 +11774,89 @@ def sky_grab_frames(path, t0, t1, rect, wh, size=(SKY_W, SKY_H), fps=120):
     return [np.frombuffer(buf[i * w * h * 3:(i + 1) * w * h * 3], np.uint8).reshape(h, w, 3) for i in range(n)]
 
 
+_COVER_CACHE = {}
+
+
+def sky_cover_colour(song_path):
+    """V8.6: the dominant DARK colour of the song's cover art (the picture embedded in the MP3, read with ffmpeg), or None when there is none / it has no clear colour. Returns (0xRRGGBB or None, reason).
+    Only pixels that are neither near grey nor near white / black count (saturation >= 0.3, value 0.15 .. 0.75); the colour is the most common hue bin, deepened (value <= 0.7)."""
+    if song_path in _COVER_CACHE:
+        return _COVER_CACHE[song_path]
+    res = (None, "no cover art in the MP3")
+    try:
+        import cv2
+        import numpy as np
+        r = run(["ffmpeg", "-v", "error", "-i", str(song_path), "-an", "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=96:96:flags=area", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], timeout=30)
+        if r.returncode == 0 and len(r.stdout or b"") >= 96 * 96 * 3:
+            im = np.frombuffer(r.stdout[:96 * 96 * 3], np.uint8).reshape(96, 96, 3)
+            hsv = cv2.cvtColor(im, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.float32)
+            ok = (hsv[:, 1] >= 0.3 * 255) & (hsv[:, 2] >= 0.15 * 255) & (hsv[:, 2] <= 0.75 * 255)
+            if ok.sum() >= 0.05 * len(hsv):
+                bins = (hsv[ok, 0] // 6).astype(int)
+                top = int(np.bincount(bins, minlength=30).argmax())
+                sel = hsv[ok][bins == top]
+                h_, s_, v_ = float(np.median(sel[:, 0])) * 2, float(np.median(sel[:, 1])) / 255, float(np.median(sel[:, 2])) / 255
+                import colorsys
+                rr, gg, bb = colorsys.hsv_to_rgb(h_ / 360.0, max(s_, 0.55), min(max(v_, 0.35), 0.7))
+                res = ((int(rr * 255) << 16) | (int(gg * 255) << 8) | int(bb * 255), f"cover art: dominant dark colour hue {h_:.0f} deg")
+            else:
+                res = (None, "the cover art has no clear dark colour")
+    except Exception as ex:                                # noqa: BLE001
+        res = (None, f"cover art not readable ({type(ex).__name__})")
+    _COVER_CACHE[song_path] = res
+    return res
+
+
+def sky_blend_cover(rgb, cover, amount=0.35):
+    """V8.6: the palette colour moved `amount` of the way (on the hue circle) toward the cover art's colour, kept deep (value <= 0.75, saturation >= 0.6). Hues that are yellow / acid green (40 .. 170 deg)
+    are never taken: then the palette colour stays. Returns (0xRRGGBB, reason)."""
+    import colorsys
+    c = [((rgb >> 16) & 255) / 255.0, ((rgb >> 8) & 255) / 255.0, (rgb & 255) / 255.0]
+    k = [((cover >> 16) & 255) / 255.0, ((cover >> 8) & 255) / 255.0, (cover & 255) / 255.0]
+    hc, sc, vc = colorsys.rgb_to_hsv(*c)
+    hk, sk, vk = colorsys.rgb_to_hsv(*k)
+    if 40 <= hk * 360 <= 170:
+        return rgb, f"cover hue {hk * 360:.0f} deg is yellow / green: palette kept"
+    d = ((hk - hc + 0.5) % 1.0) - 0.5
+    h = (hc + max(-30 / 360.0, min(30 / 360.0, d * amount))) % 1.0       # at most 30 degrees toward the cover (a red never drifts into a neon pink)
+    r_, g_, b_ = colorsys.hsv_to_rgb(h, max(0.6, sc * (1 - amount) + sk * amount), min(0.75, vc * (1 - amount) + vk * amount))
+    return (int(r_ * 255) << 16) | (int(g_ * 255) << 8) | int(b_ * 255), f"palette blended {amount * 100:.0f}% toward the cover colour (hue {hc * 360:.0f} -> {h * 360:.0f} deg)"
+
+
+def sky_anim_params(energy, bpm):
+    """V8.6: how fast the sky lives, from the song's energy (0..1) and BPM: cloud drift (mask pixels a second), breathing period (s, two bars), surge strength (0..1) and push (scale)."""
+    try:
+        e = max(0.0, min(1.0, float(energy)))
+    except (TypeError, ValueError):
+        e = 0.6
+    try:
+        b = max(60.0, min(200.0, float(bpm)))
+    except (TypeError, ValueError):
+        b = 110.0
+    return {"drift": round(4.0 + 12.0 * e + 0.05 * (b - 60.0), 2), "period": round(8 * 60.0 / b, 2), "surge": round(0.55 + 0.4 * e, 2), "push": round(0.018 + 0.022 * e, 4)}
+
+
+def sky_cloud_field(w, h, nfr, fps, drift, period, seed):
+    """V8.6: a generator of dark-cloud density maps (h x w floats 0..1), one per output frame: soft fractal noise that drifts sideways (`drift` mask pixels a second) and breathes (the cloud threshold
+    swings with `period` seconds, so the clouds grow and thin), deterministic for the seed."""
+    import cv2
+    import numpy as np
+    rng = np.random.RandomState(int(seed) % (2 ** 31))
+    ww = w * 3
+    base = np.zeros((h, ww), np.float32)
+    for sz, amp in ((16, 1.0), (32, 0.55), (64, 0.3)):
+        n = rng.rand(max(2, h // sz + 1), max(2, ww // sz + 1)).astype(np.float32)
+        n = np.concatenate([n, n[:, :1]], axis=1)
+        base += amp * cv2.resize(n, (ww, h), interpolation=cv2.INTER_CUBIC)
+    base = (base - base.min()) / max(1e-6, float(base.max() - base.min()))
+    for f in range(nfr):
+        t = f / float(fps)
+        off = int(t * drift) % w
+        win = base[:, off:off + w]
+        th = 0.50 + 0.10 * np.sin(2 * np.pi * t / max(1.0, period))
+        yield np.clip((win - th) * 6.0 + 0.5, 0.0, 1.0)
+
+
 def sky_rule_mask(img, zone=None):
     """V8.5.1: the sky mask of ONE picture (HxWx3 uint8 RGB): the colour rule of V8.4.1 / V8.4.2 (clearly blue bright pixels, or very bright grey ones; not a precise segmentation: the whole sky and the bright
     tops of boxes / walls that look like it), upper SKY_MAX_ROW only, never the radar (top left); inside the killfeed zone only the blue rule (the kill rows stay readable). Closed, small specks removed and holes
@@ -11733,12 +11967,17 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     ramp_pl = np.clip(np.arange(h, dtype=np.float32) / max(1.0, float(hor)), 0.0, 1.0)
     ramp_pl = (ramp_pl * ramp_pl * (3 - 2 * ramp_pl))[:, None] * np.ones((1, w), np.float32)
     ramp_b = np.clip(ramp_pl * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes()
-    mid_b = np.full((h * w,), 128, np.uint8).tobytes()
     zero = np.zeros((h * w,), np.uint8).tobytes()
+    an_ = x.get("anim")
+    clouds = sky_cloud_field(w, h, nf, OUT_FPS, an_["drift"], an_["period"], x.get("seed", 1)) if (ramp and an_) else None
+    mid_b = np.full((h * w,), 128, np.uint8).tobytes()
+    gdark = x.get("grad_dark", 0.35)                       # the gradient: how much darker the top of the sky is than its horizon (0.55 'dark' = red to black, 0.25 'sunset')
+    gcol = (1.0 - np.clip(np.arange(h, dtype=np.float32) / max(1.0, float(hor)), 0.0, 1.0))[:, None] * np.ones((1, w), np.float32) * gdark
     with open(path, "wb") as fh:
         for f in range(nf):
+            cl = next(clouds) if clouds is not None else None
             if f0 <= f < f1 and k:
-                a = 1.0 if SKY_EASE_IN <= 0 else min(1.0, ((f - f0 + 1) / OUT_FPS) / SKY_EASE_IN)          # the kill frame itself already shows the first third
+                a = 1.0 if SKY_IMPACT_F <= 0 else min(1.0, (f - f0 + 1) / float(SKY_IMPACT_F))          # the kill frame itself shows the first third, the third frame is complete
                 m = cv2.GaussianBlur(sm[f - f0], (0, 0), SKY_FEATHER) * a
                 if ramp:
                     m = m * capv
@@ -11746,8 +11985,11 @@ def sky_take_mask(t, x, zone, path, ramp=False):
             else:
                 fh.write(zero)
             if ramp:
-                fh.write(ramp_b)
-                fh.write(mid_b)
+                dens = np.clip(1.0 - (1.0 - gcol) * (1.0 - (cl if cl is not None else 0.0) * SKY_CLOUD_MAX), 0.0, 1.0)
+                fh.write(np.clip(dens * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes())
+                tt = (f - f0) / float(OUT_FPS)
+                sg = (an_["surge"] * float(np.exp(-max(0.0, tt) / (SKY_SURGE_S / 2.5)))) if (an_ and tt >= 0) else 0.0
+                fh.write(np.full((h * w,), int(round(255 * sg)), np.uint8).tobytes())
     if ramp:
         x["mask_fmt"] = "yuv444p"
     cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm])) if segm else 0.0
@@ -11770,13 +12012,36 @@ def xfx_sky_chain(chains, base, lab, x, kin):
         return (f"lutyuv=y='clip(val*{g['y_mul']:.3f}+{g['y_add']:.2f},16,{g.get('y_max', 235)})':"
                 f"u='clip(128+({g['u']:.1f}-128)*{g.get('haze', 1.0):.3f}+(val-128)*{1.0 - g.get('haze', 1.0):.3f},16,240)':"
                 f"v='clip(128+({g['v']:.1f}-128)*{g.get('haze', 1.0):.3f}+(val-128)*{1.0 - g.get('haze', 1.0):.3f},16,240)'")
-    if "top" not in gr:
+    if "top" not in gr and "dark" not in gr:
         chains.append(f"{lab}format=yuv420p,split=2[{base}ka][{base}kb]")
         chains.append(f"[{base}kb]lutyuv=y='clip(val*{gr['y_mul']:.3f}+{gr['y_add']:.2f},16,235)':u={gr['u']:.1f}:v={gr['v']:.1f}[{base}kg]")
         chains.append(f"[{kin}:v:0]setpts=N/(60*TB),scale=1920:1080:flags=bicubic,format=gray[{base}km]")
         chains.append(f"[{base}kg][{base}km]alphamerge[{base}kga]")
         chains.append(f"[{base}ka][{base}kga]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}ks]")
         return f"[{base}ks]"
+    if "dark" in gr:                                       # V8.6: steady colour + dark clouds / gradient + the impact surge, pushed slightly, over the original through the mask
+        def lut2(g):
+            return (f"lutyuv=y='clip(16+(val-16)*{g['y_mul']:.3f},16,{g.get('y_max', 235)})':"
+                    f"u='clip(128+({g['u']:.1f}-128)*{g['haze']:.3f}+(val-128)*{1.0 - g['haze']:.3f},16,240)':"
+                    f"v='clip(128+({g['v']:.1f}-128)*{g['haze']:.3f}+(val-128)*{1.0 - g['haze']:.3f},16,240)'")
+        chains.append(f"{lab}format=yuv420p,split=4[{base}ka][{base}kb][{base}kd][{base}ks]")
+        chains.append(f"[{base}kb]{lut2(gr['steady'])}[{base}kA]")
+        chains.append(f"[{base}kd]{lut2(gr['dark'])}[{base}kB]")
+        chains.append(f"[{base}ks]{lut2(gr['surge'])}[{base}kS]")
+        chains.append(f"[{kin}:v:0]setpts=N/(60*TB),format=yuv444p,extractplanes=y+u+v[{base}ky][{base}ku][{base}kv]")
+        chains.append(f"[{base}ky]scale=1920:1080:flags=bicubic[{base}km]")
+        chains.append(f"[{base}ku]scale=1920:1080:flags=bicubic[{base}kdk]")
+        chains.append(f"[{base}kv]scale=1920:1080:flags=bicubic[{base}ksg]")
+        chains.append(f"[{base}kB][{base}kdk]alphamerge[{base}kBa]")
+        chains.append(f"[{base}kA][{base}kBa]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}kAB]")
+        chains.append(f"[{base}kS][{base}ksg]alphamerge[{base}kSa]")
+        chains.append(f"[{base}kAB][{base}kSa]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}kG]")
+        chains.append(f"[{base}kG][{base}km]alphamerge[{base}kGa]")
+        pk, pp = float(x.get("push", 0.03)), float(x["p"])
+        sc_ = f"(1+{pk:.4f}*gt(t,{pp:.4f})*exp(-(t-{pp:.4f})/{SKY_SURGE_S / 2.5:.3f}))"
+        chains.append(f"[{base}kGa]scale=w='trunc(1920*{sc_}/2)*2':h='trunc(1080*{sc_}/2)*2':eval=frame:flags=bicubic,crop=1920:1080[{base}kGp]")
+        chains.append(f"[{base}ka][{base}kGp]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}ks2]")
+        return f"[{base}ks2]"
     chains.append(f"{lab}format=yuv420p,split=3[{base}ka][{base}kb][{base}kc]")
     chains.append(f"[{base}kb]{lut(gr['top'])}[{base}kt]")
     chains.append(f"[{base}kc]{lut(gr['hor'])}[{base}kh]")
@@ -11811,6 +12076,15 @@ def sky_gradient(rgb, kind):
         return pk([v * 0.55 for v in c]), pk(c)
     red, warm = (150, 24, 30), (240, 130, 40)
     return pk([v * 0.70 + r_ * 0.30 for v, r_ in zip(c, red)]), pk([v * 0.82 + w_ * 0.18 for v, w_ in zip(c, warm)])
+
+
+def sky_grade_v2(rgb, kind):
+    """V8.6: the lutyuv constants of the three colour layers of the new sky: 'steady' (the palette colour, luminance kept), 'dark' (the clouds / the gradient: the same hue, brightness x 0.38 about black: darker, never lifted;
+    'dark' gradient = red to black: even deeper), 'surge' (the impact: chroma pushed 20 % past the palette colour, brightness x 1.14, never past SKY_Y_MAX). Chroma is SKY_HAZE of the colour's, the rest the sky's own."""
+    yt, ut, vt = _rgb_to_yuv(rgb)
+    return {"steady": {"y_mul": 0.62, "u": ut, "v": vt, "haze": SKY_HAZE, "y_max": 175},
+            "dark": {"y_mul": 0.10 if kind == "dark" else 0.16, "u": 128 + (ut - 128) * 0.9, "v": 128 + (vt - 128) * 0.9, "haze": 0.92, "y_max": 235},
+            "surge": {"y_mul": 0.95, "u": 128 + (ut - 128) * 1.2, "v": 128 + (vt - 128) * 1.2, "haze": 1.0, "y_max": SKY_Y_MAX}}
 
 
 def sky_grade(rgb, mean_y, grad=None, kind="sunset"):
@@ -11876,14 +12150,22 @@ def xfx_probe_sky(plan, tmpdir=None):
                 raise RuntimeError("no temp folder for the mask")
             Path(tmpdir).mkdir(parents=True, exist_ok=True)
             mp = Path(tmpdir) / f"sky_take{ti + 1}.gray"
-            st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True)
             name, rgb, cwhy = sky_colour_for(ranked, c["info"].get("sky_rgb"), c["info"].get("scene_hue"))
             gk = (plan.get("xfx_sky_rank") or {}).get("grad") or "sunset"
-            top_, hor_ = sky_gradient(rgb, gk)
-            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade(rgb, st["mean_y"], (top_, hor_), gk), "mask_cov": round(st["cov"], 3),
-                      "grad": gk, "held": st["held"]})
+            pal_why = ""
+            cov_rgb, cov_why = sky_cover_colour((plan.get("song") or {}).get("path"))      # V8.6: the cover art's dominant dark colour, blended in when there is one
+            if cov_rgb is not None:
+                rgb, pal_why = sky_blend_cover(rgb, cov_rgb)
+                pal_why = f"{cov_why}; {pal_why}"
+            else:
+                pal_why = f"{cov_why}: palette from the song feel only"
+            an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"))
+            x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "grad_dark": 0.55 if gk == "dark" else 0.25})
+            st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True)                  # (again: with the animation planes)
+            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade_v2(rgb, gk), "mask_cov": round(st["cov"], 3),
+                      "grad": gk, "held": st["held"], "palette_rgb": rgb, "palette_why": pal_why})
             kept.append(gp)
-            c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the upper picture -> recoloured {name} ({cwhy}); mask over the whole take: {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%, {st['held']} dropout frame(s) held, {gk} gradient, horizon at {st['horizon'] * 100:.0f}% of the height"
+            c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the upper picture -> recoloured {name} ({cwhy}); from the kill frame to the end of the take: {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%, {st['held']} dropout frame(s) held, {gk} gradient, horizon at {st['horizon'] * 100:.0f}% of the height; palette 0x{rgb:06X} ({pal_why}); animation drift {an_['drift']} px/s, breath {an_['period']} s, surge {an_['surge']}, push {an_['push']}"
         except Exception as ex:                        # noqa: BLE001
             x["ok"] = False
             c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% but the mask could not be made ({type(ex).__name__}: {ex}), skipped"
@@ -12256,7 +12538,7 @@ def drop_audio_filters(drops):
         T, L = float(d["t"]), float(d["dip_s"])
         g = 10 ** (-float(d["dip_db"]) / 20)
         post = 1 - 10 ** (-float(d.get("duck_db", 4.0)) / 20)
-        dips.append(f"(1-{1 - g:.4f}*clip((t-{T - L:.4f})/0.08,0,1)*clip(({T + 0.001:.4f}-t)/0.001,0,1))*(1-{post:.4f}*clip((t-{T:.4f})/0.001,0,1)*exp(-7*(t-{T:.4f})))")
+        dips.append(f"(1-{1 - g:.4f}*clip((t-{T - L:.4f})/0.08,0,1)*clip(({T + 0.001:.4f}-t)/0.001,0,1))*(1-{post:.4f}*clip((t-{T:.4f})/0.001,0,1)*exp(-7*max(0,t-{T:.4f})))")      # V8.6: max(0, ..): before the drop the exponent was +7 x (T - t), above 709 (t more than ~100 s before the drop) exp() overflowed to inf and 0 * inf = NaN silenced the music of the whole first part
         lf = 10 ** (float(d["lift_db"]) / 20)
         lifts.append(f"(1+{lf - 1:.4f}*clip((t-{T - 0.05:.4f})/0.02,0,1)*clip(({T + 0.30:.4f}-t)/0.10,0,1))")
         f1, f0, r, dec = float(d["boom_f1"]), float(d["boom_f0"]), float(d["boom_r"]), float(d["boom_dec"])

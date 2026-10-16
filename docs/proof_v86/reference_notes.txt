@@ -1,0 +1,17 @@
+Reference montage: E:\Movies\Montages\Fiverr 48 (2).mp4 (CS2, 2720 x 1530, 60 fps, 202.9 s). Read frame by frame (every frame scanned for red in the upper 40 %, frame difference as a speed measure; contact sheets
+docs/proof_v86/ref_sky1.jpg, ref_sky2.jpg). Nothing below was implemented beyond items 1 to 4 of the V8.6 brief.
+
+SKY
+- Exactly one real sky event: the last kill of a round at 190.57 s (an AWP kill: the scope view is up until 190.55 s, the unscoped picture appears on the kill frame at 190.60 s). The red sky is on the kill frame itself
+  (no fade: 190.55 s scope, 190.60 s red sky) and covers the upper part of the picture above the roofs / the rooftop line, about 25 % of the picture at the peak (190.70 s), dark red with black cloud shapes, blocky (low
+  resolution mask, pixel steps visible at the edge); the picture's detail and brightness under it stay (power lines, windows, the 14 : 14 score are visible through it).
+- It is strongest in the first 0.15 - 0.25 s (red share of the upper 40 % of the picture 0.14 at +0.03 s, 0.25 at +0.13 s), then it settles to a much smaller, darker strip (0.04 - 0.06) that lasts about 0.9 s more
+  (until 191.5 s) while the round-end text comes up, then it is gone with the cut. So: a hit on the kill (surge) followed by a calmer steady look for the rest of the take.
+- The other red areas found by the scan (122.9 - 124.0 s) are a red wall sign in the map, not an effect.
+
+SPEED
+- The same kill (190.57 s): motion between frames jumps to its peak right at the kill (frame difference 78 at 190.57 s, 26 - 46 over the next 0.2 s: the scope-out and the kill flash), falls to a steady ~10 from 190.80 s
+  (normal speed), then drops from 191.43 s to 2.3 - 3.1 (slow motion) while the knife comes out, a hard cut follows at 191.57 s (frame difference 47). The HUD of the weapon switch (the knife icon highlighted,
+  "Flip Knife | Damascus Steel" under it, the ammo counter "6 / 30" gone) is on screen from 190.62 s, 0.05 s after the kill; the knife is visibly in the hand from about 190.95 s (0.4 s after the kill).
+  This is the pattern item 4 follows: slow at the kill, back toward normal, slow again for the knife.
+- The other slow stretches the scan found (73.5, 91.7, 124.2, 151.7 s) are dark fade-out / fade-in frames, not ramps on kills.
