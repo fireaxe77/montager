@@ -59,7 +59,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.6.1"
+APP_VERSION = "V8.6.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -148,6 +148,43 @@ def LOGONLY(msg):
 QUIET = threading.local()               # QUIET.on = True: this thread logs nothing (the Manual status-line estimate)
 
 
+_LOG_KIND = re.compile(r"^(?:NOTE\s+(music over gameplay|dead air|clips saved next to each other|merged continuation/duplicate clips|NOT PLACED|anchor refined|slowmo release|relaxed rule|weekly pick: reused)"
+                       r"|\s+merged duplicate:()|\s{3}\S.* @ \d+:\d\d\.\d  name [\d.]+  ->()|\s{3}\S.*\(frame check:()|SKY recolour take \d+:()|\s+pair partner of()|pairing: ()|SKY recolour take)")
+
+
+def collapse_log(msg, min_run=4, keep=2):
+    """V8.6.2: the text the UI / console shows: a run of `min_run` or more consecutive lines of the same kind (the 'music over gameplay', 'dead air', 'clips saved next to each other', 'merged continuation',
+    rejected-row, ... blocks that print one line per clip) is shown as its first `keep` lines + one line with the count. The full text is always in montage.log (out() writes it before this runs)."""
+    if "\n" not in msg:
+        return msg
+    lines = msg.split("\n")
+    if len(lines) < min_run + keep:
+        return msg
+    res, i = [], 0
+    while i < len(lines):
+        m = _LOG_KIND.match(lines[i])
+        if not m:
+            res.append(lines[i])
+            i += 1
+            continue
+        kind = next((g for g in m.groups() if g), None) or lines[i][:18]
+        j = i
+        while j < len(lines):
+            mj = _LOG_KIND.match(lines[j])
+            kj = next((g for g in mj.groups() if g), None) or lines[j][:18] if mj else None
+            if kj != kind:
+                break
+            j += 1
+        run = j - i
+        if run >= min_run:
+            res += lines[i:i + keep]
+            res.append(f"   ... {run - keep} more '{str(kind).strip()[:40]}' lines (all {run} in montage.log)")
+        else:
+            res += lines[i:j]
+        i = j
+    return "\n".join(res)
+
+
 def out(*a):
     if getattr(QUIET, "on", False):
         return
@@ -158,6 +195,7 @@ def out(*a):
             f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
     except Exception:
         pass
+    msg = collapse_log(msg)                                # V8.6.2: the UI / console get the collapsed text, montage.log (above) the full one
     if LOG_SINK[0]:
         LOG_SINK[0](msg)
     else:
@@ -5325,6 +5363,123 @@ def cmd_scan(args):
     run_scan(load_config(), [args.game] if args.game else None, None, args.limit, args.rescan, getattr(args, "confirm_region_rescan", False))
 
 
+# ---- V8.6.2 CS2 deathmatch detector: a clip is rejected only when at least TWO independent signals agree (a single signal never rejects). Signals (OCR of the HUD, 3 frames per clip, cached per clip):
+#   a1  the chat log at the bottom left says "N points for neutralizing an enemy with ..." (competitive / wingman say "+$300 for neutralizing ...")
+#   a2  the bonus-weapon prompt: "BONUS WEAPON" panel (left) or "[G] Switch to bonus weapon" (bottom right)
+#   b   the top bar is the deathmatch one: a single timer and a row of points under >= 8 player icons (competitive: the timer with the two round scores, no row of numbers)
+DM_CACHE = DATA / "dm_cache.json"
+DM_MIN_SIGNALS = 2
+_DM_LOCK = threading.Lock()
+_DM_A1 = re.compile(r"points?\s*for", re.I)                # (competitive says "+$300: Award for neutralizing an enemy with ..." - only "points for" is the deathmatch text)
+_DM_A2 = re.compile(r"bonus\s*weapon|switch\s*to\s*bonus", re.I)
+
+
+def _dm_crop(path, t, box, rect, wh, scale=1.0):
+    """One crop (BGR) of a clip at time t: box = (x0, y0, x1, y1) as shares of the game picture; None when the frame cannot be read."""
+    import numpy as np
+    cx, cy, cw, ch = rect
+    w_, h_ = int(cw * (box[2] - box[0])) & ~1, int(ch * (box[3] - box[1])) & ~1
+    r = run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.2f}", "-i", str(path), "-frames:v", "1", "-vf", f"crop={w_}:{h_}:{int(cx + cw * box[0])}:{int(cy + ch * box[1])}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"], timeout=40)
+    if len(r.stdout or b"") < w_ * h_ * 3:
+        return None
+    im = np.frombuffer(r.stdout[:w_ * h_ * 3], np.uint8).reshape(h_, w_, 3)
+    if scale != 1.0:
+        import cv2
+        im = cv2.resize(im, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return im
+
+
+def cs2_dm_signals(rec, cfg):
+    """V8.6.2: the deathmatch signals of ONE CS2 clip (cached in dm_cache.json per file): {'a1', 'a2', 'b', 'signals' (how many), 'dm' (>= DM_MIN_SIGNALS), 'texts' (what was read)}. Cheap first: the log text on
+    3 frames; only when a deathmatch text is seen the other signals are measured (so a normal clip costs about 1 s once, then nothing)."""
+    cache = load_json(DM_CACHE, {})
+    key = file_key(rec["path"])
+    if key in cache:
+        return cache[key]
+    res = {"a1": False, "a2": False, "b": False, "signals": 0, "dm": False, "texts": []}
+    try:
+        eng = ocr_engine()
+        dur = float(rec.get("dur") or 15.0)
+        rect, wh = content_rect(rec, cfg), [rec["w"], rec["h"]]
+        ts = sorted({round(min(max(0.5, 0.35 * dur), dur - 0.5), 2), round(max(0.5, dur - 2.5), 2)})
+
+        def read(box, t, scale=1.0):
+            im = _dm_crop(rec["path"], t, box, rect, wh, scale)
+            if im is None:
+                return []
+            out_, _ = eng(im)
+            return [str(x[1]) for x in (out_ or [])]
+        for t in ts:                                          # a1: the points log (2 frames)
+            tx = read((0.0, 0.72, 0.36, 0.95), t)
+            if any(_DM_A1.search(x) for x in tx):
+                res["a1"] = True
+                res["texts"].append(" | ".join(tx)[:90])
+                break
+        for t in ([0.6] if not res["a1"] else [0.6, ts[-1]]):  # a2: the bonus-weapon panel (left of the picture, at spawn)
+            tx = read((0.0, 0.22, 0.26, 0.44), t)
+            if any(_DM_A2.search(x) for x in tx):
+                res["a2"] = True
+                res["texts"].append(" | ".join(tx)[:90])
+                break
+        if res["a1"] or res["a2"]:                          # only then the (slower) top bar
+            for t in ts:
+                tx = read((0.25, 0.0, 0.75, 0.12), t, 1.5)
+                nums = [m for x in tx if "$" not in x for m in re.findall(r"\d+", x)]
+                timer = any(re.fullmatch(r"\d{1,2}[:.]\d\d", x.strip()) for x in tx)
+                if timer and len(nums) >= 8:
+                    res["b"] = True
+                    res["texts"].append(f"top bar: {len(nums)} numbers under the icons")
+                    break
+        res["signals"] = int(res["a1"]) + int(res["a2"]) + int(res["b"])
+        res["dm"] = res["signals"] >= DM_MIN_SIGNALS
+    except Exception as ex:                                 # noqa: BLE001
+        res["texts"].append(f"{type(ex).__name__}: {ex}")
+        return res                                          # not cached: tried again next time
+    with _DM_LOCK:
+        cache = load_json(DM_CACHE, {})
+        cache[key] = res
+        save_json(DM_CACHE, cache)
+    return res
+
+
+def cs2_dm_rejected(cfg, recs, progress=None):
+    """V8.6.2: the set of paths (of the CS2 records given) that are deathmatch clips; the first time a clip is seen it is measured (cached). One log line with the count. Hand-ticked clips are never passed here."""
+    bad, n_new = set(), 0
+    cache0 = load_json(DM_CACHE, {})
+    todo = [r for r in recs if file_key(r["path"]) not in cache0]
+    if todo:
+        out(f"CS2 deathmatch check: {len(todo)} clip(s) not checked yet (first time only, about 1 s each) ...")
+    if todo:
+        from concurrent.futures import ThreadPoolExecutor
+        done = [0]
+
+        def one(r):
+            if CANCEL.is_set():
+                return None
+            d = cs2_dm_signals(r, cfg)
+            done[0] += 1
+            if progress and done[0] % 25 == 0:
+                progress(done[0] / max(1, len(todo)), f"deathmatch check {done[0]}/{len(todo)}")
+            return d
+        with ThreadPoolExecutor(max_workers=4) as ex:       # one OCR engine per thread (ocr_engine)
+            list(ex.map(one, todo))
+    for r in recs:
+        d = cs2_dm_signals(r, cfg)
+        if d.get("dm"):
+            bad.add(r["path"])
+    out(f"CS2: {len(bad)} deathmatch clip(s) rejected" + (f" ({', '.join(Path(b).name for b in sorted(bad)[:3])}{' ...' if len(bad) > 3 else ''})" if bad else ""))
+    return bad
+
+
+def cs2_dm_filter_cands(cfg, cands, game):
+    """V8.6.2: Auto / Random pick (Manual): the candidate clips (GUI rows with a 'path') without the CS2 deathmatch clips (one log line). Other games and an empty list pass unchanged."""
+    if game != "cs2" or not cands:
+        return cands
+    by = {r["path"]: r for r in scan_clips(cfg) if r.get("game") == "cs2" and not r.get("error") and r.get("w")}
+    bad = cs2_dm_rejected(cfg, [by[c["path"]] for c in cands if c["path"] in by])
+    return [c for c in cands if c["path"] not in bad]
+
+
 BROKEN_FPS = 20.0                       # V8.4.5: a clip whose video has fewer frames than this per second over its whole length is a broken recording
 STALL_GAP_S, STALL_MAX_SHARE, STALL_CHECK_FPS = 0.12, 0.10, 45.0     # V8.6: a clip whose picture stands still for gaps of >= 0.12 s (the recorder stalled) over more than 10 % of its length freezes / glitches in a montage; only clips under 45 fps on average are measured
 STALL_CACHE = DATA / "stall_cache.json"
@@ -5372,10 +5527,15 @@ def game_pool(cfg, game, paths=None):
     pool, allrej, cjk = [], [], {}
     cands = []
     broken = []
+    dm_bad = set()
+    if game == "cs2" and ps is None:                       # V8.6.2: automatic runs (Auto, Force New, Force New Full) never use deathmatch clips; hand-ticked clips are never rejected
+        dm_bad = cs2_dm_rejected(cfg, [r for r in scan_clips(cfg) if r.get("game") == "cs2" and not r.get("error") and r.get("w") and not any(x in r["path"].lower() for x in exc)])
     for r in scan_clips(cfg):
         if r.get("error") or not r.get("w") or r.get("game") != game or (ps is not None and r["path"] not in ps):
             continue
         if any(x in r["path"].lower() for x in exc):
+            continue
+        if r["path"] in dm_bad:
             continue
         if r.get("fps") and float(r["fps"]) < BROKEN_FPS:     # V8.4.5: a broken recording (the recorder stalled: whole seconds without a new picture) cannot make a clip; left out of every pool
             broken.append(Path(r["path"]).name)
@@ -8650,6 +8810,9 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first", 
         return None
     if slow:
         win = (win[0], max(win[1], SLOW_TAIL_MAX))         # V7.6.1: the slow-mo is released about 1.0 s after the kill
+        kn_ = ev.get("_knife")
+        if kn_ and kn_.get("ok"):                          # V8.6.2: a CS2 take with a knife-out keeps the footage of the second slow-down (the source footage exists: 'ok')
+            win = (win[0], max(win[1], min(float(kn_["knife_t"]) + KNIFE_TAIL_AFTER_S, float(kn_["post"]) - 0.05, 2.2)))
     if not (win[0] - 1e-6 <= tail <= win[1] + 1e-6):
         return None
     if slow:
@@ -8731,12 +8894,17 @@ def place(ev, U, down, rp, c=None, kb=None, end=None, ramp=1.0, slow=False, endi
             continue
         last_out = U[kk] if anchor == "last" else U[kk] + dead_air_cuts(ev, U, kk)[1]
         hi = max(TAIL[1], 2 * max(0.0, max(ev.get("rows") or ev["times"]) - ev["times"][-1]) + ROW_TAIL + ROW_SLACK)
+        want_tail = 1.0
         if slow:
             hi = max(hi, SLOW_TAIL_MAX)
+            kn_ = ev.get("_knife")
+            if kn_ and kn_.get("ok"):                      # V8.6.2: a CS2 take with a knife-out keeps the footage the second slow-down needs (only when the source footage exists: 'ok')
+                hi = max(hi, min(float(kn_["knife_t"]) + KNIFE_TAIL_AFTER_S, float(kn_["post"]) - 0.05, 2.2))
+                want_tail = max(1.0, min(float(kn_["knife_t"]) + KNIFE_TAIL_AFTER_S, hi))
         ends = [end] if end is not None else \
             sorted([j for j in range(kk + 1, min(nt + 1, kk + 40 + int(span / max(1e-3, float(U[1] - U[0]))) + 1))   # long fights too
                     if TAIL[0] - 0.12 <= U[j] - last_out <= hi + 0.01],
-                   key=lambda j: (j % 2, abs(U[j] - last_out - (1.0 if slow else 0.32))))
+                   key=lambda j: (j % 2, abs(U[j] - last_out - (want_tail if slow else 0.32))))
         for j in ends:
             g = geom(ev, U, cc, kk, j, ramp, slow, ext=ext, anchor=anchor)
             if g:
@@ -9304,6 +9472,8 @@ def take_tail_bounds(t):
     hi = max(TAIL[1], rows - ko + ROW_TAIL + ROW_SLACK)
     if t.get("slow"):
         hi = max(hi, SLOW_TAIL_MAX)
+        if (t.get("cs2ramp") or {}).get("knife_t"):
+            hi = max(hi, float(t["cs2ramp"]["knife_t"]) + KNIFE_TAIL_AFTER_S + 0.05)
     return t["dur"] - ko, rows - ko + ROW_TAIL, hi
 
 
@@ -9695,9 +9865,28 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     if HEADLINE_RULES_V73 and head_cands[0]["n"] == 1 and k_top > 1 and all(e["n"] == 1 for e in head_cands[:k_top]):
         # V7.3: a single-kill headline among equal scores: flick first, then headshot, then the rest (the order stays otherwise)
         head_cands = sorted(head_cands[:k_top], key=lambda e: (not e.get("flick"), not (e.get("hs") or 0) > 0)) + head_cands[k_top:]
+    if game == "cs2" and not CS2_RAMP_OFF[0] and head_cands:             # V8.6.2: among the headline candidates whose score is within 8 % of the best, one with a knife-out and the footage for it comes first
+        top_ = float(head_cands[0]["score"])
+        band_ = [e for e in head_cands[:12] if float(e["score"]) >= 0.92 * top_ and e is not head_cands[0]]
+        for e_ in [head_cands[0]] + band_:
+            cs2_event_knife(e_, cfg)
+        pref_ = [e for e in [head_cands[0]] + band_ if (e.get("_knife") or {}).get("ok")]
+        if pref_ and pref_[0] is not head_cands[0]:
+            notes.append(f"CS2 headline: {nm(pref_[0])} (knife-out at +{pref_[0]['_knife']['hud_t']:.2f} s, footage for the speed ramp) preferred over {nm(head_cands[0])}: scores within 8 %")
+            head_cands = [pref_[0]] + [e for e in head_cands if e is not pref_[0]]
     head = head_cands[0]
     rest = [e for e in usable if e is not head]
-    ending = next((e for e in sorted(rest, key=ending_rank) if e["post"] >= 0.5 and not e.get("util") and ending_safe(e)), None)      # V7.7.5: verified, clean footage after the last kill first
+    end_sorted = sorted(rest, key=ending_rank)
+    if game == "cs2" and not CS2_RAMP_OFF[0] and end_sorted:             # V8.6.2: the same for the ending: close score + the same cleanliness class, the one with a knife-out first
+        e0 = end_sorted[0]
+        grp_ = [e for e in end_sorted[:12] if ending_rank(e)[0] == ending_rank(e0)[0] and float(e["score"]) >= 0.92 * float(e0["score"]) and e["post"] >= 0.5 and not e.get("util") and ending_safe(e)]
+        for e_ in grp_:
+            cs2_event_knife(e_, cfg)
+        pk_ = [e for e in grp_ if (e.get("_knife") or {}).get("ok")]
+        if pk_ and pk_[0] is not e0 and e0 in grp_:
+            notes.append(f"CS2 ending: {nm(pk_[0])} (knife-out at +{pk_[0]['_knife']['hud_t']:.2f} s) preferred over {nm(e0)}: scores within 8 %")
+            end_sorted = [pk_[0]] + [e for e in end_sorted if e is not pk_[0]]
+    ending = next((e for e in end_sorted if e["post"] >= 0.5 and not e.get("util") and ending_safe(e)), None)      # V7.7.5: verified, clean footage after the last kill first
     if ending is None:
         ending = next((e for e in sorted(rest, key=lambda e: -e["score"]) if e["post"] >= 0.5 and not e.get("util")), None)
     if ending is None:                                     # V7.3: a utility take never ends the montage - unless every candidate is one (base behaviour, logged)
@@ -10080,6 +10269,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
 
 # ---- V8.6 CS2 speed ramp on the headline / ending kill: slow at the kill, a ramp back up toward normal after RAMP_HOLD_S, a second slow-down when the knife comes out, then the existing release
 CS2_RAMP_OFF = [False]                  # V8.6: test switch (the plan without the CS2 speed ramp = V8.5.1)
+RAMP_PEAK_S = 0.10                      # V8.6.2: without a knife the speed stays at the top this long before it comes back down
 RAMP_HOLD_S, RAMP_UP_S, RAMP_DOWN_S, RAMP_V_HI = 0.10, 0.20, 0.20, 0.90     # slow hold after the kill, ramp up to V_HI, ramp down into the slow-mo again, the speed it ramps up to
 KNIFE_ANIM_S = 0.30                     # the knife animation starts this long after the weapon HUD switched to it (measured on the reference montage: HUD at kill + 0.05 s, the knife in the hand from kill + 0.4 s)
 KNIFE_REGIONS = ((0.60, 0.91, 0.82, 1.0), (0.80, 0.88, 1.0, 1.0))   # the ammo counter of the CS2 HUD (bottom, right of the middle) and of the older HUD (bottom right corner): share of the game picture
@@ -10091,7 +10281,7 @@ def cs2_knife_out(path, rect, wh, t_kill, post):
     after it. Frames of the clip (20 per second, the HUD region only) are measured, nothing is guessed. Returns (seconds after the kill, '') or (None, reason it cannot be told).
     Reasons: no steady ammo counter before the kill (not enough bright pixels / unsteady), it never goes away, it comes back, or the clip has no footage."""
     import numpy as np
-    key = f"{file_key(path)}|{t_kill:.3f}|v2"
+    key = f"{file_key(path)}|{t_kill:.3f}|v3"
     cache = load_json(KNIFE_CACHE, {})
     if key in cache:
         v = cache[key]
@@ -10103,14 +10293,14 @@ def cs2_knife_out(path, rect, wh, t_kill, post):
     best = None
     for (x0, y0, x1, y1) in KNIFE_REGIONS:                # the region whose counter is clearest before the kill
         w_, h_ = int(cw * (x1 - x0)) & ~1, int(ch * (y1 - y0)) & ~1
-        crop = f"crop={w_}:{h_}:{int(cx + cw * x0)}:{int(cy + ch * y0)},scale=176:48:flags=area,format=gray,fps=20"
+        crop = f"crop={w_}:{h_}:{int(cx + cw * x0)}:{int(cy + ch * y0)},scale=352:96:flags=area,fps=20,format=rgb24"
         r = run(["ffmpeg", "-v", "error", "-ss", f"{ts:.3f}", "-t", f"{n_after + (t_kill - ts):.3f}", "-i", str(path), "-vf", crop, "-an", "-f", "rawvideo", "-"], timeout=60)
         buf = r.stdout or b""
-        n = len(buf) // (176 * 48)
+        n = len(buf) // (352 * 96 * 3)
         if n < 10:
             continue
-        a = np.frombuffer(buf[:n * 176 * 48], np.uint8).reshape(n, 48, 176)
-        cnt = (a > 170).sum(axis=(1, 2)).astype(float)
+        a = np.frombuffer(buf[:n * 352 * 96 * 3], np.uint8).reshape(n, 96, 352, 3)
+        cnt = (a.max(3) > 200).sum(axis=(1, 2)).astype(float)          # the bright digits of the ammo counter (any colour channel)
         B = float(np.median(cnt[:max(2, k0)]))
         if best is None or B > best[0]:
             best = (B, cnt, n)
@@ -10118,10 +10308,10 @@ def cs2_knife_out(path, rect, wh, t_kill, post):
     if best is not None:
         B, cnt, n = best
         base = cnt[:max(2, k0)]
-        if B < 25 or (base.max() - base.min()) > 0.6 * B:
+        if B < 150 or (base.max() - base.min()) > 1.3 * B:
             res = (None, f"no steady ammo counter on the HUD before the kill ({B:.0f} bright pixels)")
         else:
-            low = cnt < 0.25 * B
+            low = cnt < 0.10 * B
             res = (None, "the ammo counter never goes away after the kill (no knife-out seen)")
             for i in range(k0, n - 5):
                 if low[i:i + 6].all():                       # gone for 0.3 s
@@ -10132,44 +10322,67 @@ def cs2_knife_out(path, rect, wh, t_kill, post):
     return res
 
 
+KNIFE_TAIL_AFTER_S = 0.9                # V8.6.2: a take that shows the knife slow-down keeps this much footage after the knife animation starts (the ramp down + the start of the slow-mo ending)
+
+
+def cs2_event_knife(ev, cfg):
+    """V8.6.2: the knife-out of a CS2 event (cached on the event): {'hud_t' (s after the last kill the weapon HUD switched to the knife), 'knife_t' (+ KNIFE_ANIM_S: the animation), 'post' (source footage after the
+    last kill), 'ok' (knife seen AND enough footage after it for the second slow-down), 'why'}."""
+    if ev.get("_knife") is not None:
+        return ev["_knife"]
+    res = {"hud_t": None, "knife_t": None, "post": None, "ok": False, "why": "not measured"}
+    try:
+        part_ = (ev.get("parts") or [{"path": ev["path"], "shift": 0.0, "rec": ev["rec"]}])[-1]
+        rec_ = part_["rec"]
+        tkl_ = float(ev["times"][-1]) - float(part_.get("shift", 0.0))
+        post_ = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
+        kt_, why_ = cs2_knife_out(part_["path"], content_rect(rec_, cfg), [rec_["w"], rec_["h"]], tkl_, post_)
+        res.update({"hud_t": kt_, "post": round(float(post_), 3), "why": why_ or "knife out seen"})
+        if kt_ is not None:
+            res["knife_t"] = round(kt_ + KNIFE_ANIM_S, 3)
+            res["ok"] = bool(float(post_) >= res["knife_t"] + KNIFE_TAIL_AFTER_S)
+            if not res["ok"]:
+                res["why"] = f"knife out at +{kt_:.2f} s but only {post_:.2f} s of footage after the kill (needs {res['knife_t'] + KNIFE_TAIL_AFTER_S:.2f} s)"
+    except Exception as ex:                                # noqa: BLE001
+        res["why"] = f"{type(ex).__name__}: {ex}"
+    ev["_knife"] = res
+    return res
+
+
 def cs2_ramp_speeds(rem, v0, post, knife_t, margin=0.017):
-    """V8.6: per-frame speeds of the `rem` output frames after the last kill of a CS2 headline / ending take: v0 for RAMP_HOLD_S, a smooth ramp up toward normal (RAMP_V_HI), held until the knife
-    (knife_t = source seconds after the kill when the knife animation starts), a smooth ramp down into v0 around it, then the existing release (v0 held SLOW_HOLD_S, released to 1.0x). Without a knife time
-    (not detected) there is no second slow-down: v0, the ramp up, then straight on to 1.0x. Every speed change is a smooth curve (no frozen / repeated frame from a jump). The footage after the kill
-    (post) must cover it, else v_hi is lowered; Returns (speeds, v_hi, text) or None when it cannot be done."""
-    h, u, d = int(round(RAMP_HOLD_S * OUT_FPS)), int(round(RAMP_UP_S * OUT_FPS)), int(round(RAMP_DOWN_S * OUT_FPS))
-    if rem < h + u + 6:
+    """V8.6 / V8.6.2: per-frame speeds of the `rem` output frames after the last kill of a CS2 headline / ending take: slow at the kill (v0 for RAMP_HOLD_S), a smooth ramp up toward normal (RAMP_V_HI), then a smooth ramp
+    back down into the slow-mo and the existing slow-mo ending (v0 held SLOW_HOLD_S, released to 1.0x). The ramp down is centred on the knife animation (knife_t = source seconds after the kill) when the knife-out was
+    detected; without one it follows after a short peak (RAMP_PEAK_S), so slow - fast - slow ALWAYS happens when the take is long enough (>= 40 frames after the kill; shorter: the phases are shortened to fit, under 24
+    frames the plain release). The footage after the kill (post) must cover it, else v_hi is lowered. Returns (speeds, v_hi, text) or None when it cannot be done."""
+    if rem < 24:
         return None
+    if rem >= 40:
+        h, u, d, pk = int(round(RAMP_HOLD_S * OUT_FPS)), int(round(RAMP_UP_S * OUT_FPS)), int(round(RAMP_DOWN_S * OUT_FPS)), int(round(RAMP_PEAK_S * OUT_FPS))
+    else:
+        h, u, d, pk = 4, 6, 6, 3
     for v_hi in (RAMP_V_HI, 0.8, 0.7, 0.6):
         sp = [v0] * h + [v0 + (v_hi - v0) * _smooth((j + 0.5) / u) for j in range(u)]
-        why = "no knife-out detected: ramp up, then released"
+        why = "no knife-out detected: slow, ramp up, ramp down into the slow-mo ending"
         if knife_t is not None:
             src = sum(sp) / OUT_FPS
-            i = len(sp)
-            while i < rem and src < knife_t - RAMP_DOWN_S / 2:          # hold v_hi until the ramp down is centred on the knife
+            while len(sp) < rem - d - 12 and src < knife_t - RAMP_DOWN_S / 2:          # hold v_hi until the ramp down is centred on the knife
                 sp.append(v_hi)
                 src += v_hi / OUT_FPS
-                i += 1
-            if rem - i >= d + int(0.3 * OUT_FPS):                       # the ramp down + the release of the existing slow-mo ending still fit in this take
-                sp += [v_hi + (v0 - v_hi) * _smooth((j + 0.5) / d) for j in range(d)]
-                rest = release_speeds(rem - len(sp), v0, post - sum(sp) / OUT_FPS)
-                if rest is not None:
-                    sp += rest
-                    why = f"knife out at +{knife_t:.2f} s: second slow-down"
-                else:
-                    sp = None
+            if src >= knife_t - RAMP_DOWN_S / 2 - 0.02:
+                why = f"knife out at +{knife_t:.2f} s: second slow-down on it"
             else:
-                sp = None
-                why = "the take ends before the knife slow-down fits"
+                why = "the take ends before the knife: the slow-down follows the peak instead"
+                sp += [v_hi] * max(0, min(pk, rem - len(sp) - d - 6))
         else:
-            sp = None
-        if sp is None:                                                  # no (usable) knife: ramp up, then the normal release to 1.0x
-            sp = [v0] * h + [v0 + (v_hi - v0) * _smooth((j + 0.5) / u) for j in range(u)]
-            rest = [v_hi + (1.0 - v_hi) * _smooth((j + 0.5) / max(1, rem - len(sp))) for j in range(rem - len(sp))]
-            sp += rest
-            if knife_t is not None:
-                why = why or "second slow-down skipped"
-        if len(sp) == rem and sum(sp) / OUT_FPS <= post - margin:
+            sp += [v_hi] * max(0, min(pk, rem - len(sp) - d - 6))
+        if len(sp) + d + 6 > rem:
+            continue
+        sp += [v_hi + (v0 - v_hi) * _smooth((j + 0.5) / d) for j in range(d)]
+        rest = release_speeds(rem - len(sp), v0, post - sum(sp) / OUT_FPS)
+        if rest is None or len(sp) + len(rest) != rem:
+            continue
+        sp += rest
+        if sum(sp) / OUT_FPS <= post - margin:
             return sp, v_hi, why
     return None
 
@@ -10516,18 +10729,19 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             f_x = fr(U[takes[i + 1]["c"]])
         if game == "cs2" and tk.get("slow") and not tk.get("tailmode") and (tk is head_take or tk.get("ending")) and not CS2_RAMP_OFF[0]:      # V8.6: CS2 headline / ending kills only
             try:
-                part_ = (ev.get("parts") or [{"path": ev["path"], "shift": 0.0, "rec": ev["rec"]}])[-1]
-                rec_ = part_["rec"]
-                tkl_ = float(ev["times"][-1]) - float(part_.get("shift", 0.0))
-                post_ = ev["post"] if ev.get("death_after") is None else min(ev["post"], ev["death_after"] - 0.05)
-                kt_, kwhy_ = cs2_knife_out(part_["path"], content_rect(rec_, cfg), [rec_["w"], rec_["h"]], tkl_, post_)
-                tk["cs2ramp"] = {"knife_t": None if kt_ is None else round(kt_ + KNIFE_ANIM_S, 3), "hud_t": kt_}
-                notes.append(f"CS2 speed ramp: {Path(ev['path']).name} ({'ending' if tk.get('ending') else 'headline'}): " +
-                             (f"weapon HUD switched to the knife {kt_:.2f} s after the kill, knife animation at +{kt_ + KNIFE_ANIM_S:.2f} s" if kt_ is not None else f"knife-out not used: {kwhy_}"))
+                kn_ = cs2_event_knife(ev, cfg)
+                tk["cs2ramp"] = {"knife_t": kn_["knife_t"] if kn_["ok"] else None, "hud_t": kn_["hud_t"], "post": kn_["post"]}
+                role_ = "ending" if tk.get("ending") else "headline"
             except Exception as ex_:                       # noqa: BLE001
                 tk["cs2ramp"] = {"knife_t": None}
                 notes.append(f"CS2 speed ramp: {Path(ev['path']).name}: knife-out not used: {type(ex_).__name__}: {ex_}")
         segs = split_parts(take_segments(tk, f_c, f_k, f_x), ev)
+        if tk.get("cs2ramp"):
+            cr_ = tk["cs2ramp"]
+            kn_ = ev.get("_knife") or {}
+            notes.append(f"CS2 speed ramp: {Path(ev['path']).name} ({'ending' if tk.get('ending') else 'headline'}): {cr_.get('why', 'normal slow-mo release')}"
+                         + (f"; knife: {kn_.get('why')}" if kn_ and not cr_.get("knife_t") else "")
+                         + (f"; footage after the kill {kn_['post']:.2f} s" if kn_.get("post") is not None else ""))
         if tk.get("cuts"):
             notes.append(f"dead air: {Path(ev['path']).name} jump-cut over {len(tk['cuts'])} empty stretch"
                          f"{'es' * (len(tk['cuts']) > 1)} between its kills ({ev['span']:.1f} s of fight shown in {tk['ospan']:.1f} s)")
@@ -10719,6 +10933,8 @@ def verify_cutlist(plan, log=True):
         tmax = max(TAIL[1], t["dur"] - row_tail - t["kills_out"][-1] + ROW_TAIL + ROW_SLACK)
         if t.get("slow"):
             tmax = max(tmax, SLOW_TAIL_MAX)                    # V7.6.1: a slow-mo take is released about 1 s after the kill
+            if (t.get("cs2ramp") or {}).get("knife_t"):
+                tmax = max(tmax, float(t["cs2ramp"]["knife_t"]) + KNIFE_TAIL_AFTER_S + 0.05)       # V8.6.2: the knife slow-down needs its footage
         if not t.get("ending") and tail > tmax + 1.0 / OUT_FPS:
             bad.append(f"take {i}: tail {tail:.2f} s after the last kill (max {tmax:.2f})")
         sg_l = [sg for sg in t["segs"] if sg[2] > 0][-1:]                   # my death or the clip end may come sooner
@@ -11085,8 +11301,8 @@ def drop_moment(rng, s, gp):
     before the kill). Kill time, speed, tail and kill row are not touched: only the music, one added low sound and the game audio level change."""
     v = rng.choice(DROP_VARIANTS)
     k = (s - 1.0) / 0.6
-    return {"t": round(float(gp), 4), "s": round(s, 3), "variant": v[0], "dip_s": v[1], "dip_db": round(min(9.5, 4.0 + 6.0 * k), 1), "boom_f1": v[2], "boom_f0": v[3], "boom_r": v[4], "boom_dec": v[5],
-            "boom_db": round(-2.0 + 2.0 * k, 1), "lift_db": round(2.0 + 3.0 * k, 1), "duck_db": round(4.0 + 3.0 * k, 1), "breath": v[6]}
+    return {"t": round(float(gp), 4), "s": round(s, 3), "variant": v[0], "dip_s": v[1], "boom_f1": v[2], "boom_f0": v[3], "boom_r": v[4], "boom_dec": v[5],
+            "boom_db": round(-2.0 + 2.0 * k, 1), "lift_db": round(2.0 + 3.0 * k, 1), "breath": v[6]}
 
 
 def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
@@ -11304,7 +11520,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
              f"colour split {cnt['rgb']}, punch {cnt['punch']}; {cnt['burst']} drop kill(s) with build-up, hit and afterglow; cuts: {cnt['settle']} settles, {cnt['mirror']} mirror cuts; "
              f"{cnt['speed']} faster run-ups",
              f"EFFECT PLAN: white flash on {cnt['flash']} of {len(cands)} kills (budget {budget} for {dur_all:.0f} s = one per {FLASH_PER_S:.0f} s; headline, drop kills, strong beat kills first; at least {FLASH_MIN_GAP_S:.1f} s apart, never on consecutive kills, one per take; peak at most {FLASH_A_MAX:.2f})",
-             f"EFFECT PLAN: drop moments: {len(drops_audio)} (music dip " + ", ".join(f"{d['dip_db']:.1f} dB / {d['dip_s']:.2f} s" for d in drops_audio) + ")" if drops_audio else "EFFECT PLAN: no drop moment (no drop kill)",
+             f"EFFECT PLAN: drop moments: {len(drops_audio)} (low hit on the kill, gunshot lift, vignette breath, build-up; the music is not lowered)" if drops_audio else "EFFECT PLAN: no drop moment (no drop kill)",
              f"EFFECT PLAN: sky recolour: up to {sky_max} for {dur_all:.0f} s (at least {SKY_SPACING_S:.0f} s apart, clear sky only; {len(sky_c)} candidate kills: headline / ending / last of a multikill / 1k flick, never a first, calm or middle kill; from the kill frame to the end of its take); "
              f"colour family from the song's feel: {', '.join(ranked[:3])} ({rank_why})"]
     for ln in lines:
@@ -11543,6 +11759,9 @@ SKY_HAZE = 0.85                      # V8.5: share of the sky's colour that beco
 SKY_Y_MAX = 205                      # V8.5: the sky never gets brighter than this (video levels): deep, never glaring
 SKY_OPACITY = 0.93                   # V8.5: the haze lets a little of the sky show through (never a solid paint)
 SKY_MAX_ROW = 1.0                   # V8.5: the sky mask never goes below the vertical middle of the picture (walls lower down are never painted)
+SKY_MIN_L = 120                      # V8.6.2: a sky is bright: a smooth region darker than this (Lab L, 0-255) is a wall
+SKY_FRAME_MAX_COV = 0.45             # V8.6.2: a sky region that covers more of the picture than this is a wall; a take with more than SKY_MAX_BAD of such frames is skipped
+SKY_MAX_BAD = 0.15
 SKY_HOLD_FRAMES = 15                 # V8.5: a frame whose sky region collapses while the frames around it have one (a dropout) takes the nearest good frame's mask
 SKY_PALETTE = {                      # V8.6: the colour the sky's CHROMA is set to (luminance is kept, the dark clouds darken it multiplicatively): deep red first, then the cool songs' deep blue / teal / violet; no yellow, no acid green, no neon pink
     "ember": 0xC01818, "amber": 0xC4581A, "rose": 0x9A2850, "violet": 0x5A2AA0, "deep blue": 0x1A3AA8, "teal": 0x0E7C80}
@@ -11823,6 +12042,27 @@ def sky_blend_cover(rgb, cover, amount=0.35):
     return (int(r_ * 255) << 16) | (int(g_ * 255) << 8) | int(b_ * 255), f"palette blended {amount * 100:.0f}% toward the cover colour (hue {hc * 360:.0f} -> {h * 360:.0f} deg)"
 
 
+def sky_take_beats(plan, t, x):
+    """V8.6.2: the beats of the song inside a sky take after the kill, as [(seconds from the take's start, strength)]: the song map's downbeats 1.0, the other beats 0.45, scaled a little by the section level
+    (0.75 .. 1.0); from plan['beats_out'] (output seconds) with the song's own beat indices. Empty when the song map is not available."""
+    try:
+        an = get_songmap(plan["song"]["path"], plan["song"].get("csv_bpm"))
+        bt = [float(b) for b in an["beats"]]
+        down = {int(d) for d in (an.get("down") or [])}
+        lv = an.get("level") or []
+        st0 = float(plan["song"]["start_t"])
+        out_ = []
+        o0 = float(t.get("out_start", 0.0))
+        for i, b in enumerate(bt):
+            tr = b - st0 - o0
+            if x["p"] - 0.05 <= tr <= float(t.get("dur", 0.0)) + 0.1:
+                st = (1.0 if i in down else 0.45) * (0.75 + 0.25 * min(1.0, (float(lv[min(i // 2, len(lv) - 1)]) if lv else 1.0) / 2.0))
+                out_.append((round(tr, 4), round(st, 3)))
+        return out_
+    except Exception:                                      # noqa: BLE001
+        return []
+
+
 def sky_anim_params(energy, bpm):
     """V8.6: how fast the sky lives, from the song's energy (0..1) and BPM: cloud drift (mask pixels a second), breathing period (s, two bars), surge strength (0..1) and push (scale)."""
     try:
@@ -11833,27 +12073,32 @@ def sky_anim_params(energy, bpm):
         b = max(60.0, min(200.0, float(bpm)))
     except (TypeError, ValueError):
         b = 110.0
-    return {"drift": round(4.0 + 12.0 * e + 0.05 * (b - 60.0), 2), "period": round(8 * 60.0 / b, 2), "surge": round(0.55 + 0.4 * e, 2), "push": round(0.018 + 0.022 * e, 4)}
+    return {"drift": round(45.0 + 70.0 * e + 0.2 * (b - 60.0), 2), "period": round(8 * 60.0 / b, 2), "surge": round(0.7 + 0.3 * e, 2), "push": round(0.03 + 0.03 * e, 4), "depth": round(0.18 + 0.42 * e, 2)}
 
 
 def sky_cloud_field(w, h, nfr, fps, drift, period, seed):
-    """V8.6: a generator of dark-cloud density maps (h x w floats 0..1), one per output frame: soft fractal noise that drifts sideways (`drift` mask pixels a second) and breathes (the cloud threshold
-    swings with `period` seconds, so the clouds grow and thin), deterministic for the seed."""
+    """V8.6 / V8.6.2: a generator of dark-cloud density maps (h x w floats 0..1), one per output frame: two layers of soft fractal noise drifting sideways in opposite directions at different speeds (`drift` mask
+    pixels a second, V8.6.2: 3 times faster than before, so the movement is clearly visible; the slower layer moves the other way) and breathing (the cloud threshold swings with `period` seconds, so the clouds grow and
+    thin), deterministic for the seed."""
     import cv2
     import numpy as np
     rng = np.random.RandomState(int(seed) % (2 ** 31))
     ww = w * 3
-    base = np.zeros((h, ww), np.float32)
-    for sz, amp in ((16, 1.0), (32, 0.55), (64, 0.3)):
-        n = rng.rand(max(2, h // sz + 1), max(2, ww // sz + 1)).astype(np.float32)
-        n = np.concatenate([n, n[:, :1]], axis=1)
-        base += amp * cv2.resize(n, (ww, h), interpolation=cv2.INTER_CUBIC)
-    base = (base - base.min()) / max(1e-6, float(base.max() - base.min()))
+
+    def layer():
+        base = np.zeros((h, ww), np.float32)
+        for sz, amp in ((16, 1.0), (32, 0.55), (64, 0.3)):
+            n = rng.rand(max(2, h // sz + 1), max(2, ww // sz + 1)).astype(np.float32)
+            n = np.concatenate([n, n[:, :1]], axis=1)
+            base += amp * cv2.resize(n, (ww, h), interpolation=cv2.INTER_CUBIC)
+        return (base - base.min()) / max(1e-6, float(base.max() - base.min()))
+    a_, b_ = layer(), layer()
     for f in range(nfr):
         t = f / float(fps)
-        off = int(t * drift) % w
-        win = base[:, off:off + w]
-        th = 0.50 + 0.10 * np.sin(2 * np.pi * t / max(1.0, period))
+        oa = int(t * drift) % w
+        ob = (ww - w - int(t * drift * 0.55)) % (ww - w)
+        win = 0.62 * a_[:, oa:oa + w] + 0.38 * b_[:, ob:ob + w]
+        th = 0.50 + 0.17 * np.sin(2 * np.pi * t / max(1.0, period))
         yield np.clip((win - th) * 6.0 + 0.5, 0.0, 1.0)
 
 
@@ -11974,8 +12219,10 @@ def sky_eyedrop(img):
     info.update({"cov": float(m.mean()), "top": float(m[:int(h * 0.15)].mean()), "low": float(rows.max() / h) if len(rows) else 0.0})
     if (b0 - 128.0) > 8.0 and L0 < 200:
         info["why"] = "the smooth region is warm (orange / yellow): a wall, not a sky"
-    elif L0 < 30:
-        info["why"] = "the smooth region is almost black"
+    elif L0 < SKY_MIN_L:
+        info["why"] = "the smooth region is too dark for a sky (a wall)"
+    elif info["cov"] > SKY_FRAME_MAX_COV:
+        info["why"] = "the smooth region covers too much of the picture (a wall)"
     elif info["low"] > 0.72:
         info["why"] = "the region runs down the picture (a wall, not a sky)"
     else:
@@ -12056,11 +12303,21 @@ def sky_take_mask(t, x, zone, path, ramp=False):
         img = frs[min(len(frs) - 1, max(0, int(round((st - base) * 60))))]
         imgs.append(img)
         samples.append(sky_eyedrop_sample(img))
-    segm, ys = [], []
+    segm, ys, status = [], [], []
     for img, sp in zip(imgs, sky_smooth_samples(samples)):           # the sampled sky colour follows the sky over the take, smoothed (no jumps)
-        m = sky_eyedrop_mask(img, sp) if sp is not None else np.zeros((h, w), bool)
-        if m.any() and (float(m.mean()) > XFX_SKY_MAX_COV or float(np.where(m.any(1))[0].max()) / h > 0.72):          # a region that fills the picture / runs far down it is a wall, not a sky
-            m = np.zeros((h, w), bool)
+        m = np.zeros((h, w), bool)
+        st_ = "none"                                                   # no sky in this picture
+        if sp is not None:
+            if float(sp["lab"][0]) < SKY_MIN_L:
+                st_ = "bad"                                            # a smooth region that is too dark for a sky (a wall)
+            else:
+                m = sky_eyedrop_mask(img, sp)
+                if m.any() and (float(m.mean()) > SKY_FRAME_MAX_COV or float(np.where(m.any(1))[0].max()) / h > 0.72):          # a region that fills the picture / runs far down it is a wall, not a sky
+                    m = np.zeros((h, w), bool)
+                    st_ = "bad"
+                elif m.any():
+                    st_ = "ok"
+        status.append(st_)
         segm.append(m.astype(np.uint8))
         if m.any():
             ys.append(float(np.mean(img[m] @ np.array([0.1826, 0.6142, 0.0620], np.float32)) + 16))
@@ -12074,8 +12331,11 @@ def sky_take_mask(t, x, zone, path, ramp=False):
         ref = win[len(win) // 2]
         good.append(not (ref > 0.03 and cv[i] < 0.35 * ref))
     held = 0
+    n_bad = sum(1 for q in status if q == "bad")
     if any(good):
-        gi = [i for i in range(k) if good[i]]
+        gi = [i for i in range(k) if good[i] and status[i] == "ok"]          # a held mask is only a mask that passed every check itself
+        if not gi:
+            good = [True] * k
         for i in range(k):
             if not good[i]:
                 j = min(gi, key=lambda q: abs(q - i))
@@ -12113,6 +12373,14 @@ def sky_take_mask(t, x, zone, path, ramp=False):
                 fh.write(zero)
             if ramp:
                 dens = np.clip(1.0 - (1.0 - gcol) * (1.0 - (cl if cl is not None else 0.0) * SKY_CLOUD_MAX), 0.0, 1.0)
+                if an_ and x.get("beats") and f >= f0:                         # V8.6.2: after the kill the density pulses on the beats of the song (strong beats more), depth from the song's energy; between the pulses it is steady
+                    tr = f / float(OUT_FPS)
+                    pul = 0.0
+                    for bt_, bs_ in x["beats"]:
+                        if bt_ <= tr:
+                            pul += bs_ * float(np.exp(-(tr - bt_) / 0.14))
+                    pul = min(1.0, pul)
+                    dens = np.clip(dens + an_["depth"] * pul * (1.0 - dens), 0.0, 1.0)
                 fh.write(np.clip(dens * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes())
                 tt = (f - f0) / float(OUT_FPS)
                 sg = (an_["surge"] * float(np.exp(-max(0.0, tt) / (SKY_SURGE_S / 2.5)))) if (an_ and tt >= 0) else 0.0
@@ -12120,7 +12388,7 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     if ramp:
         x["mask_fmt"] = "yuv444p"
     cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm])) if segm else 0.0
-    return {"mean_y": ymean, "frames": nf, "cov": cov, "held": held, "horizon": x["horizon"]}
+    return {"mean_y": ymean, "frames": nf, "cov": cov, "held": held, "horizon": x["horizon"], "bad": n_bad, "window": k, "ok_frames": sum(1 for q in status if q == "ok")}
 
 
 def sky_mask_input(x):
@@ -12166,7 +12434,9 @@ def xfx_sky_chain(chains, base, lab, x, kin):
         chains.append(f"[{base}kG][{base}km]alphamerge[{base}kGa]")
         pk, pp = float(x.get("push", 0.03)), float(x["p"])
         sc_ = f"(1+{pk:.4f}*gt(t,{pp:.4f})*exp(-(t-{pp:.4f})/{SKY_SURGE_S / 2.5:.3f}))"
-        chains.append(f"[{base}kGa]scale=w='trunc(1920*{sc_}/2)*2':h='trunc(1080*{sc_}/2)*2':eval=frame:flags=bicubic,crop=1920:1080[{base}kGp]")
+        dec_ = f"(gt(t,{pp:.4f})*exp(-(t-{pp:.4f})/0.09))"                  # V8.6.2: the shake dies out in ~0.2 s, never larger than 80 % of the room the push leaves (the layer stays inside the picture)
+        chains.append(f"[{base}kGa]scale=w='trunc(1920*{sc_}/2)*2':h='trunc(1080*{sc_}/2)*2':eval=frame:flags=bicubic,"
+                      f"crop=1920:1080:x='(in_w-1920)/2*(1+0.8*{dec_}*sin(2*PI*17*(t-{pp:.4f})))':y='(in_h-1080)/2*(1+0.8*{dec_}*sin(2*PI*13*(t-{pp:.4f})+1))'[{base}kGp]")
         chains.append(f"[{base}ka][{base}kGp]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}ks2]")
         return f"[{base}ks2]"
     chains.append(f"{lab}format=yuv420p,split=3[{base}ka][{base}kb][{base}kc]")
@@ -12209,9 +12479,11 @@ def sky_grade_v2(rgb, kind):
     """V8.6: the lutyuv constants of the three colour layers of the new sky: 'steady' (the palette colour, luminance kept), 'dark' (the clouds / the gradient: the same hue, brightness x 0.38 about black: darker, never lifted;
     'dark' gradient = red to black: even deeper), 'surge' (the impact: chroma pushed 20 % past the palette colour, brightness x 1.14, never past SKY_Y_MAX). Chroma is SKY_HAZE of the colour's, the rest the sky's own."""
     yt, ut, vt = _rgb_to_yuv(rgb)
-    return {"steady": {"y_mul": 0.45, "u": ut, "v": vt, "haze": SKY_HAZE, "y_max": 150},
-            "dark": {"y_mul": 0.10 if kind == "dark" else 0.16, "u": 128 + (ut - 128) * 0.9, "v": 128 + (vt - 128) * 0.9, "haze": 0.92, "y_max": 235},
-            "surge": {"y_mul": 0.95, "u": 128 + (ut - 128) * 1.2, "v": 128 + (vt - 128) * 1.2, "haze": 1.0, "y_max": SKY_Y_MAX}}
+    r_, g_, b_ = (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255
+    ym = 0.95 if (r_ > 2 * g_ and r_ > 2 * b_) else 0.55          # calibrated so the mean sky brightness is about 40 % of the original (35 - 45 %): a red keeps less luminance per unit of Y than a blue / teal / violet
+    return {"steady": {"y_mul": ym, "u": ut, "v": vt, "haze": SKY_HAZE, "y_max": 200},
+            "dark": {"y_mul": 0.20 if kind == "dark" else 0.28, "u": 128 + (ut - 128) * 0.9, "v": 128 + (vt - 128) * 0.9, "haze": 0.92, "y_max": 235},
+            "surge": {"y_mul": 1.0, "u": 128 + (ut - 128) * 1.25, "v": 128 + (vt - 128) * 1.25, "haze": 1.0, "y_max": 235}}
 
 
 def sky_grade(rgb, mean_y, grad=None, kind="sunset"):
@@ -12285,8 +12557,10 @@ def xfx_probe_sky(plan, tmpdir=None):
             else:
                 pal_why = f"{cov_why}: palette from the song feel only"
             an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"))
-            x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "grad_dark": 0.55 if gk == "dark" else 0.25})
+            x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "grad_dark": 0.55 if gk == "dark" else 0.25, "beats": sky_take_beats(plan, plan["takes"][ti], x)})
             st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True)                  # (again: with the animation planes)
+            if st["bad"] > SKY_MAX_BAD * max(1, st["window"]):                           # V8.6.2: a wrong sky is worse than none
+                raise RuntimeError(f"the sky mask was a wall in {st['bad']} of {st['window']} frames of the take - no sky for this take")
             x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade_v2(rgb, gk), "mask_cov": round(st["cov"], 3),
                       "grad": gk, "held": st["held"], "palette_rgb": rgb, "palette_why": pal_why})
             kept.append(gp)
@@ -12633,12 +12907,11 @@ def build_filter(plan, cfg, preview, fx=None):
     drops_ = [d_ for d_ in (plan.get("xfx_drop") or []) if "drop" in fx and 0.2 < float(d_["t"]) < D - 0.1] if plan.get("effects") == "extra" else []
     if drops_:                                                                          # V8.4.5 drop moments (EXTRA only): music dip, low hit, gunshot lift; see drop_audio_filters
         music_dip, lift, hits = drop_audio_filters(drops_)
-        chains.append(f"[sg]volume='{music_dip}':eval=frame[sgd]")
         chains.append(f"[gc]volume='{head:.4f}*{lift}':eval=frame[gh]")
         for i_, h_ in enumerate(hits):
             chains.append(f"{h_}[hit{i_}]")
         chains.append("".join(f"[hit{i_}]" for i_ in range(len(hits))) + (f"amix=inputs={len(hits)}:duration=longest:normalize=0" if len(hits) > 1 else "anull") + "[bm]")
-        music_l, extra_in = "[sgd]", "[bm]"
+        music_l, extra_in = "[sg]", "[bm]"
     else:
         chains.append(f"[gc]volume={head:.4f}[gh]")
         music_l, extra_in = "[sg]", ""
@@ -12651,19 +12924,15 @@ def build_filter(plan, cfg, preview, fx=None):
 
 
 def drop_audio_filters(drops):
-    """V8.4.5: the audio filters of the drop moments. Returns (music dip expression, game lift expression, [aevalsrc chain texts]).
-    - music dip: for each drop the music falls by dip_db over 80 ms (the breath) and stays down until the kill; on the kill it comes back at once, but ducked by duck_db (4 .. 7 dB) for a moment,
-      recovering over ~0.15 s (exp(-7 t)): that is the room the low hit needs (the music is mastered up to the limiter, an added sound would only be limited away);
+    """V8.4.5 / V8.6.2: the audio filters of the drop moments. Returns ("1" = no music change, game lift expression, [aevalsrc chain texts]).
+    - V8.6.2: there is NO music dip and NO duck any more (V8.4.5 lowered the music before the kill and ducked it on the kill): the music level is never touched;
     - game lift: the gunshot of the drop kill is lifted by lift_db from 50 ms before to 0.3 s after the kill (with soft ends);
     - hit: a synthesised low hit starting exactly on the kill: a sine whose pitch falls from boom_f0 to boom_f1 Hz (rate boom_r) with an exponential decay, plus a quiet second harmonic, 0.9 s,
       stereo (identical channels: no phase / delay between left and right), placed with adelay. They are mixed with the music and the game audio before the limiter (nothing is stretched or
       shifted: the music and game streams keep their timing)."""
     dips, lifts, hits = [], [], []
     for d in drops:
-        T, L = float(d["t"]), float(d["dip_s"])
-        g = 10 ** (-float(d["dip_db"]) / 20)
-        post = 1 - 10 ** (-float(d.get("duck_db", 4.0)) / 20)
-        dips.append(f"(1-{1 - g:.4f}*clip((t-{T - L:.4f})/0.08,0,1)*clip(({T + 0.001:.4f}-t)/0.001,0,1))*(1-{post:.4f}*clip((t-{T:.4f})/0.001,0,1)*exp(-7*max(0,t-{T:.4f})))")      # V8.6: max(0, ..): before the drop the exponent was +7 x (T - t), above 709 (t more than ~100 s before the drop) exp() overflowed to inf and 0 * inf = NaN silenced the music of the whole first part
+        T = float(d["t"])
         lf = 10 ** (float(d["lift_db"]) / 20)
         lifts.append(f"(1+{lf - 1:.4f}*clip((t-{T - 0.05:.4f})/0.02,0,1)*clip(({T + 0.30:.4f}-t)/0.10,0,1))")
         f1, f0, r, dec = float(d["boom_f1"]), float(d["boom_f0"]), float(d["boom_r"]), float(d["boom_dec"])
@@ -12672,7 +12941,7 @@ def drop_audio_filters(drops):
         e_ = f"{amp:.4f}*(sin({ph})+0.25*sin(2*{ph}))*exp(-{dec:.2f}*t)*min(1,t*400)"
         ms = int(round(T * 1000))
         hits.append(f"aevalsrc='{e_}|{e_}':d=0.9:s=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={ms}|{ms}")
-    return "*".join(dips), "*".join(lifts), hits
+    return "1", "*".join(lifts), hits                          # V8.6.2: no music dip, no duck: the music level is never touched by the drop moment ("1" = unchanged)
 
 
 def enc_args(maxq, preview, nvenc):
@@ -17402,6 +17671,8 @@ class App:
             n = 15                                                  # R6S: unscanned clips have no kill times to size the pick with: a fixed N (the number box overrides it)
 
         def work():
+            nonlocal cands
+            cands = cs2_dm_filter_cands(load_config(), cands, self._snap.get("m_game", "valorant"))      # V8.6.2: no CS2 deathmatch clips (hand-ticked ones are never touched)
             if n:
                 paths = [c["path"] for c in random.sample(cands, min(n, len(cands)))]
                 why = f"you asked for {n}" if n <= len(cands) else f"you asked for {n}, only {len(cands)} eligible, so all were ticked"
@@ -17459,9 +17730,10 @@ class App:
             except Exception as ex:
                 out(f"Auto: song map unavailable ({ex})")
                 return
+            cands_ = cs2_dm_filter_cands(load_config(), cands, game)                  # V8.6.2: no CS2 deathmatch clips
             QUIET.on = True
             try:
-                allp, info = auto_fill_verified(load_config(), game, cands, song["path"], an, style, seed, note=out)
+                allp, info = auto_fill_verified(load_config(), game, cands_, song["path"], an, style, seed, note=out)
             finally:
                 QUIET.on = False
             msg = (f"Auto: {len(allp)} clips ticked, planned {info['length']:.0f} s, target {info['target']:.0f} s for '{song.get('title') or Path(song['path']).stem}' "

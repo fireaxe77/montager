@@ -1,0 +1,17 @@
+valorant: 5 takes
+take  1 (Valorant 2024.08.18 - 02.14.15.14.DVR.mp4): source low-end share  +13.1 dB | render game audio  +13.2 dB | difference  +0.1 dB | chain: clip gain -2.46 dB (lift 8.0)
+take  2 (Valorant 2024.10.15 - 17.56.56.02.DVR.mp4): source low-end share  +11.0 dB | render game audio  +10.5 dB | difference  -0.5 dB | chain: clip gain -5.7 dB (lift 4.76)
+take  3 (Valorant 2024.10.07 - 18.17.04.03.DVR.mp4): source low-end share  +11.6 dB | render game audio  +11.9 dB | difference  +0.3 dB | chain: clip gain -4.5 dB (lift 5.96)
+take  4 (Valorant 2024.10.13 - 19.16.51.04.DVR.mp4): source low-end share   +9.0 dB | render game audio   +8.7 dB | difference  -0.3 dB | chain: clip gain -2.46 dB (lift 8.0)
+take  5 (Valorant 2024.10.08 - 12.23.13.23.DVR.mp4): source low-end share   +3.1 dB | render game audio   +4.4 dB | difference  +1.3 dB | chain: clip gain -40.46 dB (lift 0.0)
+mean difference render - source: +0.2 dB (positive = our chain adds low end)
+
+cs2: 5 takes
+take  1 (Counter-strike 2 2024.04.27 - 20.58.48.25.DV): source low-end share  +11.4 dB | render game audio  +11.2 dB | difference  -0.2 dB | chain: clip gain -2.46 dB (lift 8.0)
+take  2 (Counter-strike 2 2024.04.06 - 20.00.32.06.DV): source low-end share   +3.8 dB | render game audio   +4.2 dB | difference  +0.4 dB | chain: clip gain -2.46 dB (lift 8.0)
+take  3 (Counter-strike 2 2024.04.27 - 17.47.10.18.DV): source low-end share   +8.9 dB | render game audio  +10.0 dB | difference  +1.1 dB | chain: clip gain -2.46 dB (lift 8.0)
+take  4 (Counter-strike 2 2024.04.02 - 00.57.45.21.DV): source low-end share   +6.0 dB | render game audio   +5.5 dB | difference  -0.5 dB | chain: clip gain -2.46 dB (lift 8.0)
+take  5 (Counter-strike 2 2024.04.29 - 17.00.42.07.DV): source low-end share   -0.9 dB | render game audio   -1.6 dB | difference  -0.7 dB | chain: clip gain -2.7 dB (lift 7.76)
+mean difference render - source: +0.0 dB (positive = our chain adds low end)
+
+RESULT: the render's game audio has the same low-end share as the source clips (mean difference within about +-0.5 dB for Valorant, see the CS2 value above): the chain adds no bass. It has no EQ, no loudness step and no stereo / surround effect; the only gain steps are the clip gain (-2.5 .. -40 dB with up to +8 dB lift for quiet clips, a gain that scales ALL frequencies equally) and the 2 dB headroom, and the limiter at 0.99 (it only acts on peaks). The strong low end (+3 .. +13 dB below 200 Hz relative to 200 Hz - 4 kHz) is in the source clips (game sound design / the recorder). Nothing was changed.
