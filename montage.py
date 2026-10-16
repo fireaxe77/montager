@@ -59,7 +59,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.4.5"
+APP_VERSION = "V8.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -8742,6 +8742,8 @@ def optimal_length(events, bd, notes):
 
 HEADLINE_RULES_V73 = True               # V7.3: headline anchor (finisher on the drop) + single-kill tie-break; False = the V7.2 planner (tests compare against it)
 
+FULL_CAP_S, FULL_MIN_S, FULL_TOTAL_S = 150.0, 90.0, 180.0     # V8.5: Force New Full / Manual Auto only: montage content at most 2:30 (3:00 with the ending), a long song's section is 1:30 .. 2:30; the one place to change it
+FULL_CTX = {"on": False}                # V8.5: True while make_plan(full=True) plans: optimal_fit() then uses the FULL_* range instead of OPT_RANGE
 OPT_RANGE = (80.0, 180.0)               # V5.42B Optimal: 80 s minimum (when the material allows), V8.4.1: 180 s maximum (was 150), never past the song
 
 
@@ -9449,7 +9451,9 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     bd = float(np.median(np.diff(bt)))
     song_end = float(an.get("dur") or (bt[-1] + bd)) - 0.1
     avail = song_end - float(bt[0])
-    mx = min(OPT_RANGE[1], avail)
+    full = bool(FULL_CTX["on"])
+    mx = min(FULL_CAP_S if full else OPT_RANGE[1], avail)
+    rng_lo, cap_v = (FULL_MIN_S, FULL_CAP_S) if full else OPT_RANGE
     est = {id(e): take_estimate(e, bd, rname) for e in clips}
     end_x = (END_FADE[0] + END_FADE[1]) / 2 - 0.4           # the slow-mo ending runs longer than a normal tail
     total = lambda lst: sum(est[id(e)] for e in lst) + (end_x if len(lst) >= 3 else 0.0)
@@ -9457,8 +9461,15 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     left = []
     while len(chosen) > 1 and total(chosen) > mx - bd:         # one beat of room for the drop alignment
         e = chosen.pop()
-        left.append((e, f"don't fit in {mx:.0f} s ({'the whole song' if mx < OPT_RANGE[1] else f'the {OPT_RANGE[1]:.0f} s maximum'})"))
+        left.append((e, f"don't fit in {mx:.0f} s ({'the whole song' if mx < cap_v else f'the {cap_v:.0f} s maximum'})"))
     L = min(mx, total(chosen))
+    last_b0 = int(np.searchsorted(bt, song_end, side="right") - 1)
+    if full:                                               # V8.5: the whole song when it fits the cap; a long song tries every length from 1:30 up to the cap
+        L = min(L, float(bt[last_b0] - bt[0]))
+        Ls = [L] + ([x for x in range(int(L) - 10, int(FULL_MIN_S) - 1, -10)] if L > FULL_MIN_S + 5 and avail > FULL_CAP_S else [])
+    else:
+        Ls = [L]
+    L_top = L
     # song section: [S, E], E on a phrase / section boundary (or the song end), S = E - L; drop inside it preferred
     nb = len(bt)
     last_b = int(np.searchsorted(bt, song_end, side="right") - 1)
@@ -9472,7 +9483,8 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
         drops = [{"beat": int(np.argmin(np.abs(bt - t_))), "strength": 2.0} for t_ in lab_t]
         main = min((d["beat"] for d in drops), key=lambda b: abs(b - main)) if main is not None else drops[0]["beat"]
     best, allc = None, []
-    for E in bounds:
+    for L in Ls:
+      for E in bounds:
         if E > last_b or bt[E] - bt[0] < L - 1e-6:
             continue
         s_t = float(bt[E]) - L
@@ -9492,7 +9504,8 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
         elif inside:
             sc += 1.5
         sc += 0.5 * (E in sec_b) + 0.3 * (E == last_b) + 0.2 * float(np.mean(an["level"][S:E] if len(an.get("level", [])) >= E else [0]))
-        allc.append((sc, S, E, inside))
+        allc.append((sc + (0.01 * L if full else 0.0), S, E, inside, L))
+    L = L_top
     allc = sorted(allc, key=lambda c_: -c_[0])             # V7.6.1: every candidate section, best first; plan_montage tries the best few and keeps the one that places the most
     seen_c, uniq = set(), []
     for c_ in allc:
@@ -9503,8 +9516,13 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     if allc:
         best = allc[min(rank, len(allc) - 1)]
     if best is None:                                       # the material needs the whole song
-        best = (0.0, 0, last_b, [d for d in drops if d["beat"] < last_b])
-    _, S, E, inside = best
+        best = (0.0, 0, last_b, [d for d in drops if d["beat"] < last_b], L)
+    _, S, E, inside, L = best
+    if full and L < L_top - 1e-6:                          # V8.5: a shorter section than the material allows: the weakest clips that no longer fit are left out
+        while len(chosen) > 1 and total(chosen) > L - bd:
+            e = chosen.pop()
+            left.append((e, f"don't fit in the {L:.0f} s section"))
+        L = min(L, total(chosen))
     fr = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
     # V7.4.7: a map drop inside the section that misses the strict 20-60 % room (but has a run-up and a tail) still beats the anchor / a computed downbeat
     lenient = [d for d in drops if S < int(d["beat"]) < E and 0.1 <= fr(int(d["beat"])) <= 0.8 and bt[int(d["beat"])] - bt[S] >= 10.0 and bt[E] - bt[int(d["beat"])] >= 8.0]
@@ -9525,11 +9543,11 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
         dwhy = "no drop fits inside this section - a downbeat ~38% in" + (" - drop kept (no map drop in section: " + drop_fail(drops, S, E, bt, fr) + ")" if drops else "")
     second = [d for d in drops if S < int(d["beat"]) < E and abs(int(d["beat"]) - drop_b) > 2]
     end_kind = "the song end" if E == last_b else "a section boundary" if E in sec_b else "a 4-bar phrase"
-    rng_txt = (f"range {OPT_RANGE[0]:.0f}-{mx:.0f} s" if mx >= OPT_RANGE[0] else f"at most {mx:.0f} s") + \
-        f" ({f'the {OPT_RANGE[1]:.0f} s maximum' if mx >= OPT_RANGE[1] else 'the whole song is ' + format(avail, '.0f') + ' s'})"
+    rng_txt = (f"range {rng_lo:.0f}-{mx:.0f} s" if mx >= rng_lo else f"at most {mx:.0f} s") + \
+        f" ({f'the {cap_v:.0f} s maximum' if mx >= cap_v else 'the whole song is ' + format(avail, '.0f') + ' s'})"
     why = (f"OPTIMAL {L:.0f} s ({rname} pacing): {len(chosen)} of {len(clips)} usable clips ~ {total(chosen):.0f} s; {rng_txt}"
-           + (f"; under {OPT_RANGE[0]:.0f} s because that is all the usable material (nothing is padded)"
-              if L < min(OPT_RANGE[0], mx) - 0.5 and not left else "")
+           + (f"; under {rng_lo:.0f} s because that is all the usable material (nothing is padded)"
+              if L < min(rng_lo, mx) - 0.5 and not left else "")
            + (f"; {len(left)} weakest didn't fit: " + ", ".join(Path(e["path"]).name for e, _ in left) if left else "")
            + f". Song section {ts(bt[S])}-{ts(bt[E])} ends on {end_kind}; drop at {ts(bt[drop_b])} ({dwhy}, {fr(drop_b):.0%} in)")
     return {"cands_n": max(1, len(allc)), "rank": rank, "length": round(L, 2), "start_beat": int(S), "end_beat": int(E), "drop_beat": int(drop_b), "clips": chosen,
@@ -9632,7 +9650,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     if fitm:                                 # V5.42B: THE shared Optimal rule picks length, section and clips
         fit = optimal_fit(usable, an, rname, song_path=song.get("path"), rank=fit_rank)
         if not manual and plain:                           # V6.0: best multikills first, then best singles, until >= 80 s (never padded)
-            need, added = min(OPT_RANGE[0], fit["max"]) - 0.5, 0
+            need, added = (fit["max"] if FULL_CTX["on"] else min(OPT_RANGE[0], fit["max"])) - 0.5, 0
             for e in sorted(plain, key=lambda e: -e["score"]):
                 if fit["length"] >= need:
                     break
@@ -10877,11 +10895,11 @@ def xfx_strength(t):
 
 XFX_FX = ("split", "grade", "sky", "drop")     # V8.4.3: the extra effects that switch on in the render (glow / flash are gone: no effect washes the picture in a colour); transition = mirror, zoom = settle / punch
 FEEL_PROFILES = {                    # V8.4.4: how a style's montage is dressed: weight of each kill effect (white flash / colour split / zoom punch), how many a montage keeps, share of kills dressed, cut effects, sky
-    "aggressive": {"w": {"punch": 0.9, "split": 0.6}, "k": (2, 3), "share": 0.52, "settle": 0.7, "mirror": 0.5, "sky": 3},
-    "hype": {"w": {"punch": 0.8, "split": 0.3}, "k": (1, 2), "share": 0.46, "settle": 0.6, "mirror": 0.3, "sky": 2},
-    "cinematic": {"w": {"punch": 0.4, "split": 0.15}, "k": (1, 2), "share": 0.38, "settle": 0.4, "mirror": 0.15, "sky": 3},
-    "smooth": {"w": {"punch": 0.35, "split": 0.1}, "k": (1, 2), "share": 0.3, "settle": 0.5, "mirror": 0.0, "sky": 1},
-    "chill": {"w": {"punch": 0.25, "split": 0.05}, "k": (1, 1), "share": 0.22, "settle": 0.4, "mirror": 0.0, "sky": 1}}
+    "aggressive": {"w": {"punch": 0.9, "flash": 0.8, "split": 0.6}, "k": (2, 3), "share": 0.52, "settle": 0.7, "mirror": 0.5, "sky": 3},
+    "hype": {"w": {"punch": 0.8, "flash": 0.5, "split": 0.3}, "k": (1, 2), "share": 0.46, "settle": 0.6, "mirror": 0.3, "sky": 2},
+    "cinematic": {"w": {"punch": 0.4, "flash": 0.3, "split": 0.15}, "k": (1, 2), "share": 0.38, "settle": 0.4, "mirror": 0.15, "sky": 3},
+    "smooth": {"w": {"punch": 0.35, "flash": 0.2, "split": 0.1}, "k": (1, 2), "share": 0.3, "settle": 0.5, "mirror": 0.0, "sky": 1},
+    "chill": {"w": {"punch": 0.25, "flash": 0.1, "split": 0.05}, "k": (1, 1), "share": 0.22, "settle": 0.4, "mirror": 0.0, "sky": 1}}
 FEEL_PROFILES["mix"] = FEEL_PROFILES["hype"]
 XFX_SKY_CANDS = 24                   # kills that are looked at for a clear sky (drop / headline / ending / flick kills; the render keeps the clear ones, SKY_SPACING_S apart, at most sky_max_for(length))
 
@@ -11021,11 +11039,11 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
         lag = ((t.get("rows_out") or t["kills_out"])[c["i"]] - p) if c["i"] < len(t.get("rows_out") or t["kills_out"]) else 0.15
         fx = per_take[c["ti"]]
         if c["drop"]:
-            kinds = ["split", "punch"]
+            kinds = ["flash", "split", "punch"]
         else:
             n_e = 3 if sc >= 1.6 else 2 if sc >= 1.05 else 1
             kinds = []
-            opts = [x for x in sig if x != "flash"]
+            opts = [x for x in sig]
             rng.shuffle(opts)
             opts.sort(key=lambda x: (x == prev_first, -prof["w"].get(x, 0.1) * rng.uniform(0.6, 1.4)))
             for x in opts[:n_e]:
@@ -11033,6 +11051,9 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
             if not kinds:
                 kinds = [sig[0]]
             prev_first = kinds[0]
+        if "flash" in kinds:                                     # V8.5: the white pulse is back on the dressed kills (V8.4.4 density); the look stays the V8.4.5 stylised pulse (peak FLASH_A_MAX)
+            fx.append({"k": "flash", "p": round(p, 4), "a": round(max(FLASH_A_MIN, min(FLASH_A_MAX, 0.10 + 0.10 * sc * par["f"] * (1.25 if c["drop"] else 1.0))), 3), "t1": XFX_FLASH_S})
+            cnt["flash"] += 1
         if "split" in kinds:
             fx.append({"k": "rgb", "p": round(p, 4), "px": int(max(2, min(10, round(par["px"] * sc * (1.35 if c["drop"] else 1.0) / 1.0)))), "t1": XFX_RGB_S})
             cnt["rgb"] += 1
@@ -11055,28 +11076,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
                 fx.append({"k": "breath", "p": round(p, 4), "t0": round(p - dm["dip_s"], 4), "a": dm["breath"], "s": round(s_drop, 3)})
                 cnt["breath"] += 1
     cnt["clean"] = len(cands) - cnt["kills"]
-    # (3b) the white flash: an emphasis effect, not a flashbang: the drop kills and the headline kill, then a few of the strongest beat-landing kills; about one every FLASH_EVERY_S seconds on average
-    budget = max(2, int(round(dur_all / FLASH_EVERY_S)))
-    flash_sel = []
-
-    def flash_ok(c, gap):
-        for o in flash_sel:
-            if abs(c["gp"] - o["gp"]) < gap or abs(c["order"] - o["order"]) <= 1 or c["ti"] == o["ti"]:
-                return False                                              # never two close together, never on consecutive kills, one per take (never on every kill of a multikill)
-        return True
-    for c in sorted([c for c in cands if c["drop"]], key=lambda c: (not c["head"], -c["sc"])):
-        if len(flash_sel) < budget and flash_ok(c, 1.0):
-            flash_sel.append(c)
-    for c in sorted([c for c in cands if not c["drop"] and c["on"] and c["sc"] >= 1.0], key=lambda c: -c["sc"]):
-        if len(flash_sel) >= budget:
-            break
-        if flash_ok(c, FLASH_MIN_GAP_S):
-            flash_sel.append(c)
-    for c in sorted(flash_sel, key=lambda c: c["gp"]):
-        t = takes[c["ti"]]
-        s_ = xfx_strength(t) * (1.35 if c["head"] else 1.25 if c["drop"] else 1.0)
-        per_take[c["ti"]].append({"k": "flash", "p": round(c["p"], 4), "a": round(max(FLASH_A_MIN, min(FLASH_A_MAX, 0.12 + 0.12 * s_)), 3), "t1": XFX_FLASH_S})
-        cnt["flash"] += 1
+    budget = cnt["flash"]
     # (4) cut side
     for ti, t in enumerate(takes):
         first = (t.get("kills_out") or [9.0])[0]
@@ -11094,7 +11094,8 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
     # (5) sky candidates: the drop kills, the headline kill, the ending's last kill and flick kills - never a first, a calm or an ordinary middle take; the render keeps the ones with a clear sky,
     # as many as fit the montage's length (sky_max_for) and SKY_SPACING_S apart, best role first
     ranked, rank_why = sky_ranked(recipe, energy, (plan.get("song") or {}).get("bpm"))
-    plan["xfx_sky_rank"] = {"names": ranked, "why": rank_why}
+    g_kind, g_why = sky_gradient_kind(recipe, energy, (plan.get("song") or {}).get("bpm"))
+    plan["xfx_sky_rank"] = {"names": ranked, "why": rank_why, "grad": g_kind, "grad_why": g_why}
     sky_max = 0 if prof["sky"] <= 0 else sky_max_for(dur_all)
     sky_c = []
     for c in sorted(cands, key=lambda c: (-(3 if c["head"] else 2 if c["drop"] else 1 if c["end"] else 0), -c["sc"])):
@@ -11110,7 +11111,8 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
     for c in sky_c:
         t = takes[c["ti"]]
         dur = float(t.get("dur") or 0)
-        per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": round(max(0.0, c["p"] - XFX_SKY_IN), 4), "t1": round(min(dur, c["p"] + XFX_SKY_OUT), 4),
+        per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": 0.0, "t1": round(dur, 4),                                  # V8.5: the whole take
+                                  
                                   "ok": None, "gp": round(c["gp"], 3), "why": c["why"], "prio": 3 if c["head"] else 2 if c["drop"] else 1 if c["end"] else 0})
     plan["xfx_sky_max"] = sky_max
     plan["xfx_drop"] = drops_audio
@@ -11129,8 +11131,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
              f"EFFECT PLAN: {cnt['kills']} of {len(cands)} kills dressed ({share * 100:.0f}% share by style / energy, {on_n} on a beat; the rest stay clean): "
              f"colour split {cnt['rgb']}, punch {cnt['punch']}; {cnt['burst']} drop kill(s) with build-up, hit and afterglow; cuts: {cnt['settle']} settles, {cnt['mirror']} mirror cuts; "
              f"{cnt['speed']} faster run-ups",
-             f"EFFECT PLAN: white flash on {cnt['flash']} of {len(cands)} kills (budget {budget} for {dur_all:.0f} s = one per {FLASH_EVERY_S:.0f} s on average; {sum(1 for c in flash_sel if c['drop'])} drop / headline kills, "
-             f"{sum(1 for c in flash_sel if not c['drop'])} strong beat kills; at least {FLASH_MIN_GAP_S:.1f} s apart, never on consecutive kills, one per take, peak at most {FLASH_A_MAX:.2f})",
+             f"EFFECT PLAN: white flash on {cnt['flash']} of {len(cands)} kills (the dressed kills of the signature, as in V8.4.4; the stylised pulse, peak at most {FLASH_A_MAX:.2f})",
              f"EFFECT PLAN: drop moments: {len(drops_audio)} (music dip " + ", ".join(f"{d['dip_db']:.1f} dB / {d['dip_s']:.2f} s" for d in drops_audio) + ")" if drops_audio else "EFFECT PLAN: no drop moment (no drop kill)",
              f"EFFECT PLAN: sky recolour: up to {sky_max} for {dur_all:.0f} s (at least {SKY_SPACING_S:.0f} s apart, clear sky only; {len(sky_c)} candidate kills: drop / headline / ending / flick, never a first, calm or middle take); "
              f"colour family from the song's feel: {', '.join(ranked[:3])} ({rank_why})"]
@@ -11363,17 +11364,22 @@ def sky_mask_np(rgb):
 XFX_SKY_U, XFX_SKY_R0, XFX_SKY_R1, XFX_SKY_Y = 9.0, 0.3, 1.9, 90.0       # V8.4.3 sky colour family (old rule)
 SKY_W, SKY_H = 384, 216              # V8.4.4: the sky mask is made and stored at this size (the render scales it up to 1920 x 1080)
 SKY_FEATHER = 1.4                    # sigma (mask pixels = 5 output pixels each) of the edge feather
-SKY_EASE_IN, SKY_EASE_OUT = 0.20, 0.50   # seconds the recolour takes to come in / go out inside the effect window
-SKY_FLAT = 0.35                      # how much of the sky's own brightness variation stays (0 = one flat tone, 1 = untouched)
-SKY_PALETTE = {                      # V8.4.4: deep colours the sky can turn into (name: 0xRRGGBB)
-    "red": 0xB3121A, "orange": 0xD4520C, "gold": 0xC99A10, "magenta": 0xB0147E,
-    "purple": 0x5B22A6, "deep blue": 0x1536B8, "teal": 0x0E8C8C, "green": 0x1E8E3A}
+SKY_EASE_IN, SKY_EASE_OUT = 0.15, 0.08   # V8.5: the sky colours the WHOLE take: it comes in over this many seconds at the take's first frame and stays to its last (the cut ends it)
+SKY_FLAT = 0.35                      # (V8.4.4 flat grade, kept for the older tests)
+SKY_TILT = 0.70                      # V8.5: how much of the sky's own brightness variation stays (clouds, light): the haze keeps the picture's depth
+SKY_HAZE = 0.90                      # V8.5: share of the sky's colour that becomes the palette colour (the rest is the sky's own tint: a haze, not a paint)
+SKY_Y_MAX = 205                      # V8.5: the sky never gets brighter than this (video levels): deep, never glaring
+SKY_OPACITY = 0.88                   # V8.5: the haze lets a little of the sky show through (never a solid paint)
+SKY_MAX_ROW = 0.50                   # V8.5: the sky mask never goes below the vertical middle of the picture (walls lower down are never painted)
+SKY_HOLD_FRAMES = 15                 # V8.5: a frame whose sky region collapses while the frames around it have one (a dropout) takes the nearest good frame's mask
+SKY_PALETTE = {                      # V8.5: deep, hazy colours the sky can turn into (name: 0xRRGGBB = the colour of the finished sky on average): no yellow, no acid green, no neon pink
+    "amber": 0xB58A52, "ember": 0x9A4638, "rose": 0x93566C, "violet": 0x65508F, "deep blue": 0x3A5C9A, "teal": 0x3A7F86}
 SKY_STYLE_W = {                      # the song's style -> weight of each colour
-    "aggressive": {"red": 3, "orange": 2, "magenta": 1.5, "purple": 1},
-    "hype": {"orange": 2.5, "gold": 2, "red": 1.5, "magenta": 1.5, "green": 0.5},
-    "cinematic": {"teal": 2.5, "deep blue": 2, "purple": 1.5, "orange": 1, "gold": 0.5},
-    "smooth": {"purple": 2.5, "magenta": 1.5, "deep blue": 2, "teal": 1},
-    "chill": {"deep blue": 2.5, "teal": 2, "green": 1.5, "purple": 1.5},
+    "aggressive": {"ember": 3, "amber": 1.5, "rose": 1.5, "violet": 1},
+    "hype": {"amber": 3, "ember": 1.5, "rose": 1.5, "violet": 0.5},
+    "cinematic": {"teal": 2.5, "deep blue": 2, "violet": 1.5, "amber": 1},
+    "smooth": {"violet": 2.5, "rose": 1.5, "deep blue": 2, "teal": 1},
+    "chill": {"deep blue": 2.5, "teal": 2, "violet": 1.5, "rose": 0.5},
     "mix": {k_: 1.0 for k_ in SKY_PALETTE}}
 
 
@@ -11415,7 +11421,7 @@ def sky_ranked(recipe, energy, bpm):
         why += f", energy {e:.2f}, {b:.0f} BPM"
         warm = e * 0.8 + min(1.0, max(0.0, (b - 80.0) / 80.0)) * 0.6        # 0 (slow, calm) .. 1.4 (fast, intense)
         for k_ in list(w):
-            if k_ in ("red", "orange", "magenta", "gold"):
+            if k_ in ("ember", "amber", "rose"):
                 w[k_] *= 0.4 + 1.3 * warm / 1.4
             else:
                 w[k_] *= 1.7 - 1.3 * warm / 1.4
@@ -11597,10 +11603,13 @@ def sky_grab_frames(path, t0, t1, rect, wh, size=(SKY_W, SKY_H), fps=120):
     return [np.frombuffer(buf[i * w * h * 3:(i + 1) * w * h * 3], np.uint8).reshape(h, w, 3) for i in range(n)]
 
 
-def sky_take_mask(t, x, zone, path):
-    """V8.4.4: writes the sky mask of one take for the render: a raw grey video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take, 0..255; ffmpeg's alphamerge turns it into the alpha of the graded copy). The mask is made from the take's own pictures (the source frames its output frames come from, so slow-mo and speed-ups are followed) with
-    the colour model fixed from the kill frame (same sky colour in every frame); every frame's mask is averaged with its neighbours (+-2 frames: no flicker), feathered a little and eased
-    in / out; outside the effect window it is 0. Returns {'mean_y': mean luma of the sky (video levels, for the flattening), 'frames': n, 'cov': mean coverage in the window}."""
+def sky_take_mask(t, x, zone, path, ramp=False):
+    """V8.4.4 / V8.5: writes the sky mask of one take for the render: a raw video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take) made from the take's own pictures (the source frames its
+    output frames come from, so slow-mo and speed-ups are followed) with the colour model fixed from the kill frame (same sky colour in every frame). V8.5: the window is the WHOLE take (x['t0'] .. x['t1']);
+    a frame whose sky region collapses while its neighbours (+- SKY_HOLD_FRAMES) have one (a dropout) takes the nearest good frame's mask, so the sky does not blink off; every frame is averaged with its
+    +-2 neighbours, feathered a little, never lower than SKY_MAX_ROW of the picture height (walls below the middle are never painted) and eased in at the take's start. ramp=True writes yuv444p frames:
+    Y = the mask, U = a vertical ramp 0 (top) .. 255 (the take's usual horizon) for the gradient, V = 128 (x['mask_fmt'] = 'yuv444p'); ramp=False the older gray file.
+    Returns {'mean_y': mean luma of the sky (video levels, for the flattening), 'frames': n, 'cov': mean coverage in the window}."""
     import cv2
     import numpy as np
     nf = int(t["nf"])
@@ -11612,6 +11621,8 @@ def sky_take_mask(t, x, zone, path):
         tmin[si] = min(tmin.get(si, st), st)
         tmax[si] = max(tmax.get(si, st), st)
     grabbed = {si: (tmin[si] - 0.03, sky_grab_frames(srcs[si]["path"], tmin[si] - 0.03, tmax[si] + 0.06, srcs[si]["rect"], srcs[si]["wh"])) for si in tmin}
+    w, h = SKY_W, SKY_H
+    cap_row = int(h * SKY_MAX_ROW)
     segm, ys = [], []
     for si, st in fr_src:
         base, frs = grabbed[si]
@@ -11619,51 +11630,139 @@ def sky_take_mask(t, x, zone, path):
         m, inf = sky_segment(img, zone, model=x.get("model"))
         if x.get("model") is None and inf.get("model"):
             x["model"] = inf["model"]
+        m = m.copy()
+        m[cap_row:] = False                                # never below the vertical middle
         segm.append(m.astype(np.float32))
         if m.any():
             ys.append(float(np.mean(img[m] @ np.array([0.1826, 0.6142, 0.0620], np.float32)) + 16))
     ymean = float(np.mean(ys)) if ys else 120.0
     k = len(segm)
+    cv = [float(m_.mean()) for m_ in segm]                 # dropouts: the sky region collapses for a few frames while the frames around it have one: hold the nearest good mask
+    good = []
+    for i in range(k):
+        win = sorted(cv[max(0, i - SKY_HOLD_FRAMES):i + SKY_HOLD_FRAMES + 1])
+        ref = win[len(win) // 2]
+        good.append(not (ref > 0.03 and cv[i] < 0.35 * ref))
+    held = 0
+    if any(good):
+        gi = [i for i in range(k) if good[i]]
+        for i in range(k):
+            if not good[i]:
+                j = min(gi, key=lambda q: abs(q - i))
+                if abs(j - i) <= SKY_HOLD_FRAMES:
+                    segm[i] = segm[j]
+                    held += 1
     sm = [np.mean(segm[max(0, i - 2):i + 3], axis=0) for i in range(k)]
-    w, h = SKY_W, SKY_H
+    capv = np.ones((h, 1), np.float32)                     # the lower edge fades out over 8 rows above the limit (no hard line, and nothing below it)
+    for r in range(h):
+        capv[r, 0] = 0.0 if r >= cap_row else min(1.0, (cap_row - r) / 8.0)
+    bottoms = []
+    for m_ in sm:
+        rows_ = np.where(m_.max(1) > 0.5)[0]
+        if len(rows_) > 8:
+            bottoms.append(int(rows_.max()))
+    hor = int(np.clip(np.percentile(bottoms, 80), 0.2 * h, cap_row)) if bottoms else cap_row
+    x["horizon"] = round(hor / h, 3)
+    ramp_pl = np.clip(np.arange(h, dtype=np.float32) / max(1.0, float(hor)), 0.0, 1.0)
+    ramp_pl = (ramp_pl * ramp_pl * (3 - 2 * ramp_pl))[:, None] * np.ones((1, w), np.float32)
+    ramp_b = np.clip(ramp_pl * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes()
+    mid_b = np.full((h * w,), 128, np.uint8).tobytes()
+    zero = np.zeros((h * w,), np.uint8).tobytes()
     with open(path, "wb") as fh:
-        zero = np.zeros((h * w,), np.uint8).tobytes()
         for f in range(nf):
             if f0 <= f < f1 and k:
                 tt = f / OUT_FPS
-                a = min(1.0, max(0.0, (tt - x["t0"]) / SKY_EASE_IN))
-                b_ = min(1.0, max(0.0, (x["t1"] - tt) / SKY_EASE_OUT))
+                a = min(1.0, max(0.0, (tt - x["t0"]) / SKY_EASE_IN)) if SKY_EASE_IN > 0 else 1.0
+                b_ = min(1.0, max(0.0, (x["t1"] - tt) / SKY_EASE_OUT)) if SKY_EASE_OUT > 0 else 1.0
                 ease = (a * a * (3 - 2 * a)) * (b_ * b_ * (3 - 2 * b_))
                 m = cv2.GaussianBlur(sm[f - f0], (0, 0), SKY_FEATHER) * ease
-                fh.write(np.clip(m * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes())
+                if ramp:
+                    m = m * capv
+                fh.write(np.clip(m * (255.0 * SKY_OPACITY) + 0.5, 0, 255).astype(np.uint8).tobytes())
             else:
                 fh.write(zero)
+            if ramp:
+                fh.write(ramp_b)
+                fh.write(mid_b)
+    if ramp:
+        x["mask_fmt"] = "yuv444p"
     cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm])) if segm else 0.0
-    return {"mean_y": ymean, "frames": nf, "cov": cov}
+    return {"mean_y": ymean, "frames": nf, "cov": cov, "held": held, "horizon": x["horizon"]}
 
 
 def sky_mask_input(x):
-    """The ffmpeg input arguments of a take's sky mask file (raw gray, SKY_W x SKY_H, 60 fps)."""
-    return ["-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{SKY_W}x{SKY_H}", "-framerate", "60", "-i", str(x["mask"])]
+    """The ffmpeg input arguments of a take's sky mask file (raw, SKY_W x SKY_H, 60 fps; gray, or yuv444p with the gradient ramp in U since V8.5)."""
+    return ["-f", "rawvideo", "-pix_fmt", x.get("mask_fmt", "gray"), "-s", f"{SKY_W}x{SKY_H}", "-framerate", "60", "-i", str(x["mask"])]
 
 
 def xfx_sky_chain(chains, base, lab, x, kin):
-    """V8.4.4 render chain of the sky recolour on a take's label `lab` (1920 x 1080): the whole picture graded to the deep colour (one lutyuv: chroma set, brightness flattened), then merged
-    back over the original with the mask as its alpha (input `kin`, scaled up with a soft bicubic edge; alphamerge + overlay): only the masked sky changes, everything else is the untouched
-    picture, bit for bit. Returns the new label."""
+    """V8.4.4 / V8.5 render chain of the sky recolour on a take's label `lab` (1920 x 1080): the whole picture graded to the deep, hazy colour (lutyuv: the colour's chroma mostly set, the sky's own
+    brightness variation kept, never brighter than SKY_Y_MAX), then merged back over the original with the mask as its alpha (input `kin`, scaled up with a soft bicubic edge; alphamerge + overlay): only the
+    masked sky changes, everything else is the untouched picture, bit for bit. V8.5 with a gradient (x['grade']['top'] / ['hor']): two graded copies, the horizon one laid over the top one through the ramp plane
+    of the mask file, then the mask. Returns the new label."""
     gr = x["grade"]
-    chains.append(f"{lab}format=yuv420p,split=2[{base}ka][{base}kb]")
-    chains.append(f"[{base}kb]lutyuv=y='clip(val*{gr['y_mul']:.3f}+{gr['y_add']:.2f},16,235)':u={gr['u']:.1f}:v={gr['v']:.1f}[{base}kg]")
-    chains.append(f"[{kin}:v:0]setpts=N/(60*TB),scale=1920:1080:flags=bicubic,format=gray[{base}km]")
-    chains.append(f"[{base}kg][{base}km]alphamerge[{base}kga]")
+
+    def lut(g):
+        return (f"lutyuv=y='clip(val*{g['y_mul']:.3f}+{g['y_add']:.2f},16,{g.get('y_max', 235)})':"
+                f"u='clip(128+({g['u']:.1f}-128)*{g.get('haze', 1.0):.3f}+(val-128)*{1.0 - g.get('haze', 1.0):.3f},16,240)':"
+                f"v='clip(128+({g['v']:.1f}-128)*{g.get('haze', 1.0):.3f}+(val-128)*{1.0 - g.get('haze', 1.0):.3f},16,240)'")
+    if "top" not in gr:
+        chains.append(f"{lab}format=yuv420p,split=2[{base}ka][{base}kb]")
+        chains.append(f"[{base}kb]lutyuv=y='clip(val*{gr['y_mul']:.3f}+{gr['y_add']:.2f},16,235)':u={gr['u']:.1f}:v={gr['v']:.1f}[{base}kg]")
+        chains.append(f"[{kin}:v:0]setpts=N/(60*TB),scale=1920:1080:flags=bicubic,format=gray[{base}km]")
+        chains.append(f"[{base}kg][{base}km]alphamerge[{base}kga]")
+        chains.append(f"[{base}ka][{base}kga]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}ks]")
+        return f"[{base}ks]"
+    chains.append(f"{lab}format=yuv420p,split=3[{base}ka][{base}kb][{base}kc]")
+    chains.append(f"[{base}kb]{lut(gr['top'])}[{base}kt]")
+    chains.append(f"[{base}kc]{lut(gr['hor'])}[{base}kh]")
+    chains.append(f"[{kin}:v:0]setpts=N/(60*TB),format=yuv444p,extractplanes=y+u[{base}ky][{base}ku]")
+    chains.append(f"[{base}ky]scale=1920:1080:flags=bicubic[{base}km]")
+    chains.append(f"[{base}ku]scale=1920:1080:flags=bicubic[{base}kr]")
+    chains.append(f"[{base}kh][{base}kr]alphamerge[{base}khr]")
+    chains.append(f"[{base}kt][{base}khr]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}kgr]")
+    chains.append(f"[{base}kgr][{base}km]alphamerge[{base}kga]")
     chains.append(f"[{base}ka][{base}kga]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}ks]")
     return f"[{base}ks]"
 
 
-def sky_grade(rgb, mean_y):
-    """V8.4.4: the lutyuv constants that turn the sky into ONE deep colour: chroma = the colour's U / V, brightness = the colour's own tone with only SKY_FLAT of the sky's own variation left."""
-    yt, ut, vt = _rgb_to_yuv(rgb)
-    return {"y_mul": SKY_FLAT, "y_add": yt - SKY_FLAT * mean_y, "u": ut, "v": vt}
+def sky_gradient_kind(recipe, energy, bpm):
+    """V8.5: which very subtle gradient the sky gets, from the song's feel: a fast / intense / aggressive song 'dark' (the colour fades to near black towards the top, like red to black), every other one
+    'sunset' (a deeper, cooler top and a warmer, lighter horizon: a hazy sunset). Returns (kind, why)."""
+    try:
+        e, b = float(energy), float(bpm)
+    except (TypeError, ValueError):
+        e = b = None
+    if recipe == "aggressive" or (e is not None and b is not None and e >= 0.8 and b >= 130):
+        return "dark", "fast / intense song: the sky fades to near black at the top"
+    return "sunset", "hazy sunset: deeper at the top, warmer and lighter at the horizon"
+
+
+def sky_gradient(rgb, kind):
+    """V8.5: the two ends of the gradient for a palette colour (0xRRGGBB): (top, horizon), both kept deep (the mean stays the palette colour). 'dark': top 0.40 x the colour, horizon 1.06 x; 'sunset': the top
+    leans towards a deep plum (35 %), the horizon towards a warm dusk orange (20 %). Subtle on purpose."""
+    c = [(rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255]
+    pk = lambda v: int(max(0, min(255, round(v[0]))) << 16 | max(0, min(255, round(v[1]))) << 8 | max(0, min(255, round(v[2]))))
+    if kind == "dark":
+        return pk([v * 0.40 for v in c]), pk([v * 1.06 for v in c])
+    plum, dusk = (62, 40, 92), (224, 140, 84)
+    top = [v * 0.65 + p_ * 0.35 for v, p_ in zip(c, plum)]
+    hor = [v * 0.80 + d_ * 0.20 for v, d_ in zip(c, dusk)]
+    return pk([v * 0.92 for v in top]), pk(hor)
+
+
+def sky_grade(rgb, mean_y, grad=None):
+    """V8.4.4 / V8.5: the lutyuv constants that turn the sky into ONE deep colour. Without `grad` (older): chroma = the colour's U / V, brightness = the colour's own tone with only SKY_FLAT of the sky's own
+    variation left. With grad = (top 0xRRGGBB, horizon 0xRRGGBB) (V8.5): {'top': g, 'hor': g}: each end keeps SKY_TILT of the sky's own brightness variation around its own tone, the chroma is SKY_HAZE of the
+    colour's (the rest the sky's own), the brightness never goes past SKY_Y_MAX."""
+    if grad is None:
+        yt, ut, vt = _rgb_to_yuv(rgb)
+        return {"y_mul": SKY_FLAT, "y_add": yt - SKY_FLAT * mean_y, "u": ut, "v": vt}
+    out_ = {}
+    for key, c in (("top", grad[0]), ("hor", grad[1])):
+        yt, ut, vt = _rgb_to_yuv(c)
+        out_[key] = {"y_mul": SKY_TILT, "y_add": yt - SKY_TILT * mean_y, "u": ut, "v": vt, "haze": SKY_HAZE, "y_max": SKY_Y_MAX}
+    return out_
 
 
 def xfx_probe_sky(plan, tmpdir=None):
@@ -11715,11 +11814,14 @@ def xfx_probe_sky(plan, tmpdir=None):
                 raise RuntimeError("no temp folder for the mask")
             Path(tmpdir).mkdir(parents=True, exist_ok=True)
             mp = Path(tmpdir) / f"sky_take{ti + 1}.gray"
-            st = sky_take_mask(plan["takes"][ti], x, zone, mp)
+            st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True)
             name, rgb, cwhy = sky_colour_for(ranked, c["info"].get("sky_rgb"), c["info"].get("scene_hue"))
-            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade(rgb, st["mean_y"]), "mask_cov": round(st["cov"], 3)})
+            gk = (plan.get("xfx_sky_rank") or {}).get("grad") or "sunset"
+            top_, hor_ = sky_gradient(rgb, gk)
+            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade(rgb, st["mean_y"], (top_, hor_)), "mask_cov": round(st["cov"], 3),
+                      "grad": gk, "held": st["held"]})
             kept.append(gp)
-            c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the upper picture -> recoloured {name} ({cwhy}); mask from {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%"
+            c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the upper picture -> recoloured {name} ({cwhy}); mask over the whole take: {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%, {st['held']} dropout frame(s) held, {gk} gradient, horizon at {st['horizon'] * 100:.0f}% of the height"
         except Exception as ex:                        # noqa: BLE001
             x["ok"] = False
             c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% but the mask could not be made ({type(ex).__name__}: {ex}), skipped"
@@ -13093,7 +13195,7 @@ def _ev_paths(e):
     return {e["path"]} | {x["path"] for x in e.get("srcs", []) if isinstance(x, dict) and x.get("path")}
 
 
-def weekly_pick(events, cfg, target, style, now_ts=None, game=None):
+def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None):
     """V6.0 weekly / Auto clip pick: this week's (last 7 days) new clips come first; if they do not reach the minimum length, older
     UNUSED clips of the same game follow - best multikills first, then best singles - only as many as needed. V6.5.1: if the unused
     material cannot reach the 60 s minimum, previously used events are reused (best-scoring first among those whose last use is the oldest),
@@ -13114,6 +13216,8 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None):
     old = sorted([e for e in unused if e not in new], key=lambda e: (bool(e.get("plain")), -e["score"]))
     optimal = target in (None, "", "optimal", 0)
     need = OPT_RANGE[0] + 8.0 if optimal else float(target) * 1.1
+    if need_s:                                             # V8.5 Force New Full: enough material to fill the song / the 2:30 section (unused first, then the oldest-used ones)
+        need = float(need_s)
     rn = style if style in RECIPES else "hype"
     est = lambda lst: sum(take_estimate(e, 0.47, rn) for e in lst)
     pick = list(new)
@@ -13124,7 +13228,7 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None):
             pick.append(e)
     n_old = len(pick) - len(new)
     reused = []
-    floor_need = WEEKLY_MIN_S * 1.1
+    floor_need = max(WEEKLY_MIN_S * 1.1, float(need_s or 0))
     if est(pick) < floor_need:
         last = hist_list(USED_CLIPS, game)[-1:] if game else []
         prev = {_pkey(c) for h in last for c in h.get("clips", [])}              # the game's previous montage: never reused
@@ -13637,7 +13741,16 @@ def ledger_plan_check(led, plan):
     return n_led, n_plan
 
 
-def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None):
+def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False):
+    """V8.5 full=True (Force New Full / Manual Auto): the montage fills the whole song (2:30 content at most, a long song uses its best 1:30 - 2:30 section)."""
+    FULL_CTX["on"] = bool(full)
+    try:
+        return _make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, scan, pin, full)
+    finally:
+        FULL_CTX["on"] = False
+
+
+def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False):
     """scan=False: plan from what is already scanned (the Manual status-line estimate runs exactly this, quietly).
     V7.6.1 pin = {"song": path, "at": "HH:MM:SS"}: the song the summary (the estimate) already picked for this job. A song the user chose (song_path) always wins; otherwise the
     pinned song is used instead of picking again, so the summary, the plan and the render share ONE pick (the pool / used-history / playlist CSV may have changed since)."""
@@ -13681,9 +13794,20 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     if not events:
         raise RuntimeError("no usable kill events (utility kills are excluded)")
     all_events = list(events)
+    pre_song, need_full = None, None
+    if full and not manual:                                # V8.5: the planner's own song pick first (same pick as Force New), so the clip pick knows how much to fill
+        songs_, unm_, csv_ = song_pool(cfg)
+        pin_s = pin["song"] if pin and not song_path and pin.get("song") and os.path.exists(pin["song"]) else None
+        pre_song = pick_song(cfg, game, songs_, forced=song_path or pin_s)
+        if not song_path and not pin_s:
+            pre_song = weekly_song_fit(*pre_song)
+        an_ = pre_song[1]
+        avail_ = float(an_.get("dur") or 0) - float((an_.get("beats") or [0])[0])
+        need_full = min(FULL_CAP_S, avail_) * 1.25
+        out(f"Force New Full: song {pre_song[0].get('title') or Path(pre_song[0]['path']).stem} ({avail_:.0f} s): filling {min(FULL_CAP_S, avail_):.0f} s, ~{need_full:.0f} s of clips wanted")
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
         events, wk_notes = weekly_pick(events, cfg, cfg.get("length_s", "optimal") if target is None else target,
-                                       cfg.get("style", "auto") if style is None else style, game=game)
+                                       cfg.get("style", "auto") if style is None else style, game=game, need_s=need_full)
         notes += wk_notes
         for n_ in wk_notes:
             out(n_)
@@ -13702,9 +13826,12 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     events, pair = companions(events, pair)
     songs, unmatched, csvname = song_pool(cfg)
     pin_song = pin["song"] if pin and not song_path and pin.get("song") and os.path.exists(pin["song"]) else None
-    song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path or pin_song)
-    if not manual and not song_path and not pin_song:
-        song, an, sinfo, runners = weekly_song_fit(song, an, sinfo, runners)
+    if pre_song:
+        song, an, sinfo, runners = pre_song
+    else:
+        song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path or pin_song)
+        if not manual and not song_path and not pin_song:
+            song, an, sinfo, runners = weekly_song_fit(song, an, sinfo, runners)
     placement = placement or cfg.get("placement", "v5")
     if placement == "v4":
         an = analyse_song_v4(song["path"], song.get("csv_bpm"))
@@ -13751,11 +13878,12 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
             raise
         zero_err, plan, pool_ev, fixes = ex, None, [], []       # V7.4: zero takes placed: the top-up below still runs (it used to need at least one take)
     rounds = 0
-    while not manual and game == "cs2" and (plan is None or plan["duration"] < WEEKLY_MIN_S - 0.5) and rounds < 6:
+    floor_s = (min(FULL_CAP_S, need_full / 1.25) * 0.9) if need_full else WEEKLY_MIN_S
+    while not manual and (game == "cs2" or need_full) and (plan is None or plan["duration"] < floor_s - 0.5) and rounds < 6:
         # V7.3: CS2 reaches the 60 s weekly minimum with the SAME mechanism as Valorant (weekly_pick: unused first, then previously used clips)
         # - weekly_pick() only counts estimated seconds, and the planner may not be able to place every event (no run-up / tail fits the song's beats)
         dur_ = plan["duration"] if plan is not None else 0.0
-        add, reused_ = weekly_more(all_events, picked, style, game, max(8.0, (WEEKLY_MIN_S - dur_) * 1.5))
+        add, reused_ = weekly_more(all_events, picked, style, game, max(8.0, (floor_s - dur_) * 1.5))
         if not add:
             break
         rounds += 1
@@ -13906,7 +14034,7 @@ def video_ready(path):
 
 
 def run_job(game, mode="render", force=False, paths=None, song_path=None, target=None, style=None,
-            seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True, pin=None):
+            seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True, pin=None, full=False):
     """mode: dry | preview | render. weekly=True is Auto. Always prints a plan or a plain-language reason.
     pin: the song / summary the Manual status line showed for exactly these inputs (V7.6.1, see make_plan)."""
     try:
@@ -13933,7 +14061,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             except Exception as ex:                        # noqa: BLE001
                 LOGONLY(f"kill ledger skipped: {type(ex).__name__}: {ex}")
         else:
-            plan, text = make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, pin=pin)
+            plan, text = make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, pin=pin, full=full)
         out(text)
         if paths is not None:                              # V7.6.1: the summary of THIS plan, printed from the plan that is rendered, and compared with the one shown before
             now_sum = plan_summary_text(plan, len(paths))
@@ -14574,6 +14702,31 @@ def random_pick(cands, an=None, style="auto", rng=None):
         return [], None
     fit = optimal_fit(pool, an, style)
     return [e["path"] for e in fit["clips"]], fit
+
+
+def auto_fill_pick(cands, an, style, rng=None):
+    """V8.5 Manual Auto: preselects enough clips to fill the whole song (or its best 1:30 - 2:30 section, FULL_CAP_S at most): unused clips first (random),
+    then used ones (the oldest use first), until their estimated length covers the section. Returns (paths, info)."""
+    import numpy as np
+    rng = rng or random.Random()
+    bt = np.array(an["beats"], float)
+    bd = float(np.median(np.diff(bt)))
+    avail = float(an.get("dur") or (bt[-1] + bd)) - 0.1 - float(bt[0])
+    L = min(FULL_CAP_S, avail)
+    need = L * 1.15                                        # a little over: the planner leaves out the weakest that do not fit
+    rname = style if style in RECIPES else "hype"
+    fresh = [c for c in cands if not c.get("used")]
+    rng.shuffle(fresh)
+    old = sorted([c for c in cands if c.get("used")], key=lambda c: (str(c.get("used")), rng.random()))
+    pick, tot = [], 0.0
+    for c in fresh + old:
+        if tot >= need:
+            break
+        ks = list(c.get("ks") or [])
+        tot += take_estimate({"times": ks, "rows": ks}, bd, rname) if ks else 7.0
+        pick.append(c)
+    n_old = sum(1 for c in pick if c.get("used"))
+    return [c["path"] for c in pick], {"length": L, "est": tot, "n_used": n_old, "short": tot < L * 0.95}
 
 
 # V5.57: accent colour (main, dark = selection / pressed, darkest, OpenCV hue 0-179) x base (grey | black)
@@ -15759,7 +15912,7 @@ class App:
             ttk.Label(col, textvariable=sv, justify="left").pack(anchor="w")
             sm = ttk.Frame(col)
             sm.pack(anchor="w", pady=4)
-            for text, kw in (("Force new", dict(weekly=True, force=True)), ("Dry plan", dict(mode="dry", weekly=True)),
+            for text, kw in (("Force new", dict(weekly=True, force=True)), ("Force New Full", dict(weekly=True, force=True, full=True)), ("Dry plan", dict(mode="dry", weekly=True)),
                              ("Preview 720p / 20 s", dict(mode="preview", weekly=True))):
                 self.btn(sm, text, lambda g=g, kw=kw, text=text: self.run_task(f"{g} {text}", self.job_video(g, **kw)),
                          name=f"auto:{g}:{text}").pack(side="left", padx=3)
@@ -15920,9 +16073,11 @@ class App:
         self.m_n = tk.StringVar(value="15")                         # 'Tick newest' count
         ttk.Spinbox(top2, from_=1, to=500, textvariable=self.m_n, width=5).pack(side="left")
         self.btn(top2, "Random pick", self.random_pick_ticks).pack(side="left", padx=(12, 6))
+        self.auto_full = None                                       # V8.5: {"ticked": set, "song": path} of the last Auto preselection (its render keeps the full-song rules)
         self.m_rand_n = tk.StringVar(value="15")                    # V5.57: 'Random pick' has its own count (never shared with Tick newest)
         self.e_rand = ttk.Spinbox(top2, from_=1, to=500, textvariable=self.m_rand_n, width=5)
         self.e_rand.pack(side="left")
+        self.btn(top2, "Auto", self.auto_fill_ticks, name="manual:auto_fill").pack(side="left", padx=(8, 3))
         self.m_incl_used = tk.BooleanVar(value=False)
         ttk.Checkbutton(top2, text="Include used clips", variable=self.m_incl_used).pack(side="left", padx=(12, 3))
         self.btn(top2, "Unflag all", self.unflag_all, name="manual:unflag_all").pack(side="left", padx=(12, 3))
@@ -16614,7 +16769,8 @@ class App:
             return
         sel = self.stree.selection()
         args = dict(paths=paths, song_path=None if not sel or sel[0] == "auto" else sel[0],
-                    target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=self.m_style.get(), seed=self.est_seed())
+                    target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=self.m_style.get(), seed=self.est_seed(),
+                    full=self.full_flag(None if not sel or sel[0] == "auto" else sel[0]))
         game, head, short = self.m_game.get(), self.m_head, getattr(self, "m_short", "")
         sig_ = self.pin_sig(paths)
         self.est_gen = getattr(self, "est_gen", 0) + 1
@@ -16657,7 +16813,8 @@ class App:
         """What the summary was made from: game, the ticked clips that have kills, the song chosen in the list (None = auto), length, style, seed."""
         sel = self.stree.selection()
         return (self.m_game.get(), tuple(sorted(p for p in paths if p in getattr(self, "byp", {}) and self.byp[p]["kills"])),
-                None if not sel or sel[0] == "auto" else sel[0], "optimal" if self.m_opt.get() else int(self.m_len.get()), self.m_style.get(), self.est_seed())
+                None if not sel or sel[0] == "auto" else sel[0], "optimal" if self.m_opt.get() else int(self.m_len.get()), self.m_style.get(), self.est_seed(),
+                self.full_flag(None if not sel or sel[0] == "auto" else sel[0]))
 
     def pick_count(self):
         """N from the number box next to 'Random pick' (its own box, never the 'Tick newest' one); None = empty / not a number
@@ -16720,6 +16877,53 @@ class App:
             self.q.put(("call", apply))
         self.run_task("random pick", work)
 
+    def full_flag(self, song):
+        """V8.5: True while the ticked clips are exactly what Manual Auto preselected for this song (hand changes = the normal Manual rules)."""
+        af = getattr(self, "auto_full", None)
+        return bool(af and af["song"] == song and af["ticked"] == set(self.ticked))
+
+    def auto_fill_ticks(self):
+        """V8.5 Manual Auto: tick enough clips (unused first, random) to fill the selected song start to finish (long song: its best 1:30 - 2:30 section).
+        Only ticks: nothing is rendered. Clicking it again (e.g. after another song) replaces the previous preselection."""
+        sel = self.stree.selection()
+        song = next((x for x in self.songs if sel and x["path"] == sel[0]), None)
+        if not song:
+            messagebox.showinfo("Auto", "Select a song in the list first (Auto fills the montage for that song).")
+            return
+        g_r6s = self.m_game.get() == "r6s"
+        cands = [self.byp[i] for i in self.ctree.get_children()
+                 if i in self.byp and (self.byp[i].get("kills") or (g_r6s and self.byp[i].get("kills") is None))]
+        if not cands:
+            messagebox.showinfo("Auto", "No clips with kills in the list (the game, folder and date filters apply).")
+            return
+        style = self.m_style.get()
+
+        def work():
+            try:
+                an = get_songmap(song["path"], song.get("csv_bpm"))
+            except Exception as ex:
+                out(f"Auto: song map unavailable ({ex})")
+                return
+            paths, info = auto_fill_pick(cands, an, style)
+            extra, plines = random_companions(load_config(), self._snap.get("m_game", "valorant"), paths)
+            for l_ in plines:
+                out(l_)
+            allp = list(paths) + extra
+            msg = (f"Auto: {len(paths)} clips ticked to fill {info['length']:.0f} s of '{song.get('title') or Path(song['path']).stem}' "
+                   f"({len(paths) - info['n_used']} unused + {info['n_used']} used)" + (f" + {len(extra)} companion clip(s)" if extra else "")
+                   + ("; not enough clips to fill it completely" if info["short"] else ""))
+
+            def apply():
+                self.ticked = set(allp)
+                self.auto_full = {"ticked": set(allp), "song": song["path"]}
+                for iid in self.ctree.get_children():
+                    self.ctree.item(iid, text=self.row_text(iid))
+                self.update_status()
+                self.status_flash(msg, 4000)
+            out(msg)
+            self.q.put(("call", apply))
+        self.run_task("auto fill", work)
+
     def manual(self, mode):
         paths = list(self.ticked)
         if not paths:
@@ -16741,7 +16945,7 @@ class App:
         style = self.m_style.get()
         self.run_task("manual " + mode, self.job_video(
             self.m_game.get(), mode=mode, force=True, paths=paths, song_path=song,
-            target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=style, seed=seed, maxq=(self.m_q.get() == "max"), pin=pin))
+            target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=style, seed=seed, maxq=(self.m_q.get() == "max"), pin=pin, full=self.full_flag(song)))
 
     # ------------------------------------------------------------ Songs tab
     def build_songs(self):
@@ -18465,6 +18669,7 @@ REQUIRED_BUTTONS = {}
 for _g in GAMES:
     REQUIRED_BUTTONS[f"auto:{_g}:make"] = ("Auto", f"task:{_g} auto")
     REQUIRED_BUTTONS[f"auto:{_g}:Force new"] = ("Auto", f"task:{_g} Force new")
+    REQUIRED_BUTTONS[f"auto:{_g}:Force New Full"] = ("Auto", f"task:{_g} Force New Full")
     REQUIRED_BUTTONS[f"auto:{_g}:Dry plan"] = ("Auto", f"task:{_g} Dry plan")
     REQUIRED_BUTTONS[f"auto:{_g}:Preview 720p / 20 s"] = ("Auto", f"task:{_g} Preview 720p / 20 s")
 REQUIRED_BUTTONS.update({
@@ -18472,7 +18677,7 @@ REQUIRED_BUTTONS.update({
     "manual:render": ("Manual", "task:manual render"),
     "Tick all shown": ("Manual", "ticked"), "Untick all": ("Manual", "unticked"), "Tick clips with kills": ("Manual", "ticked"),
     "Tick newest": ("Manual", "ticked"), "Reload list": ("Manual", "task:clips"),
-    "Random pick": ("Manual", "task:random pick"), "Used filter": ("Manual", None),
+    "Random pick": ("Manual", "task:random pick"), "manual:auto_fill": ("Manual", "task:auto fill"), "Used filter": ("Manual", None),
     "Play selected song": ("Manual", "open:song.mp3"),
     "Refresh": ("Songs", "task:matches"), "Change match for selected file...": ("Songs", "info"),
     "Play selected file": ("Songs", "open:song.mp3"), "Open song_matches.csv": ("Songs", "open:song_matches.csv"),
