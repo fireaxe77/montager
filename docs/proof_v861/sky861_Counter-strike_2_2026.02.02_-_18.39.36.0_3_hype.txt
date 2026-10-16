@@ -1,0 +1,9 @@
+Counter-strike_2_2026.02.02_-_18.39.36.0_3: song feel style hype, energy 0.80, 140 BPM: palette ember -> 0xC01818 (song feel rank 1; sky was 209 deg); no song given: palette from the song feel only; gradient dark (fast / intense song: the sky gets deeper and darker towards the top); animation drift 17.6 px/s, breathing 3.43 s, surge 0.87, push 0.0356
+mask coverage (share of the picture): frame before the kill 0.0%, kill frame 7.7%, +1 15.4%, +2 23.2%, +3 23.3%, middle 6.8%, last frame 0.0%; frames 0..199 all zero: True
+surge plane (0..255) from the frame before the kill: 0 222 193 168 146 127 111 96 84 73 64 55 48 42 36 32 28 24 21 18 16 14 12 10 9
+edge movement between neighbouring frames (area that changes / mask area): mean 5.2%, worst 48.1%; held dropout frames 0
+lowest mask row: 263 of 432 = 60.9% of the height (limit 100%): OK
+frame 3.32s (before kill): sky pixels 0; mean luminance change inside +0.0 levels (0% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)
+frame 6.67s (middle): sky pixels 143288; mean luminance change inside -154.2 levels (100% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)
+frame 9.95s (end of take): sky pixels 0; mean luminance change inside +0.0 levels (0% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)
+video: docs/proof_v861/sky_test_10s_full.mp4 (exit 0) 

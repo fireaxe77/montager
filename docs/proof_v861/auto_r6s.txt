@@ -1,0 +1,3 @@
+r6s / 'Bumpy Ride' (150 s target): 654 candidate clips -> 71 ticked, planned 145 s, 10 rounds, 33 unplaceable dropped, 70 added, 180 s
+the render's own plan of that selection: 145 s, 66 takes, 71 ticked / 71 placed; summary: montage 145 s from 71 of 71 clips (66 usable events, song section 185 s), song: Bumpy Ride, style: hype
+lines the render would print about clips that do not fit: none

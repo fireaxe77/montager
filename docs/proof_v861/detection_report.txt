@@ -1,0 +1,3 @@
+valorant 109 s: SKY recolour: 3 chosen of 25 candidate kills (5 with a clear sky; at most 4 for 109 s, at least 14 s apart, best role first)
+cs2 126 s: SKY recolour: 4 chosen of 15 candidate kills (6 with a clear sky; at most 4 for 126 s, at least 14 s apart, best role first)
+valorant 148 s: SKY recolour: 3 chosen of 28 candidate kills (3 with a clear sky; at most 5 for 148 s, at least 14 s apart, best role first)

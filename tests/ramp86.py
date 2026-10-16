@@ -19,9 +19,11 @@ import montage as M                                                             
 out = Path(sys.argv[1])
 out.mkdir(parents=True, exist_ok=True)
 cfg = M.load_config()
-recs = {r["path"]: r for r in M.scan_clips(cfg) if r.get("game") == "cs2"}
+import os
+GAME = os.environ.get("RAMP_GAME", "cs2")
+recs = {r["path"]: r for r in M.scan_clips(cfg) if r.get("game") == GAME}
 paths = [p for p in recs if any(w in p for w in sys.argv[2:])]
-plan, _ = M.make_plan(cfg, "cs2", paths, None, 40, None, 5)
+plan, _ = M.make_plan(cfg, GAME, paths, None, 40, None, 5)
 vid = out / "cs2_ramp_full.mp4"
 M.render_plan(plan, str(vid), cfg, maxq=False, preview=False, encoder=None, effects=True)
 rep = []
