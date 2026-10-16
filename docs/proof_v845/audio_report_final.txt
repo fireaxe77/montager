@@ -1,0 +1,4 @@
+plan: 19 takes, 73.85 s, effects extra
+rendered game audio 73.87 s
+== final_extra: 43 segments measured, 0 do not match the source range
+total planned 73.850 s, audio 73.865 s
