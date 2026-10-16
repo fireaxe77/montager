@@ -1,0 +1,8 @@
+Counter-strike_2_2026.03.04_-_20.02.58.0_13: palette ember 0xC01818 (song feel only); gradient dark; animation {'drift': 117.0, 'period': 3.43, 'surge': 0.94, 'push': 0.054, 'depth': 0.52}
+kill frame (output) = 60; first frame with a non-zero mask = 60: EQUAL
+mask coverage: before the kill 0.0%, kill frame 4.7%, +3 14.1%, middle 11.4%, last 13.3%; checks: 120 of 120 frames with sky, 0 wall frames, 0 held
+frame 59 (before kill): sky pixels 0; sky brightness output / source = 0%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 72 (surge: the layer is pushed 3 - 6 % and shaken, so the mask area is widened by 40 px): sky pixels 315550; sky brightness output / source = 66%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 120 (middle): sky pixels 242830; sky brightness output / source = 37%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 177 (end of take): sky pixels 286240; sky brightness output / source = 34%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+mean sky brightness, middle and end of the take: 35% of the original (target 35 - 45 %)

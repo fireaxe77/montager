@@ -1,0 +1,8 @@
+Counter-strike_2_2025.02.11_-_20.21.22.0_12: palette violet 0x382C87 (cover art: dominant dark colour hue 218 deg; palette blended 35% toward the cover colour (hue 264 -> 248 deg)); gradient sunset; animation {'drift': 70.0, 'period': 6.0, 'surge': 0.79, 'push': 0.039, 'depth': 0.31}
+kill frame (output) = 60; first frame with a non-zero mask = 60: EQUAL
+mask coverage: before the kill 0.0%, kill frame 6.0%, +3 17.9%, middle 5.1%, last 6.5%; checks: 120 of 120 frames with sky, 0 wall frames, 0 held
+frame 59 (before kill): sky pixels 0; sky brightness output / source = 0%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 72 (surge: the layer is pushed 3 - 6 % and shaken, so the mask area is widened by 40 px): sky pixels 396596; sky brightness output / source = 55%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 120 (middle): sky pixels 108317; sky brightness output / source = 49%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+frame 177 (end of take): sky pixels 123327; sky brightness output / source = 42%; pixels outside the mask area that differ from the source: 0 (0 = identical)
+mean sky brightness, middle and end of the take: 45% of the original (target 35 - 45 %)
