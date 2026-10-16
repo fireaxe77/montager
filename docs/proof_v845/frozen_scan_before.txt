@@ -1,0 +1,19 @@
+4239 frames decoded (70.65 s)
+take  1 ant 2024.08.18 - 04.32.01.21.DVR.mp4 out   0.00-  4.00s  240 frames, 227 distinct ( 95%), longest repeat   5 frames at +0.42s, min speed 1.00
+take  2 ant 2024.09.11 - 11.44.13.06.DVR.mp4 out   4.00-  9.03s  302 frames, 277 distinct ( 92%), longest repeat  10 frames at +0.58s, min speed 1.00
+take  3 ant 2024.02.26 - 04.19.21.06.DVR.mp4 out   9.03- 11.80s  166 frames, 161 distinct ( 97%), longest repeat   6 frames at +2.72s, min speed 1.00
+take  4 ant 2024.08.18 - 23.11.01.13.DVR.mp4 out  11.80- 13.60s  108 frames, 106 distinct ( 98%), longest repeat   2 frames at +1.08s, min speed 1.00
+take  5 ant 2024.10.08 - 12.21.33.22.DVR.mp4 out  13.60- 15.20s   96 frames,  96 distinct (100%), longest repeat   1 frames at +0.00s, min speed 1.00
+take  6 ant 2024.09.17 - 11.36.19.05.DVR.mp4 out  15.20- 17.80s  156 frames, 156 distinct (100%), longest repeat   1 frames at +0.00s, min speed 1.00
+take  7 ant 2024.09.20 - 14.07.39.03.DVR.mp4 out  17.80- 21.93s  248 frames, 235 distinct ( 95%), longest repeat  13 frames at +2.17s, min speed 1.00
+take  8 ant 2024.08.16 - 21.22.35.06.DVR.mp4 out  21.93- 27.20s  316 frames, 314 distinct ( 99%), longest repeat   2 frames at +0.02s, min speed 1.00
+take  9 ant 2024.09.13 - 12.14.27.04.DVR.mp4 out  27.20- 31.17s  238 frames, 236 distinct ( 99%), longest repeat   2 frames at +2.42s, min speed 0.74
+take 10 ant 2024.09.12 - 19.57.45.10.DVR.mp4 out  31.17- 34.70s  212 frames, 203 distinct ( 96%), longest repeat   6 frames at +1.23s, min speed 0.50
+take 11 ant 2024.09.09 - 18.31.20.04.DVR.mp4 out  34.70- 39.20s  270 frames, 263 distinct ( 97%), longest repeat   5 frames at +0.25s, min speed 1.00
+take 12 ant 2024.09.09 - 23.20.30.18.DVR.mp4 out  39.20- 43.60s  264 frames, 264 distinct (100%), longest repeat   1 frames at +0.00s, min speed 1.00
+take 13 ant 2024.08.16 - 22.25.10.12.DVR.mp4 out  43.60- 47.00s  204 frames, 200 distinct ( 98%), longest repeat   3 frames at +0.17s, min speed 1.00
+take 14 ant 2024.08.18 - 18.19.15.03.DVR.mp4 out  47.00- 54.60s  456 frames, 431 distinct ( 95%), longest repeat   8 frames at +4.73s, min speed 1.00
+take 15 ant 2024.10.04 - 11.21.26.03.DVR.mp4 out  54.60- 60.40s  348 frames, 345 distinct ( 99%), longest repeat   2 frames at +2.62s, min speed 0.92
+take 16 ant 2024.09.08 - 20.08.19.02.DVR.mp4 out  60.40- 64.80s  264 frames,  40 distinct ( 15%), longest repeat  56 frames at +2.12s, min speed 1.00   <-- FROZEN / REPEATED FRAMES
+take 17 ant 2024.10.02 - 15.50.40.04.DVR.mp4 out  64.80- 70.65s  351 frames, 348 distinct ( 99%), longest repeat   2 frames at +3.62s, min speed 0.53
+1 take(s) with frozen / repeated frames

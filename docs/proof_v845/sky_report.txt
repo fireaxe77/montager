@@ -1,0 +1,24 @@
+Valorant_2025.10.16_-_03.29.05.29.DVR_4: sky coverage 34% of the upper picture (top strip 51%, kind blue) -> the render would RECOLOUR the sky
+  song feel style aggressive, energy 0.90, 150 BPM: family red, orange, magenta; sky 98D0F8, scene hue 40.632389068603516: colour red (song feel rank 1; sky was 205 deg, scene 41 deg)
+  mask: mean coverage in the window 35% of the upper picture; PIXEL CHECK at the peak and +0.12 s: 0 pixels outside the mask area differ from the render without the sky effect (0 = identical); inside the mask area 1097199 of 1251400 pixels changed by more than 8 levels; colour red 0xB3121A
+Valorant_2025.10.15_-_22.08.31.07.DVR_4: sky coverage 17% of the upper picture (top strip 21%, kind blue) -> the render would RECOLOUR the sky
+  song feel style chill, energy 0.30, 70 BPM: family deep blue, teal, green; sky B9E0FA, scene hue 215.49752807617188: colour green (song feel rank 3; sky was 204 deg, scene 215 deg)
+  mask: mean coverage in the window 17% of the upper picture; PIXEL CHECK at the peak and +0.12 s: 0 pixels outside the mask area differ from the render without the sky effect (0 = identical); inside the mask area 426078 of 493475 pixels changed by more than 8 levels; colour green 0x1E8E3A
+Valorant_2025.10.11_-_23.55.02.07.DVR_9: sky coverage 30% of the upper picture (top strip 49%, kind blue) -> the render would RECOLOUR the sky
+  song feel style cinematic, energy 0.60, 100 BPM: family teal, deep blue, purple; sky A8D3F6, scene hue 67.18156433105469: colour purple (song feel rank 3; sky was 207 deg, scene 67 deg)
+  mask: mean coverage in the window 29% of the upper picture; PIXEL CHECK at the peak and +0.12 s: 0 pixels outside the mask area differ from the render without the sky effect (0 = identical); inside the mask area 750924 of 823775 pixels changed by more than 8 levels; colour purple 0x5B22A6
+Valorant_2025.10.28_-_01.04.20.12.DVR_13: sky coverage 13% of the upper picture (top strip 24%, kind blue) -> the render would RECOLOUR the sky
+  song feel style smooth, energy 0.50, 85 BPM: family purple, deep blue, teal; sky 9BD3FA, scene hue 39.42044448852539: colour purple (song feel rank 1; sky was 205 deg, scene 39 deg)
+  mask: mean coverage in the window 13% of the upper picture; PIXEL CHECK at the peak and +0.12 s: 0 pixels outside the mask area differ from the render without the sky effect (0 = identical); inside the mask area 342132 of 416400 pixels changed by more than 8 levels; colour purple 0x5B22A6
+Replay_2026-08-11_12-31-04_15: sky coverage 14% of the upper picture (top strip 30%, kind blue) -> the render would RECOLOUR the sky
+  song feel style aggressive, energy 0.90, 150 BPM: family red, orange, magenta; sky B5E0F5, scene hue 233.824462890625: colour red (song feel rank 1; sky was 200 deg, scene 234 deg)
+  mask: mean coverage in the window 11% of the upper picture; PIXEL CHECK at the peak and +0.12 s: 0 pixels outside the mask area differ from the render without the sky effect (0 = identical); inside the mask area 411271 of 489950 pixels changed by more than 8 levels; colour red 0xB3121A
+Counter-strike_2_2026.03.04_-_20.02.58.0_13: sky coverage 24% of the upper picture (top strip 45%, kind blue) -> the render would RECOLOUR the sky
+  song feel style chill, energy 0.30, 70 BPM: family deep blue, teal, green; sky B5DAFD, scene hue 28.832265853881836: colour green (song feel rank 3; sky was 209 deg, scene 29 deg)
+  mask: mean coverage in the window 20% of the upper picture; PIXEL CHECK at the peak and +0.12 s: 0 pixels outside the mask area differ from the render without the sky effect (0 = identical); inside the mask area 583338 of 698200 pixels changed by more than 8 levels; colour green 0x1E8E3A
+Counter-strike_2_2026.02.05_-_22.57.32.1_10: sky coverage 24% of the upper picture (top strip 48%, kind blue) -> the render would RECOLOUR the sky
+  song feel style hype, energy 0.74, 150 BPM: family orange, gold, magenta; sky A4CCF8, scene hue 31.68943977355957: colour magenta (song feel rank 3; sky was 211 deg, scene 32 deg)
+  mask: mean coverage in the window 25% of the upper picture; PIXEL CHECK at the peak and +0.12 s: 0 pixels outside the mask area differ from the render without the sky effect (0 = identical); inside the mask area 673635 of 802500 pixels changed by more than 8 levels; colour magenta 0xB0147E
+Counter-strike_2_2025.02.11_-_20.21.22.0_12: sky coverage 22% of the upper picture (top strip 40%, kind blue) -> the render would RECOLOUR the sky
+  song feel style cinematic, energy 0.60, 100 BPM: family teal, deep blue, purple; sky 94C0EE, scene hue 27.748615264892578: colour purple (song feel rank 3; sky was 211 deg, scene 28 deg)
+  mask: mean coverage in the window 18% of the upper picture; PIXEL CHECK at the peak and +0.12 s: 0 pixels outside the mask area differ from the render without the sky effect (0 = identical); inside the mask area 600878 of 741325 pixels changed by more than 8 levels; colour purple 0x5B22A6

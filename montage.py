@@ -59,7 +59,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.4.4"
+APP_VERSION = "V8.4.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5325,6 +5325,9 @@ def cmd_scan(args):
     run_scan(load_config(), [args.game] if args.game else None, None, args.limit, args.rescan, getattr(args, "confirm_region_rescan", False))
 
 
+BROKEN_FPS = 20.0                       # V8.4.5: a clip whose video has fewer frames than this per second over its whole length is a broken recording
+
+
 def game_pool(cfg, game, paths=None):
     """([{rec, kills, deaths, vis}], stats): same analyse_entry as the crop view / Self-test, then the soft audio + death-lock
     step. Every rejected row is logged with its reason."""
@@ -5345,16 +5348,22 @@ def game_pool(cfg, game, paths=None):
     util_adm = {}
     pool, allrej, cjk = [], [], {}
     cands = []
+    broken = []
     for r in scan_clips(cfg):
         if r.get("error") or not r.get("w") or r.get("game") != game or (ps is not None and r["path"] not in ps):
             continue
         if any(x in r["path"].lower() for x in exc):
+            continue
+        if r.get("fps") and float(r["fps"]) < BROKEN_FPS:     # V8.4.5: a broken recording (the recorder stalled: whole seconds without a new picture) cannot make a clip; left out of every pool
+            broken.append(Path(r["path"]).name)
             continue
         stats["tagged"] += 1
         e = cache.get(kills_key(r, game, det))
         if not e or e.get("error"):
             continue
         cands.append((r, e))
+    if broken:
+        out(f"{game}: {len(broken)} clip(s) left out - broken recording, the video has under {BROKEN_FPS:.0f} frames a second (the recorder stalled): " + "; ".join(broken))
     if game == "cs2" and cands:                            # V6.8.1: red-border row sidecars, built once per clip when missing
         try:
             border_build_many([r for r, _ in cands], cfg, det)
@@ -9937,7 +9946,8 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     assign_soft_cuts(plan, plan["notes"])                  # V7.6.1: soft dissolves where footage allows it, hard cuts elsewhere
     if effects_mode(cfg, game) == "extra":                 # V8.4: EXTRA EFFECTS: only adds look data to the takes (its own random stream); kills, cuts, timing and the default effects' draws stay as they are
         try:
-            assign_extra_fx(plan, game, seed, plan["notes"], energy=song.get("energy"))
+            assign_extra_fx(plan, game, seed, plan["notes"], energy=song.get("energy"),
+                            flicks={(str(e_["path"]), round(float(e_["times"][0]), 3)) for e_ in events if e_.get("flick") and e_.get("times")})
         except Exception as ex_:
             LOGONLY(f"extra effects skipped: {type(ex_).__name__}: {ex_}")
     D, S0 = plan["duration"], plan["song"]["start_t"]
@@ -10659,7 +10669,8 @@ def slice_plan(plan, length=20.0):
     sg = dict(plan["song"], start_t=plan["song"]["start_t"] + t0 / OUT_FPS)
     tf = nt[-1]["f0"] + nt[-1]["nf"]
     sg["fade_out_start"] = max(0.0, min(sg["fade_out_start"] - t0 / OUT_FPS, tf / OUT_FPS - 1.0))
-    return dict(plan, takes=nt, song=sg, duration=tf / OUT_FPS, total_frames=tf, preview=True)
+    drops = [dict(d_, t=round(float(d_["t"]) - t0 / OUT_FPS, 4)) for d_ in (plan.get("xfx_drop") or []) if 0 <= float(d_["t"]) - t0 / OUT_FPS <= tf / OUT_FPS]
+    return dict(plan, takes=nt, song=sg, duration=tf / OUT_FPS, total_frames=tf, preview=True, **({"xfx_drop": drops} if "xfx_drop" in plan else {}))
 
 
 def _sum_expr(terms):
@@ -10812,7 +10823,11 @@ EFFECT_LABELS = {"default": "Default (minimal effects)", "extra": "Extra effects
 XFX_SETTLE_S = 0.25                  # the incoming take eases out of a small zoom for this long (reference: a settle after most cuts)
 XFX_MIRROR_F = 2                     # the mirror-edge zoom-out lasts this many frames at the start of a take
 XFX_MIN_LEAD = 0.8                   # cut-side effects only when the take's first kill is at least this far in (the kill row is never near them)
-XFX_GLOW_S, XFX_FLASH_S, XFX_RGB_S = 0.26, 0.14, 0.12      # lengths (s) of the per-kill colour glow, white flash and colour-channel split
+XFX_GLOW_S, XFX_FLASH_S, XFX_RGB_S = 0.26, 0.12, 0.12      # lengths (s) of the (removed) glow, the white flash pulse and the colour-channel split
+FLASH_EVERY_S = 17.5                 # V8.4.5: about one white flash per this many seconds of montage (70 s: 4)
+FLASH_MIN_GAP_S = 3.5                # and at least this far apart (drop / headline kills: 1 s); never on consecutive kills, one per take
+FLASH_A_MIN, FLASH_A_MAX = 0.14, 0.34   # peak strength of the flash (weight towards white at the brightest, outermost pixels): moderate, well below pure white
+FLASH_FALL = 30.0                    # exp(-FLASH_FALL * t): the pulse is down to 5 % after 0.1 s
 XFX_RISE_S, XFX_AFTER_S = 1.0, 1.2   # drop kill: the build-up before it (picture gets more saturated / contrasty) and the afterglow after it
 XFX_SKY_IN, XFX_SKY_OUT = 0.25, 0.75  # sky recolour: starts this long before the kill, ends this long after it (eased in and out)
 XFX_SKY_MIN_TOP = 0.05               # and at least this share of the top 15 % of the picture
@@ -10860,16 +10875,15 @@ def xfx_strength(t):
     return 0.65
 
 
-XFX_FX = ("split", "grade", "sky")     # V8.4.3: the extra effects that switch on in the render (glow / flash are gone: no effect washes the picture in a colour); transition = mirror, zoom = settle / punch
+XFX_FX = ("split", "grade", "sky", "drop")     # V8.4.3: the extra effects that switch on in the render (glow / flash are gone: no effect washes the picture in a colour); transition = mirror, zoom = settle / punch
 FEEL_PROFILES = {                    # V8.4.4: how a style's montage is dressed: weight of each kill effect (white flash / colour split / zoom punch), how many a montage keeps, share of kills dressed, cut effects, sky
-    "aggressive": {"w": {"punch": 0.9, "flash": 0.8, "split": 0.6}, "k": (2, 3), "share": 0.52, "settle": 0.7, "mirror": 0.5, "sky": 3},
-    "hype": {"w": {"punch": 0.8, "flash": 0.5, "split": 0.3}, "k": (1, 2), "share": 0.46, "settle": 0.6, "mirror": 0.3, "sky": 2},
-    "cinematic": {"w": {"punch": 0.4, "flash": 0.3, "split": 0.15}, "k": (1, 2), "share": 0.38, "settle": 0.4, "mirror": 0.15, "sky": 3},
-    "smooth": {"w": {"punch": 0.35, "flash": 0.2, "split": 0.1}, "k": (1, 2), "share": 0.3, "settle": 0.5, "mirror": 0.0, "sky": 1},
-    "chill": {"w": {"punch": 0.25, "flash": 0.1, "split": 0.05}, "k": (1, 1), "share": 0.22, "settle": 0.4, "mirror": 0.0, "sky": 1}}
+    "aggressive": {"w": {"punch": 0.9, "split": 0.6}, "k": (2, 3), "share": 0.52, "settle": 0.7, "mirror": 0.5, "sky": 3},
+    "hype": {"w": {"punch": 0.8, "split": 0.3}, "k": (1, 2), "share": 0.46, "settle": 0.6, "mirror": 0.3, "sky": 2},
+    "cinematic": {"w": {"punch": 0.4, "split": 0.15}, "k": (1, 2), "share": 0.38, "settle": 0.4, "mirror": 0.15, "sky": 3},
+    "smooth": {"w": {"punch": 0.35, "split": 0.1}, "k": (1, 2), "share": 0.3, "settle": 0.5, "mirror": 0.0, "sky": 1},
+    "chill": {"w": {"punch": 0.25, "split": 0.05}, "k": (1, 1), "share": 0.22, "settle": 0.4, "mirror": 0.0, "sky": 1}}
 FEEL_PROFILES["mix"] = FEEL_PROFILES["hype"]
-XFX_SKY_SPACING = 25.0               # seconds between two sky recolours in one montage
-XFX_SKY_CANDS = 12                   # kills that are looked at for a clear sky (the render keeps at most the profile's number of them)
+XFX_SKY_CANDS = 24                   # kills that are looked at for a clear sky (drop / headline / ending / flick kills; the render keeps the clear ones, SKY_SPACING_S apart, at most sky_max_for(length))
 
 
 def xfx_kill_score(t, i, is_drop, on_beat, near_drop):
@@ -10885,7 +10899,31 @@ def xfx_kill_score(t, i, is_drop, on_beat, near_drop):
     return s * (1.15 if near_drop else 1.0)
 
 
-def assign_extra_fx(plan, game, seed, notes=None, energy=None):
+def drop_strength(c, t):
+    """V8.4.5: how strong a drop moment is: the headline kill (the song's main drop) 1.45, any other kill a song drop is anchored on 1.2, +0.1 when the kill sits exactly on a beat; 1.0 .. 1.6."""
+    s_ = 1.45 if c.get("head") else 1.2
+    if c.get("on"):
+        s_ += 0.1
+    return max(1.0, min(1.6, s_))
+
+
+DROP_VARIANTS = (                    # V8.4.5 drop moments: (name, music dip length s, hit: end pitch Hz, start pitch Hz, pitch fall 1/s, decay 1/s, vignette breath)
+    ("punch", 0.22, 52.0, 130.0, 26.0, 6.5, 0.45),
+    ("breath", 0.40, 46.0, 110.0, 18.0, 4.2, 0.80),
+    ("slam", 0.30, 58.0, 150.0, 30.0, 7.5, 0.60))
+
+
+def drop_moment(rng, s, gp):
+    """V8.4.5: the drop moment of ONE drop kill (output time gp), scaled by its strength s (1.0 .. 1.6): a music dip that ends exactly on the kill (the breath before the drop: 4 .. 9.5 dB, 0.22 .. 0.4 s,
+    one of three variants), a synthesised low hit on the kill (a falling sine: pitch glide + decay, level scaled by s), the gunshot lifted for 0.3 s, and the picture's breath (a vignette that closes
+    before the kill). Kill time, speed, tail and kill row are not touched: only the music, one added low sound and the game audio level change."""
+    v = rng.choice(DROP_VARIANTS)
+    k = (s - 1.0) / 0.6
+    return {"t": round(float(gp), 4), "s": round(s, 3), "variant": v[0], "dip_s": v[1], "dip_db": round(min(9.5, 4.0 + 6.0 * k), 1), "boom_f1": v[2], "boom_f0": v[3], "boom_r": v[4], "boom_dec": v[5],
+            "boom_db": round(-2.0 + 2.0 * k, 1), "lift_db": round(2.0 + 3.0 * k, 1), "duck_db": round(4.0 + 3.0 * k, 1), "breath": v[6]}
+
+
+def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
     """V8.4.2 EXTRA EFFECTS: builds the EFFECT PLAN of this montage and writes t['xfx'] (effect dicts on the take's own timeline). Nothing here changes segments, kill times, cut timing or
     the default zoom pulses (its own random stream). The plan: (1) the song's feel (style, energy, BPM) fixes the colour and the profile (FEEL_PROFILES: which kill effects weigh how much,
     how many kills are dressed, which cut effects, how many sky recolours); (2) a seed and the song pick this montage's SIGNATURE (2-3 of glow / flash / split / punch, so two montages
@@ -10904,8 +10942,6 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
         en = float(energy)
     except (TypeError, ValueError):
         en = 0.6
-    sky_name, sky_rgb, sky_why = sky_pick(recipe, energy, (plan.get("song") or {}).get("bpm"), seed, title)      # V8.4.4: ONE sky colour per montage, from the song's feel
-    plan["xfx_sky_hue"] = {"name": sky_name, "rgb": sky_rgb, "why": sky_why}
     plan["effects"] = "extra"
     plan["xfx_zone"] = [round(float(v), 4) for v in zone]
     plan["xfx_feel"] = {"name": fname, "hue": fhue, "rgb": frgb, "why": fwhy}
@@ -10933,44 +10969,63 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
     head_ix = [i for i, t in enumerate(takes) if t.get("role") == "headline"]
     near_drop = {j for i in head_ix for j in range(i - 2, i + 3)}
     da = plan.get("drop_anchor") or {}
+    dur_all = float(plan.get("duration") or 0.0)
+    # the drop kills: every kill a song drop is anchored on (drop_sync) and the headline's drop kill; the headline kill itself
+    drop_keys = {}
+    for d_ in plan.get("drop_sync") or []:
+        try:
+            drop_keys[(int(d_["take"]) - 1, int(d_["kill"]) - 1)] = "drop"
+        except (KeyError, TypeError, ValueError):
+            continue
+    head_key = None
+    if head_ix:
+        hk = (int(da.get("kill", len(takes[head_ix[0]].get("kills_out") or [1]))) - 1) if da else len(takes[head_ix[0]].get("kills_out") or [1]) - 1
+        head_key = (head_ix[0], max(0, min(hk, len(takes[head_ix[0]].get("kills_out") or [1]) - 1)))
+        drop_keys[head_key] = "headline"
+    end_ix = next((i for i in range(len(takes) - 1, -1, -1) if takes[i].get("ending")), len(takes) - 1 if takes else None)
+    flick_keys = set(flicks or [])
     # (3) score every kill
     cands = []
+    order = 0
     for ti, t in enumerate(takes):
         kills = list(t.get("kills_out") or [])
         uns = list(t.get("unsure") or [False] * len(kills))
-        drop_k = (int(da.get("kill", 1)) - 1) if ti in head_ix else None
+        is_flick_take = (str(t.get("path")), round(float((t.get("kills") or [0])[0]), 3)) in flick_keys
         for i, p in enumerate(kills):
+            order += 1
             if uns[i] if i < len(uns) else False:
                 continue
             gp = float(t.get("out_start") or 0) + p
             dt = min((abs(gp - b) for b in beats), default=1.0)
-            is_drop = drop_k is not None and i == drop_k
+            kind_ = drop_keys.get((ti, i))
+            is_drop = kind_ is not None
             sc = xfx_kill_score(t, i, is_drop, dt <= 0.04, ti in near_drop) + rng.uniform(-0.12, 0.12)
-            cands.append({"ti": ti, "i": i, "p": p, "gp": gp, "sc": sc, "drop": is_drop, "on": dt <= 0.04})
+            cands.append({"ti": ti, "i": i, "p": p, "gp": gp, "sc": sc, "drop": is_drop, "head": kind_ == "headline", "on": dt <= 0.04, "order": order,
+                          "end": ti == end_ix and i == len(kills) - 1, "flick": bool(is_flick_take and i == 0)})
     n_dress = int(round(share * len(cands)))
-    chosen, last_gp = [], -9.0
+    chosen = []
     for c in sorted(cands, key=lambda c: (not c["drop"], -c["sc"])):
         if len(chosen) >= n_dress and not c["drop"]:
             break
         if not c["drop"] and any(abs(c["gp"] - o["gp"]) < 0.5 for o in chosen):
             continue
         chosen.append(c)
-    chosen_ix = {(c["ti"], c["i"]): c for c in chosen}
-    cnt = {"settle": 0, "mirror": 0, "flash": 0, "rgb": 0, "punch": 0, "burst": 0, "rise": 0, "after": 0, "sky": 0, "kills": 0, "clean": 0}
+    cnt = {"settle": 0, "mirror": 0, "flash": 0, "rgb": 0, "punch": 0, "burst": 0, "rise": 0, "after": 0, "breath": 0, "sky": 0, "kills": 0, "clean": 0}
     prev_first = None
     last_mirror = -9
     per_take = {ti: [] for ti in range(len(takes))}
+    drops_audio = []
     for c in sorted(chosen, key=lambda c: c["gp"]):
         t = takes[c["ti"]]
         p, sc = c["p"], c["sc"]
         lag = ((t.get("rows_out") or t["kills_out"])[c["i"]] - p) if c["i"] < len(t.get("rows_out") or t["kills_out"]) else 0.15
         fx = per_take[c["ti"]]
         if c["drop"]:
-            kinds = ["flash", "split", "punch"]
+            kinds = ["split", "punch"]
         else:
             n_e = 3 if sc >= 1.6 else 2 if sc >= 1.05 else 1
             kinds = []
-            opts = [x for x in sig]
+            opts = [x for x in sig if x != "flash"]
             rng.shuffle(opts)
             opts.sort(key=lambda x: (x == prev_first, -prof["w"].get(x, 0.1) * rng.uniform(0.6, 1.4)))
             for x in opts[:n_e]:
@@ -10978,9 +11033,6 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
             if not kinds:
                 kinds = [sig[0]]
             prev_first = kinds[0]
-        if "flash" in kinds:                                     # V8.4.4: a neutral white flash on the chosen kills only (never a colour: see _xfx_chains)
-            fx.append({"k": "flash", "p": round(p, 4), "a": round(min(0.6, 0.3 * sc * par["f"] * (1.3 if c["drop"] else 1.0)), 3), "t1": XFX_FLASH_S})
-            cnt["flash"] += 1
         if "split" in kinds:
             fx.append({"k": "rgb", "p": round(p, 4), "px": int(max(2, min(10, round(par["px"] * sc * (1.35 if c["drop"] else 1.0) / 1.0)))), "t1": XFX_RGB_S})
             cnt["rgb"] += 1
@@ -10990,12 +11042,41 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
         cnt["kills"] += 1
         if c["drop"]:
             cnt["burst"] += 1
+            s_drop = drop_strength(c, t)
+            c["s_drop"] = s_drop
             if p - XFX_RISE_S >= 0.0:
-                fx.append({"k": "rise", "p": round(p, 4), "t0": round(p - XFX_RISE_S, 4)})
+                fx.append({"k": "rise", "p": round(p, 4), "t0": round(p - XFX_RISE_S, 4), "s": round(s_drop, 3)})
                 cnt["rise"] += 1
-            fx.append({"k": "after", "p": round(p, 4), "t1": min(XFX_AFTER_S, max(0.3, float(t.get("dur") or 0) - p))})
+            fx.append({"k": "after", "p": round(p, 4), "t1": min(XFX_AFTER_S, max(0.3, float(t.get("dur") or 0) - p)), "s": round(s_drop, 3)})
             cnt["after"] += 1
+            dm = drop_moment(rng, s_drop, c["gp"])                          # V8.4.5: the drop moment: a breath before it, a low hit on it, the gunshot lifted (audio), a vignette breath + hit (picture)
+            drops_audio.append(dm)
+            if p - dm["dip_s"] >= 0.0 and dm["breath"] > 0:
+                fx.append({"k": "breath", "p": round(p, 4), "t0": round(p - dm["dip_s"], 4), "a": dm["breath"], "s": round(s_drop, 3)})
+                cnt["breath"] += 1
     cnt["clean"] = len(cands) - cnt["kills"]
+    # (3b) the white flash: an emphasis effect, not a flashbang: the drop kills and the headline kill, then a few of the strongest beat-landing kills; about one every FLASH_EVERY_S seconds on average
+    budget = max(2, int(round(dur_all / FLASH_EVERY_S)))
+    flash_sel = []
+
+    def flash_ok(c, gap):
+        for o in flash_sel:
+            if abs(c["gp"] - o["gp"]) < gap or abs(c["order"] - o["order"]) <= 1 or c["ti"] == o["ti"]:
+                return False                                              # never two close together, never on consecutive kills, one per take (never on every kill of a multikill)
+        return True
+    for c in sorted([c for c in cands if c["drop"]], key=lambda c: (not c["head"], -c["sc"])):
+        if len(flash_sel) < budget and flash_ok(c, 1.0):
+            flash_sel.append(c)
+    for c in sorted([c for c in cands if not c["drop"] and c["on"] and c["sc"] >= 1.0], key=lambda c: -c["sc"]):
+        if len(flash_sel) >= budget:
+            break
+        if flash_ok(c, FLASH_MIN_GAP_S):
+            flash_sel.append(c)
+    for c in sorted(flash_sel, key=lambda c: c["gp"]):
+        t = takes[c["ti"]]
+        s_ = xfx_strength(t) * (1.35 if c["head"] else 1.25 if c["drop"] else 1.0)
+        per_take[c["ti"]].append({"k": "flash", "p": round(c["p"], 4), "a": round(max(FLASH_A_MIN, min(FLASH_A_MAX, 0.12 + 0.12 * s_)), 3), "t1": XFX_FLASH_S})
+        cnt["flash"] += 1
     # (4) cut side
     for ti, t in enumerate(takes):
         first = (t.get("kills_out") or [9.0])[0]
@@ -11010,24 +11091,29 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
                 per_take[ti].append({"k": "mirror", "z": round(0.84 - 0.08 * (min(1.45, s0) - 1.0), 3), "t0": 0.0, "t1": round(XFX_MIRROR_F / OUT_FPS, 4)})
                 last_mirror = ti
                 cnt["mirror"] += 1
-    # (5) sky candidates: strong takes only; the render keeps the ones with a clear sky
-    sky_max = 0 if prof["sky"] <= 0 else rng.randint(1, prof["sky"])
+    # (5) sky candidates: the drop kills, the headline kill, the ending's last kill and flick kills - never a first, a calm or an ordinary middle take; the render keeps the ones with a clear sky,
+    # as many as fit the montage's length (sky_max_for) and SKY_SPACING_S apart, best role first
+    ranked, rank_why = sky_ranked(recipe, energy, (plan.get("song") or {}).get("bpm"))
+    plan["xfx_sky_rank"] = {"names": ranked, "why": rank_why}
+    sky_max = 0 if prof["sky"] <= 0 else sky_max_for(dur_all)
     sky_c = []
-    for c in sorted(cands, key=lambda c: -c["sc"]):
+    for c in sorted(cands, key=lambda c: (-(3 if c["head"] else 2 if c["drop"] else 1 if c["end"] else 0), -c["sc"])):
         t = takes[c["ti"]]
-        if xfx_strength(t) < 1.0 and not t.get("ending"):
+        why_ = "headline kill" if c["head"] else "drop kill" if c["drop"] else "ending kill" if c["end"] else "flick kill" if c["flick"] else None
+        if why_ is None or c["ti"] == 0 or t.get("role") == "calm" or any(c["ti"] == o["ti"] for o in sky_c):
             continue
-        if c["i"] != len(t["kills_out"]) - 1 or any(c["ti"] == o["ti"] for o in sky_c):          # V8.4.3: every strong take's last kill is a candidate (the render keeps the clear skies, 25 s apart)
+        if why_ == "drop kill" and "role" in t and t["role"] not in ("drop", "headline", "ending", "build", "calm", ""):
             continue
-        sky_c.append(c)
+        sky_c.append(dict(c, why=why_))
         if len(sky_c) >= XFX_SKY_CANDS:
             break
     for c in sky_c:
         t = takes[c["ti"]]
         dur = float(t.get("dur") or 0)
         per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": round(max(0.0, c["p"] - XFX_SKY_IN), 4), "t1": round(min(dur, c["p"] + XFX_SKY_OUT), 4),
-                                  "hue": sky_name, "ok": None, "gp": round(c["gp"], 3)})
+                                  "ok": None, "gp": round(c["gp"], 3), "why": c["why"], "prio": 3 if c["head"] else 2 if c["drop"] else 1 if c["end"] else 0})
     plan["xfx_sky_max"] = sky_max
+    plan["xfx_drop"] = drops_audio
     for ti, fx in per_take.items():
         if fx:
             takes[ti]["xfx"] = fx
@@ -11036,14 +11122,18 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None):
         xfx_speed(plan, rng, cnt)
     on_n = sum(1 for c in chosen if c["on"])
     summary = {"feel": fname, "why": fwhy, "recipe": recipe, "signature": sig, "share": round(share, 2), "kills": len(cands), "dressed": cnt["kills"], "dressed_on_beat": on_n,
-               "flash": cnt["flash"], "split": cnt["rgb"], "punch": cnt["punch"], "sky_colour": sky_name, "burst": cnt["burst"], "settle": cnt["settle"], "mirror": cnt["mirror"],
-               "speed": cnt["speed"], "sky_max": sky_max, "sky_candidates": len(sky_c)}
+               "flash": cnt["flash"], "flash_budget": budget, "split": cnt["rgb"], "punch": cnt["punch"], "sky_family": ranked[:3], "burst": cnt["burst"], "breath": cnt["breath"],
+               "settle": cnt["settle"], "mirror": cnt["mirror"], "speed": cnt["speed"], "sky_max": sky_max, "sky_candidates": len(sky_c)}
     plan["xfx_plan"] = summary
-    lines = [f"EFFECT PLAN (extra): song feel {fname} - {fwhy}; this montage's signature: {' + '.join(sig)} (kill effects not in it only on the drop kill)",
+    lines = [f"EFFECT PLAN (extra): song feel {fname} - {fwhy}; this montage's signature: {' + '.join(sig)} (kill effects not in it only on the drop kills)",
              f"EFFECT PLAN: {cnt['kills']} of {len(cands)} kills dressed ({share * 100:.0f}% share by style / energy, {on_n} on a beat; the rest stay clean): "
-             f"white flash {cnt['flash']}, colour split {cnt['rgb']}, punch {cnt['punch']}; {cnt['burst']} drop burst(s) with build-up and afterglow; cuts: {cnt['settle']} settles, {cnt['mirror']} mirror cuts; "
-             f"{cnt['speed']} faster run-ups; sky recolour: up to {sky_max} (clear sky only, {len(sky_c)} candidate kills, at least {XFX_SKY_SPACING:.0f} s apart)",
-             f"EFFECT PLAN: sky colour {sky_name} (0x{sky_rgb:06X}) - {sky_why}, seed {seed}"]
+             f"colour split {cnt['rgb']}, punch {cnt['punch']}; {cnt['burst']} drop kill(s) with build-up, hit and afterglow; cuts: {cnt['settle']} settles, {cnt['mirror']} mirror cuts; "
+             f"{cnt['speed']} faster run-ups",
+             f"EFFECT PLAN: white flash on {cnt['flash']} of {len(cands)} kills (budget {budget} for {dur_all:.0f} s = one per {FLASH_EVERY_S:.0f} s on average; {sum(1 for c in flash_sel if c['drop'])} drop / headline kills, "
+             f"{sum(1 for c in flash_sel if not c['drop'])} strong beat kills; at least {FLASH_MIN_GAP_S:.1f} s apart, never on consecutive kills, one per take, peak at most {FLASH_A_MAX:.2f})",
+             f"EFFECT PLAN: drop moments: {len(drops_audio)} (music dip " + ", ".join(f"{d['dip_db']:.1f} dB / {d['dip_s']:.2f} s" for d in drops_audio) + ")" if drops_audio else "EFFECT PLAN: no drop moment (no drop kill)",
+             f"EFFECT PLAN: sky recolour: up to {sky_max} for {dur_all:.0f} s (at least {SKY_SPACING_S:.0f} s apart, clear sky only; {len(sky_c)} candidate kills: drop / headline / ending / flick, never a first, calm or middle take); "
+             f"colour family from the song's feel: {', '.join(ranked[:3])} ({rank_why})"]
     for ln in lines:
         if notes is not None:
             notes.append(ln)
@@ -11110,6 +11200,8 @@ def xfx_windows(t, ti, soft_in=False):
             w.append((x["p"] - 0.02, x["p"] + 0.45))
         elif k == "rise":
             w.append((x["t0"], x["p"]))
+        elif k == "breath":
+            w.append((x["t0"], x["p"] + 0.04))
         elif k == "after":
             w.append((x["p"], x["p"] + x["t1"]))
         elif k == "sky" and x.get("ok"):
@@ -11190,16 +11282,13 @@ def _jf(path, div=1.0):
     return f"(STARTPTS+N/(60*TB))/{div:.4f}" if abs(div - 1.0) > 1e-9 else "STARTPTS+N/(60*TB)"
 
 
+AUDIO_GAP_FIX = [True]               # V8.4.5: holes inside a source range are filled with silence by timestamp (switch for the A/B proof)
 AUDIO_HOLE_FIX = [True]              # V8.4.3: a source range with no audio packets at all becomes silence (switch for the A/B proof)
 _APKT = {}
 
 
-def audio_hole(path, a_stream, t0, dur):
-    """V8.4.3: True when the clip's audio track has NO packet inside [t0, t0 + dur] (a hole in the recording: some DVR clips lose audio for seconds). ffmpeg then hands the
-    filter graph audio frames without timestamps and the audio `concat` stops the whole render with "Invalid data found when processing input" (the cause of the seed 417349
-    Valorant failure, in DEFAULT too). Such a range is rendered as silence, exactly like a muted clip. False when the track cannot be read (the old chain is kept)."""
-    if not AUDIO_HOLE_FIX[0]:
-        return False
+def _audio_packets(path, a_stream):
+    """V8.4.5: the sorted packet times of a clip's audio track (cached; [] when it cannot be read)."""
     key = (str(path), int(a_stream))
     pk = _APKT.get(key)
     if pk is None:
@@ -11210,6 +11299,44 @@ def audio_hole(path, a_stream, t0, dur):
         except Exception:                              # noqa: BLE001
             pk = []
         _APKT[key] = pk
+    return pk
+
+
+AUDIO_GAP_S = 0.035                  # V8.4.5: an AAC packet lasts 21.3 ms; a space between two packets longer than this is a hole in the recording
+
+
+def audio_gap(path, a_stream, t0, dur):
+    """V8.4.5: True when the clip's audio track has a HOLE (a space between two packets of more than AUDIO_GAP_S, or no packet at the start / end) inside [t0, t0 + dur] (some DVR clips lose
+    audio for a moment while the video goes on). ffmpeg then hands the filter graph audio frames whose timestamps jump; `asetpts=PTS-STARTPTS` + `atrim` count the samples, not the time, so the
+    hole is cut out of the take's audio and every take after it plays EARLIER than its picture (the montage R_VAL_V8.4.4 of seed 614716: take 10 was 0.63 s short, takes 11-17 off by that much).
+    Such a range is resampled with `aresample=async=1:first_pts=0`, which fills the hole with silence by timestamp. False when the track cannot be read (the old chain is kept)."""
+    if not AUDIO_GAP_FIX[0]:
+        return False
+    pk = _audio_packets(path, a_stream)
+    if len(pk) < 2:
+        return False
+    i = bisect.bisect_left(pk, t0 - 0.05)
+    j = bisect.bisect_right(pk, t0 + dur + 0.05)
+    win = pk[max(0, i - 1):j + 1]
+    if len(win) < 2:
+        return False
+    if any(b - a > AUDIO_GAP_S for a, b in zip(win, win[1:])):
+        return True
+    return pk[0] < t0 - 0.2 and (win[0] > t0 + 0.05 or win[-1] < t0 + dur - 0.05) and win[-1] < pk[-1] - 0.5
+
+
+def aresample_for(path, a_stream, t0, dur):
+    """The first filter of a take audio chain: the old one, or the gap-filling one when the range holds a hole in the recording (see audio_gap)."""
+    return "aresample=48000:async=1:first_pts=0" if audio_gap(path, a_stream, t0, dur) else "aresample=48000"
+
+
+def audio_hole(path, a_stream, t0, dur):
+    """V8.4.3: True when the clip's audio track has NO packet inside [t0, t0 + dur] (a hole in the recording: some DVR clips lose audio for seconds). ffmpeg then hands the
+    filter graph audio frames without timestamps and the audio `concat` stops the whole render with "Invalid data found when processing input" (the cause of the seed 417349
+    Valorant failure, in DEFAULT too). Such a range is rendered as silence, exactly like a muted clip. False when the track cannot be read (the old chain is kept)."""
+    if not AUDIO_HOLE_FIX[0]:
+        return False
+    pk = _audio_packets(path, a_stream)
     if len(pk) < 2:
         return False
     i = bisect.bisect_left(pk, t0 - 0.05)
@@ -11250,10 +11377,35 @@ SKY_STYLE_W = {                      # the song's style -> weight of each colour
     "mix": {k_: 1.0 for k_ in SKY_PALETTE}}
 
 
-def sky_pick(recipe, energy, bpm, seed, title):
-    """V8.4.4: the sky colour of ONE montage from the song's feel: the style gives the weights, a fast / intense song pushes towards red / orange / magenta / gold, a slow / calm one towards
-    blue / teal / purple / green, and the seed + song title pick among them (so different songs, BPMs and seeds get different colours). Returns (name, 0xRRGGBB, why)."""
+SKY_WARM = [False]                   # V8.4.5: dusk (orange / yellow) skies: OFF. Measured on 3,900 Valorant frames and 493 kill frames: every warm "sky" found was an orange wall (Bind, Haven, Dust); a wall must never be recoloured
+SKY_SPACING_S = 14.0                 # V8.4.5: two sky recolours of one montage are at least this far apart (seconds between their kills)
+SKY_PER_S = 30.0                     # and a montage gets at most one per this many seconds of length (70 s: 2, 150 s: 5, 180 s: 6), fewer when fewer takes qualify
+SKY_MAX_N = 6
+
+
+def sky_max_for(duration):
+    """V8.4.5: how many sky recolours a montage of this length may have at most (a couple at 70 s, about 5 at 2.5 minutes, never more than 6)."""
+    return int(max(1, min(SKY_MAX_N, round(float(duration) / SKY_PER_S))))
+
+
+def _hue_deg(rgb):
+    import colorsys
+    r, g, b = ((rgb >> 16) & 255) / 255.0, ((rgb >> 8) & 255) / 255.0, (rgb & 255) / 255.0
+    return colorsys.rgb_to_hsv(r, g, b)[0] * 360.0
+
+
+def _hue_dist(a, b):
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
+
+
+def sky_ranked(recipe, energy, bpm):
+    """V8.4.5: the palette colours in the order the SONG'S FEEL prefers them (style, energy, BPM; no seed, no game: the same song feel gives the same family of colours in every game and every
+    montage): a fast / intense song prefers red / orange / magenta / gold, a slow / calm one deep blue / teal / purple / green; the style weights decide the order inside. Returns
+    ([names best first], why)."""
     w = dict(SKY_STYLE_W.get(recipe, SKY_STYLE_W["hype"]))
+    for k_ in SKY_PALETTE:
+        w.setdefault(k_, 0.15)
     why = f"style {recipe}"
     try:
         e, b = float(energy), float(bpm)
@@ -11267,20 +11419,27 @@ def sky_pick(recipe, energy, bpm, seed, title):
                 w[k_] *= 0.4 + 1.3 * warm / 1.4
             else:
                 w[k_] *= 1.7 - 1.3 * warm / 1.4
-        for k_ in ("red", "orange", "deep blue", "teal"):                   # a colour outside the style stays possible when the feel points to it
-            if k_ not in w and ((warm >= 1.0 and k_ in ("red", "orange")) or (warm <= 0.5 and k_ in ("deep blue", "teal"))):
-                w[k_] = 0.6
-    rng = random.Random(f"{seed}|{title}|sky844")
-    names = sorted(w)
-    tot = sum(w[n_] for n_ in names)
-    r, acc = rng.random() * tot, 0.0
-    pick = names[-1]
-    for n_ in names:
-        acc += w[n_]
-        if r <= acc:
-            pick = n_
-            break
-    return pick, SKY_PALETTE[pick], why
+    return sorted(w, key=lambda n_: (-round(w[n_], 6), n_)), why
+
+
+def sky_colour_for(ranked, sky_rgb, scene_hue=None):
+    """V8.4.5: the colour for ONE sky out of the song's family (the first colours of `ranked`): the best-ranked one whose hue is at least 50 degrees away from the sky's own colour (so the change
+    is plain to see) and 30 degrees from the strongest colour of the scene (so the sky does not melt into the ground / walls); when none qualifies the one that is farthest from the sky.
+    Returns (name, 0xRRGGBB, reason)."""
+    sh = _hue_deg(sky_rgb) if sky_rgb is not None else None
+    best, best_d = None, -1.0
+    for n_ in ranked[:5]:
+        c = SKY_PALETTE[n_]
+        h = _hue_deg(c)
+        d_sky = _hue_dist(h, sh) if sh is not None else 180.0
+        d_scene = _hue_dist(h, scene_hue) if scene_hue is not None else 180.0
+        if d_sky >= 50.0 and d_scene >= 30.0:
+            return n_, c, f"song feel rank {ranked.index(n_) + 1}; sky was {sh:.0f} deg" + (f", scene {scene_hue:.0f} deg" if scene_hue is not None else "") if sh is not None else f"song feel rank {ranked.index(n_) + 1}"
+        sc = min(d_sky, d_scene * 1.5)
+        if sc > best_d:
+            best, best_d = n_, sc
+    c = SKY_PALETTE[best]
+    return best, c, f"no colour of the song's family was clear of the sky / scene hue; the farthest one ({best_d:.0f} deg)"
 
 
 def _rgb_to_yuv(rgb):
@@ -11290,15 +11449,17 @@ def _rgb_to_yuv(rgb):
 
 
 def sky_segment(rgb, zone=None, model=None):
-    """V8.4.4: the SKY REGION of a picture (HxWx3 uint8 RGB, any size): not pixel by pixel but as one connected region. Smooth pixels of the sky's own colour (a colour model taken from the top
-    of the picture: median Lab chroma and brightness; or `model` from an earlier frame, so the colour does not change from frame to frame) -> only the pieces that touch the top edge ->
-    closing (gaps) and hole filling (a cloud, a wire, an antenna inside the sky is sky) -> in the killfeed zone only the sky-coloured pixels themselves (the rows stay readable); the
-    radar corner is not sky. Sky kind: blue (sky blue / cyan); grey / white / brown / orange (walls, smoke) is not a clear sky.
-    Returns (mask bool, info {cov, top, kind, model}). Without a clear sky mask is all False."""
+    """V8.4.4 / V8.4.5: the SKY REGION of a picture (HxWx3 uint8 RGB, any size): not pixel by pixel but as one connected region. Smooth pixels of the sky's own colour (a colour model taken from the
+    top of the picture: median Lab chroma and brightness; or `model` from an earlier frame, so the colour does not change from frame to frame) -> only the pieces that touch the top edge ->
+    growth through the paler / darker soft pixels that touch them (gradient towards the horizon, clouds) -> closing (gaps) and hole filling (a wire, an antenna inside the sky is sky) ->
+    in the killfeed zone only the sky-coloured pixels themselves (the rows stay readable). Sky kinds: blue (sky blue / cyan, any brightness above a light grey) and warm (dusk: orange / yellow /
+    peach, saturated). V8.4.5 rules that keep walls out: a region that runs from the top edge down to the lower limit in more than a third of its columns is a wall / a ceiling, not a sky
+    (a sky ends in a horizon inside the picture); slivers narrower than 4.5 % of the width (strips along the edges, narrow gaps between objects) are removed and pieces narrower than 7 % are dropped; grey / white / brown surfaces and smoke are no sky.
+    Returns (mask bool, info {cov, top, kind, model, sky_rgb, scene_hue}). Without a clear sky mask is all False and info['kind'] is 'none' (or 'wall')."""
     import cv2
     import numpy as np
     H, W = rgb.shape[:2]
-    info = {"cov": 0.0, "top": 0.0, "kind": "none", "model": None}
+    info = {"cov": 0.0, "top": 0.0, "kind": "none", "model": None, "sky_rgb": None, "scene_hue": None}
     bl = cv2.GaussianBlur(rgb, (0, 0), 1.2)
     lab = cv2.cvtColor(bl, cv2.COLOR_RGB2LAB).astype(np.float32)
     L, A, B = lab[..., 0], lab[..., 1] - 128, lab[..., 2] - 128
@@ -11322,27 +11483,41 @@ def sky_segment(rgb, zone=None, model=None):
                 break
             med = np.median(ab[keep], 0)
         Lm = float(np.median(L[seed]))
-        chroma = float(np.hypot(*med))
-        kind = "blue" if (med[1] <= -12 and -14 <= med[0] <= 6 and Lm >= 115) else "none"          # sky blue / cyan only: a sunset sky cannot be told from an orange wall in one picture, and a wall must never be recoloured
+        kind = "blue" if (med[1] <= -12 and -14 <= med[0] <= 6 and Lm >= 115) else "none"           # sky blue / cyan only (see SKY_WARM)
+        if SKY_WARM[0] and kind == "none" and med[1] >= 28 and med[0] >= -8 and Lm >= 120 and float(np.hypot(*med)) >= 32:
+            kind = "warm"
         if kind == "none":
             return np.zeros((H, W), bool), info
         model = {"a": float(med[0]), "b": float(med[1]), "L": Lm, "kind": kind}
     info["kind"], info["model"] = model["kind"], model
+    warm = model["kind"] == "warm"
     dab = np.hypot(A - model["a"], B - model["b"])
     cloud = smooth & (L > model["L"] + 8) & (np.hypot(A, B) < 14)
-    cand = smooth & (((dab < 11.0) & (L > max(55.0, model["L"] - 50.0))) | cloud)
+    cand = smooth & (((dab < (13.0 if warm else 11.0)) & (L > max(55.0, model["L"] - 50.0))) | cloud)
     cand[int(H * 0.66):] = False
     cand = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    n, lbl = cv2.connectedComponents(cand, connectivity=8)
-    top_ids = np.unique(lbl[:max(2, int(H * 0.04))])
-    raw = np.isin(lbl, top_ids[top_ids > 0])
+    n, lbl, cst, ccen = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    top_ids = set(int(i) for i in np.unique(lbl[:max(2, int(H * 0.04))]) if i > 0)
+    for i in range(1, n):                                    # V8.4.5: a big sky-coloured piece high in the picture belongs to the sky too (sky left of the radar, between wires, behind the HUD bar)
+        if i not in top_ids and cst[i, cv2.CC_STAT_AREA] >= 0.012 * H * W and cst[i, cv2.CC_STAT_TOP] < 0.30 * H and ccen[i][1] < 0.35 * H:
+            top_ids.add(i)
+    raw = np.isin(lbl, list(top_ids)) if top_ids else np.zeros((H, W), bool)
     smooth2 = (grad < 48) & (noise < 7.0)
-    loose = smooth2 & (((dab < 24.0) & (np.hypot(A, B) >= 4.0)) | ((np.hypot(A, B) < 14.0) & (L > model["L"] + 4.0))) & (L > max(55.0, model["L"] - 70.0))         # the sky's soft edges and its gradient towards the horizon: paler / darker, same hue family
+    loose = smooth2 & (((dab < (22.0 if warm else 24.0)) & (np.hypot(A, B) >= 4.0)) | ((np.hypot(A, B) < 14.0) & (L > model["L"] + 4.0))) & (L > max(55.0, model["L"] - 70.0))
     loose[int(H * 0.66):] = False
     cross = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
     cur = raw.astype(np.uint8)
     for _ in range(40):                                                                                      # grow the sky through the loose pixels that touch it (not further than 40 px)
         nxt = cv2.dilate(cur, cross) & (loose | raw).astype(np.uint8)
+        if np.array_equal(nxt, cur):
+            break
+        cur = nxt
+    raw = cur.astype(bool)
+    haze = smooth2 & (np.hypot(A, B) < 12.0) & (L > max(150.0, model["L"] - 45.0))                         # the pale haze along the horizon (nearly white / grey): sky too, but only a short way from the clear sky
+    haze[int(H * 0.60):] = False
+    cur = raw.astype(np.uint8)
+    for _ in range(22):
+        nxt = cv2.dilate(cur, cross) & (haze | raw).astype(np.uint8)
         if np.array_equal(nxt, cur):
             break
         cur = nxt
@@ -11353,14 +11528,40 @@ def sky_segment(rgb, zone=None, model=None):
     ff = inv.copy()
     cv2.floodFill(ff, np.zeros((pad.shape[0] + 2, pad.shape[1] + 2), np.uint8), (0, 0), 2)
     filled = (pad.astype(bool) | ((inv == 1) & (ff != 2)))[1:-1, 1:-1]
+    # V8.4.5: no thin slivers (strips along the picture edges, narrow gaps) ...
+    opened = cv2.morphologyEx(filled.astype(np.uint8), cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, int(W * 0.045)) | 1, 3)))
+    n2, lb2, st2, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
+    keep_ids = [i for i in range(1, n2) if st2[i, cv2.CC_STAT_WIDTH] >= 0.07 * W and st2[i, cv2.CC_STAT_AREA] >= 0.006 * W * H]
+    filled = np.isin(lb2, keep_ids) if keep_ids else np.zeros((H, W), bool)
+    if not filled.any():
+        info["kind"] = "none"
+        return filled, info
+    # ... and a region that runs from the top edge to the lower limit in many columns is a wall / ceiling (a sky ends in a horizon)
+    cols = filled.any(0)
+    run = np.where(cols, np.argmax(~filled, axis=0), 0)
+    run = np.where(filled.all(0), H, run)
+    reach = float((run[cols] >= int(H * 0.62)).mean()) if cols.any() else 0.0
+    if reach > 0.35:
+        info["kind"] = "wall"
+        return np.zeros((H, W), bool), info
     filled = cv2.dilate(filled.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))).astype(bool)         # the soft sky edge pixels belong to the sky too (a little spill onto the neighbour is fine)
     if zone is not None:
         x0, y0, x1, y1 = zone
         zm = np.zeros((H, W), bool)
         zm[int(y0 * H):int(y1 * H) + 1, int(x0 * W):int(x1 * W) + 1] = True
-        filled = np.where(zm, raw, filled)
+        filled = np.where(zm, raw & filled, filled)
     info["cov"] = float(filled[:int(H * 0.55)].mean())
     info["top"] = float(filled[:int(H * 0.15)].mean())
+    if filled.any():
+        m_ = rgb[filled].reshape(-1, 3).mean(0)
+        info["sky_rgb"] = (int(m_[0]) << 16) | (int(m_[1]) << 8) | int(m_[2])
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)               # the strongest colour of the rest of the picture (ground, walls): saturation-weighted mean hue
+        rest = (~filled) & (hsv[..., 1] > 90) & (hsv[..., 2] > 70)
+        rest[:int(H * 0.30)] = False
+        if rest.sum() > 0.02 * H * W:
+            ang = np.deg2rad(hsv[..., 0][rest] * 2.0)
+            wgt = hsv[..., 1][rest]
+            info["scene_hue"] = float(np.rad2deg(np.arctan2((np.sin(ang) * wgt).sum(), (np.cos(ang) * wgt).sum())) % 360.0)
     return filled, info
 
 
@@ -11466,59 +11667,75 @@ def sky_grade(rgb, mean_y):
 
 
 def xfx_probe_sky(plan, tmpdir=None):
-    """V8.4.4: before a render: every sky candidate kill is looked at (the real frame at the kill: how much of the upper picture is sky, by sky_segment). Only kills with a clear sky qualify (the
-    sky reaches the top edge and covers XFX_SKY_MIN_COV .. XFX_SKY_MAX_COV of the upper picture); of those the clearest are kept, at most the montage's number (plan['xfx_sky_max']), at least
-    XFX_SKY_SPACING seconds apart. For every kept one the take's sky mask is written (sky_take_mask) into `tmpdir` and the colour (plan['xfx_sky_hue']) fixed. No clear sky = no effect.
-    One log line per candidate; a candidate whose frame / mask cannot be made is skipped with the reason (never a silent black frame)."""
+    """V8.4.5: before a render: every sky candidate kill (the drop kills, the headline kill, the ending's last kill, flick kills: see assign_extra_fx) is looked at on its real frame (sky_segment: is there
+    a clear sky, how much of the upper picture, its own colour and the strongest colour of the scene). Only kills with a clear sky qualify (the sky reaches the top edge, ends in a horizon, covers
+    XFX_SKY_MIN_COV .. XFX_SKY_MAX_COV of the upper picture); of those the planner keeps the best roles first (headline, drop, ending, flick; then the clearest sky) as long as the montage's number
+    (plan['xfx_sky_max'] = sky_max_for(length)) is not reached and the kill is at least SKY_SPACING_S from every kept one; never more just to fill a number. For every kept one the take's sky mask is
+    written (sky_take_mask) into `tmpdir`, and the colour is chosen from the song's family (plan['xfx_sky_rank']) against the sky's own colour and the scene (sky_colour_for). Everything is
+    logged: one line per candidate (coverage or the reason it was skipped), one line per kept sky (role, colour, why), one summary."""
     cands = []
     zone = plan.get("xfx_zone")
     for ti, t in enumerate(plan.get("takes") or []):
         for x in t.get("xfx") or []:
             if x.get("k") != "sky" or x.get("ok") is not None:
                 continue
-            cov, why = None, ""
+            cov, why, info = None, "", {}
             try:
                 srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"]}]
-                ks = float(t["kills"][-1])
-                src = next((s_ for s_ in reversed(srcs) if 0 <= ks - s_["shift"] <= (s_.get("dur") or 1e9)), srcs[0])
-                img = sky_grab_frames(src["path"], ks - src["shift"], ks - src["shift"] + 0.04, src["rect"], src["wh"], fps=60)[0]
+                f0 = int(round(float(x["p"]) * OUT_FPS))
+                fr = sky_src_frames(t, f0, f0 + 1)
+                if fr:
+                    si, st = fr[0]
+                    src, tsrc = srcs[si], st
+                else:
+                    src = next((s_ for s_ in reversed(srcs) if 0 <= float(t["kills"][-1]) - s_["shift"] <= (s_.get("dur") or 1e9)), srcs[0])
+                    tsrc = float(t["kills"][-1]) - src["shift"]
+                img = sky_grab_frames(src["path"], tsrc, tsrc + 0.04, src["rect"], src["wh"], fps=60)[0]
                 mk_, info = sky_segment(img, zone)
                 cov = float(info["cov"])
-                if info["top"] < XFX_SKY_MIN_TOP or info["kind"] == "none":                 # real sky reaches the top edge; walls, smoke and lights do not
+                if info["top"] < XFX_SKY_MIN_TOP or info["kind"] not in ("blue", "warm"):                  # real sky reaches the top edge; walls, smoke and lights do not
                     cov = min(cov, XFX_SKY_MIN_COV - 0.01)
                 x["model"] = info.get("model")
             except Exception as ex:                       # noqa: BLE001
                 why = f" ({type(ex).__name__}: {ex})"
             x["cov"] = None if cov is None else round(cov, 3)
             x["ok"] = False
-            cands.append((ti, x, cov, why))
-    hue = plan.get("xfx_sky_hue") or {"name": "orange", "rgb": SKY_PALETTE["orange"], "why": "default"}
+            cands.append({"ti": ti, "x": x, "cov": cov, "why": why, "info": info})
+    ranked = (plan.get("xfx_sky_rank") or {}).get("names") or list(SKY_PALETTE)
     mx = int(plan.get("xfx_sky_max", 1))
+    qual = [c for c in cands if c["cov"] is not None and XFX_SKY_MIN_COV <= c["cov"] <= XFX_SKY_MAX_COV]
     kept = []
-    for ti, x, cov, why in sorted(cands, key=lambda c: -(c[2] or 0)):
-        good = cov is not None and XFX_SKY_MIN_COV <= cov <= XFX_SKY_MAX_COV
+    for c in sorted(qual, key=lambda c: (-int(c["x"].get("prio", 0)), -c["cov"])):
+        x, ti = c["x"], c["ti"]
         gp = float(x.get("gp", 0.0))
-        if good and len(kept) < mx and all(abs(gp - g_) >= XFX_SKY_SPACING for g_ in kept):
-            try:
-                if tmpdir is None:
-                    raise RuntimeError("no temp folder for the mask")
-                Path(tmpdir).mkdir(parents=True, exist_ok=True)
-                mp = Path(tmpdir) / f"sky_take{ti + 1}.yuv"
-                st = sky_take_mask(plan["takes"][ti], x, zone, mp)
-                x.update({"ok": True, "mask": str(mp), "hue": hue["name"], "grade": sky_grade(hue["rgb"], st["mean_y"]), "mask_cov": round(st["cov"], 3)})
-                kept.append(gp)
-                msg = f"sky covers {cov * 100:.0f}% of the upper picture -> recoloured {hue['name']} (mask made from {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%)"
-            except Exception as ex:                        # noqa: BLE001
-                x["ok"] = False
-                msg = f"sky covers {cov * 100:.0f}% but the mask could not be made ({type(ex).__name__}: {ex}), skipped"
-        elif cov is None:
-            msg = f"frame not readable{why}, skipped"
-        elif not good:
-            msg = f"sky covers {cov * 100:.0f}% of the upper picture -> no clear sky here, skipped"
+        if len(kept) >= mx or any(abs(gp - g_) < SKY_SPACING_S for g_ in kept):
+            continue
+        try:
+            if tmpdir is None:
+                raise RuntimeError("no temp folder for the mask")
+            Path(tmpdir).mkdir(parents=True, exist_ok=True)
+            mp = Path(tmpdir) / f"sky_take{ti + 1}.gray"
+            st = sky_take_mask(plan["takes"][ti], x, zone, mp)
+            name, rgb, cwhy = sky_colour_for(ranked, c["info"].get("sky_rgb"), c["info"].get("scene_hue"))
+            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade(rgb, st["mean_y"]), "mask_cov": round(st["cov"], 3)})
+            kept.append(gp)
+            c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the upper picture -> recoloured {name} ({cwhy}); mask from {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%"
+        except Exception as ex:                        # noqa: BLE001
+            x["ok"] = False
+            c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% but the mask could not be made ({type(ex).__name__}: {ex}), skipped"
+    for c in sorted(cands, key=lambda c: c["ti"]):
+        x = c["x"]
+        if c.get("kept"):
+            msg = c["kept"]
+        elif c["cov"] is None:
+            msg = f"{x.get('why', 'kill')}: frame not readable{c['why']}, skipped"
+        elif c["cov"] < XFX_SKY_MIN_COV or c["cov"] > XFX_SKY_MAX_COV:
+            msg = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the upper picture ({c['info'].get('kind', 'none')}) -> no clear sky here, skipped"
         else:
-            msg = f"sky covers {cov * 100:.0f}% -> clear sky, but not chosen (at most {mx} per montage, {XFX_SKY_SPACING:.0f} s apart)"
-        out(f"SKY recolour take {ti + 1}: {msg}")
-    out(f"SKY recolour: {len(kept)} of {len(cands)} candidate kills recoloured {hue['name']} (at most {mx} per montage)" if cands else "SKY recolour: no candidate kill")
+            msg = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% -> clear sky, but not chosen ({'enough sky recolours for this length' if len(kept) >= mx else 'within ' + format(SKY_SPACING_S, '.0f') + ' s of a better one'})"
+        out(f"SKY recolour take {c['ti'] + 1}: {msg}")
+    out(f"SKY recolour: {len(kept)} chosen of {len(cands)} candidate kills ({len(qual)} with a clear sky; at most {mx} for {plan.get('duration', 0):.0f} s, at least {SKY_SPACING_S:.0f} s apart, best role first)" if cands
+        else "SKY recolour: no candidate kill")
 
 
 def _zone_weight(zone, f=0.012):
@@ -11571,11 +11788,14 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
                       f"chromashift=cbh={max(1, px // 2)}:crh=-{max(1, px // 2)}:enable='between(t,{l0 + e['t1'] / 2:.4f},{l0 + e['t1']:.4f})'[{o}]")
         lab = f"[{o}]"
     fl = [e for e in xs if e["k"] == "flash"] if "flash" in fx else []
-    if fl:                                                        # V8.4.4: neutral WHITE flash, made per plane in YUV: luma moves towards white, both chroma planes move towards 128 (grey) by the same
-        # share, so the flash can only add white, never a colour (nothing is blended in from a colour layer). It is weaker over the killfeed zone (30 %), the rows stay readable.
-        kx = "+".join(f"if(between(T,{e['p']:.4f},{e['p'] + e['t1']:.4f}),{e['a']:.3f}*exp(-22*(T-{e['p']:.4f})),0)" for e in fl)
+    if fl:                                                        # V8.4.5 flash: a stylised pulse, not a flashbang. Per plane in YUV: luma moves towards white and both chroma planes towards 128 (grey) by the SAME
+        # share K at every pixel, so it can only add white, never a colour. K = peak x fall-off x vignette (stronger toward the edges, 0.4 in the middle) x bloom (the bright areas lift
+        # most, shadows little: the picture stays visible under it) x zone (30 % over the killfeed zone: the rows stay readable). Peak at most FLASH_A_MAX: far below pure white.
+        kx = "+".join(f"if(between(T,{e['p']:.4f},{e['p'] + e['t1']:.4f}),{e['a']:.3f}*exp(-{FLASH_FALL:g}*(T-{e['p']:.4f})),0)" for e in fl)
         en = "+".join(f"between(t,{e['p'] - 0.005:.4f},{e['p'] + e['t1']:.4f})" for e in fl)
-        kk = f"min(0.9,({kx})*(0.3+0.7*({zw})))"
+        vg = "(0.4+0.6*min(1,hypot(2*X/W-1,2*Y/H-1)/1.3))"
+        bl = "(0.45+0.55*pow(lum(X*SW,Y*SH)/235,2))"
+        kk = f"min(0.5,({kx})*{vg}*{bl}*(0.3+0.7*({zw})))"
         o = nxt("f")
         chains.append(f"{lab}format=yuv420p,geq=lum='lum(X,Y)+(235-lum(X,Y))*{kk}':cb='cb(X,Y)+(128-cb(X,Y))*{kk}':cr='cr(X,Y)+(128-cr(X,Y))*{kk}':enable='{en}'[{o}]")
         lab = f"[{o}]"
@@ -11583,14 +11803,22 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
         if e["k"] == "rise" and "grade" in fx:
             t0, p = e["t0"], e["p"]
             rp = f"min(1,max(0,(t-{t0:.4f})/{max(p - t0, 0.1):.3f}))"
+            sd = float(e.get("s", 1.0))                           # V8.4.5: the build-up grows with the drop's strength (1.0 .. 1.6)
             o = nxt("r")
-            chains.append(f"{lab}eq=contrast='1+0.14*{rp}':saturation='1+0.40*{rp}':eval=frame:enable='between(t,{t0:.4f},{p:.4f})'[{o}]")
+            chains.append(f"{lab}eq=contrast='1+{0.14 * sd:.3f}*{rp}':saturation='1+{0.40 * sd:.3f}*{rp}':eval=frame:enable='between(t,{t0:.4f},{p:.4f})'[{o}]")
+            lab = f"[{o}]"
+        elif e["k"] == "breath" and "drop" in fx:                 # V8.4.5: the picture breathes in before the drop kill: a vignette closes (lens angle PI/5 -> darker) and is gone at the kill
+            t0, p, ba = e["t0"], e["p"], float(e["a"])
+            ang = f"{math.pi / 5:.4f}-{0.30 * ba:.4f}*min(1,max(0,(t-{t0:.4f})/{max(p - t0, 0.1):.3f}))"
+            o = nxt("v")
+            chains.append(f"{lab}vignette=angle='{ang}':eval=frame:enable='between(t,{t0:.4f},{p + 0.03:.4f})'[{o}]")
             lab = f"[{o}]"
         elif e["k"] == "after" and "grade" in fx:
             p, l1 = e["p"], e["t1"]
             ex_ = f"exp(-3*(t-{p:.4f}))"
+            sd = float(e.get("s", 1.0))
             o = nxt("a")
-            chains.append(f"{lab}eq=contrast='1+0.07*{ex_}':saturation='1+0.35*{ex_}':eval=frame:enable='between(t,{p:.4f},{p + l1:.4f})'[{o}]")
+            chains.append(f"{lab}eq=contrast='1+{0.07 * sd:.3f}*{ex_}':saturation='1+{0.35 * sd:.3f}*{ex_}':eval=frame:enable='between(t,{p:.4f},{p + l1:.4f})'[{o}]")
             lab = f"[{o}]"
     return lab
 
@@ -11674,7 +11902,7 @@ def build_filter(plan, cfg, preview, fx=None):
                     at = f"atempo={min(2.0, max(0.5, vbar)):.4f}," if vbar >= 0.5 else f"atempo=0.5,atempo={vbar / 0.5:.4f},"
                     kt = [f"between(t,{ko - off - 0.2:.3f},{ko - off + 0.2:.3f})" for ko in t["kills_out"] if -0.25 < ko - off < out_len + 0.25]
                     vol = f"volume='{gain:.4f}+{max(0.0, boost - gain):.4f}*min(1,{_sum_expr(kt)})':eval=frame" if kt else f"volume={gain:.4f}"
-                    chains.append(f"[{ka}:a:{int(src.get('a_stream') or 0)}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                    chains.append(f"[{ka}:a:{int(src.get('a_stream') or 0)}]{aresample_for(src['path'], src.get('a_stream') or 0, ssa, out_len * vbar + 0.6)},aformat=sample_fmts=fltp:channel_layouts=stereo,"
                                   f"{at}{vol},asetpts=PTS-STARTPTS,apad,atrim=duration={out_len:.4f}[s{k0_}a]")
                     k += 1
                 else:
@@ -11720,7 +11948,7 @@ def build_filter(plan, cfg, preview, fx=None):
                     at = f"atempo=0.5,atempo={sp / 0.5:.4f},"
                 kt = [f"between(t,{ko - off - 0.2:.3f},{ko - off + 0.2:.3f})" for ko in t["kills_out"] if -0.25 < ko - off < out_len + 0.25]
                 vol = f"volume='{gain:.4f}+{max(0.0, boost - gain):.4f}*min(1,{_sum_expr(kt)})':eval=frame" if kt else f"volume={gain:.4f}"
-                chains.append(f"[{k}:a:{int(src.get('a_stream') or 0)}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                chains.append(f"[{k}:a:{int(src.get('a_stream') or 0)}]{aresample_for(src['path'], src.get('a_stream') or 0, max(0.0, sa), dur_src + 0.3)},aformat=sample_fmts=fltp:channel_layouts=stereo,"
                               f"{at}{vol},asetpts=PTS-STARTPTS,apad,atrim=duration={out_len:.4f}[s{k}a]")
             else:
                 chains.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={out_len:.4f},asetpts=PTS-STARTPTS[s{k}a]")
@@ -11831,12 +12059,49 @@ def build_filter(plan, cfg, preview, fx=None):
         inputs[-2:-2] = ["-ss", f"{plan['song']['start_t']:.3f}", "-t", f"{D + 0.6:.3f}"]
         chains.append(f"[{sidx}:a:0]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS,"
                       f"volume={head:.4f}[sg]")
-    chains.append(f"[gc]volume={head:.4f}[gh]")
-    mix = "amix=inputs=2:duration=first:normalize=0" if amix_has_normalize() else "amix=inputs=2:duration=first,volume=2"
+    drops_ = [d_ for d_ in (plan.get("xfx_drop") or []) if "drop" in fx and 0.2 < float(d_["t"]) < D - 0.1] if plan.get("effects") == "extra" else []
+    if drops_:                                                                          # V8.4.5 drop moments (EXTRA only): music dip, low hit, gunshot lift; see drop_audio_filters
+        music_dip, lift, hits = drop_audio_filters(drops_)
+        chains.append(f"[sg]volume='{music_dip}':eval=frame[sgd]")
+        chains.append(f"[gc]volume='{head:.4f}*{lift}':eval=frame[gh]")
+        for i_, h_ in enumerate(hits):
+            chains.append(f"{h_}[hit{i_}]")
+        chains.append("".join(f"[hit{i_}]" for i_ in range(len(hits))) + (f"amix=inputs={len(hits)}:duration=longest:normalize=0" if len(hits) > 1 else "anull") + "[bm]")
+        music_l, extra_in = "[sgd]", "[bm]"
+    else:
+        chains.append(f"[gc]volume={head:.4f}[gh]")
+        music_l, extra_in = "[sg]", ""
+    n_in = 3 if extra_in else 2
+    mix = f"amix=inputs={n_in}:duration=first:normalize=0" if amix_has_normalize() else f"amix=inputs={n_in}:duration=first,volume={n_in}"
     lim = "alimiter=limit=0.99:attack=2:release=40:level=disabled" + (":latency=1" if _alimiter_latency() else "")
-    chains.append(f"[sg][gh]{mix},{lim},atrim=duration={D:.4f},afade=t=in:st=0:d={FADE_IN},"
+    chains.append(f"{music_l}[gh]{extra_in}{mix},{lim},atrim=duration={D:.4f},afade=t=in:st=0:d={FADE_IN},"
                   f"afade=t=out:st={fo:.3f}:d={max(0.3, D - fo):.3f}[aout]")
     return inputs, ";\n".join(chains)
+
+
+def drop_audio_filters(drops):
+    """V8.4.5: the audio filters of the drop moments. Returns (music dip expression, game lift expression, [aevalsrc chain texts]).
+    - music dip: for each drop the music falls by dip_db over 80 ms (the breath) and stays down until the kill; on the kill it comes back at once, but ducked by duck_db (4 .. 7 dB) for a moment,
+      recovering over ~0.15 s (exp(-7 t)): that is the room the low hit needs (the music is mastered up to the limiter, an added sound would only be limited away);
+    - game lift: the gunshot of the drop kill is lifted by lift_db from 50 ms before to 0.3 s after the kill (with soft ends);
+    - hit: a synthesised low hit starting exactly on the kill: a sine whose pitch falls from boom_f0 to boom_f1 Hz (rate boom_r) with an exponential decay, plus a quiet second harmonic, 0.9 s,
+      stereo (identical channels: no phase / delay between left and right), placed with adelay. They are mixed with the music and the game audio before the limiter (nothing is stretched or
+      shifted: the music and game streams keep their timing)."""
+    dips, lifts, hits = [], [], []
+    for d in drops:
+        T, L = float(d["t"]), float(d["dip_s"])
+        g = 10 ** (-float(d["dip_db"]) / 20)
+        post = 1 - 10 ** (-float(d.get("duck_db", 4.0)) / 20)
+        dips.append(f"(1-{1 - g:.4f}*clip((t-{T - L:.4f})/0.08,0,1)*clip(({T + 0.001:.4f}-t)/0.001,0,1))*(1-{post:.4f}*clip((t-{T:.4f})/0.001,0,1)*exp(-7*(t-{T:.4f})))")
+        lf = 10 ** (float(d["lift_db"]) / 20)
+        lifts.append(f"(1+{lf - 1:.4f}*clip((t-{T - 0.05:.4f})/0.02,0,1)*clip(({T + 0.30:.4f}-t)/0.10,0,1))")
+        f1, f0, r, dec = float(d["boom_f1"]), float(d["boom_f0"]), float(d["boom_r"]), float(d["boom_dec"])
+        ph = f"2*PI*({f1:.2f}*t+{(f0 - f1) / r:.4f}*(1-exp(-{r:.2f}*t)))"
+        amp = 10 ** (float(d["boom_db"]) / 20)
+        e_ = f"{amp:.4f}*(sin({ph})+0.25*sin(2*{ph}))*exp(-{dec:.2f}*t)*min(1,t*400)"
+        ms = int(round(T * 1000))
+        hits.append(f"aevalsrc='{e_}|{e_}':d=0.9:s=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,adelay={ms}|{ms}")
+    return "*".join(dips), "*".join(lifts), hits
 
 
 def enc_args(maxq, preview, nvenc):
@@ -12256,7 +12521,7 @@ def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
             d = e - s0
             sp = r_["speed"]
             urate = min(m["ts_fps"], m["content_fps"]) or m["ts_fps"] or float(OUT_FPS)
-            LOGONLY(txt[-600:]); out(f"effective fps: {nm} {lo:.2f}-{hi:.2f} s container {pr['eff']:.0f}, content {m['content_fps']:.0f}, speed {sp:.2f} -> "
+            out(f"effective fps: {nm} {lo:.2f}-{hi:.2f} s container {pr['eff']:.0f}, content {m['content_fps']:.0f}, speed {sp:.2f} -> "
                 f"{min(m['ts_fps'], m['content_fps']) * sp:.0f} effective -> interpolating ({' + '.join(r_['why'])})")
             if d < 0.2:
                 continue

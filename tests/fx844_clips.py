@@ -64,14 +64,14 @@ def clip_inputs(clip, ss):
     return ["-ss", f"{ss:.3f}", "-t", "4.2", "-i", str(clip)]
 
 
-def flash(out_dir, clip, kt, game, a=0.45):
+def flash(out_dir, clip, kt, game, a=0.34):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     kt, a = float(kt), float(a)
     p = 2.0
     zone = list(M.DEFAULT_REGION[game])
     zone[3] = zone[1] + 0.55 * (zone[3] - zone[1])
-    take = {"nf": 240, "xfx": [{"k": "flash", "p": p, "a": a, "t1": M.XFX_FLASH_S}]}
+    take = {"nf": 240, "xfx": [{"k": "flash", "p": p, "a": a, "t1": M.XFX_FLASH_S}]}               # V8.4.5: the stylised pulse (vignette + bloom, peak a <= FLASH_A_MAX)
     chains = []
     lab = M._xfx_chains(chains, "t0", "[src]", take, M.FX_ALL, False, zone, {"name": "x", "hue": 0, "rgb": 0xFFFFFF})
     inp = clip_inputs(clip, kt - p)
@@ -113,7 +113,10 @@ def flash(out_dir, clip, kt, game, a=0.45):
     mean_d = [float((fxp[..., ch][mask] - srp[..., ch][mask]).mean()) for ch in range(3)]
     sat0 = float(np.mean(srp[mask].max(1) - srp[mask].min(1)))
     sat1 = float(np.mean(fxp[mask].max(1) - fxp[mask].min(1)))
-    print(f"{name} ({game}): white share R {shares[0]:.3f} G {shares[1]:.3f} B {shares[2]:.3f} (cast {cast:.3f}); mean change RGB {mean_d[0]:+.1f} {mean_d[1]:+.1f} {mean_d[2]:+.1f}; "
+    ly0 = srp @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    ly1 = fxp @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    print(f"{name} ({game}): peak frame mean luma {float(ly0[mask].mean()):.0f} -> {float(ly1[mask].mean()):.0f} (+{float(ly1[mask].mean() - ly0[mask].mean()):.0f}), brightest 1 % of pixels {float(np.percentile(ly1[mask], 99)):.0f} (white = 255), "
+          f"centre +{float((ly1 - ly0)[300:700, 700:1200].mean()):.0f}, edges +{float((ly1 - ly0)[:, :300][mask[:, :300]].mean()):.0f}; white share R {shares[0]:.3f} G {shares[1]:.3f} B {shares[2]:.3f} (cast {cast:.3f}); mean change RGB {mean_d[0]:+.1f} {mean_d[1]:+.1f} {mean_d[2]:+.1f}; "
           f"colourfulness {sat0:.1f} -> {sat1:.1f}; " + ("NEUTRAL WHITE" if cast < 0.02 and sat1 <= sat0 + 1 else "CAST!"))
     return 0 if cast < 0.02 else 1
 
@@ -134,7 +137,8 @@ def old_module():
     return m
 
 
-def sky(out_dir, clip, tm, colour="orange", seed="1"):
+def sky(out_dir, clip, tm, colour="auto:hype:0.74:150", seed="1"):
+    """colour = a palette name, or auto:<style>:<energy>:<bpm> = the V8.4.5 choice from the song's feel against the clip's own sky and scene colours."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tm = float(tm)
@@ -145,23 +149,29 @@ def sky(out_dir, clip, tm, colour="orange", seed="1"):
     img = M.sky_grab_frames(clip, tm, tm + 0.04, [0, 0, wh[0], wh[1]], wh, fps=60)[0]
     mk, info = M.sky_segment(img, zone)
     cov, top = info["cov"], info["top"]
-    qualifies = M.XFX_SKY_MIN_COV <= cov <= M.XFX_SKY_MAX_COV and top >= M.XFX_SKY_MIN_TOP and info["kind"] != "none"
+    qualifies = M.XFX_SKY_MIN_COV <= cov <= M.XFX_SKY_MAX_COV and top >= M.XFX_SKY_MIN_TOP and info["kind"] in ("blue", "warm")
     name = Path(clip).stem.replace(" ", "_")[:40] + f"_{int(tm)}"
     print(f"{name}: sky coverage {cov * 100:.0f}% of the upper picture (top strip {top * 100:.0f}%, kind {info['kind']}) -> the render would " + ("RECOLOUR the sky" if qualifies else "SKIP the sky (no clear sky)"))
+    if not qualifies:
+        return 2
     ss = max(0.0, tm - p)
     take = {"nf": 240, "segs": [[ss, ss + 4.0, 1.0, 240, 0]], "srcs": [{"path": str(clip), "shift": 0.0, "rect": [0, 0, wh[0], wh[1]], "wh": list(wh)}], "path": str(clip),
             "rect": [0, 0, wh[0], wh[1]], "wh": list(wh)}
     x = {"k": "sky", "p": p, "t0": p - M.XFX_SKY_IN, "t1": p + M.XFX_SKY_OUT, "model": None}
-    mp = out_dir / f"{name}.mask.yuv"
+    mp = out_dir / f"{name}.mask.gray"
     st = M.sky_take_mask(take, x, zone, mp)
-    cname, crgb = colour, M.SKY_PALETTE[colour]
+    if colour.startswith("auto"):
+        _, style, en, bpm = colour.split(":")
+        ranked, why = M.sky_ranked(style, float(en), float(bpm))
+        cname, crgb, cwhy = M.sky_colour_for(ranked, info.get("sky_rgb"), info.get("scene_hue"))
+        print(f"  song feel {why}: family {', '.join(ranked[:3])}; sky {info['sky_rgb']:06X}, scene hue {info.get('scene_hue')}: colour {cname} ({cwhy})")
+    else:
+        cname, crgb = colour, M.SKY_PALETTE[colour]
     x.update({"mask": str(mp), "grade": M.sky_grade(crgb, st["mean_y"]), "ok": True})
     inp = clip_inputs(clip, ss)
-    # new method
     chains = []
     nl = M.xfx_sky_chain(chains, "t0", "[src]", x, 1)
     g_new = f"[0:v]{PRE}[src];" + ";".join(chains) + f";{nl}null[o]"
-    # old method (V8.4.3)
     old = old_module()
     fe = old.feel_hue("hype", 0.7, 128)
     oldx = {"k": "sky", "p": p, "t0": p - old.XFX_SKY_IN, "t1": p + old.XFX_SKY_OUT, "hue": fe[1], "ok": True}
@@ -172,10 +182,9 @@ def sky(out_dir, clip, tm, colour="orange", seed="1"):
     ns = [int((p - 0.3) * 60), int(p * 60), int((p + 0.12) * 60), int((p + 0.4) * 60)]
     inp2 = inp + ["-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{M.SKY_W}x{M.SKY_H}", "-framerate", "60", "-i", str(mp)]
     rows = []
-    for tag, g, ii in (("SOURCE", g_src, inp), ("OLD V8.4.3", g_old, inp), (f"NEW V8.4.4 {cname}", g_new, inp2)):
+    for tag, g, ii in (("SOURCE", g_src, inp), ("OLD V8.4.3", g_old, inp), (f"NEW V8.4.5 {cname}", g_new, inp2)):
         fr = frames(ii, g, ns)
         rows.append(np.concatenate([label(f, f"{tag} {n / 60 - p:+.2f}s") for f, n in zip(fr, ns)], 1))
-    # mask row: the mask frames themselves (read straight from the file)
     raw = np.fromfile(mp, np.uint8)
     fsz = M.SKY_W * M.SKY_H
     mrow = []
@@ -183,11 +192,24 @@ def sky(out_dir, clip, tm, colour="orange", seed="1"):
         y = raw[n * fsz:(n + 1) * fsz].reshape(M.SKY_H, M.SKY_W)
         mrow.append(label(cv2.cvtColor(cv2.resize(y, (480, 270)), cv2.COLOR_GRAY2RGB), f"MASK {n / 60 - p:+.2f}s"))
     rows.append(np.concatenate(mrow, 1))
-    sheet = np.concatenate(rows, 0)
-    cv2.imwrite(str(out_dir / f"sky_{name}.png"), cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
-    print(f"  mask: mean coverage in the window {st['cov'] * 100:.0f}% of the upper picture, sky brightness {st['mean_y']:.0f}; colour {cname} 0x{crgb:06X}")
+    cv2.imwrite(str(out_dir / f"sky_{name}.jpg"), cv2.cvtColor(np.concatenate(rows, 0), cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 88])
+    # pixel check at full size: outside the sky mask the picture is IDENTICAL to the render without the sky effect
+    nsel = [int(p * 60), int((p + 0.12) * 60)]
+    with_sky = full_frames(inp2, g_new, nsel)
+    without = full_frames(inp, g_src, nsel)
+    bad_total, in_total, changed_in = 0, 0, 0
+    for k_, n in enumerate(nsel):
+        m = raw[n * fsz:(n + 1) * fsz].reshape(M.SKY_H, M.SKY_W)
+        mm = cv2.dilate((m > 0).astype(np.uint8), np.ones((5, 5), np.uint8))                      # the mask pixels and their 2-pixel neighbourhood: where the bicubic up-scaling may reach
+        big = cv2.resize(mm, (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
+        d = np.abs(with_sky[k_].astype(np.int16) - without[k_].astype(np.int16)).max(-1)
+        bad_total += int((d[~big] > 0).sum())
+        in_total += int(big.sum())
+        changed_in += int((d[big] > 8).sum())
+    print(f"  mask: mean coverage in the window {st['cov'] * 100:.0f}% of the upper picture; PIXEL CHECK at the peak and +0.12 s: {bad_total} pixels outside the mask area differ from the render without the sky effect "
+          f"(0 = identical); inside the mask area {changed_in} of {in_total} pixels changed by more than 8 levels; colour {cname} 0x{crgb:06X}")
     mp.unlink()
-    return 0 if qualifies else 2
+    return 0 if bad_total == 0 else 3
 
 
 if __name__ == "__main__":
