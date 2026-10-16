@@ -1,0 +1,3 @@
+cs2 / 'Icarus' (150 s target): 596 candidate clips -> 57 ticked, planned 149 s, 1 rounds, 33 unplaceable dropped, 0 added, 60 s
+the render's own plan of that selection: 149 s, 56 takes, 57 ticked / 57 placed; summary: montage 149 s from 57 of 57 clips (56 usable events, song section 175 s), song: Icarus, style: aggressive
+lines the render would print about clips that do not fit: none

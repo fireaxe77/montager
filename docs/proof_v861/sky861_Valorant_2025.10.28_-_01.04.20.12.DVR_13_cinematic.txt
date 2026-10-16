@@ -1,0 +1,8 @@
+Valorant_2025.10.28_-_01.04.20.12.DVR_13: song feel style cinematic, energy 0.60, 100 BPM: palette violet -> 0x5A2AA0 (song feel rank 3; sky was 205 deg); no song given: palette from the song feel only; gradient sunset (hazy sunset: deeper at the top, warmer and lighter at the horizon); animation drift 13.2 px/s, breathing 4.8 s, surge 0.79, push 0.0312
+mask coverage (share of the picture): frame before the kill 0.0%, kill frame 2.7%, +1 5.5%, +2 8.2%, +3 8.2%, middle 7.2%, last frame 24.6%; frames 0..59 all zero: True
+surge plane (0..255) from the frame before the kill: 0 201 175 153 133 116 101 88 76 66 58 50 44 38 33 29 25 22 19 17 14 13 11 9 8
+edge movement between neighbouring frames (area that changes / mask area): mean 6.3%, worst 369.7%; held dropout frames 6
+lowest mask row: 299 of 432 = 69.2% of the height (limit 100%): OK
+frame 0.98s (before kill): sky pixels 0; mean luminance change inside +0.0 levels (0% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)
+frame 2.00s (middle): sky pixels 153346; mean luminance change inside -133.1 levels (100% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)
+frame 2.95s (end of take): sky pixels 461594; mean luminance change inside -39.3 levels (100% of the sky pixels darker = the clouds / gradient); pixels outside the mask area that differ: 0 (0 = identical)

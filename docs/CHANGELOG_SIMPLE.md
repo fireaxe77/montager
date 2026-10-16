@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.6.1 - 2026-10-17: Sky that follows the real sky
+- The recoloured sky now follows the real sky shape: rooftops, wires, poles and antennas are cut out cleanly and nothing but sky is coloured
+- It is nearly solid (not see-through) in deep red and black, and more skies are found, with the next-best kill used when one has no sky
+- Manual Auto only ticks clips the planner can actually place: the montage fills the song and nothing is reported as "didn't fit"
+
 ## V8.6 - 2026-10-17: Sky hits on the kill, music and glitch fixes
 - The recoloured sky now hits on the kill: it snaps in, flares for a moment, then settles into deep red with dark clouds drifting through it; calm songs get deep blue, teal or violet instead (cover art colours are blended in)
 - CS2 headline and ending kills get a speed ramp: slow at the kill, back toward normal, then slow again when the knife comes out
