@@ -2,6 +2,9 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.6.3 - 2026-10-17: Manual Auto fixed
+- Manual Auto works like before V8.6.1 again and no longer stalls or leaves the montage empty
+
 ## V8.6.2 - 2026-10-17: Animated sky, CS2 speed ramp, no more deathmatch clips
 - The sky is darker and alive: dark clouds drift and pulse with the beat, and the kill hits with a stronger surge, a push and a shake; a sky that would paint over walls is skipped
 - CS2 headline and ending kills now always go slow, fast, slow, and the knife-out gets its own slow-down when the footage allows it

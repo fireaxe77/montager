@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.6.2"
+APP_VERSION = "V8.6.3"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -17755,14 +17755,14 @@ class App:
                 out(f"Auto: song map unavailable ({ex})")
                 return
             cands_ = cs2_dm_filter_cands(load_config(), cands, game)                  # V8.6.2: no CS2 deathmatch clips
-            QUIET.on = True
-            try:
-                allp, info = auto_fill_verified(load_config(), game, cands_, song["path"], an, style, seed, note=out)
-            finally:
-                QUIET.on = False
-            msg = (f"Auto: {len(allp)} clips ticked, planned {info['length']:.0f} s, target {info['target']:.0f} s for '{song.get('title') or Path(song['path']).stem}' "
-                   f"({info['rounds']} planning round(s), {info['dropped']} unplaceable clip(s) dropped, {info['added']} added)"
-                   + ("" if info["full"] else "; not enough placeable clips to fill it completely"))
+            paths, info = auto_fill_pick(cands_, an, style)
+            extra, plines = random_companions(load_config(), self._snap.get("m_game", "valorant"), paths)
+            for l_ in plines:
+                out(l_)
+            allp = list(paths) + extra
+            msg = (f"Auto: {len(paths)} clips ticked to fill {info['length']:.0f} s of '{song.get('title') or Path(song['path']).stem}' "
+                   f"({len(paths) - info['n_used']} unused + {info['n_used']} used)" + (f" + {len(extra)} companion clip(s)" if extra else "")
+                   + ("; not enough clips to fill it completely" if info["short"] else ""))
 
             def apply():
                 self.ticked = set(allp)
