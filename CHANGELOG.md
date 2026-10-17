@@ -5,6 +5,9 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V8.6.3 (branch work-v863, merged to main, APP_VERSION = V8.6.3) - 2026-10-17
+- Hotfix: reverted the V8.6.1 Manual Auto change (`auto_fill_verified` re-planning loop); Auto is back to the V8.5 `auto_fill_pick` + companions behaviour (the V8.6.2 deathmatch filter is kept). `auto_fill_verified` stays in the file, unused. Not tested (hotfix).
+
 ## V8.6.2 (branch work-v862, merged to main, APP_VERSION = V8.6.2) - 2026-10-17
 - Sky timing / walls: the sky start was measured on the three sky takes of the V8.6.1 Valorant render: kill frame = first red frame (+0 .. 2 frames of fade-in): the timing was right; the first sky take had sampled a smooth dark-blue wall (41 % coverage, 18 held frames).
   Now: the sampled region must be bright (`SKY_MIN_L` 120), a frame whose region covers more than `SKY_FRAME_MAX_COV` 0.45 or runs below 72 % of the height is a wall, a held mask is only a mask that passed every check, and a take with more than `SKY_MAX_BAD` 15 % wall frames gets no sky (`sky_take_mask` 'bad').
