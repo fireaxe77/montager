@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.8"
+APP_VERSION = "V8.8.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2383,16 +2383,23 @@ def r6s_old_icons_note():
 
 R6S_UTIL_THR = 0.90                  # template correlation that counts as 'a utility kill icon is here' (real hits score 0.97-0.99; scenery noise stays under 0.89)
 R6S_UTIL_MIN_F = 5                   # a utility hit must stay on screen this many frames (a real row's icon is there as long as the row; noise lasts 1-4 frames)
+R6S_UTIL_ROW_SC = 0.92               # V8.8.1: a hit's best score must reach this to count (real icons 0.93-0.99; the headshot crosshair next to a gun reaches only 0.90-0.91 against kill_season10 and is NOT utility)
+R6S_UTIL_PART_THR = 0.95             # V8.8.1: an icon half-covered by name text: its left / right 60% alone must match this well ...
+R6S_UTIL_PART_MIN_F = 10             # ... for this many frames (the half of a gun icon never does; a whole icon needs only R6S_UTIL_THR and R6S_UTIL_MIN_F)
+R6S_UTIL_PART_FRAC = 0.6
 
 
 class R6SUtilScan:
     """Utility-icon pass over the killfeed crop frames (one frame per step): every sighting of a utility template becomes / extends a HIT (first / last frame,
     position). No OCR here; the analysis decides which killfeed row a hit belongs to (the hit must sit in that row's weapon slot, between killer and victim)."""
     def __init__(self, icons, thr=R6S_UTIL_THR):
-        self.icons, self.thr, self.hits, self.lock, self.quiet = icons, thr, [], None, 0
+        self.icons, self.thr, self.hits, self.lock, self.quiet, self.w = icons, thr, [], None, 0, 1
+        self.parts = r6s_util_parts(icons)                 # V8.8.1: the left / right part of every icon (text running over the other part)
 
-    def step(self, f, fr):
+    def step(self, f, fr, w=1):
+        """One frame. `w` = how many frames this step stands for (a re-check looks at every 3rd frame: a hit counts 3 frames per sighting)."""
         import cv2
+        self.w = w
         gray = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
         scales = R6S_SCALES if self.lock is None else tuple(R6S_SCALES[i] for i in sorted(self.lock))
         try:
@@ -2400,6 +2407,14 @@ class R6SUtilScan:
         except Exception as ex:
             LOGONLY(f"R6S: frame {f}: utility match failed: {type(ex).__name__}: {ex}")
             return
+        try:
+            mp = r6s_find_matches(gray, self.parts, scales, R6S_UTIL_PART_THR, cap=60) if self.parts else []
+        except Exception as ex:
+            LOGONLY(f"R6S: frame {f}: utility part match failed: {type(ex).__name__}: {ex}")
+            mp = []
+        for m in mp:
+            if not any(self._same_spot(m, w) for w in ms):            # a part inside a whole-icon match is that icon
+                self._track(f, m, self.parts[m[5]]["name"], True)
         if ms:
             self.quiet = 0
             bi = ms[0][6]
@@ -2409,14 +2424,36 @@ class R6SUtilScan:
             if self.quiet > 60:
                 self.lock = None
         for m in ms:
-            cx, cy = m[0] + m[2] / 2.0, m[1] + m[3] / 2.0
-            for h in self.hits:
-                if f - h["last"] <= R6S_GAP_F and abs(cy - h["y"]) <= 0.6 * max(h["h"], 12) and abs(cx - h["x"]) <= 0.8 * max(h["w"], 12):
-                    h.update(last=f, hits=h["hits"] + 1, sc=max(h["sc"], round(m[4], 3)))
-                    break
-            else:
-                self.hits.append({"first": int(f), "last": int(f), "hits": 1, "x": int(cx), "y": int(cy), "w": int(m[2]), "h": int(m[3]), "sc": round(float(m[4]), 3),
-                                  "tpl": self.icons[m[5]]["name"]})
+            self._track(f, m, self.icons[m[5]]["name"], False)
+
+    @staticmethod
+    def _same_spot(a, b):
+        ix = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+        iy = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+        return ix > 0 and iy > 0
+
+    def _track(self, f, m, name, part):
+        cx, cy = m[0] + m[2] / 2.0, m[1] + m[3] / 2.0
+        for h in self.hits:
+            if bool(h.get("part")) == part and f - h["last"] <= R6S_GAP_F and abs(cy - h["y"]) <= 0.6 * max(h["h"], 12) and abs(cx - h["x"]) <= 0.8 * max(h["w"], 12):
+                h.update(last=f, hits=h["hits"] + self.w, sc=max(h["sc"], round(m[4], 3)))
+                return
+        self.hits.append({"first": int(f), "last": int(f), "hits": self.w, "x": int(cx), "y": int(cy), "w": int(m[2]), "h": int(m[3]), "sc": round(float(m[4]), 3), "tpl": name,
+                          **({"part": True} if part else {})})
+
+
+def r6s_util_parts(icons):
+    """V8.8.1: [{'name', 'gray'}] the left and the right R6S_UTIL_PART_FRAC of every utility icon (a name running over one side leaves the other side to be found)."""
+    import numpy as np
+    parts = []
+    for ic in icons:
+        g = ic["gray"]
+        w = g.shape[1]
+        cut = int(round(w * R6S_UTIL_PART_FRAC))
+        for nm, sl in (("L", g[:, :cut]), ("R", g[:, w - cut:])):
+            if sl.shape[1] >= 8 and float(sl.std()) >= 8.0:
+                parts.append({"name": f"{ic['name']}:{nm}", "gray": np.ascontiguousarray(sl)})
+    return parts
 
 
 R6S_SHAPE_MIN_READS = 2              # V8.23.1: a row needs this many small / square icon reads to be called utility by shape
@@ -2435,74 +2472,164 @@ def r6s_shape_util(r):
 
 
 def r6s_row_util(r, uhits):
-    """True when a utility-icon hit sits in this row's weapon slot: the hit is on screen while the row is (a few frames of slack), at the row's height, and between
-    the killer side's names and the victim side's names. `r` is an R6S row ({first, last, y, h, reads}); `uhits` = entry['util']."""
+    """True when a utility-icon hit belongs to this row: the hit is on screen while the row is (a few frames of slack) and at the row's height. V8.8.1: wherever it sits along the row
+    (the names the OCR read, a long name or a name running over the icon decide nothing): ANY icon of the utility folder in the row makes it a utility row.
+    `r` is an R6S row ({first, last, y, h, reads}); `uhits` = entry['util']."""
     if not uhits:
         return False
-    xk = max([b[1] for _f, l, _r in r.get("reads", []) for b in l] or [0])
-    xv = min([b[0] for _f, _l, rr in r.get("reads", []) for b in rr] or [10 ** 6])
-    lo, hi = xk - 12, xv + 12
-    if xk >= xv - 6 and r.get("reads"):                    # V8.8: the reads disagree (the OCR ran the killer's name past the icon: killer right edge beyond the victim's left edge, so the
-        bx = [b for _f, l, rr in r["reads"] for b in list(l) + list(rr)]          # slot between them is empty): the weapon slot is somewhere inside the row, so the row's whole extent counts
-        if bx:
-            lo, hi = min(b[0] for b in bx) - 12, max(b[1] for b in bx) + 12
     hh = max(r.get("h") or 0, 14)
     for h in uhits:
-        if h["hits"] < R6S_UTIL_MIN_F:
+        if h["hits"] < (R6S_UTIL_PART_MIN_F if h.get("part") else R6S_UTIL_MIN_F) or h["sc"] < R6S_UTIL_ROW_SC:
             continue
         if h["last"] + 3 < r["first"] or h["first"] - 3 > r["last"]:
             continue
         if abs(h["y"] - r["y"]) > 0.7 * max(hh, h["h"]):
             continue
-        if lo <= h["x"] <= hi:
-            return True
+        return True
     return False
 
 
+R6S_RECHECK_STEP = 3                 # V8.8.1: a re-check looks at every 3rd frame of a kill row's life (the icon is there as long as the row)
+R6S_UTIL_RULE = "u881c"               # V8.8.1: version of the utility rule; a saved scan stamped with another one (or none) is matched again once
+
+
+def r6s_util_chk(icons):
+    """V8.8.1: what a re-check of a saved scan was made with: the utility icon set + the rule version."""
+    return r6s_icons_sig(icons) + "." + R6S_UTIL_RULE
+
+
 def r6s_util_refresh(r, e, det, cfg, store=None, key=None):
-    """V8.8: an R6S entry scanned with another utility icon set than exists now (or before there were any: no 'util_sig') is matched again against the CURRENT icons
-    (template pass only, no OCR: the same frames, the same frame numbers as the scan) and saved back, so a utility kill (skull, gadget ...) is never kept because its
-    clip was scanned before its icon was added. Returns the (updated) entry; the old one when it cannot be read."""
+    """V8.8 / V8.8.1: an R6S entry that was not checked with EVERY utility icon of the folder under the current rule (another icon set, an older rule, or no stamp: 'util_chk') is matched
+    again (template pass only, no OCR: the same frames, the same frame numbers as the scan) around EVERY kill row, whatever its icon looked like before, and saved back stamped. A clip
+    that is stamped current is skipped. Returns the (updated) entry; the old one when it cannot be read."""
     uicons = r6s_load_util_icons(log=False)
     if not uicons or not e or e.get("error"):
         return e
     sig = r6s_icons_sig(uicons)
-    if (e.get("util_sig") or "") == sig:
+    chk = r6s_util_chk(uicons)
+    if (e.get("util_chk") or "") == chk:
         return e
     try:
-        a_ = r6s_analyse_entry(dict(e, util=[]), cfg)       # only the frames around my kill rows are matched (the icon only matters there): seconds, not a minute
+        a_ = r6s_analyse_entry(dict(e, util=[]), cfg)       # the rows of MY kills (before the duplicate rules drop any: a second kill of the same victim is a row too) are the only ones matched
         off_ = float(e.get("v_off", 0.0))
         rows_ = r6s_rows_from_ocr(e) if e.get("ocr") else (e.get("rows") or [])
-        sus_ = [k for k in a_["kills"] if any(0 in (r_.get("gunv") or []) for r_ in rows_ if abs(r_["first"] / FPS + off_ - k["t"]) < 0.1)]
-        if not sus_:                                       # no kill row ever read with a small / square icon: a gun kill, nothing to re-match (the scan stays as it is)
-            return e
-        a_ = dict(a_, kills=sus_)
-        wins = [(int(round((k["t"] - off_) * FPS)) - 2 * FPS, int(round((k.get("t_last", k["t"]) - off_) * FPS)) + FPS) for k in a_["kills"]]
-        us = R6SUtilScan(uicons)
+        mine_ = {round(float(m["t"]), 3) for m in a_.get("mine", []) if m.get("verdict") == "kill"}
+        sel_ = [r_ for r_ in rows_ if round(r_["first"] / FPS + off_, 3) in mine_]
+        hits_ = []
+        wins = [(int(r_["first"]) - 2 * FPS, int(r_["last"]) + FPS) for r_ in sel_]      # (a row's icon is on screen before its names are read)
         if wins:
+            us = R6SUtilScan(uicons)
             last_ = max(w[1] for w in wins)
-            ys = [float(k.get("y", 0)) for k in a_["kills"]]
-            hs = max([float(k.get("h") or 20) for k in a_["kills"]] or [20.0])
-            y0 = max(0, int(min(ys) - 2.5 * hs - 20))           # only the band of my kill rows is matched (the same band in every frame, so the hits line up)
-            y1 = int(max(ys) + 2.5 * hs + 20)
+            ys = [float(r_.get("y", 0)) for r_ in sel_]
+            hs = max([float(r_.get("h") or 20) for r_ in sel_] or [20.0])
+            y0 = max(0, int(min(ys) - 1.4 * hs - 8))            # only the band of my kill rows is matched (the same band in every frame, so the hits line up)
+            y1 = int(max(ys) + 1.4 * hs + 8)
             for f, fr in enumerate(frame_stream(r["path"], r, det, cfg, FPS)):
-                if f > last_:
+                if f > last_ or CANCEL.is_set():
                     break
-                if any(w0 <= f <= w1 for w0, w1 in wins):
-                    us.step(f, fr[y0:min(fr.shape[0], y1)])
+                if f % R6S_RECHECK_STEP == 0 and any(w0 <= f <= w1 for w0, w1 in wins):          # every 3rd frame of the row's life: a row stays for seconds
+                    us.step(f, fr[y0:min(fr.shape[0], y1)], R6S_RECHECK_STEP)
+            if CANCEL.is_set():
+                return e
             for h in us.hits:
                 h["y"] += y0
+            hits_ = us.hits
     except Exception as ex:                                # noqa: BLE001
         LOGONLY(f"R6S: utility icons not re-matched for {Path(r['path']).name}: {type(ex).__name__}: {ex}")
         return e
-    e2 = dict(e, util=us.hits, util_sig=sig)
+    e2 = dict(e, util=hits_, util_sig=sig, util_chk=chk)
     if store is not None and key is not None:
         try:
             store.put(key, e2)
         except Exception:                                  # noqa: BLE001
             pass
-    LOGONLY(f"R6S: utility icons re-matched for {Path(r['path']).name} ({len(us.hits)} hit(s), icon set {sig})")
+    LOGONLY(f"R6S: utility icons re-matched for {Path(r['path']).name} ({len(hits_)} hit(s), icon set {chk})")
     return e2
+
+
+def r6s_recheck_library(cfg, det=None, cache=None, paths=None):
+    """V8.8.1: every R6S clip with a saved scan that was not checked with all utility icons under the current rule is re-matched once (r6s_util_refresh), with progress; clips already stamped
+    are skipped. `paths` limits it to those clips. Returns (clips checked, clips whose utility hits changed)."""
+    det = det or load_dets("r6s").get("r6s")
+    cache = cache if cache is not None else load_kills_cache()
+    uicons = r6s_load_util_icons(log=False)
+    if det is None or not uicons:
+        return 0, 0
+    chk = r6s_util_chk(uicons)
+    todo = []
+    for r in scan_clips(cfg):
+        if r.get("game") != "r6s" or r.get("error") or not r.get("w") or (paths is not None and r["path"] not in paths):
+            continue
+        k = kills_key(r, "r6s", det)
+        e = cache.get(k) if k in cache else None
+        if e and not e.get("error") and (e.get("util_chk") or "") != chk:
+            todo.append((r, k, e))
+    if not todo:
+        return 0, 0
+    out(f"R6S utility icons: re-checking {len(todo)} clip(s) against all {len(uicons)} icons of the folder (one time; a clip checked once is skipped afterwards)")
+    t0, changed = time.time(), 0
+    workers = max(1, min(4, (os.cpu_count() or 2) // 2))
+
+    def one(job):
+        r, k, e = job
+        return job, (None if CANCEL.is_set() else r6s_util_refresh(r, e, det, cfg, cache, k))
+    with ThreadPoolExecutor(max_workers=workers) as ex_:
+        for i, ((r, k, e), e2) in enumerate(ex_.map(one, todo)):
+            if e2 is None:
+                continue
+            if e2 is not e and (e2.get("util") or []) != (e.get("util") or []):
+                changed += 1
+            el = time.time() - t0
+            progress((i + 1) / len(todo), f"R6S utility icons {i + 1}/{len(todo)}")
+            out(f"[{i + 1}/{len(todo)}] R6S utility icons re-checked: {Path(r['path']).name} ({len(e2.get('util') or [])} icon hit(s)); {el / 60:.1f} min so far, about {el / (i + 1) * (len(todo) - i - 1) / 60:.1f} min left")
+    out(f"R6S utility icons: {len(todo)} clip(s) re-checked in {(time.time() - t0) / 60:.1f} min, {changed} with other icon hits than before")
+    return len(todo), changed
+
+
+def r6s_audit_entry(e, cfg, chk=""):
+    """V8.8.1: [(kill time or None, victim, why)] for ONE saved R6S scan: every kill the planner would keep that still has any utility-icon hit in its row (a looser test than the rule: the row's height with a wider margin, no position test), and 'not re-checked' when the scan is not stamped with `chk`."""
+    bad = []
+    if chk and (e.get("util_chk") or "") != chk:
+        bad.append((None, "", "not re-checked with the current icon set"))
+    off = float(e.get("v_off", 0.0))
+    for kl in r6s_safe_analyse(e, cfg)["kills"]:
+        fk, lk = int(round((kl["t"] - off) * FPS)), int(round((kl.get("t_last", kl["t"]) - off) * FPS))
+        for h in e.get("util") or []:
+            if h["hits"] >= (R6S_UTIL_PART_MIN_F if h.get("part") else R6S_UTIL_MIN_F) and h["sc"] >= R6S_UTIL_ROW_SC and h["last"] + 3 >= fk and h["first"] - 3 <= lk and abs(h["y"] - kl.get("y", 0)) <= 1.2 * max(kl.get("h") or 0, h["h"], 14):
+                bad.append((kl["t"], kl.get("victim") or "", f"icon {h.get('tpl')} in the row ({h['hits']} frame(s), score {h['sc']})"))
+                break
+    return bad
+
+
+def r6s_util_audit(cfg, det=None, cache=None):
+    """V8.8.1: the proof. Every saved R6S scan is analysed as the planner would (r6s_audit_entry); returns ([(clip, kill time, victim, why)], clips, kills kept). The list must be empty."""
+    det = det or load_dets("r6s").get("r6s")
+    cache = cache if cache is not None else load_kills_cache()
+    uicons = r6s_load_util_icons(log=False)
+    chk = r6s_util_chk(uicons) if uicons else ""
+    bad, n_clips, n_kills = [], 0, 0
+    for r in scan_clips(cfg):
+        if r.get("game") != "r6s" or r.get("error") or not r.get("w"):
+            continue
+        k = kills_key(r, "r6s", det)
+        e = cache.get(k) if k in cache else None
+        if not e or e.get("error"):
+            continue
+        n_clips += 1
+        n_kills += len(r6s_safe_analyse(e, cfg)["kills"])
+        bad += [(Path(r["path"]).name,) + b_ for b_ in r6s_audit_entry(e, cfg, chk)]
+    return bad, n_clips, n_kills
+
+
+def cmd_r6srecheck(args):
+    """python montage.py r6srecheck [--audit]: re-checks every saved R6S scan against all utility icons (once per clip; progress), then prints the audit: kills that still hold a utility icon."""
+    cfg = load_config()
+    if not getattr(args, "audit_only", False):
+        r6s_recheck_library(cfg)
+    bad, nc, nk = r6s_util_audit(cfg)
+    print(f"AUDIT: {nc} R6S clips, {nk} kills kept; kills / clips still holding a utility icon: {len(bad)}")
+    for b in bad:
+        print("  ", b)
 
 
 def r6s_icons_sig(icons):
@@ -2513,8 +2640,9 @@ def r6s_icons_sig(icons):
     return h.hexdigest()[:8]
 
 
-def r6s_find_matches(gray, icons, scales=R6S_SCALES, thr=R6S_MATCH_THR):
-    """Kill-icon sightings in one grayscale killfeed crop: [(x, y, w, h, score, icon index, scale index)], best first, overlapping hits merged."""
+def r6s_find_matches(gray, icons, scales=R6S_SCALES, thr=R6S_MATCH_THR, cap=None):
+    """Kill-icon sightings in one grayscale killfeed crop: [(x, y, w, h, score, icon index, scale index)], best first, overlapping hits merged (`cap`: at most this many best hits
+    are kept before the merge, for a loose template that can match in hundreds of places)."""
     import cv2
     import numpy as np
     hits = []
@@ -2532,6 +2660,8 @@ def r6s_find_matches(gray, icons, scales=R6S_SCALES, thr=R6S_MATCH_THR):
             for y, x in zip(ys.tolist(), xs.tolist()):
                 hits.append((int(x), int(y), int(tw), int(th), float(r[y, x]), ii, si))
     hits.sort(key=lambda h: -h[4])
+    if cap:
+        hits = hits[:cap]
     keep = []
     for h in hits:
         for k in keep:
@@ -2694,7 +2824,8 @@ def r6s_scan_clip(path, rec, det, cfg):
     ocr, n = scan_frames(frames())
     e = {"v": CACHE_V, "names": names_for_cache("r6s"), "ocr": ocr, "rows": [], "frames": n, "size": [det.dw, det.dh],
          "region": det.d["region"], "v_off": rec.get("v_off", 0.0), "ocr_calls": len(ocr),
-         "secs": round(time.time() - t0, 1), "game": "r6s", "mode": "ocr", "util": us.hits if us else [], "util_sig": r6s_icons_sig(uicons) if uicons else ""}
+         "secs": round(time.time() - t0, 1), "game": "r6s", "mode": "ocr", "util": us.hits if us else [], "util_sig": r6s_icons_sig(uicons) if uicons else "",
+         "util_chk": r6s_util_chk(uicons) if uicons else ""}
     a = r6s_analyse_entry(e, cfg)
     e["best_name"], e["best_vic"] = round(a["best_k"], 3), round(a["best_v"], 3)
     return e
@@ -5815,9 +5946,10 @@ def game_pool(cfg, game, paths=None):
         e = cache.get(kills_key(r, game, det))
         if not e or e.get("error"):
             continue
-        if game == "r6s":                                  # V8.8: an entry scanned with an older utility icon set is matched against the current icons first
-            e = r6s_util_refresh(r, e, det, cfg, cache, kills_key(r, game, det))
         cands.append((r, e))
+    if game == "r6s" and cands:                            # V8.8.1: every candidate clip is checked against ALL utility icons (once per clip; a stamped clip is skipped), with progress
+        r6s_recheck_library(cfg, det, cache, {r["path"] for r, _e in cands})
+        cands = [(r, cache.get(kills_key(r, game, det)) or e) for r, e in cands]
     if broken:
         out(f"{game}: {len(broken)} clip(s) left out - broken recording (under {BROKEN_FPS:.0f} frames a second, or frozen for more than {STALL_MAX_SHARE * 100:.0f}% of its length: the recorder stalled): " + "; ".join(broken))
     if game == "cs2" and cands:                            # V6.8.1: red-border row sidecars, built once per clip when missing
@@ -13726,12 +13858,142 @@ def _free_mem_gb():
         return None, None
 
 
-def _run_ffmpeg(cmd, D, elog):
+CMD_LIMIT = 30000          # V8.8.1: Windows refuses a command line over 32767 characters (WinError 206); a render command above this is shortened by fit_cmd
+
+
+def _cmd_len(cmd):
+    return len(subprocess.list2cmdline([str(c) for c in cmd]))
+
+
+def _alias_file(src, dst, symlink=True):
+    """A second name for the file `src` at `dst` (hard link, else symbolic link): the picture / sound read through it is the file's own. False when neither works."""
+    for fn in ((os.link, os.symlink) if symlink else (os.link,)):
+        try:
+            fn(src, dst)
+            return True
+        except (OSError, NotImplementedError, AttributeError):
+            continue
+    return False
+
+
+def _alias_dir(src_dir, dst):
+    """A short name for a folder (symbolic link, on Windows a junction: no privilege needed, any local volume)."""
+    try:
+        os.symlink(src_dir, dst, target_is_directory=True)
+        return True
+    except (OSError, NotImplementedError):
+        pass
+    if os.name == "nt":
+        try:
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src_dir)], capture_output=True, timeout=30)
+            return r.returncode == 0 and os.path.isdir(dst)
+        except (OSError, subprocess.SubprocessError):
+            return False
+    return False
+
+
+def clean_alias(work, extras=()):
+    """Removes an alias folder made by fit_cmd WITHOUT following its folder links (a link is removed, never the folder it points to), then the helper folders made next to the clips."""
+    work = str(work)
+    try:
+        for nm in os.listdir(work):
+            p = os.path.join(work, nm)
+            try:
+                if getattr(os.path, "isjunction", lambda _p: False)(p) or (os.path.isdir(p) and os.path.islink(p)):
+                    os.rmdir(p)
+                elif os.path.islink(p):
+                    os.unlink(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    shutil.rmtree(work, ignore_errors=True)
+    for d in extras:
+        shutil.rmtree(d, ignore_errors=True)               # only hard links of the clips live there (removing a hard link never touches the clip)
+
+
+def fit_cmd(cmd, work, limit=CMD_LIMIT):
+    """V8.8.1: (cmd, cwd, extras) with the command guaranteed under `limit` characters. A short command comes back unchanged (cwd None). A long one (many takes, long file names) has every input
+    file renamed to a short alias and runs with the folder `work` as its folder: the same bytes are read, so picture and sound are identical. An alias is, in this order: a hard link in `work`;
+    a hard link in a helper folder next to the clip (same disk) reached through a short folder link in `work`; a symbolic link; the clip's own name behind a short folder link; a copy for the
+    longest names still in the way. Last resort: the decoder thread option (memory only, never the output) is dropped. Clean up with clean_alias(work, extras).
+    Raises RuntimeError only when even that cannot bring the command under the limit."""
+    if _cmd_len(cmd) <= limit:
+        return cmd, None, []
+    work = Path(work)
+    clean_alias(work)
+    work.mkdir(parents=True, exist_ok=True)
+    c2 = [str(c) for c in cmd]
+    names, longs, jn, helper, extras = {}, [], {}, {}, []
+    for i in [i + 1 for i, c in enumerate(c2[:-1]) if c == "-i"]:
+        src = c2[i]
+        if src not in names:
+            n = len(names)
+            ext = Path(src).suffix
+            ext = ext if len(ext) <= 6 else ""
+            al = f"{n}{ext}"
+            names[src] = src
+            if os.path.isfile(src):
+                full = os.path.abspath(src)
+                pdir, base = os.path.split(full)
+                if _alias_file(full, str(work / al), symlink=False):
+                    names[src] = al
+                else:
+                    if pdir not in helper:                  # a hard link must stay on the clip's disk: made in a helper folder beside the clip, reached through a short link
+                        hd = os.path.join(pdir, f".mtgalias{os.getpid()}")
+                        helper[pdir] = None
+                        try:
+                            os.makedirs(hd, exist_ok=True)
+                            extras.append(hd)
+                            if _alias_dir(hd, str(work / f"h{len(helper)}")):
+                                helper[pdir] = (hd, f"h{len(helper)}")
+                        except OSError:
+                            pass
+                    h = helper[pdir]
+                    if h and _alias_file(full, os.path.join(h[0], al), symlink=False):
+                        names[src] = h[1] + os.sep + al
+                    elif _alias_file(full, str(work / al)):
+                        names[src] = al
+                    else:
+                        if pdir not in jn:
+                            jn[pdir] = f"j{len(jn)}"
+                            if not _alias_dir(pdir, str(work / jn[pdir])):
+                                jn[pdir] = None
+                        if jn[pdir]:
+                            names[src] = jn[pdir] + os.sep + base
+                        longs.append((len(names[src]), src, al))
+        c2[i] = names[src]
+    for _l, src, al in sorted(longs, reverse=True):
+        if _cmd_len(c2) <= limit:
+            break
+        try:
+            shutil.copyfile(src, work / al)
+        except OSError:
+            continue
+        old = names[src]
+        names[src] = al
+        c2 = [al if c == old else c for c in c2]
+    if _cmd_len(c2) > limit:
+        c3, j = [], 0
+        while j < len(c2):
+            if c2[j] == "-threads" and j + 1 < len(c2) and c2[j + 1].isdigit():
+                j += 2
+                continue
+            c3.append(c2[j])
+            j += 1
+        c2 = c3
+    if _cmd_len(c2) > limit:
+        clean_alias(work, extras)
+        raise RuntimeError(f"the ffmpeg command is {_cmd_len(c2)} characters even with short input names (limit {limit})")
+    return c2, str(work), extras
+
+
+def _run_ffmpeg(cmd, D, elog, cwd=None):
     RUN_MEM["min_free"], RUN_MEM["total"] = _free_mem_gb()
     RUN_PROG["t"] = 0.0
     tick = 0
     with open(elog, "w", encoding="utf-8") as ef:
-        pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, text=True)
+        pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, text=True, cwd=cwd)
         PROCS.append(pr)
         for line in pr.stdout:
             if line.startswith("out_time_us="):
@@ -14438,7 +14700,15 @@ def _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, el
     cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"] + inputs +
            ["-filter_complex_script", str(gp), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.4f}"] +
            enc_args(maxq, preview, nvenc) + (["-preset", "veryfast"] if encoder == "fast" else []) + [str(tmp)])
-    rc = _run_ffmpeg(cmd, D, elog)
+    awork = DATA / f"cmdalias_{os.getpid()}"
+    extras_ = []
+    try:
+        run_cmd, cwd_, extras_ = fit_cmd(cmd, awork)        # V8.8.1: a command over the Windows limit gets short input names (the same files); a short one is unchanged
+        if cwd_:
+            LOGONLY(f"render command {_cmd_len(cmd)} characters: input files renamed to short aliases ({_cmd_len(run_cmd)} characters)")
+        rc = _run_ffmpeg(run_cmd, D, elog, cwd_)
+    finally:
+        clean_alias(awork, extras_)
     if CANCEL.is_set():
         raise RuntimeError("cancelled")
     txt = ""
@@ -21831,6 +22101,9 @@ def main():
     ds.add_argument("--list", action="store_true")
     ds.set_defaults(fn=cmd_dropsave)
     sp.add_parser("musicscan", help="V7.7.0: run the music-over-gameplay detector over all cached clips (read-only; writes musicscan.txt only)").set_defaults(fn=cmd_musicscan)
+    q_ = sp.add_parser("r6srecheck", help="V8.8.1: re-check every saved R6S scan against all utility icons (once per clip), then list kills that still hold a utility icon (the audit; must be empty)")
+    q_.add_argument("--audit-only", dest="audit_only", action="store_true", help="only the audit, no re-check")
+    q_.set_defaults(fn=cmd_r6srecheck)
     sp.add_parser("songmatch", help="V7.7.5: song-to-CSV match counts with / without the loose rule (read-only; writes montage_data/song_match_v775.txt)").set_defaults(fn=cmd_songmatch)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
