@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8.2 - 2026-10-22: Smoother, more colourful sky everywhere
+- Valorant, CS2 and Rainbow Six now share one sky look: an even, smooth tint with soft edges instead of blotchy patches
+- More sky colours, with a hazy orange sky as a favourite; white or black skies when the song or its cover art suits them and the picture stays clear
+- Montages made with Auto fill the whole song and never run into the silence at the start or end of a song
+- Every clip's game sound is about equally loud, and renders are faster with the same picture and sound
+
 ## V8.8.1 - 2026-10-21: Long montages render again
 - Long montages with many clips or long file names no longer fail to start rendering, in every game; the picture and sound are exactly the same as before
 - Rainbow Six: every utility kill icon from your icon folder is now left out, wherever the icon sits in the kill row and however long the player names are
