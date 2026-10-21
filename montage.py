@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.6.3"
+APP_VERSION = "V8.7"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -83,6 +83,7 @@ GAMES = ("valorant", "cs2", "r6s")        # V8.0.0: r6s = Rainbow Six Siege (own
 
 LEN_MIN_S, LEN_MAX_S = 80, 180                      # V6.1.3: fixed-length range = the Optimal rule of V5.42B; V8.4.1: 80-180 s
 EFFECTS_START = {"cs2": "extra", "valorant": "default", "r6s": "default"}      # V8.4.1: the Effects mode of each game when nothing is saved yet
+SKY_START = {"cs2": True, "valorant": True, "r6s": False}                       # V8.7: the sky recolour of each game (Settings, next to Effects): on for CS2 and Valorant, off for R6S (no skies there)
 DEFAULT_CONFIG = {
     "playlist_dir": str(DATA / "playlist"),
     "mp3_dir": "",
@@ -103,6 +104,7 @@ DEFAULT_CONFIG = {
     "name_match": 80,               # V4 OCR: rapidfuzz partial_ratio needed for FIREAXE (killer side = kill, victim side = death)
     "death_lock_s": 8.0,            # no kills counted this long after my own death
     "sync_report": True,
+    "sky_game": dict(SKY_START),           # V8.7: the sky recolour (Extra effects only) per game: True | False
     "effects_game": dict(EFFECTS_START),   # V8.4.1: Effects mode per game: default (the minimal effects, the safety net) | extra (more effects and transitions: only look, never kills / timing)
     "post_checks": False,           # V8.22: SSIM quality check + sync report + transition check after the video is written (off by default)
     "gap_s": {"valorant": 6.0, "cs2": 5.0, "r6s": 6.0},
@@ -267,6 +269,8 @@ def load_config():
     cfg.pop("effects", None)                          # V8.4's single Effects setting: replaced by one per game
     eg_ = cfg.get("effects_game") if isinstance(cfg.get("effects_game"), dict) else {}
     cfg["effects_game"] = {g_: (eg_.get(g_) if eg_.get(g_) in ("default", "extra") else EFFECTS_START[g_]) for g_ in EFFECTS_START}
+    sg_ = cfg.get("sky_game") if isinstance(cfg.get("sky_game"), dict) else {}
+    cfg["sky_game"] = {g_: (bool(sg_[g_]) if g_ in sg_ else SKY_START[g_]) for g_ in SKY_START}
     cfg.pop("theme", None)                            # V5.56: one theme only
     cfg.pop("duck_db", None)                          # never read by the engine
     cfg.pop("game_under_music_db", None)
@@ -2919,10 +2923,11 @@ def border_rects(fr):
     thin = sorted(l[1] - l[0] + 1 for l in lines if l[1] - l[0] + 1 <= 5)
     lt = thin[len(thin) // 2] if thin else 3                       # typical thickness of one outline line
     rects = []
+    used_ln = set()
     for i, (ya, yb, xa0, xa1) in enumerate(lines):
         a_thick = yb - ya + 1 > 5                                  # two touching rows (bottom line + top line) blurred into one thick line
         y0 = yb - (lt - 1) if a_thick else ya                      # such a line is the TOP of the row below it ...
-        for yc, yd, xb0, xb1 in lines[i + 1:]:
+        for j, (yc, yd, xb0, xb1) in enumerate(lines[i + 1:], i + 1):
             b_thick = yd - yc + 1 > 5
             y1 = yc + (lt - 1) if b_thick else yd                  # ... and the BOTTOM of the row above it
             if y1 - y0 < BORDER_H[0] or yc - yb < 3:
@@ -2947,7 +2952,41 @@ def border_rects(fr):
                 band = np.concatenate([dd[y0:y0 + lt, x0:x1 + 1].ravel(), dd[max(y0, y1 - lt + 1):y1 + 1, x0:x1 + 1].ravel()])
                 band = band[band >= 40]
                 rects.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "str": float(band.mean()) if band.size else 0.0})
+                used_ln |= {i, j}
             break                                                  # the nearest matching line below closes this row
+    strict_ = list(rects)
+    if len(used_ln) < len(lines) and strict_:                      # V8.7: a strict line without a partner (the other edge smeared by compression): the loose mask may still hold it
+        lm = border_loose(fr)
+        mh2 = cv2.morphologyEx(cv2.morphologyEx(lm, cv2.MORPH_CLOSE, np.ones((1, 7), np.uint8)), cv2.MORPH_OPEN, np.ones((1, BORDER_LINE_MIN), np.uint8))
+        n2, _, st2, _ = cv2.connectedComponentsWithStats(mh2, connectivity=8)
+        lines2 = sorted((int(st2[k][1]), int(st2[k][1] + st2[k][3] - 1), int(st2[k][0]), int(st2[k][0] + st2[k][2] - 1))
+                        for k in range(1, n2) if st2[k][2] >= BORDER_LINE_MIN and st2[k][3] <= 14)
+        for i in sorted(set(range(len(lines))) - used_ln):
+            ya, yb, xa0, xa1 = lines[i]
+            if xa1 - xa0 + 1 < BORDER_RESCUE_MIN:
+                continue                                           # only a long, clear line (most of a row's width) is completed
+            cand = []
+            for yc, yd, xb0, xb1 in lines2:
+                if (yd >= ya - 2 and yc <= yb + 2) or xb1 - xb0 + 1 < 0.85 * (xa1 - xa0 + 1):
+                    continue                                       # the same line again / a partner that is much shorter
+                up_, lo_ = ((ya, yb, xa0, xa1), (yc, yd, xb0, xb1)) if yc > yb else ((yc, yd, xb0, xb1), (ya, yb, xa0, xa1))
+                hh = lo_[1] - up_[0] + 1
+                if hh < BORDER_H[0] or hh > BORDER_RESCUE_H or lo_[0] - up_[1] < 3 or abs(xa1 - xb1) > 12 or abs(xa0 - xb0) > 12:
+                    continue
+                cand.append((hh, up_, lo_))
+            if not cand:
+                continue
+            hh, up_, lo_ = min(cand, key=lambda c: c[0])
+            x0, x1 = min(up_[2], lo_[2]), max(up_[3], lo_[3])
+            if not any(abs(r_["x1"] - x1) <= 6 and abs((r_["y1"] - r_["y0"] + 1) - hh) <= 6 for r_ in strict_):
+                continue                                           # only in a frame that already holds a clearly outlined row of the same height and right edge (the killfeed is on screen; no red bar elsewhere)
+            side = lm[up_[0]:lo_[1] + 1, :]
+            fl = float(side[:, max(0, x0 - 3):x0 + 9].any(axis=1).mean())
+            fr_ = float(side[:, max(0, x1 - 9):x1 + 3].any(axis=1).mean())
+            if max(fl, fr_) >= 0.5 and min(fl, fr_) >= 0.25:
+                band = np.concatenate([dd[up_[0]:up_[0] + lt, x0:x1 + 1].ravel(), dd[max(up_[0], lo_[1] - lt + 1):lo_[1] + 1, x0:x1 + 1].ravel()])
+                band = band[band >= 25]
+                rects.append({"x0": x0, "y0": up_[0], "x1": x1, "y1": lo_[1], "str": float(band.mean()) if band.size else 0.0})
     out_ = []
     for r in sorted(rects, key=lambda r: r["y1"] - r["y0"]):       # smallest first: of two rects with one bottom edge only the row itself stays
         if any(abs(r["y1"] - o["y1"]) <= 4 and abs(r["x1"] - o["x1"]) <= 12 and o["y0"] > r["y0"] + 8 for o in out_):
@@ -2957,7 +2996,76 @@ def border_rects(fr):
             out_.append(r)
         elif r["x0"] < twin["x0"] - 4:                             # the same outline found twice: the wider one has the full top line
             out_[out_.index(twin)] = r
-    return sorted(out_, key=lambda r: r["y0"])
+    res_ = []
+    for r in out_:
+        res_ += border_split_tall(fr, r, lt)
+    return sorted(res_, key=lambda r: r["y0"])
+
+
+BORDER_TALL = 42                 # V8.7: an outlined rect taller than this (real rows: 26 - 31 px in the killfeed crop) may be two stacked rows whose shared edge was too weak to be found
+BORDER_RESCUE_MIN = 120          # V8.7: the lone strict line must be at least this long (px) for the rescue
+BORDER_RESCUE_H = 44             # V8.7: the lone-line rescue only closes a single row (real rows 26 - 34 px), never a long stretch
+BORDER_SPLIT_MIN = 60            # px: a loose-mask red line (inside a tall rect, or the partner of a lone line) must be this long
+
+
+def border_loose(fr):
+    """V8.7: the red-outline mask with the ratio / difference relaxed (R >= 80, R - max(G, B) >= 25, R >= 1.4 x max(G, B)): on a bright sky a 1 px outline smeared by 4:2:0 compression is about BGR (119, 91, 181), which the strict mask
+    (ratio 2.0, difference 40) loses. Only used to complete an outline that the strict mask already started (border_split_tall, the lone-line rescue in border_rects), never on its own."""
+    import cv2
+    b, g, r = cv2.split(fr)
+    mx = cv2.max(g, b)
+    d = cv2.subtract(r, mx)
+    return ((r >= 80) & (d >= 25) & (r.astype("float32") >= 1.4 * mx.astype("float32")) & (b.astype("int16") >= g.astype("int16") - 12)).astype("uint8")      # blue not far below green: red / magenta-red, never orange, sand or yellow (green well above blue)
+
+
+def _line_run(m, ylo, yhi):
+    """(x_start, x_end) of the longest horizontal red run (gaps up to 6 px bridged) in the rows ylo..yhi of mask m, None when shorter than BORDER_SPLIT_MIN."""
+    import cv2
+    import numpy as np
+    col = m[ylo:yhi + 1, :].any(axis=0).astype(np.uint8).reshape(1, -1)
+    col = cv2.morphologyEx(col, cv2.MORPH_CLOSE, np.ones((1, 7), np.uint8)).ravel()
+    best, st = (0, 0, 0), None
+    for x in range(len(col) + 1):
+        on = x < len(col) and col[x]
+        if on and st is None:
+            st = x
+        elif not on and st is not None:
+            if x - st > best[0]:
+                best = (x - st, st, x - 1)
+            st = None
+    return (best[1], best[2]) if best[0] >= BORDER_SPLIT_MIN else None
+
+
+def border_split_tall(fr, rc, lt=3):
+    """V8.7: two outlined rows that touch (kill rows pushed down one after the other) share an edge that compression smears so far that the strict red mask loses it; only the top line of the upper and the bottom line
+    of the lower row were found and the pair became ONE tall rect (the second kill never got a row). Inside a tall rect the shared edge is searched with the loose mask; where it exists the rect is split into the two
+    rows (recursively). A rect without such an interior line (a real tall row) is returned unchanged."""
+    if rc["y1"] - rc["y0"] + 1 < BORDER_TALL:
+        return [rc]
+    lm = border_loose(fr)
+    cnt = lm[:, rc["x0"]:rc["x1"] + 1].sum(axis=1)
+    ys = [y for y in range(rc["y0"] + 14, rc["y1"] - 13) if cnt[y] >= BORDER_SPLIT_MIN]
+    if not ys:
+        return [rc]
+    ya = yb = ys[0]
+    for y in ys[1:]:
+        if y - yb > 6:
+            break
+        yb = y
+    if yb - ya > 8:
+        return [rc]
+    up_y1, lo_y0 = min(yb, ya + lt - 1), max(ya, yb - (lt - 1))
+    lo_y0 = max(lo_y0, up_y1)
+    if up_y1 - rc["y0"] + 1 < BORDER_H[0] or rc["y1"] - lo_y0 + 1 < BORDER_H[0]:
+        return [rc]
+    runs_up = [_line_run(lm, rc["y0"], rc["y0"] + lt - 1), _line_run(lm, ya, up_y1)]
+    runs_lo = [_line_run(lm, lo_y0, yb), _line_run(lm, rc["y1"] - lt + 1, rc["y1"])]
+    xs_up, xs_lo = [r_ for r_ in runs_up if r_], [r_ for r_ in runs_lo if r_]
+    if not xs_up or not xs_lo:
+        return [rc]
+    up = dict(rc, y1=up_y1, x0=min(r_[0] for r_ in xs_up), x1=max(r_[1] for r_ in xs_up))
+    lo = dict(rc, y0=lo_y0, x0=min(r_[0] for r_ in xs_lo), x1=max(r_[1] for r_ in xs_lo))
+    return border_split_tall(fr, up, lt) + border_split_tall(fr, lo, lt)
 
 
 def _border_inner(fr, rc, ins=3):
@@ -3058,7 +3166,7 @@ class BorderTracker:
     def finish(self):
         """Tracks seen at least BORDER_MIN_HITS frames (or still on screen at the very end), each with its clearest crops."""
         raw = [t for t in self.tracks if not (t["hits"] < 2 and t["last"] < self.n - 2)]
-        res, blobs = border_shape_filter(raw, self.n)
+        res, blobs = border_shape_filter(raw, self.n, fix=True)
         self.blob_n = len(blobs) + len(self.tracks) - len(raw)
         for t in res:
             t["op0"] = round(min(1.0, t["s0"] / t["smax"]), 3) if t.get("smax") else None      # outline strength at the first frame / its best (fade-in)
@@ -3150,7 +3258,7 @@ def border_build(rec, det, cfg, write=True, keep_images=False):
             images[t["id"]] = best[2]
     t2 = time.time()
     p, key = border_path(rec, det)
-    sc = {"v": BORDER_V, "ext": 2, "blobs": tr.blob_n, "key": key, "stamp": det.d["stamp"], "fps": BORDER_FPS, "frames": tr.n, "size": [det.dw, det.dh],
+    sc = {"v": BORDER_V, "ext": 3, "blobs": tr.blob_n, "key": key, "stamp": det.d["stamp"], "fps": BORDER_FPS, "frames": tr.n, "size": [det.dw, det.dh],
           "v_off": rec.get("v_off", 0.0), "built": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "tracks": out_tracks,
           "secs": round(t2 - t0, 2), "decode_secs": round(t1 - t0, 2), "ocr_secs": round(t2 - t1, 2),
           "ms_per_frame": round(1000 * (t1 - t0) / max(1, tr.n), 2)}
@@ -3330,7 +3438,7 @@ def _slot_at(t, f):
     return cur[2] if len(cur) > 2 else int(round(cur[1] / 40.0))
 
 
-def border_shape_filter(tracks, n):
+def border_shape_filter(tracks, n, fix=False):
     """V6.8.2 ROW SHAPE VALIDATION -> (rows, blobs). An outlined track is a killfeed row only when it is a closed thin rectangle at least
     BORDER_ASPECT x wider than high with a valid row height, lasts at least 3 frames (or is still there at the very end of the clip), ends at the
     killfeed's right edge (rows are right-aligned; the edge is taken from the long-lived tracks) and sits on the row slot grid (pitch and phase
@@ -3352,13 +3460,22 @@ def border_shape_filter(tracks, n):
         d = [b - a for a, b in zip(lv, lv[1:]) if b - a >= 0.6 * h]
         if d:
             pitch, anchor = min(d), lv[0]
+
+    def on_grid(t, pitch_):
+        return all(abs(((y - anchor + pitch_ / 2.0) % pitch_) - pitch_ / 2.0) <= 0.3 * pitch_ for y in (t["slots"][0][1], t["slots"][-1][1]))
+    if pitch and fix:                                              # V8.7: one early slot of a fragment (two touching rows seen as one thick line) made the smallest level distance 26 instead of the true row pitch 31 and every row from the 3rd on was thrown out as a blob
+        okx = [t for t in cand if (x1ref is None or abs(t["x1"] - x1ref) <= 14) and t["hits"] >= 8]
+        if any(not on_grid(t, pitch) for t in okx):
+            hm = sorted(t["y1"] - t["y0"] for t in refs)[len(refs) // 2] if refs else 30
+            for alt in sorted({round(x / k, 1) for x in d for k in (1, 2, 3) if x / k >= 0.9 * hm and x / k > pitch + 1}):
+                if all(on_grid(t, alt) for t in okx):              # a pitch that puts EVERY real row (8 frames or more) on the grid and is not smaller than a row: nothing else changes
+                    pitch = alt
+                    break
     rows, blobs = [], [t for t in tracks if not shape(t)]
     for t in cand:
         ok = x1ref is None or abs(t["x1"] - x1ref) <= 14
         if ok and pitch:
-            for y in (t["slots"][0][1], t["slots"][-1][1]):
-                off = ((y - anchor + pitch / 2.0) % pitch) - pitch / 2.0
-                ok = ok and abs(off) <= 0.3 * pitch
+            ok = on_grid(t, pitch)
         (rows if ok else blobs).append(t)
     return rows, blobs
 
@@ -3655,7 +3772,7 @@ def border_analysis(sc, cfg, deaths=None):
     outlined: `deaths` comes from the normal name rule (analyse_entry) and keeps its 8 s lock."""
     off, fps, n = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS)), int(sc.get("frames", 0))
     legacy = sc.get("ext", 1) < 2
-    rows_t, blob_t = border_shape_filter(sc.get("tracks", []), n)
+    rows_t, blob_t = border_shape_filter(sc.get("tracks", []), n, **({"fix": True} if sc.get("ext", 1) >= 3 else {}))      # V8.7: sidecars built from ext 3 on use the corrected row grid (older ones are read exactly as before)
     kills, rej, vis, mine, det_rows, sus, others, merges = [], [], [], [], [], [], [], []
     unread = []                      # V8.21: outlined, row-shaped tracks whose text never split into killer / weapon / victim: (time, frames) - no verdict, but a row WAS there
     pre_victims = []
@@ -3770,7 +3887,7 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
     if not CS2_NAMEKEEP_ON[0] or len(b["kills"]) >= len(a["kills"]):
         return []
     off, fps, n = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS)), int(sc.get("frames", 0))
-    _, blobs = border_shape_filter(sc.get("tracks", []), n)
+    _, blobs = border_shape_filter(sc.get("tracks", []), n, **({"fix": True} if sc.get("ext", 1) >= 3 else {}))
     shaped = []
     for t in blobs:
         r = t.get("best_rect") or {}
@@ -4304,11 +4421,13 @@ _CS2_STREAM = {}
 
 def _cs2_stream(rec, cfg):
     """V6.7 (CS2 only): the audio track the clip actually has sound on - the very pick the plan uses (Settings > Audio mode and
-    game audio track, a silent track is never chosen) - instead of track 1, which many CS2 replays leave silent."""
-    key = (rec.get("path"), str((cfg or {}).get("audio_mode", "auto")), str(((cfg or {}).get("game_audio_track") or {}).get("cs2", "auto")))
+    game audio track, a silent track is never chosen) - instead of track 1, which many CS2 replays leave silent.
+    V8.7: every game (the gunshot analysis and the shot refinement of Valorant / R6S clips read track 1 whatever the Settings track said)."""
+    game_ = rec.get("game") or "cs2"
+    key = (rec.get("path"), str((cfg or {}).get("audio_mode", "auto")), game_, str(((cfg or {}).get("game_audio_track") or {}).get(game_, "auto")))
     if key not in _CS2_STREAM:
         try:
-            _CS2_STREAM[key] = int(resolve_clip_audio(rec, cfg or {}, "cs2", {}).get("stream") or 0)
+            _CS2_STREAM[key] = int(resolve_clip_audio(rec, cfg or {}, game_, {}).get("stream") or 0)
         except Exception:
             _CS2_STREAM[key] = int(rec.get("a_stream", 0))
     return _CS2_STREAM[key]
@@ -4318,7 +4437,8 @@ def _onset_key(rec, cfg=None):
     """Onset-cache key. Valorant (and every other caller): unchanged '<file>o1' (track a_stream). CS2: '<file>o1c<track>'."""
     if rec.get("game") == "cs2":
         return file_key(rec["path"]) + f"o1c{_cs2_stream(rec, cfg)}"
-    return file_key(rec["path"]) + "o1"
+    st_ = _cs2_stream(rec, cfg) if cfg is not None else 0              # V8.7: the Settings track of the game (track 1: the key stays '<file>o1' as before)
+    return file_key(rec["path"]) + ("o1" if not st_ else f"o1c{st_}")
 
 
 def cs2_no_gunshots(rec, ons):
@@ -4336,7 +4456,7 @@ def gun_onsets(rec, cache=None, cfg=None):
         return None
     import numpy as np
     key = _onset_key(rec, cfg)
-    stream = _cs2_stream(rec, cfg) if rec.get("game") == "cs2" else int(rec.get("a_stream", 0))
+    stream = _cs2_stream(rec, cfg) if (rec.get("game") == "cs2" or cfg is not None) else int(rec.get("a_stream", 0))
     cache = cache if cache is not None else load_json(ONSET_CACHE, {})
     if key in cache:
         return cache[key]
@@ -7138,19 +7258,20 @@ def resolve_clip_audio(rec, cfg, game, state):
 clip_audio_auto = lambda rec, setting="auto": clip_audio(rec, setting)      # V5.56 path (looked up at call time: tests may swap clip_audio)
 
 
-def refine_shot(rec, t_hint, row_t, cache):
+def refine_shot(rec, t_hint, row_t, cache, cfg=None):
     """Sample-exact time of the FATAL SHOT = the moment the kill happens on screen (the killfeed row appears ~0.1-0.2 s later).
     The last strong attack in the clip's game audio between 0.7 s before the row and the row itself. None = no shot heard."""
     import numpy as np
     if not rec.get("audio"):
         return None
-    key = f"{file_key(rec['path'])}|shot|{row_t:.3f}|s1"
+    stream = _cs2_stream(rec, cfg) if cfg is not None else int(rec.get("a_stream", 0))      # V8.7: the clip's game track (Settings), not always track 1
+    key = f"{file_key(rec['path'])}|shot|{row_t:.3f}|s1" + (f"c{stream}" if stream else "")
     if key in cache:
         return cache[key]
     sr = 48000
     t0 = max(0.0, row_t - 0.75)
     r = run(["ffmpeg", "-v", "error", "-ss", f"{t0:.4f}", "-i", rec["path"], "-t", f"{row_t + 0.05 - t0:.4f}",
-             "-map", f"0:a:{int(rec.get('a_stream', 0))}", "-ac", "1", "-ar", str(sr), "-af", "highpass=f=400",
+             "-map", f"0:a:{stream}", "-ac", "1", "-ar", str(sr), "-af", "highpass=f=400",
              "-f", "f32le", "-"], timeout=60)
     y = np.abs(np.frombuffer(r.stdout, np.float32))
     res = None
@@ -8289,7 +8410,7 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
         shot = None
         if k.get("shot_t") is not None:
             try:
-                shot = refine_shot(src["rec"], k["shot_t"], row, refine)
+                shot = refine_shot(src["rec"], k["shot_t"], row, refine, cfg)
             except Exception:
                 shot = None
             if shot is not None and not (row - 0.7 <= shot <= row + 0.02):
@@ -10205,7 +10326,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     assign_soft_cuts(plan, plan["notes"])                  # V7.6.1: soft dissolves where footage allows it, hard cuts elsewhere
     if effects_mode(cfg, game) == "extra":                 # V8.4: EXTRA EFFECTS: only adds look data to the takes (its own random stream); kills, cuts, timing and the default effects' draws stay as they are
         try:
-            assign_extra_fx(plan, game, seed, plan["notes"], energy=song.get("energy"),
+            assign_extra_fx(plan, game, seed, plan["notes"], energy=song.get("energy"), sky_on=sky_enabled(cfg, game),
                             flicks={(str(e_["path"]), round(float(e_["times"][0]), 3)) for e_ in events if e_.get("flick") and e_.get("times")})
         except Exception as ex_:
             LOGONLY(f"extra effects skipped: {type(ex_).__name__}: {ex_}")
@@ -11250,6 +11371,12 @@ def effects_mode(cfg, game=None):
     return m if m in EFFECT_MODES else EFFECTS_START.get(game, "default")
 
 
+def sky_enabled(cfg, game=None):
+    """V8.7: whether the sky recolour is on for a game (Settings > Sky recolour, per game; the starting values: CS2 and Valorant on, R6S off). Off = the planner makes no sky candidate and the render no recolour."""
+    v = ((cfg or {}).get("sky_game") or {}).get(game)
+    return bool(v) if v is not None else SKY_START.get(game, True)
+
+
 def feel_hue(recipe, energy, bpm):
     """V8.4.1: the colour of the song's feel, fixed mapping: the style picks it (aggressive red, hype amber, cinematic teal, smooth violet, chill blue);
     a fast, high-energy song (>= 140 BPM and energy >= 0.85) is red whatever the style, a slow or low-energy one (< 90 BPM or energy < 0.45) is blue.
@@ -11329,7 +11456,7 @@ def drop_moment(rng, s, gp):
             "boom_db": round(-2.0 + 2.0 * k, 1), "lift_db": round(2.0 + 3.0 * k, 1), "breath": v[6]}
 
 
-def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
+def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None, sky_on=True):
     """V8.4.2 EXTRA EFFECTS: builds the EFFECT PLAN of this montage and writes t['xfx'] (effect dicts on the take's own timeline). Nothing here changes segments, kill times, cut timing or
     the default zoom pulses (its own random stream). The plan: (1) the song's feel (style, energy, BPM) fixes the colour and the profile (FEEL_PROFILES: which kill effects weigh how much,
     how many kills are dressed, which cut effects, how many sky recolours); (2) a seed and the song pick this montage's SIGNATURE (2-3 of glow / flash / split / punch, so two montages
@@ -11508,10 +11635,11 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
     g_kind, g_why = sky_gradient_kind(recipe, energy, (plan.get("song") or {}).get("bpm"))
     plan["xfx_energy"] = en
     plan["xfx_sky_rank"] = {"names": ranked, "why": rank_why, "grad": g_kind, "grad_why": g_why}
-    sky_max = 0 if prof["sky"] <= 0 else sky_max_for(dur_all)
+    sky_max = 0 if (prof["sky"] <= 0 or not sky_on) else sky_max_for(dur_all)
+    plan["xfx_sky_on"] = bool(sky_on)
     sky_c = []
     prio = lambda c: 5 if c["head"] else 4 if c["end"] else 3 if c["multi_last"] else 2 if c["flick"] else 1       # V8.6.1: headline, ending, last kill of a multikill, 1k flick, then any drop kill
-    for c in sorted(cands, key=lambda c: (-prio(c), -c["sc"])):
+    for c in (sorted(cands, key=lambda c: (-prio(c), -c["sc"])) if sky_on else []):          # V8.7: sky off for this game: no candidate at all
         t = takes[c["ti"]]
         nk_ = len(t.get("kills_out") or [])
         why_ = ("headline kill" if c["head"] else "ending kill" if c["end"] else "last kill of a multikill" if (nk_ >= 2 and c["i"] == nk_ - 1) else
@@ -11545,6 +11673,7 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None):
              f"{cnt['speed']} faster run-ups",
              f"EFFECT PLAN: white flash on {cnt['flash']} of {len(cands)} kills (budget {budget} for {dur_all:.0f} s = one per {FLASH_PER_S:.0f} s; headline, drop kills, strong beat kills first; at least {FLASH_MIN_GAP_S:.1f} s apart, never on consecutive kills, one per take; peak at most {FLASH_A_MAX:.2f})",
              f"EFFECT PLAN: drop moments: {len(drops_audio)} (low hit on the kill, gunshot lift, vignette breath, build-up; the music is not lowered)" if drops_audio else "EFFECT PLAN: no drop moment (no drop kill)",
+             "EFFECT PLAN: sky recolour is OFF for this game (Settings): no sky candidates, no recolour" if not sky_on else
              f"EFFECT PLAN: sky recolour: up to {sky_max} for {dur_all:.0f} s (at least {SKY_SPACING_S:.0f} s apart, clear sky only; {len(sky_c)} candidate kills: headline / ending / last of a multikill / 1k flick, never a first, calm or middle kill; from the kill frame to the end of its take); "
              f"colour family from the song's feel: {', '.join(ranked[:3])} ({rank_why})"]
     for ln in lines:
@@ -11786,6 +11915,8 @@ SKY_MAX_ROW = 1.0                   # V8.5: the sky mask never goes below the ve
 SKY_MIN_L = 120                      # V8.6.2: a sky is bright: a smooth region darker than this (Lab L, 0-255) is a wall
 SKY_FRAME_MAX_COV = 0.45             # V8.6.2: a sky region that covers more of the picture than this is a wall; a take with more than SKY_MAX_BAD of such frames is skipped
 SKY_MAX_BAD = 0.15
+SKY_NEUTRAL_C0, SKY_NEUTRAL_SHARE, SKY_NEUTRAL_MIN = 9.0, 0.20, 2.5      # V8.7: for a sky with at least this much colour (Lab chroma of the sample), pixels with less than SHARE of it (at least MIN) are grey: smoke, fog, grey walls
+SKY_FLICKER_WIN, SKY_FLICKER_MAX = 15, 5                                 # V8.7: a pixel that flips in / out of the sky more than MAX times within +- WIN frames is flicker (smoke wisps, noise): it stays out of the mask, so the mask never blinks on and off
 SKY_HOLD_FRAMES = 15                 # V8.5: a frame whose sky region collapses while the frames around it have one (a dropout) takes the nearest good frame's mask
 SKY_PALETTE = {                      # V8.6: the colour the sky's CHROMA is set to (luminance is kept, the dark clouds darken it multiplicatively): deep red first, then the cool songs' deep blue / teal / violet; no yellow, no acid green, no neon pink
     "ember": 0xC01818, "amber": 0xC4581A, "rose": 0x9A2850, "violet": 0x5A2AA0, "deep blue": 0x1A3AA8, "teal": 0x0E7C80}
@@ -12087,17 +12218,48 @@ def sky_take_beats(plan, t, x):
         return []
 
 
-def sky_anim_params(energy, bpm):
-    """V8.6: how fast the sky lives, from the song's energy (0..1) and BPM: cloud drift (mask pixels a second), breathing period (s, two bars), surge strength (0..1) and push (scale)."""
+SKY_STYLE_HARD = {"aggressive": 0.20, "hype": 0.10, "mix": 0.0, "cinematic": -0.05, "smooth": -0.15, "chill": -0.25}      # V8.7: how much the style adds to the sky's hardness
+
+
+def sky_hardness(energy, bpm, recipe=None, drop=False):
+    """V8.7: how hard the song is, 0 (calm, chill) .. 1 (hardcore), from the song feel the plan already has: energy (0..1), BPM, the style and whether the sky is on a drop / headline kill. The sky animation follows it:
+    a hardcore song gets a harsh, flickering, chaotic sky, a chill one a calm slow sky. Not a setting."""
     try:
         e = max(0.0, min(1.0, float(energy)))
     except (TypeError, ValueError):
         e = 0.6
     try:
+        b = max(60.0, min(220.0, float(bpm)))
+    except (TypeError, ValueError):
+        b = 110.0
+    h = 0.55 * e + 0.30 * max(0.0, min(1.0, (b - 90.0) / 90.0)) + SKY_STYLE_HARD.get(recipe or "mix", 0.0) + 0.05 + (0.08 if drop else 0.0)
+    return round(max(0.0, min(1.0, h)), 3)
+
+
+def sky_anim_params(energy, bpm, recipe=None, drop=False):
+    """V8.6 / V8.7: how fast and how wildly the sky lives, from the song's feel. `hard` (sky_hardness, 0 calm .. 1 hardcore) sets everything: cloud drift (mask pixels a second), breathing / swing period (s, two bars), surge
+    strength, push (scale), the depth of the beat pulses, and from hard 0.35 on a strobe (black flicker bursts, `strobe_hz` bursts a second of depth `strobe_depth`), from 0.45 on colour jumps to a second colour on the
+    beats (`jump` = share of the offbeats) and drops to black on the downbeats (`bd`), and a swing of the gradient (`swing`: the dark end moves between the top and the horizon)."""
+    hd = sky_hardness(energy, bpm, recipe, drop)
+    try:
         b = max(60.0, min(200.0, float(bpm)))
     except (TypeError, ValueError):
         b = 110.0
-    return {"drift": round(45.0 + 70.0 * e + 0.2 * (b - 60.0), 2), "period": round(8 * 60.0 / b, 2), "surge": round(0.7 + 0.3 * e, 2), "push": round(0.03 + 0.03 * e, 4), "depth": round(0.18 + 0.42 * e, 2)}
+    on = lambda lo: max(0.0, min(1.0, (hd - lo) / (1.0 - lo)))
+    return {"hard": hd, "drift": round(25.0 + 110.0 * hd + 0.1 * (b - 60.0), 2), "period": round(8 * 60.0 / b, 2), "surge": round(0.7 + 0.3 * hd, 2), "push": round(0.03 + 0.03 * hd, 4),
+            "depth": round(0.12 + 0.55 * hd, 2), "strobe_hz": round(on(0.35) * 14.0, 2), "strobe_depth": round(0.30 + 0.65 * on(0.35), 2), "jump": round(on(0.45), 2), "bd": round(on(0.40), 2),
+            "swing": round(0.05 + 0.95 * on(0.15), 2), "swing_period": round(max(0.6, 2 * 60.0 / b * (2.0 - hd)), 2)}
+
+
+def sky_alt_colour(ranked, rgb):
+    """V8.7: the colour the sky jumps to on the beats of a hard song: the first colour of the song's family at least 80 degrees away from the main colour (else the complement of the main colour)."""
+    h0 = _hue_deg(rgb)
+    for n_ in ranked:
+        c = SKY_PALETTE.get(n_)
+        if c is not None and _hue_dist(_hue_deg(c), h0) >= 80.0:
+            return n_, c
+    r_, g_, b_ = (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255
+    return "complement", ((255 - r_) << 16) | ((255 - g_) << 8) | (255 - b_)
 
 
 def sky_cloud_field(w, h, nfr, fps, drift, period, seed):
@@ -12185,12 +12347,15 @@ def sky_eyedrop_mask(img, sample):
     dL = lab[..., 0] - L0
     tab = min(18.0, max(10.0, 3.0 * float(np.hypot(sa, sb)) + 6.0))
     near = ((dab <= tab) & (np.abs(dL) <= max(22.0, 3.5 * sL + 12.0))) | ((dab <= tab * 0.8) & (dL > 0) & (dL <= 45.0))
+    c0_ = float(np.hypot(a0 - 128.0, b0 - 128.0))
+    neutral = (np.hypot(lab[..., 1] - 128.0, lab[..., 2] - 128.0) < max(SKY_NEUTRAL_MIN, SKY_NEUTRAL_SHARE * c0_)) if c0_ >= SKY_NEUTRAL_C0 else np.zeros(near.shape, bool)
+    near &= ~neutral                                       # V8.7: a coloured sky never takes grey: smoke grenades (and grey walls / fog) that touch the sky are not sky; white clouds INSIDE the sky come back with the hole filling below
     for _ in range(5):                                     # a sky is a gradient (deeper at the top, paler at the horizon): the colour is followed outward from what is already sky (a local colour estimate)
         wgt = near.astype(np.float32)
         den = cv2.GaussianBlur(wgt, (0, 0), 20) + 1e-4
         loc = [cv2.GaussianBlur(lab[..., c] * wgt, (0, 0), 20) / den for c in range(3)]
         grow = ((den > 0.02) & (np.hypot(lab[..., 1] - loc[1], lab[..., 2] - loc[2]) <= 8.0) & (np.abs(lab[..., 0] - loc[0]) <= 12.0)
-                & (dab <= tab + 6.0) & (np.abs(dL) <= 38.0))             # ... but never far from the sampled colour (a pale sky must not run on into a white wall)
+                & (dab <= tab + 6.0) & (np.abs(dL) <= 38.0) & ~neutral)             # ... but never far from the sampled colour (a pale sky must not run on into a white wall)
         new = near | grow
         if int(new.sum()) == int(near.sum()):
             break
@@ -12302,6 +12467,77 @@ def sky_rule_mask(img, zone=None):
     return m
 
 
+def sky_flicker_unstable(segm, win=None, max_tr=None):
+    """V8.7: for each frame of a take's sky masks (list of HxW uint8 0 / 1): the boolean map (HxW) of pixels that changed state more than `max_tr` times within +- `win` frames: flicker, not an edge that moves with the camera
+    (that changes once or twice). Worked out at half size. None when nothing flickers."""
+    import cv2
+    import numpy as np
+    win = SKY_FLICKER_WIN if win is None else win
+    max_tr = SKY_FLICKER_MAX if max_tr is None else max_tr
+    k = len(segm)
+    h, w = segm[0].shape
+    h2, w2 = h // 2, w // 2
+    st = np.stack([cv2.resize(m_, (w2, h2), interpolation=cv2.INTER_AREA) > 0 for m_ in [(m_ * 255).astype(np.uint8) for m_ in segm]])
+    ch = np.zeros((k, h2, w2), np.int16)
+    ch[1:] = st[1:] != st[:-1]
+    cs = np.cumsum(ch, axis=0, dtype=np.int16)
+    out_, any_ = [], False
+    for i in range(k):
+        n_ = cs[min(k - 1, i + win)] - cs[max(0, i - win)]
+        u = n_ > max_tr
+        if u.any():
+            any_ = True
+            u = cv2.dilate(u.astype(np.uint8), np.ones((3, 3), np.uint8))
+            out_.append(cv2.resize(u, (w, h), interpolation=cv2.INTER_NEAREST) > 0)
+        else:
+            out_.append(np.zeros((h, w), bool))
+    return out_ if any_ else None
+
+
+def sky_anim_schedule(an, x, f0, nf):
+    """V8.7: the frame-by-frame plan of the sky's chaos for one take (deterministic for x['seed']): arrays of nf floats: `black` (0..1: strobe bursts, drops to black on the downbeats), `jump` (0..1: the sky is the second colour),
+    `swing` (0..1: where the gradient's dark end is, top .. horizon). All zero / calm for a soft song (`an` from sky_anim_params): no strobe under hard 0.35, no jumps / drops under 0.4 / 0.45, the swing small."""
+    import numpy as np
+    rng = np.random.RandomState((int(x.get("seed", 1)) * 977 + 13) % (2 ** 31))
+    fps = float(OUT_FPS)
+    black, jump, swing = np.zeros(nf, np.float32), np.zeros(nf, np.float32), np.zeros(nf, np.float32)
+    for f in range(nf):
+        tt = (f - f0) / fps
+        if tt >= 0 and an.get("swing"):
+            swing[f] = 0.5 + 0.5 * np.sin(2 * np.pi * tt / max(0.6, an["swing_period"]) - 1.2) if an["swing"] > 0.3 else 0.0
+            swing[f] *= float(an["swing"])
+    hz, sd = float(an.get("strobe_hz", 0.0)), float(an.get("strobe_depth", 0.0))
+    if hz > 0:                                             # strobe: bursts of 1 - 3 black frames at about `hz` a second, random depth, from 0.12 s after the kill
+        f = f0 + int(0.12 * fps)
+        while f < nf:
+            if rng.rand() < hz / fps:
+                ln = int(rng.choice([1, 1, 2, 3]))
+                amp = sd * float(rng.uniform(0.55, 1.0))
+                for j in range(ln):
+                    if f + j < nf:
+                        black[f + j] = max(black[f + j], amp * (1.0 - 0.25 * j))
+                f += ln
+            f += 1
+    bd, jp = float(an.get("bd", 0.0)), float(an.get("jump", 0.0))
+    for bt_, bs_ in (x.get("beats") or []):
+        fb = int(round(float(bt_) * fps))
+        if fb < f0 or fb >= nf:
+            continue
+        if bd > 0 and bs_ >= 0.9:                          # a downbeat: the sky drops to black for 2 - 3 frames, then jumps to the second colour
+            for j in range(3):
+                if fb + j < nf:
+                    black[fb + j] = max(black[fb + j], bd * (0.95 - 0.15 * j))
+            if jp > 0:
+                for j in range(3, 9):
+                    if fb + j < nf:
+                        jump[fb + j] = max(jump[fb + j], jp * (1.0 - 0.08 * (j - 3)))
+        elif jp > 0 and rng.rand() < 0.6 * jp:             # an offbeat: a short colour jump
+            for j in range(4):
+                if fb + j < nf:
+                    jump[fb + j] = max(jump[fb + j], jp * (0.95 - 0.1 * j))
+    return {"black": black, "jump": jump, "swing": swing}
+
+
 def sky_take_mask(t, x, zone, path, ramp=False):
     """V8.4.4 / V8.5.1: writes the sky mask of one take for the render: a raw video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take). V8.5.1: the window is x['t0'] .. x['t1'] = the KILL frame to the
     END of the take (the frames before the kill are 0); every frame's mask is the V8.4.1 colour rule (sky_rule_mask) of the take's own source frame (so slow-mo and speed-ups are followed), a frame whose region
@@ -12366,6 +12602,11 @@ def sky_take_mask(t, x, zone, path, ramp=False):
                 if abs(j - i) <= SKY_HOLD_FRAMES:
                     segm[i] = segm[j]
                     held += 1
+    if k > 4:                                              # V8.7: temporal stabilisation: pixels that flicker in and out of the sky mask (a smoke grenade drifting in front of the sky, noise) are taken out for the whole window
+        sm_ = [m_ for m_ in segm]
+        unst = sky_flicker_unstable(sm_)
+        if unst is not None:
+            segm = [np.where(unst[i], 0, segm[i]).astype(np.uint8) for i in range(k)]
     sm = []
     for i in range(k):                                     # +-4 frames, then a soft threshold: the edge settles where most of the neighbouring frames agree
         a_ = np.mean(segm[max(0, i - 4):i + 5], axis=0)
@@ -12385,7 +12626,8 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     clouds = sky_cloud_field(w, h, nf, OUT_FPS, an_["drift"], an_["period"], x.get("seed", 1)) if (ramp and an_) else None
     mid_b = np.full((h * w,), 128, np.uint8).tobytes()
     gdark = x.get("grad_dark", 0.35)                       # the gradient: how much darker the top of the sky is than its horizon (0.55 'dark' = red to black, 0.25 'sunset')
-    gcol = (1.0 - np.clip(np.arange(h, dtype=np.float32) / max(1.0, float(hor)), 0.0, 1.0))[:, None] * np.ones((1, w), np.float32) * gdark
+    rr_ = np.clip(np.arange(h, dtype=np.float32) / max(1.0, float(hor)), 0.0, 1.0)[:, None] * np.ones((1, w), np.float32)      # 0 at the top .. 1 at the horizon
+    sched = sky_anim_schedule(an_, x, f0, nf) if (ramp and an_) else None
     with open(path, "wb") as fh:
         for f in range(nf):
             cl = next(clouds) if clouds is not None else None
@@ -12396,7 +12638,10 @@ def sky_take_mask(t, x, zone, path, ramp=False):
             else:
                 fh.write(zero)
             if ramp:
-                dens = np.clip(1.0 - (1.0 - gcol) * (1.0 - (cl if cl is not None else 0.0) * SKY_CLOUD_MAX), 0.0, 1.0)
+                sw = float(sched["swing"][f]) if sched else 0.0                  # V8.7: the gradient's dark end swings between the top (0) and the horizon (1)
+                gcol = ((1.0 - rr_) * (1.0 - sw) + rr_ * sw) * gdark
+                cmul = 1.0 - 0.55 * max(0.0, float(an_.get("hard", 0.0)) - 0.4) / 0.6 if an_ else 1.0                # V8.7: on a hard song the strobe / jumps / swing carry the look, not slow soft blobs
+                dens = np.clip(1.0 - (1.0 - gcol) * (1.0 - (cl if cl is not None else 0.0) * SKY_CLOUD_MAX * cmul), 0.0, 1.0)
                 if an_ and x.get("beats") and f >= f0:                         # V8.6.2: after the kill the density pulses on the beats of the song (strong beats more), depth from the song's energy; between the pulses it is steady
                     tr = f / float(OUT_FPS)
                     pul = 0.0
@@ -12405,10 +12650,14 @@ def sky_take_mask(t, x, zone, path, ramp=False):
                             pul += bs_ * float(np.exp(-(tr - bt_) / 0.14))
                     pul = min(1.0, pul)
                     dens = np.clip(dens + an_["depth"] * pul * (1.0 - dens), 0.0, 1.0)
+                if sched and sched["black"][f] > 0:                              # V8.7: strobe bursts and drops to black: the whole sky goes dark for a few frames
+                    dens = dens + float(sched["black"][f]) * (1.0 - dens)
                 fh.write(np.clip(dens * 255.0 + 0.5, 0, 255).astype(np.uint8).tobytes())
                 tt = (f - f0) / float(OUT_FPS)
                 sg = (an_["surge"] * float(np.exp(-max(0.0, tt) / (SKY_SURGE_S / 2.5)))) if (an_ and tt >= 0) else 0.0
-                fh.write(np.full((h * w,), int(round(255 * sg)), np.uint8).tobytes())
+                if sched:
+                    sg = max(sg, float(sched["jump"][f]))                      # V8.7: the sky jumps to the second colour on the beats
+                fh.write(np.full((h * w,), int(round(255 * min(1.0, sg))), np.uint8).tobytes())
     if ramp:
         x["mask_fmt"] = "yuv444p"
     cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm])) if segm else 0.0
@@ -12499,15 +12748,23 @@ def sky_gradient(rgb, kind):
     return pk([v * 0.70 + r_ * 0.30 for v, r_ in zip(c, red)]), pk([v * 0.82 + w_ * 0.18 for v, w_ in zip(c, warm)])
 
 
-def sky_grade_v2(rgb, kind):
-    """V8.6: the lutyuv constants of the three colour layers of the new sky: 'steady' (the palette colour, luminance kept), 'dark' (the clouds / the gradient: the same hue, brightness x 0.38 about black: darker, never lifted;
-    'dark' gradient = red to black: even deeper), 'surge' (the impact: chroma pushed 20 % past the palette colour, brightness x 1.14, never past SKY_Y_MAX). Chroma is SKY_HAZE of the colour's, the rest the sky's own."""
+def sky_grade_v2(rgb, kind, alt=None, hard=0.0):
+    """V8.6 / V8.7: the lutyuv constants of the three colour layers of the sky: 'steady' (the palette colour), 'dark' (the clouds / the gradient / the black strobe: the same hue, much darker; V8.7: nearly black),
+    'surge' (the impact and the beat jumps: V8.6 the same hue brighter; V8.7 with `alt` (0xRRGGBB) the second colour, for a hard song). V8.7: DEEP, never pastel: the steady layer keeps well under half of the sky's brightness
+    (never above Y 130) and its chroma is pushed 35 - 55 % past the palette colour (the sky's own tint is only 8 %), so a bright blue sky becomes a dark saturated red / blue, not a pink or pale one."""
     yt, ut, vt = _rgb_to_yuv(rgb)
     r_, g_, b_ = (rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255
-    ym = 0.95 if (r_ > 2 * g_ and r_ > 2 * b_) else 0.55          # calibrated so the mean sky brightness is about 40 % of the original (35 - 45 %): a red keeps less luminance per unit of Y than a blue / teal / violet
-    return {"steady": {"y_mul": ym, "u": ut, "v": vt, "haze": SKY_HAZE, "y_max": 200},
-            "dark": {"y_mul": 0.20 if kind == "dark" else 0.28, "u": 128 + (ut - 128) * 0.9, "v": 128 + (vt - 128) * 0.9, "haze": 0.92, "y_max": 235},
-            "surge": {"y_mul": 1.0, "u": 128 + (ut - 128) * 1.25, "v": 128 + (vt - 128) * 1.25, "haze": 1.0, "y_max": 235}}
+    ym = 0.50 if (r_ > 2 * g_ and r_ > 2 * b_) else 0.40
+    sat = 1.35 + 0.20 * float(hard)
+    cl = lambda v: max(16.0, min(240.0, v))
+    out_ = {"steady": {"y_mul": ym, "u": cl(128 + (ut - 128) * sat), "v": cl(128 + (vt - 128) * sat), "haze": 0.92, "y_max": 130},
+            "dark": {"y_mul": (0.10 if float(hard) >= 0.45 else 0.18) if kind == "dark" else 0.24, "u": 128 + (ut - 128) * 0.45, "v": 128 + (vt - 128) * 0.45, "haze": 0.95, "y_max": 120}}      # V8.7: the dark layer is close to black (little colour left): a drop to black is black
+    if alt is not None:
+        ya, ua, va = _rgb_to_yuv(alt)
+        out_["surge"] = {"y_mul": 0.62, "u": cl(128 + (ua - 128) * 1.45), "v": cl(128 + (va - 128) * 1.45), "haze": 0.97, "y_max": 175}
+    else:
+        out_["surge"] = {"y_mul": 0.72, "u": cl(128 + (ut - 128) * 1.6), "v": cl(128 + (vt - 128) * 1.6), "haze": 1.0, "y_max": 170}
+    return out_
 
 
 def sky_grade(rgb, mean_y, grad=None, kind="sunset"):
@@ -12580,15 +12837,16 @@ def xfx_probe_sky(plan, tmpdir=None):
                 pal_why = f"{cov_why}; {pal_why}"
             else:
                 pal_why = f"{cov_why}: palette from the song feel only"
-            an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"))
+            an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"), plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"))      # V8.7: the sky follows the song's hardness
+            alt_name, alt_rgb = sky_alt_colour(ranked, rgb) if an_["jump"] > 0 else (None, None)
             x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "grad_dark": 0.55 if gk == "dark" else 0.25, "beats": sky_take_beats(plan, plan["takes"][ti], x)})
             st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True)                  # (again: with the animation planes)
             if st["bad"] > SKY_MAX_BAD * max(1, st["window"]):                           # V8.6.2: a wrong sky is worse than none
                 raise RuntimeError(f"the sky mask was a wall in {st['bad']} of {st['window']} frames of the take - no sky for this take")
-            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade_v2(rgb, gk), "mask_cov": round(st["cov"], 3),
+            x.update({"ok": True, "mask": str(mp), "hue": name, "hue_why": cwhy, "grade": sky_grade_v2(rgb, gk, alt_rgb, an_["hard"]), "alt_hue": alt_name, "mask_cov": round(st["cov"], 3),
                       "grad": gk, "held": st["held"], "palette_rgb": rgb, "palette_why": pal_why})
             kept.append(gp)
-            c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the picture -> recoloured {name} ({cwhy}); from the kill frame to the end of the take: {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%, {st['held']} dropout frame(s) held, {gk} gradient, horizon at {st['horizon'] * 100:.0f}% of the height; palette 0x{rgb:06X} ({pal_why}); animation drift {an_['drift']} px/s, breath {an_['period']} s, surge {an_['surge']}, push {an_['push']}"
+            c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the picture -> recoloured {name} ({cwhy}); from the kill frame to the end of the take: {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%, {st['held']} dropout frame(s) held, {gk} gradient, horizon at {st['horizon'] * 100:.0f}% of the height; palette 0x{rgb:06X} ({pal_why}); animation hardness {an_['hard']:.2f} ({'hardcore: strobe ' + format(an_['strobe_hz'], 'g') + '/s, drops to black, jumps to ' + str(alt_name) if an_['jump'] > 0 else 'strobe ' + format(an_['strobe_hz'], 'g') + '/s' if an_['strobe_hz'] > 0 else 'calm'}), drift {an_['drift']} px/s, breath {an_['period']} s, surge {an_['surge']}, push {an_['push']}"
         except Exception as ex:                        # noqa: BLE001
             x["ok"] = False
             c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% but the mask could not be made ({type(ex).__name__}: {ex}), skipped"
@@ -13630,7 +13888,12 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = slice_plan(plan) if preview else plan
     itmp = render_tmpdir(outfile)
-    if p.get("effects") == "extra":
+    sky_ok = sky_enabled(cfg, p.get("game"))               # V8.7: sky recolour off for this game (Settings): no probe, no mask, no recolour in the render (also for a plan made before it was switched off)
+    if not sky_ok:
+        for t_ in p.get("takes") or []:
+            if t_.get("xfx"):
+                t_["xfx"] = [x_ for x_ in t_["xfx"] if x_.get("k") != "sky"]
+    if p.get("effects") == "extra" and sky_ok:
         try:
             xfx_probe_sky(p, itmp)                             # V8.4.1: the sky recolour only where the real frame has sky (V8.4.4: its masks are made here, in the render's temp folder)
         except Exception as ex_:                               # noqa: BLE001
@@ -16439,6 +16702,7 @@ class App:
         cfg["quality"], cfg["sync_report"] = self.set_q.get(), bool(self.set_sync.get())
         cfg["post_checks"] = bool(self.set_post.get())               # V8.22
         cfg["effects_game"] = {g_: {v_: k_ for k_, v_ in EFFECT_LABELS.items()}.get(self.set_fx[g_].get(), EFFECTS_START[g_]) for g_ in EFFECTS_START}      # V8.4.1
+        cfg["sky_game"] = {g_: bool(self.set_sky[g_].get()) for g_ in SKY_START}      # V8.7
         cfg["update_on_start"] = bool(self.set_upd.get())
         cfg["interpolate_low_fps"] = bool(self.set_interp.get())     # V6.9.7
         cfg["lower_music_clips"] = bool(self.set_music.get())        # V7.7.0
@@ -18319,6 +18583,7 @@ class App:
         self.set_sync = tk.BooleanVar(value=self.cfg.get("sync_report", True))
         self.set_post = tk.BooleanVar(value=bool(self.cfg.get("post_checks", False)))      # V8.22
         self.set_fx = {g_: tk.StringVar(value=EFFECT_LABELS[effects_mode(self.cfg, g_)]) for g_ in EFFECTS_START}      # V8.4.1: one per game
+        self.set_sky = {g_: tk.BooleanVar(value=sky_enabled(self.cfg, g_)) for g_ in SKY_START}      # V8.7: the sky recolour per game
         label("Quality")
         h = holder()
         ttk.Radiobutton(h, text="NVENC p7 cq18 (fast)", variable=self.set_q, value="nvenc").pack(side="left", padx=(0, PX))
@@ -18343,6 +18608,7 @@ class App:
             label(f"Effects: {GAME_DIR.get(g_, g_.upper())}")
             h_ = holder()
             ttk.Combobox(h_, textvariable=self.set_fx[g_], values=list(EFFECT_LABELS.values()), width=40, state="readonly").pack(side="left")
+            ttk.Checkbutton(h_, text="Sky recolour", variable=self.set_sky[g_]).pack(side="left", padx=(PX, 0))      # V8.7
             r[0] += 1
         label("Checks after render")
         ttk.Checkbutton(holder(), text="Run the quality, sync and transition checks after the video is written (off = finish at once)", variable=self.set_post).pack(side="left")
@@ -18381,7 +18647,7 @@ class App:
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_post, *self.set_fx.values(), self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_post, *self.set_fx.values(), *self.set_sky.values(), self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
