@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.7 - 2026-10-17: A sky that goes wild with hard songs
+- The sky now follows the song: hardcore songs get a harsh, flickering sky that strobes, drops to black and jumps to another colour on the beat, chill songs get a calm, slow one
+- Sky colours are deeper and richer, never pale; smoke is no longer painted over and the sky no longer blinks on and off
+- New switch next to Effects in Settings to turn the sky recolour on or off for each game (off for Rainbow Six by default)
+- Fast back-to-back kills at the end of a clip are no longer missed, and the gunshot timing uses the audio track you chose in Settings
+
 ## V8.6.3 - 2026-10-17: Manual Auto fixed
 - Manual Auto works like before V8.6.1 again and no longer stalls or leaves the montage empty
 
