@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8 - 2026-10-21: A sky that hits on every beat
+- In CS2 and Rainbow Six the sky now flashes and changes colour on the beat of the song, much wilder than before, and it goes on the drops first: every drop of the song can get one
+- Clean 60 fps, full-size clips are picked first; low-quality ones still make it in when the kill is special
+- Clips with sound on another audio track are no longer silent, utility kills in Rainbow Six (the skull icon and others) are left out, and fast multikills in CS2 keep all their kills
+- Full-song montages skip silence at the start or end of a song and fill the song to the end; clips saved one after another are matched more reliably
+
 ## V8.7 - 2026-10-17: A sky that goes wild with hard songs
 - The sky now follows the song: hardcore songs get a harsh, flickering sky that strobes, drops to black and jumps to another colour on the beat, chill songs get a calm, slow one
 - Sky colours are deeper and richer, never pale; smoke is no longer painted over and the sky no longer blinks on and off
