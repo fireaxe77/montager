@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.7"
+APP_VERSION = "V8.8"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2441,6 +2441,11 @@ def r6s_row_util(r, uhits):
         return False
     xk = max([b[1] for _f, l, _r in r.get("reads", []) for b in l] or [0])
     xv = min([b[0] for _f, _l, rr in r.get("reads", []) for b in rr] or [10 ** 6])
+    lo, hi = xk - 12, xv + 12
+    if xk >= xv - 6 and r.get("reads"):                    # V8.8: the reads disagree (the OCR ran the killer's name past the icon: killer right edge beyond the victim's left edge, so the
+        bx = [b for _f, l, rr in r["reads"] for b in list(l) + list(rr)]          # slot between them is empty): the weapon slot is somewhere inside the row, so the row's whole extent counts
+        if bx:
+            lo, hi = min(b[0] for b in bx) - 12, max(b[1] for b in bx) + 12
     hh = max(r.get("h") or 0, 14)
     for h in uhits:
         if h["hits"] < R6S_UTIL_MIN_F:
@@ -2449,9 +2454,55 @@ def r6s_row_util(r, uhits):
             continue
         if abs(h["y"] - r["y"]) > 0.7 * max(hh, h["h"]):
             continue
-        if xk - 12 <= h["x"] <= xv + 12:
+        if lo <= h["x"] <= hi:
             return True
     return False
+
+
+def r6s_util_refresh(r, e, det, cfg, store=None, key=None):
+    """V8.8: an R6S entry scanned with another utility icon set than exists now (or before there were any: no 'util_sig') is matched again against the CURRENT icons
+    (template pass only, no OCR: the same frames, the same frame numbers as the scan) and saved back, so a utility kill (skull, gadget ...) is never kept because its
+    clip was scanned before its icon was added. Returns the (updated) entry; the old one when it cannot be read."""
+    uicons = r6s_load_util_icons(log=False)
+    if not uicons or not e or e.get("error"):
+        return e
+    sig = r6s_icons_sig(uicons)
+    if (e.get("util_sig") or "") == sig:
+        return e
+    try:
+        a_ = r6s_analyse_entry(dict(e, util=[]), cfg)       # only the frames around my kill rows are matched (the icon only matters there): seconds, not a minute
+        off_ = float(e.get("v_off", 0.0))
+        rows_ = r6s_rows_from_ocr(e) if e.get("ocr") else (e.get("rows") or [])
+        sus_ = [k for k in a_["kills"] if any(0 in (r_.get("gunv") or []) for r_ in rows_ if abs(r_["first"] / FPS + off_ - k["t"]) < 0.1)]
+        if not sus_:                                       # no kill row ever read with a small / square icon: a gun kill, nothing to re-match (the scan stays as it is)
+            return e
+        a_ = dict(a_, kills=sus_)
+        wins = [(int(round((k["t"] - off_) * FPS)) - 2 * FPS, int(round((k.get("t_last", k["t"]) - off_) * FPS)) + FPS) for k in a_["kills"]]
+        us = R6SUtilScan(uicons)
+        if wins:
+            last_ = max(w[1] for w in wins)
+            ys = [float(k.get("y", 0)) for k in a_["kills"]]
+            hs = max([float(k.get("h") or 20) for k in a_["kills"]] or [20.0])
+            y0 = max(0, int(min(ys) - 2.5 * hs - 20))           # only the band of my kill rows is matched (the same band in every frame, so the hits line up)
+            y1 = int(max(ys) + 2.5 * hs + 20)
+            for f, fr in enumerate(frame_stream(r["path"], r, det, cfg, FPS)):
+                if f > last_:
+                    break
+                if any(w0 <= f <= w1 for w0, w1 in wins):
+                    us.step(f, fr[y0:min(fr.shape[0], y1)])
+            for h in us.hits:
+                h["y"] += y0
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"R6S: utility icons not re-matched for {Path(r['path']).name}: {type(ex).__name__}: {ex}")
+        return e
+    e2 = dict(e, util=us.hits, util_sig=sig)
+    if store is not None and key is not None:
+        try:
+            store.put(key, e2)
+        except Exception:                                  # noqa: BLE001
+            pass
+    LOGONLY(f"R6S: utility icons re-matched for {Path(r['path']).name} ({len(us.hits)} hit(s), icon set {sig})")
+    return e2
 
 
 def r6s_icons_sig(icons):
@@ -3878,6 +3929,13 @@ CS2_UNREAD_MIN_F = 10                # V8.21: an outlined row-shaped track of at
 _NAMEKEEP_LOGGED = set()
 
 
+def _vic_like(x, y, lim=60):
+    """V8.8: two OCR reads of a victim name that may be the same name (fuzzy ratio of the letters and digits >= lim)."""
+    from rapidfuzz import fuzz
+    u, v = _alnum((x.get("victim") or "").lower()), _alnum((y.get("victim") or "").lower())
+    return bool(u and v and fuzz.ratio(u, v) >= lim)
+
+
 def cs2_name_kills_kept(a, b, sc, clip=""):
     """V7.4.9 (CS2 only): when the border list has FEWER kills than the name-based list, name-based kills the border list lacks are kept if (a) the victim name
     read is stable (ks >= CS2_NAMEKEEP_KS over >= CS2_NAMEKEEP_HITS reads, a real name), (b) the name list itself passed its pre-clip / stale / utility / death-window /
@@ -3898,6 +3956,8 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
             shaped.append(round(t["first"] / fps + off, 3))
     shaped += [tt for tt, hh in b.get("unread", []) if hh >= 3]       # V8.21: a row-shaped outlined track the OCR could not split (a short row at the very end of a clip: 3 reads, 2 unsplittable) is the same evidence
     seen_rows = [d["t"] for d in b.get("rows", [])] + [r["t"] for r in b.get("rej", [])]
+    late_ = [k["late_from"] for k in b["kills"] if k.get("late_from") is not None]          # V8.8: a re-timed late row no longer stands at its old time
+    seen_rows = [x for x in seen_rows if not any(abs(x - y) < 0.05 for y in late_)]
     kept = []
     for nk in sorted(a["kills"], key=lambda k: k["t"]):
         t = nk["t"]
@@ -3912,13 +3972,48 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
         if t < BORDER_PRE_S + 1.0 + off or (t < CS2_STALE_S + off and pre_rows) or any(abs(t - x) < 1.0 for x in seen_rows):
             continue
         if not any(abs(t - x) <= 0.6 for x in shaped):
-            continue
+            legacy_ok = (CS2_LATE_ROW_ON[0] and sc.get("ext", 1) < 3 and nk.get("ks", 0.0) >= 0.9 and nk.get("hits", 0) >= 3 and b.get("rows")
+                         and not any(cs2_same_victim(nk.get("victim"), k.get("victim")) or _vic_like(nk, k) for k in b["kills"] + kept)
+                         and not any(o is not nk and abs(o["t"] - t) <= 3.0 and _vic_like(nk, o) for o in a["kills"]))      # (not a re-read of a nearby victim: 'Melgl' / 'Meig!' / 'Moigl')
+            if not legacy_ok:                              # V8.8: a sidecar older than the V8.7 tracker (rows merged / dated late) need not hold the row: a stable read of a NEW victim is enough
+                continue
         kept.append(dict(nk, name_kept=True))
         key = (clip, round(t, 1))
         if key not in _NAMEKEEP_LOGGED:
             _NAMEKEEP_LOGGED.add(key)
             LOGONLY(f"CS2 name kill kept (border list missed it): {clip} @ {t:.1f} -> {nk.get('victim')}")
     return kept
+
+
+CS2_LATE_ROW_ON = [True]             # V8.8 switch (tests / A-B): late rows re-timed, legacy-sidecar name kills kept
+CS2_LATE_ROW_S = 8.0                 # V8.8: a border row whose victim the name scan read this much (at most) EARLIER was picked up late (a row slid up / an old sidecar's merged rows)
+CS2_LATE_ROW_MIN_S = 1.0
+
+
+def cs2_late_rows_retime(a, b, clip=""):
+    """V8.8 (CS2): a border kill whose victim (cs2_same_victim) the name-based list has as a kill 1 - 8 s EARLIER, with a stable name read, while no other border kill stands at that
+    earlier time, is the same row picked up late by the tracker (two touching rows merged until the older rows above expired: the deagle 3k of 'Replay 2026-06-25 01-27-36', whose
+    rows were dated to the moment they slid up): its time becomes the name list's time, so it no longer swallows the real later kill and the take never starts after the kill.
+    Returns the number of re-timed kills."""
+    n = 0
+    used = set()
+    if not CS2_LATE_ROW_ON[0]:
+        return 0
+    for bk in sorted(b.get("kills", []), key=lambda k: k["t"]):
+        cand = [nk for nk in a.get("kills", []) if id(nk) not in used and CS2_LATE_ROW_MIN_S <= bk["t"] - nk["t"] <= CS2_LATE_ROW_S
+                and nk.get("ks", 0.0) >= CS2_NAMEKEEP_KS and len(_alnum(nk.get("victim") or "")) >= 3 and cs2_same_victim(nk.get("victim"), bk.get("victim"))
+                and not any(abs(o["t"] - nk["t"]) < CS2_LATE_ROW_MIN_S for o in b["kills"] if o is not bk)]
+        if not cand:
+            continue
+        nk = min(cand, key=lambda k: k["t"])
+        used.add(id(nk))
+        LOGONLY(f"CS2 late row re-timed: {clip} {bk['t']:.2f} -> {nk['t']:.2f} ({nk.get('victim')}: the name scan saw this kill first)")
+        bk["late_from"] = bk["t"]
+        bk["t"] = nk["t"]
+        n += 1
+    if n:
+        b["kills"].sort(key=lambda k: k["t"])
+    return n
 
 
 CS2_DATING_ON = [True]               # V7.5.1.1: ON (V7.5.1 shipped it OFF); test / scan switch
@@ -4216,6 +4311,10 @@ def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
     b["old"] = a
     if (game or entry.get("game")) == "cs2":                 # V7.4.9: CS2 only; never removes or re-times a border kill
         try:
+            cs2_late_rows_retime(a, b, Path(rec.get("path", "")).name)       # V8.8: a row picked up late takes the name scan's earlier time
+        except Exception:                                   # noqa: BLE001
+            pass
+        try:
             add = cs2_name_kills_kept(a, b, sc, Path(rec.get("path", "")).name)
         except Exception:
             add = []
@@ -4424,20 +4523,44 @@ def _cs2_stream(rec, cfg):
     game audio track, a silent track is never chosen) - instead of track 1, which many CS2 replays leave silent.
     V8.7: every game (the gunshot analysis and the shot refinement of Valorant / R6S clips read track 1 whatever the Settings track said)."""
     game_ = rec.get("game") or "cs2"
-    key = (rec.get("path"), str((cfg or {}).get("audio_mode", "auto")), game_, str(((cfg or {}).get("game_audio_track") or {}).get(game_, "auto")))
+    if cfg is None:                                                    # V8.8: no caller reads track 1 just because it passed no config
+        cfg = load_config()
+    try:
+        fk = file_key(rec["path"])                                     # V8.8: a file that changed (re-recorded / still being written) is picked again
+    except Exception:                                                  # noqa: BLE001
+        fk = rec.get("path")
+    key = (fk, str(cfg.get("audio_mode", "auto")), game_, str((cfg.get("game_audio_track") or {}).get(game_, "auto")))
     if key not in _CS2_STREAM:
         try:
-            _CS2_STREAM[key] = int(resolve_clip_audio(rec, cfg or {}, game_, {}).get("stream") or 0)
+            _CS2_STREAM[key] = int(resolve_clip_audio(rec, cfg, game_, {}).get("stream") or 0)
         except Exception:
             _CS2_STREAM[key] = int(rec.get("a_stream", 0))
     return _CS2_STREAM[key]
 
 
+def _shot_stream(rec, cfg):
+    """V8.8: the track the gunshot analysis / shot refinement read: the game track of the clip (_cs2_stream: Settings, never a silent one); when the loudness scan saw NO
+    gunshot on it but another track with sound has them (a recorder that puts the game on another track than Settings says), that track."""
+    if rec.get("game") == "valorant":                                  # Valorant: V8.7 behaviour, untouched
+        return _cs2_stream(rec, cfg) if cfg is not None else int(rec.get("a_stream", 0))
+    st = _cs2_stream(rec, cfg)
+    try:
+        m = load_json_ro(LOUD_CACHE, {}).get(file_key(rec["path"]) + "|t2") or {}
+    except Exception:                                                  # noqa: BLE001
+        return st
+    lufs, ons = m.get("lufs") or [], m.get("ons") or []
+    if st < len(ons) and (ons[st] or 0) == 0:
+        live = [i for i in range(min(len(lufs), len(ons))) if lufs[i] is not None and lufs[i] > SILENT_LUFS and (ons[i] or 0) >= 3]
+        if live:
+            return max(live, key=lambda i: ons[i])
+    return st
+
+
 def _onset_key(rec, cfg=None):
     """Onset-cache key. Valorant (and every other caller): unchanged '<file>o1' (track a_stream). CS2: '<file>o1c<track>'."""
     if rec.get("game") == "cs2":
-        return file_key(rec["path"]) + f"o1c{_cs2_stream(rec, cfg)}"
-    st_ = _cs2_stream(rec, cfg) if cfg is not None else 0              # V8.7: the Settings track of the game (track 1: the key stays '<file>o1' as before)
+        return file_key(rec["path"]) + f"o1c{_shot_stream(rec, cfg)}"
+    st_ = _shot_stream(rec, cfg) if (cfg is not None or rec.get("game") != "valorant") else 0      # V8.7: the Settings track of the game (track 1: the key stays '<file>o1' as before); V8.8: CS2 / R6S also without cfg
     return file_key(rec["path"]) + ("o1" if not st_ else f"o1c{st_}")
 
 
@@ -4456,7 +4579,7 @@ def gun_onsets(rec, cache=None, cfg=None):
         return None
     import numpy as np
     key = _onset_key(rec, cfg)
-    stream = _cs2_stream(rec, cfg) if (rec.get("game") == "cs2" or cfg is not None) else int(rec.get("a_stream", 0))
+    stream = _shot_stream(rec, cfg)                                    # V8.8: the Settings track (or the track that has the gunshots), every game, with or without cfg
     cache = cache if cache is not None else load_json(ONSET_CACHE, {})
     if key in cache:
         return cache[key]
@@ -5692,6 +5815,8 @@ def game_pool(cfg, game, paths=None):
         e = cache.get(kills_key(r, game, det))
         if not e or e.get("error"):
             continue
+        if game == "r6s":                                  # V8.8: an entry scanned with an older utility icon set is matched against the current icons first
+            e = r6s_util_refresh(r, e, det, cfg, cache, kills_key(r, game, det))
         cands.append((r, e))
     if broken:
         out(f"{game}: {len(broken)} clip(s) left out - broken recording (under {BROKEN_FPS:.0f} frames a second, or frozen for more than {STALL_MAX_SHARE * 100:.0f}% of its length: the recorder stalled): " + "; ".join(broken))
@@ -7264,7 +7389,7 @@ def refine_shot(rec, t_hint, row_t, cache, cfg=None):
     import numpy as np
     if not rec.get("audio"):
         return None
-    stream = _cs2_stream(rec, cfg) if cfg is not None else int(rec.get("a_stream", 0))      # V8.7: the clip's game track (Settings), not always track 1
+    stream = _shot_stream(rec, cfg)                                    # V8.7: the clip's game track (Settings), not always track 1; V8.8: also without cfg, and the track with the gunshots
     key = f"{file_key(rec['path'])}|shot|{row_t:.3f}|s1" + (f"c{stream}" if stream else "")
     if key in cache:
         return cache[key]
@@ -7323,6 +7448,40 @@ def verify_stitch(spans, cut):
         return False, b["shift"], f"no clearly matching frame at the cut (difference {best:.1f} vs {ref:.1f} for other frames)"
     new_shift = round(b["shift"] - (tb[j] - tb[ib]), 4) if j != ib else b["shift"]
     return True, new_shift, f"frames match at the cut (difference {best:.1f}, {'aligned' if j == ib else f'corrected by {j - ib} frame(s)'})"
+
+
+QUAL_FPS = ((0, 0.2), (24, 0.35), (30, 0.45), (45, 0.75), (50, 0.85), (58, 1.0))           # V8.8 (CS2 / R6S): frame rate -> quality share
+QUAL_PX = ((0.0, 0.2), (0.11, 0.3), (0.2, 0.5), (0.44, 0.75), (0.59, 0.85), (0.95, 1.0))      # picture pixels / 1920 x 1080 (360p 0.11, 480p 0.2, 720p 0.44, 1280 x 960 0.59)
+QUAL_BOX = 0.75                       # the game shown in a smaller box inside the frame (the bar crop)
+QUAL_MUL, QUAL_SUB = 0.2, 12.0        # score x (1 - QUAL_MUL x (1 - q)) - QUAL_SUB x (1 - q): a weighting, never a ban (a poor-quality 4k / ace still beats a clean 2k)
+
+
+def _interp_tab(tab, x):
+    for (x0, y0), (x1, y1) in zip(tab, tab[1:]):
+        if x <= x1:
+            return y0 + (y1 - y0) * max(0.0, (x - x0)) / max(1e-9, x1 - x0)
+    return tab[-1][1]
+
+
+def clip_quality(rec, cfg=None):
+    """V8.8: picture quality of a clip, 0-1 (1 = 1080p / 60 fps full frame, the February clips): frame rate, picture size (the bar crop when the clip has it)
+    and the small-box penalty. Unknown size / fps counts as full quality."""
+    try:
+        fps = float(rec.get("fps") or 0.0)
+        w, h = int(rec.get("w") or 0), int(rec.get("h") or 0)
+    except (TypeError, ValueError):
+        return 1.0
+    if not w or not h:
+        return 1.0
+    box = bool(rec.get("bars") and (cfg or {}).get("bar"))
+    cw, ch = (content_rect(rec, cfg)[2:] if box else (w, h))
+    q = _interp_tab(QUAL_PX, min(1.0, cw * ch / (1920.0 * 1080.0))) * (_interp_tab(QUAL_FPS, fps) if fps > 0 else 1.0) * (QUAL_BOX if box else 1.0)
+    return round(max(0.05, min(1.0, q)), 3)
+
+
+def quality_score(score, q):
+    """V8.8: an event score weighted by its clip's quality (q = 1: unchanged)."""
+    return score * (1.0 - QUAL_MUL * (1.0 - q)) - QUAL_SUB * (1.0 - q)
 
 
 def base_score(ev):
@@ -7471,6 +7630,46 @@ def clip_anchor(path, dur=None, mtime=None):
     return dict(res, start=st, end=st + dur, side=side, verified=ver, provable=True, how=how)
 
 
+ANCHOR_NAME_DISAGREE_S = 60.0         # V8.8 (CS2 / R6S): a modified time this far from the time in the file name is a copied / touched file: the name time is the clock
+
+
+def clip_anchor_best(path, dur=None, game=None, mtime=None):
+    """V8.8: the clip's time range for companion matching. Valorant: clip_anchor (modified time) exactly as before. CS2 / R6S: the modified time, unless the file name
+    holds a time to the second that disagrees with it by more than ANCHOR_NAME_DISAGREE_S (a copy, an '_1' re-save, a touched file): then the name time (DVR / Outplayed
+    names = START, OBS names = END)."""
+    a = clip_anchor(path, dur, mtime)
+    if game == "valorant" or a is None:
+        return a
+    info = name_time_info(path)
+    if not info or info.get("res") != "sec":
+        return a
+    d_ = float(a["dur"])
+    st_, en_ = (info["t"], info["t"] + d_) if info["default"] == "start" else (info["t"] - d_, info["t"])
+    if abs(a["end"] - en_) <= ANCHOR_NAME_DISAGREE_S:
+        return a
+    return dict(a, start=st_, end=en_, side=info["default"], how=f"file name time (the modified time is {a['end'] - en_:+.0f} s off: copied / touched file)", clock="name")
+
+
+def clip_anchor_created(path, dur=None):
+    """V8.8 (CS2 / R6S): the clip's range from the file's CREATED time (Windows: the save; start = created - duration), the third clock when the modified time and the
+    name do not link two clips. None when unknown."""
+    try:
+        st_ = os.stat(path)
+    except OSError:
+        return None
+    if not dur or float(dur) <= 0:
+        return None
+    ct, d_ = st_.st_ctime, float(dur)
+    info = name_time_info(path)                            # a copied folder gives every file about the same created time: the clock is only trusted when it agrees with
+    ok_ = abs(ct - st_.st_mtime) <= 2 * ANCHOR_NAME_DISAGREE_S       # the modified time or with the time in the file name (never on its own)
+    if info and info.get("res") == "sec":
+        ok_ = ok_ or abs(ct - (info["t"] + (d_ if info["default"] == "start" else 0.0))) <= ANCHOR_NAME_DISAGREE_S
+    if not ok_:
+        return None
+    return {"start": ct - d_, "end": ct, "dur": d_, "side": "end", "provable": True, "verified": False, "clock": "created",
+            "how": "file created time = the save (start = created - duration)"}
+
+
 def clip_ctime(rec):
     """Anchored START of a clip (events are ordered by it); the old modified-time fallback for unparsable names."""
     a = clip_anchor(rec["path"], rec.get("dur"))
@@ -7570,6 +7769,14 @@ def save_time_link(a, b):
     if not aa or not ab:
         return None, "save time unknown (no modified time / duration)"
     ov = min(aa["end"], ab["end"]) - max(aa["start"], ab["start"])
+    if ov < -pair_gap() and a.get("anc_c") and b.get("anc_c"):         # V8.8 (CS2 / R6S): the created times are the second clock
+        ca, cb = a["anc_c"], b["anc_c"]
+        ov_c = min(ca["end"], cb["end"]) - max(ca["start"], cb["start"])
+        if ov_c >= -pair_gap():
+            lk_, why_ = save_time_link(dict(a, anc=ca, anc_c=None), dict(b, anc=cb, anc_c=None))
+            if lk_:
+                lk_["match"] += " (by the files' created times: the modified times are too far apart)"
+            return lk_, why_
     if ov < -pair_gap():
         return None, f"saved {-ov:.1f} s apart (gap larger than the {pair_gap():.0f} s continuation window)"
     if ov < 0 and getattr(PAIR_CTX, "game", None) == "r6s":    # R6S is one life per round: a death of mine after my kills ends that round, a later clip cannot continue it
@@ -8122,9 +8329,11 @@ def cmd_ledger(args):
 
 def music_fight_groups(items):
     """Pool items grouped like _build_events groups them (clips saved right next to each other = one fight; read-only, same save_time_link rule)."""
-    its = [dict(it, ctime=clip_ctime(it["rec"]), anc=clip_anchor(it["rec"]["path"], it["rec"].get("dur"))) for it in items]
+    g_ = items[0]["rec"].get("game") if items else None
+    its = [dict(it, ctime=clip_ctime(it["rec"]), anc=clip_anchor_best(it["rec"]["path"], it["rec"].get("dur"), g_ or "valorant"),
+                **({"anc_c": clip_anchor_created(it["rec"]["path"], it["rec"].get("dur"))} if g_ not in (None, "valorant") else {})) for it in items]      # V8.8: the same clocks as build_events
     its.sort(key=lambda i: ((i["anc"] or {}).get("end", i["ctime"]), (i["anc"] or {}).get("start", i["ctime"])))
-    PAIR_CTX.game = (items[0]["rec"].get("game") if items else None)       # V8.0.2: the continuation window of this group's game
+    PAIR_CTX.game = g_       # V8.0.2: the continuation window of this group's game
     groups, i = [], 0
     while i < len(its):
         g, j = [its[i]], i + 1
@@ -8216,7 +8425,8 @@ def build_events(pool, game, cfg, rng, flick_budget=40):
     for it in pool:
         ks = list(it["kills"])                             # V5.5: Valorant knife kills are normal kills
         if ks:
-            items.append(dict(it, kills=sorted(ks, key=lambda k: k["t"]), ctime=clip_ctime(it["rec"]), anc=clip_anchor(it["rec"]["path"], it["rec"].get("dur"))))
+            items.append(dict(it, kills=sorted(ks, key=lambda k: k["t"]), ctime=clip_ctime(it["rec"]), anc=clip_anchor_best(it["rec"]["path"], it["rec"].get("dur"), game),
+                              **({"anc_c": clip_anchor_created(it["rec"]["path"], it["rec"].get("dur"))} if game != "valorant" else {})))
     if LEDGER_SUBCALL[0] and LAST_LEDGER[0] is not None:   # partners (pairing_replace_events): known rows only, nothing new is 'usable' here
         led = LAST_LEDGER[0]
     else:
@@ -8386,6 +8596,9 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
             pass
     for e in evs:
         e["score"] = base_score(e) + 2.0 * e["shots"]
+        if game != "valorant":                             # V8.8 (CS2 / R6S): 60 fps / 1080p / full-frame clips first (a weighting, never a ban)
+            e["quality"] = min([clip_quality(p_["rec"], cfg) for p_ in (e.get("parts") or []) if p_.get("rec")] or [clip_quality(e["rec"], cfg)])
+            e["score"] = quality_score(e["score"], e["quality"])
         e["plain"] = e["n"] == 1 and not e["hs"] and not e["flick"]
     evs.sort(key=lambda e: -e["score"])
     if not LEDGER_SUBCALL[0]:                              # V6.9.9: a pairing sub-call (companions) must not replace the main run's event list: its rows would all end LOST
@@ -8525,6 +8738,8 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
     sl_ = [float(raw[i]["k"].get("seen_lead", 0.0)) for i in keep]
     if any(x > 0.5 for x in sl_):                           # V7.7.6 (CS2 only): a row of this victim was already on screen this long before the kill time
         ev["seen_lead"] = [round(x, 3) for x in sl_]
+    if rec.get("game") not in (None, "valorant") and len(spans) == 1 and deaths:     # V8.8 (CS2 / R6S): my deaths on the clip's timeline (the song-end fill never adds footage with one)
+        ev["deaths"] = [round(d - shift0, 3) for d in deaths]
     un_ = [bool(raw[i]["k"].get("t_unsure")) for i in keep]
     if any(un_):                                            # V8.1.1 (CS2 only): kills whose time may be late (see cs2_kill_times_earlier): no slow-mo / zoom on them, more run-in
         ev["unsure"] = un_
@@ -9085,6 +9300,25 @@ HEADLINE_RULES_V73 = True               # V7.3: headline anchor (finisher on the
 
 FULL_CAP_S, FULL_MIN_S, FULL_TOTAL_S = 150.0, 90.0, 180.0     # V8.5: Force New Full / Manual Auto only: montage content at most 2:30 (3:00 with the ending), a long song's section is 1:30 .. 2:30; the one place to change it
 FULL_CTX = {"on": False}                # V8.5: True while make_plan(full=True) plans: optimal_fit() then uses the FULL_* range instead of OPT_RANGE
+SONG_DEAD_AMP = 0.002                   # V8.8 (full mode): a stretch of the song whose peak stays under this (about -54 dBFS) is dead silence ...
+SONG_DEAD_MIN_S = 0.25                  # ... and is cut from the start / end of the song when it lasts at least this long
+
+
+def song_live_range(an):
+    """V8.8: (t0, t1) of the song's audible part from the song map's peak envelope ('wave', 2000 bins): dead silence before t0 / after t1 is never used in full mode,
+    so the montage never starts or ends on silence. (0, dur) when the map has no envelope or the song has no dead edge."""
+    w = an.get("wave") or []
+    dur = float(an.get("dur") or 0.0)
+    if len(w) < 50 or dur <= 0:
+        return 0.0, dur
+    bs = dur / len(w)
+    live = [i for i, v in enumerate(w) if v > SONG_DEAD_AMP]
+    if not live:
+        return 0.0, dur
+    t0, t1 = live[0] * bs, (live[-1] + 1) * bs
+    t0 = 0.0 if t0 < SONG_DEAD_MIN_S else t0
+    t1 = dur if dur - t1 < SONG_DEAD_MIN_S else t1
+    return round(t0, 3), round(t1, 3)
 OPT_RANGE = (80.0, 180.0)               # V5.42B Optimal: 80 s minimum (when the material allows), V8.4.1: 180 s maximum (was 150), never past the song
 
 
@@ -9793,8 +10027,15 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     bt = np.array(an["beats"], float)
     bd = float(np.median(np.diff(bt)))
     song_end = float(an.get("dur") or (bt[-1] + bd)) - 0.1
-    avail = song_end - float(bt[0])
     full = bool(FULL_CTX["on"])
+    b_lo = 0
+    if full and FULL_CTX.get("game") != "valorant":        # V8.8 (CS2 / R6S): dead silence at the start / end of the song is cut in full mode
+        lv0, lv1 = song_live_range(an)
+        FULL_CTX["live"] = (lv0, lv1)
+        song_end = min(song_end, lv1 - 0.1)
+        b_lo = int(np.searchsorted(bt, lv0 - 0.02))
+        b_lo = min(b_lo, max(0, len(bt) - 2))
+    avail = song_end - float(bt[b_lo])
     mx = min(FULL_CAP_S if full else OPT_RANGE[1], avail)
     rng_lo, cap_v = (FULL_MIN_S, FULL_CAP_S) if full else OPT_RANGE
     est = {id(e): take_estimate(e, bd, rname) for e in clips}
@@ -9808,7 +10049,7 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     L = min(mx, total(chosen))
     last_b0 = int(np.searchsorted(bt, song_end, side="right") - 1)
     if full:                                               # V8.5: the whole song when it fits the cap; a long song tries every length from 1:30 up to the cap
-        L = min(L, float(bt[last_b0] - bt[0]))
+        L = min(L, float(bt[last_b0] - bt[b_lo]))
         Ls = [L] + ([x for x in range(int(L) - 10, int(FULL_MIN_S) - 1, -10)] if L > FULL_MIN_S + 5 and avail > FULL_CAP_S else [])
     else:
         Ls = [L]
@@ -9828,10 +10069,10 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     best, allc = None, []
     for L in Ls:
       for E in bounds:
-        if E > last_b or bt[E] - bt[0] < L - 1e-6:
+        if E > last_b or bt[E] - bt[b_lo] < L - 1e-6:
             continue
         s_t = float(bt[E]) - L
-        S = max([d for d in down if bt[d] <= s_t + 1e-6] or [0])
+        S = max([d for d in down if bt[d] <= s_t + 1e-6 and d >= b_lo] or [b_lo])
         frac = lambda b: (bt[b] - bt[S]) / max(1e-6, bt[E] - bt[S])
         inside = [d for d in drops if 0.2 <= frac(d["beat"]) <= 0.6 and d["beat"] < E]
         sc = 0.0
@@ -9859,7 +10100,7 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     if allc:
         best = allc[min(rank, len(allc) - 1)]
     if best is None:                                       # the material needs the whole song
-        best = (0.0, 0, last_b, [d for d in drops if d["beat"] < last_b], L)
+        best = (0.0, b_lo, last_b, [d for d in drops if d["beat"] < last_b and d["beat"] >= b_lo], L)
     _, S, E, inside, L = best
     if full and L < L_top - 1e-6:                          # V8.5: a shorter section than the material allows: the weakest clips that no longer fit are left out
         while len(chosen) > 1 and total(chosen) > L - bd:
@@ -9896,6 +10137,110 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     return {"cands_n": max(1, len(allc)), "rank": rank, "length": round(L, 2), "start_beat": int(S), "end_beat": int(E), "drop_beat": int(drop_b), "clips": chosen,
             "left": left, "max": mx, "why": why, "drop_why": dwhy, "second": [round(float(bt[int(d["beat"])]), 1) for d in second],
             "head_kick_t": head_kick_time(song_path, bt, int(drop_b), drops)}
+
+
+FILL_LEAD_S = 1.0                    # V8.8 (CS2 / R6S, full mode): a montage that ends short of the song gets about this much more run-in before the first kill of some takes ...
+FILL_MAX_GAP_S = 15.0                 # ... when it ends at most this much short (more is not "a few seconds": the clips are missing, not the run-ins)
+
+
+def leadin_safe(ev, a, b, cfg):
+    """V8.8: may the source footage [a, b] (seconds, the clip's own timeline, just before the first kill) be added in front of a take? Only for a single clip with sound whose
+    gunshot analysis hears NO shot in it (no shooting without a kill, no enemy firing at me) and with no death of mine in it. (ok, why)."""
+    if len(ev.get("parts") or []) > 1 or ev.get("stitched"):
+        return False, "stitched clips"
+    rec = ev.get("rec") or {}
+    if not rec.get("audio"):
+        return False, "no sound to check the extra footage with"
+    if a < 0.05:
+        return False, "not enough footage before the kill"
+    try:
+        ons = gun_onsets(rec, None, cfg)
+    except Exception as ex:                                # noqa: BLE001
+        return False, f"gunshot analysis failed ({type(ex).__name__})"
+    if ons is None:
+        return False, "no sound to check the extra footage with"
+    try:
+        mute_ = not ons and rec.get("game") == "cs2" and cs2_no_gunshots(rec, ons)
+    except Exception:                                      # noqa: BLE001
+        mute_ = not ons
+    if mute_:
+        return False, "the clip's sound has no gunshots at all (cannot check)"
+    sh = [o[0] for o in ons if a - 0.05 <= float(o[0]) <= b + 0.02]
+    if sh:
+        return False, f"gunshot at {sh[0]:.2f} s in the extra footage"
+    if any(a - 0.1 <= float(d) <= b + 0.1 for d in (ev.get("deaths") or [])):
+        return False, "my death in the extra footage"
+    return True, ""
+
+
+def _take_src_start(t):
+    """V8.8: the source time a take's footage starts at (first kill - covered run-in)."""
+    ev = t["ev"]
+    lead = float(t.get("lead_t") or 0.0)
+    r = float(t.get("ramp") or 1.0)
+    cover = lead if r <= 1.0 else 1.0 + (lead - 1.0) * r
+    return float(ev["times"][0]) - cover
+
+
+def fill_lead_ins(takes, head_take, U, gap_s, cfg, notes, nm, song_end):
+    """V8.8 (CS2 / R6S, Auto / Force New Full): the montage ends gap_s short of the (audible) song and no other clip fits: some takes AFTER the headline (never the headline, the build-up
+    before the drop or the ending) start about FILL_LEAD_S earlier in their footage (whole beats: the cuts stay on the beat grid, the kills move by whole beats), every later take moves
+    by the same ticks. The calmest takes first; the extra footage must pass leadin_safe. Returns the new take list."""
+    td = float(U[1] - U[0])
+    k = max(2, 2 * int(round(FILL_LEAD_S / (2 * td))))
+    if gap_s < k * td * 0.6 or gap_s > FILL_MAX_GAP_S:
+        return takes
+    hi = next((i for i, t in enumerate(takes) if t is head_take), None)
+    if hi is None:
+        return takes
+    order = sorted([i for i in range(hi + 1, len(takes)) if not takes[i].get("ending") and not takes[i].get("slow")],
+                   key=lambda i: (takes[i]["ev"]["score"], i))
+    out_ = list(takes)
+    left = gap_s
+    added, why_not = [], []
+    for i in order:
+        if left < k * td * 0.6:
+            break
+        t = out_[i]
+        g = geom(t["ev"], U, t["c"], t["kb"] + k, t["end"] + k, t["ramp"], t["slow"], anchor=t.get("anchor", "first"), tailmode=t.get("tailmode", "plain"))
+        if not g:
+            why_not.append(f"{nm(t['ev'])}: no footage for a longer run-in")
+            continue
+        a, b = _take_src_start(g), _take_src_start(t)
+        ok, why = leadin_safe(t["ev"], a, b, cfg)
+        if not ok:
+            why_not.append(f"{nm(t['ev'])}: {why}")
+            continue
+        new_ = list(out_)
+        new_[i] = dict(g, **{k_: v_ for k_, v_ in t.items() if k_ not in g and k_ not in ("c", "kb", "end", "lead_t", "ramp", "dur")})
+        bad = None
+        for j in range(i + 1, len(out_)):
+            tj = out_[j]
+            if tj.get("ending"):
+                fe = tj.get("fade_end")
+                gj = geom(tj["ev"], U, tj["c"] + k, tj["kb"] + k, None, 1.0, True, ending=True)
+                if not gj or fe is None or fe + k >= len(U) or float(U[fe + k]) > song_end:
+                    bad = nm(tj["ev"])
+                    break
+                new_[j] = dict(tj, **{x_: gj[x_] for x_ in ("c", "kb", "lead_t", "ramp", "dur") if x_ in gj}, fade_end=fe + k)
+                continue
+            gj = geom(tj["ev"], U, tj["c"] + k, tj["kb"] + k, tj["end"] + k, tj["ramp"], tj["slow"], anchor=tj.get("anchor", "first"), tailmode=tj.get("tailmode", "plain"))
+            if not gj:
+                bad = nm(tj["ev"])
+                break
+            new_[j] = dict(gj, **{k_: v_ for k_, v_ in tj.items() if k_ not in gj and k_ not in ("c", "kb", "end", "lead_t", "ramp", "dur")})
+        if bad:
+            why_not.append(f"{nm(t['ev'])}: the takes after it could not move ({bad})")
+            continue
+        out_ = new_
+        left -= k * td
+        added.append(f"{nm(t['ev'])} +{k * td:.2f} s")
+    if added:
+        notes.append(f"song filled to the end: {len(added)} take(s) start earlier in their footage (no gunshot, no death in the added run-in): " + ", ".join(added)
+                     + f"; {max(0.0, left):.1f} s still short")
+    else:
+        notes.append(f"song {gap_s:.1f} s short at the end: no take could get a longer run-in" + (": " + "; ".join(why_not[:4]) if why_not else ""))
+    return out_
 
 
 def why_no_take(ev):
@@ -9940,6 +10285,8 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     for e in evs:                                          # V5.41: dead air allowed between kills follows the music
         e["_allow"] = None if e.get("_no_cuts") else (lambda t, _an=an, _r=rname: gap_allowance(_an, _r, t))
     song_end = float(an.get("dur") or (bt[-1] + bd)) - 0.1     # the montage's last frame stays inside the music
+    if FULL_CTX["on"] and FULL_CTX.get("live"):            # V8.8 (CS2 / R6S, full mode): inside the AUDIBLE part of the song (dead silence at the end is cut)
+        song_end = min(song_end, float(FULL_CTX["live"][1]) - 0.1)
     optimal = target_s in (None, "", "optimal", 0)
     fitm = optimal                                         # V6.0: Auto Optimal uses optimal_fit() too (same rule as Manual)
     if fitm:                                               # V5.42B: optimal_fit() below decides (80-180 s, never past the song)
@@ -10019,6 +10366,15 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         if pref_ and pref_[0] is not head_cands[0]:
             notes.append(f"CS2 headline: {nm(pref_[0])} (knife-out at +{pref_[0]['_knife']['hud_t']:.2f} s, footage for the speed ramp) preferred over {nm(head_cands[0])}: scores within 8 %")
             head_cands = [pref_[0]] + [e for e in head_cands if e is not pref_[0]]
+    if game != "valorant" and head_cands and effects_mode(cfg, game) == "extra" and sky_enabled(cfg, game) and not (head_cands[0].get("_knife") or {}).get("ok"):
+        # V8.8 (CS2 / R6S): the drop is where the sky goes: among the headline candidates within 8 % of the best score, one whose finisher shows a clear sky comes first (never a weaker clip than that)
+        top_ = float(head_cands[0]["score"])
+        band_ = [e for e in head_cands[:8] if float(e["score"]) >= 0.92 * top_]
+        if not sky_clear(event_sky_cov(head_cands[0], cfg)):
+            pref_ = [e for e in band_[1:] if sky_clear(event_sky_cov(e, cfg))]
+            if pref_:
+                notes.append(f"headline: {nm(pref_[0])} (clear sky on the finisher: {pref_[0]['_sky'] * 100:.0f}% of the picture) preferred over {nm(head_cands[0])}: scores within 8 %")
+                head_cands = [pref_[0]] + [e for e in head_cands if e is not pref_[0]]
     head = head_cands[0]
     rest = [e for e in usable if e is not head]
     end_sorted = sorted(rest, key=ending_rank)
@@ -10286,6 +10642,15 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             takes.remove(t)
             notes.append(f"removed a take shorter than the minimum: {nm(t['ev'])}" +
                          (" (no longer run-up fits its footage or the take before)" if manual else ""))
+    if FULL_CTX["on"] and FULL_CTX.get("live") and game != "valorant" and fit and takes and head_take in takes:
+        # V8.8 (CS2 / R6S, full mode): no other clip fits and the montage ends a few seconds short of the song: longer run-ins after the drop fill it (never a song longer than the cap)
+        last_b_ = int(np.searchsorted(bt, song_end, side="right") - 1)
+        if int(fit.get("end_beat", -1)) >= last_b_ - 1 and float(fit.get("max", 0.0)) < FULL_CAP_S - 0.5:
+            et_ = next((t for t in takes if t.get("ending")), None)
+            E_ = float(U[et_["fade_end"]]) if et_ and et_.get("fade_end") is not None else float(U[takes[-1]["end"]])
+            gap_ = song_end - E_
+            if gap_ >= 0.5:
+                takes = fill_lead_ins(takes, head_take, U, gap_, cfg, notes, nm, song_end)
     if drop_note:
         notes.append(drop_note)
     # (V7.6.1: the 'second drop' note is written at the end, from the window the montage really covers)
@@ -10419,6 +10784,39 @@ RAMP_HOLD_S, RAMP_UP_S, RAMP_DOWN_S, RAMP_V_HI = 0.10, 0.20, 0.20, 0.90     # sl
 KNIFE_ANIM_S = 0.30                     # the knife animation starts this long after the weapon HUD switched to it (measured on the reference montage: HUD at kill + 0.05 s, the knife in the hand from kill + 0.4 s)
 KNIFE_REGIONS = ((0.60, 0.91, 0.82, 1.0), (0.80, 0.88, 1.0, 1.0))   # the ammo counter of the CS2 HUD (bottom, right of the middle) and of the older HUD (bottom right corner): share of the game picture
 KNIFE_CACHE = DATA / "knife_cache.json"
+SKY_EV_CACHE = DATA / "sky_ev_cache.json"              # V8.8: sky coverage at an event's last kill (planner: a sky clip on the drop)
+
+
+def event_sky_cov(ev, cfg):
+    """V8.8 (CS2 / R6S planner): the share of the picture that is clear sky (sky_eyedrop, the render's own rule) on the frame of the event's LAST kill, 0 when there is none, None when
+    unreadable. Cached per file and time (sky_ev_cache.json); one frame read per event."""
+    if "_sky" in ev:
+        return ev["_sky"]
+    res = None
+    try:
+        part_ = (ev.get("parts") or [{"path": ev["path"], "shift": 0.0, "rec": ev["rec"]}])[-1]
+        rec_ = part_["rec"]
+        t_ = float(ev["times"][-1]) - float(part_.get("shift", 0.0)) + 0.05
+        key = f"{file_key(part_['path'])}|{t_:.2f}"
+        cache = load_json_ro(SKY_EV_CACHE, {})
+        if key in cache:
+            res = cache[key]
+        else:
+            img = sky_grab_frames(part_["path"], t_, t_ + 0.04, content_rect(rec_, cfg), [rec_["w"], rec_["h"]], fps=60)[0]
+            _m, info = sky_eyedrop(img)
+            res = round(float(info["cov"]), 3) if info.get("ok") else 0.0
+            cache = load_json(SKY_EV_CACHE, {})
+            cache[key] = res
+            save_json(SKY_EV_CACHE, cache)
+    except Exception:                                      # noqa: BLE001
+        res = None
+    ev["_sky"] = res
+    return res
+
+
+def sky_clear(cov):
+    """V8.8: a coverage the render's sky probe accepts."""
+    return cov is not None and XFX_SKY_MIN_COV <= float(cov) <= XFX_SKY_MAX_COV
 
 
 def cs2_knife_out(path, rect, wh, t_kill, post):
@@ -10862,7 +11260,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
             osp = tk.get("ospan", ev["span"])
             last_k = f_k + int(round(osp * OUT_FPS))
             # fade 2-3 s from the final kill, ending on a beat tick when one falls inside that window
-            room = float(an.get("dur") or 1e9) - 0.1 - (U[kb] + osp)     # never past the end of the song
+            room = min(float(an.get("dur") or 1e9), (FULL_CTX.get("live") or (0, 1e9))[1] if FULL_CTX["on"] else 1e9) - 0.1 - (U[kb] + osp)     # never past the end of the song (V8.8 full mode: of its audible part)
             cand = [j for j in range(kb, len(U)) if END_FADE[0] <= U[j] - (U[kb] + osp) <= min(END_FADE[1], room)]
             if tk.get("fade_end") is not None:
                 cand = [tk["fade_end"]]
@@ -11456,6 +11854,15 @@ def drop_moment(rng, s, gp):
             "boom_db": round(-2.0 + 2.0 * k, 1), "lift_db": round(2.0 + 3.0 * k, 1), "breath": v[6]}
 
 
+def _drop_index(plan, gp):
+    """V8.8: which drop of the song (index into plan['drops_out']) the montage moment gp (s) belongs to: the last drop at or before it, while within 20 s after it; None before the first drop."""
+    k = None
+    for i, d in enumerate(sorted(float(d) for d in (plan.get("drops_out") or []))):
+        if d - 0.5 <= gp <= d + 20.0:
+            k = i
+    return k
+
+
 def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None, sky_on=True):
     """V8.4.2 EXTRA EFFECTS: builds the EFFECT PLAN of this montage and writes t['xfx'] (effect dicts on the take's own timeline). Nothing here changes segments, kill times, cut timing or
     the default zoom pulses (its own random stream). The plan: (1) the song's feel (style, energy, BPM) fixes the colour and the profile (FEEL_PROFILES: which kill effects weigh how much,
@@ -11635,15 +12042,24 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None, sky_
     g_kind, g_why = sky_gradient_kind(recipe, energy, (plan.get("song") or {}).get("bpm"))
     plan["xfx_energy"] = en
     plan["xfx_sky_rank"] = {"names": ranked, "why": rank_why, "grad": g_kind, "grad_why": g_why}
-    sky_max = 0 if (prof["sky"] <= 0 or not sky_on) else sky_max_for(dur_all)
+    sky88 = game != "valorant"                             # V8.8 (CS2 / R6S): more skies, the drops and the strongest beats first
+    sky_max = 0 if (prof["sky"] <= 0 or not sky_on) else sky_max_for(dur_all, game)
     plan["xfx_sky_on"] = bool(sky_on)
+    if sky88:
+        plan["xfx_sky_space"] = sky_spacing_for(game)
     sky_c = []
-    prio = lambda c: 5 if c["head"] else 4 if c["end"] else 3 if c["multi_last"] else 2 if c["flick"] else 1       # V8.6.1: headline, ending, last kill of a multikill, 1k flick, then any drop kill
+    if sky88:                                              # V8.8: headline, then the finisher of every take on a drop (strongest beat first), ending, multikill finishers, flicks
+        last_ = lambda c: c["i"] == len(takes[c["ti"]].get("kills_out") or [0]) - 1
+        prio = lambda c: 6 if c["head"] else 5 if (c["drop"] or takes[c["ti"]].get("role") == "drop") and last_(c) else 4 if c["end"] else 3 if c["multi_last"] else 2 if c["flick"] else 1
+    else:
+        prio = lambda c: 5 if c["head"] else 4 if c["end"] else 3 if c["multi_last"] else 2 if c["flick"] else 1       # V8.6.1: headline, ending, last kill of a multikill, 1k flick, then any drop kill
     for c in (sorted(cands, key=lambda c: (-prio(c), -c["sc"])) if sky_on else []):          # V8.7: sky off for this game: no candidate at all
         t = takes[c["ti"]]
         nk_ = len(t.get("kills_out") or [])
         why_ = ("headline kill" if c["head"] else "ending kill" if c["end"] else "last kill of a multikill" if (nk_ >= 2 and c["i"] == nk_ - 1) else
                 "flick kill" if (nk_ == 1 and c["flick"]) else "drop kill" if c["drop"] else None)         # V8.6.1: never a first, calm or middle kill; a drop kill only after the others (the next candidate when one has no sky)
+        if sky88 and why_ is None and t.get("role") == "drop" and c["i"] == nk_ - 1:
+            why_ = "drop kill"                             # V8.8: the finisher of any take on a drop
         if why_ is None or c["ti"] == 0 or t.get("role") == "calm" or any(c["ti"] == o["ti"] for o in sky_c):
             continue
         sky_c.append(dict(c, why=why_))
@@ -11653,7 +12069,8 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None, sky_
         t = takes[c["ti"]]
         dur = float(t.get("dur") or 0)
         per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": round(c["p"], 4), "t1": round(dur, 4),            # V8.5.1: from the kill frame to the end of the take
-                                  "ok": None, "gp": round(c["gp"], 3), "why": c["why"], "prio": prio(c)})
+                                  "ok": None, "gp": round(c["gp"], 3), "why": c["why"], "prio": prio(c),
+                                  **({"sc": round(float(c["sc"]), 3), "drop_i": _drop_index(plan, c["gp"])} if sky88 else {})})
     plan["xfx_sky_max"] = sky_max
     plan["xfx_drop"] = drops_audio
     for ti, fx in per_take.items():
@@ -11938,9 +12355,19 @@ SKY_PER_S = 30.0                     # and a montage gets at most one per this m
 SKY_MAX_N = 6
 
 
-def sky_max_for(duration):
-    """V8.4.5: how many sky recolours a montage of this length may have at most (a couple at 70 s, about 5 at 2.5 minutes, never more than 6)."""
+SKY_PER_S_88, SKY_MAX_N_88, SKY_SPACING_88 = 15.0, 12, 6.0      # V8.8 (CS2 / R6S): about twice as many skies (one per 15 s, at most 12), at least 6 s apart
+
+
+def sky_max_for(duration, game=None):
+    """V8.4.5: how many sky recolours a montage of this length may have at most (a couple at 70 s, about 5 at 2.5 minutes, never more than 6). V8.8 CS2 / R6S: one per 15 s, at most 12."""
+    if game not in (None, "valorant"):
+        return int(max(1, min(SKY_MAX_N_88, round(float(duration) / SKY_PER_S_88))))
     return int(max(1, min(SKY_MAX_N, round(float(duration) / SKY_PER_S))))
+
+
+def sky_spacing_for(game=None):
+    """V8.8: the least time between two sky kills of a montage (Valorant: SKY_SPACING_S as before)."""
+    return SKY_SPACING_88 if game not in (None, "valorant") else SKY_SPACING_S
 
 
 def _hue_deg(rgb):
@@ -12236,16 +12663,27 @@ def sky_hardness(energy, bpm, recipe=None, drop=False):
     return round(max(0.0, min(1.0, h)), 3)
 
 
-def sky_anim_params(energy, bpm, recipe=None, drop=False):
+SKY_HARD_FLOOR_88 = 0.62               # V8.8 (CS2 / R6S): the sky is never calmer than this (strobe, drops to black, colour jumps always on) ...
+SKY_HARD_ADD_88 = 0.25                 # ... and this much harder than the song alone would make it
+
+
+def sky_anim_params(energy, bpm, recipe=None, drop=False, game=None):
     """V8.6 / V8.7: how fast and how wildly the sky lives, from the song's feel. `hard` (sky_hardness, 0 calm .. 1 hardcore) sets everything: cloud drift (mask pixels a second), breathing / swing period (s, two bars), surge
     strength, push (scale), the depth of the beat pulses, and from hard 0.35 on a strobe (black flicker bursts, `strobe_hz` bursts a second of depth `strobe_depth`), from 0.45 on colour jumps to a second colour on the
     beats (`jump` = share of the offbeats) and drops to black on the downbeats (`bd`), and a swing of the gradient (`swing`: the dark end moves between the top and the horizon)."""
     hd = sky_hardness(energy, bpm, recipe, drop)
+    sync = game not in (None, "valorant")
+    if sync:                                               # V8.8 (CS2 / R6S): far wilder, and every hit locked to the song's beat grid (sky_anim_schedule)
+        hd = round(max(SKY_HARD_FLOOR_88, min(1.0, hd + SKY_HARD_ADD_88)), 3)
     try:
         b = max(60.0, min(200.0, float(bpm)))
     except (TypeError, ValueError):
         b = 110.0
     on = lambda lo: max(0.0, min(1.0, (hd - lo) / (1.0 - lo)))
+    if sync:
+        return {"hard": hd, "sync": True, "drift": round(60.0 + 140.0 * hd + 0.2 * (b - 60.0), 2), "period": round(4 * 60.0 / b, 2), "surge": round(0.95 + 0.25 * hd, 2), "push": round(0.05 + 0.05 * hd, 4),
+                "depth": round(0.45 + 0.5 * hd, 2), "strobe_hz": round(on(0.55) * 2.0 * b / 60.0, 2), "strobe_depth": round(0.45 + 0.5 * on(0.55), 2), "jump": round(0.55 + 0.45 * on(0.45), 2),
+                "bd": round(0.7 + 0.3 * on(0.4), 2), "beat_bd": round(0.35 + 0.35 * hd, 2), "swing": round(0.5 + 0.5 * on(0.15), 2), "swing_period": round(2 * 60.0 / b, 2)}
     return {"hard": hd, "drift": round(25.0 + 110.0 * hd + 0.1 * (b - 60.0), 2), "period": round(8 * 60.0 / b, 2), "surge": round(0.7 + 0.3 * hd, 2), "push": round(0.03 + 0.03 * hd, 4),
             "depth": round(0.12 + 0.55 * hd, 2), "strobe_hz": round(on(0.35) * 14.0, 2), "strobe_depth": round(0.30 + 0.65 * on(0.35), 2), "jump": round(on(0.45), 2), "bd": round(on(0.40), 2),
             "swing": round(0.05 + 0.95 * on(0.15), 2), "swing_period": round(max(0.6, 2 * 60.0 / b * (2.0 - hd)), 2)}
@@ -12507,6 +12945,30 @@ def sky_anim_schedule(an, x, f0, nf):
             swing[f] = 0.5 + 0.5 * np.sin(2 * np.pi * tt / max(0.6, an["swing_period"]) - 1.2) if an["swing"] > 0.3 else 0.0
             swing[f] *= float(an["swing"])
     hz, sd = float(an.get("strobe_hz", 0.0)), float(an.get("strobe_depth", 0.0))
+    if an.get("sync") and x.get("beats"):                  # V8.8 (CS2 / R6S): every hit on the song's beat grid: a black hit on every beat (deep on the downbeats), the second colour on every other beat,
+        bts = sorted((float(a_), float(b_)) for a_, b_ in x["beats"])        # an 8th-note strobe between the beats for hard songs, the swing on two beats
+        bd, bb, jp = float(an.get("bd", 0.0)), float(an.get("beat_bd", 0.0)), float(an.get("jump", 0.0))
+        per = float(np.median(np.diff([b_[0] for b_ in bts]))) if len(bts) >= 2 else 0.5
+        hb = max(2, int(round(per * fps / 2)))
+        for k_, (bt_, bs_) in enumerate(bts):
+            fb = int(round(bt_ * fps))
+            if fb >= nf:
+                continue
+            dep = bd if bs_ >= 0.9 else bb
+            for j in range(3):
+                if f0 <= fb + j < nf:
+                    black[fb + j] = max(black[fb + j], dep * (1.0 - 0.3 * j))
+            if jp > 0 and k_ % 2 == 1:
+                for j in range(2, 2 + hb):
+                    if f0 <= fb + j < nf:
+                        jump[fb + j] = max(jump[fb + j], jp * (1.0 - 0.5 * (j - 2) / hb))
+            if hz > 0:
+                fh = fb + hb
+                if f0 <= fh < nf:
+                    black[fh] = max(black[fh], sd * 0.6)
+        for f in range(f0, min(nf, f0 + 3)):               # the impact: the kill frame itself hits black-to-colour
+            black[f] = max(black[f], 0.5 * bd * (1.0 - 0.33 * (f - f0)))
+        return {"black": black, "jump": jump, "swing": swing}
     if hz > 0:                                             # strobe: bursts of 1 - 3 black frames at about `hz` a second, random depth, from 0.12 s after the kill
         f = f0 + int(0.12 * fps)
         while f < nf:
@@ -12816,12 +13278,22 @@ def xfx_probe_sky(plan, tmpdir=None):
             cands.append({"ti": ti, "x": x, "cov": cov, "why": why, "info": info})
     ranked = (plan.get("xfx_sky_rank") or {}).get("names") or list(SKY_PALETTE)
     mx = int(plan.get("xfx_sky_max", 1))
+    space = float(plan.get("xfx_sky_space", SKY_SPACING_S))
     qual = [c for c in cands if c["cov"] is not None and XFX_SKY_MIN_COV <= c["cov"] <= XFX_SKY_MAX_COV]
     kept = []
-    for c in sorted(qual, key=lambda c: (-int(c["x"].get("prio", 0)), -c["cov"])):
+    order = sorted(qual, key=lambda c: (-int(c["x"].get("prio", 0)), -c["cov"]))
+    if any(c["x"].get("drop_i") is not None for c in qual):           # V8.8 (CS2 / R6S): first the best sky kill of EVERY drop (headline, then the strongest beat), then the rest by role
+        firsts, seen_d = [], set()
+        for c in sorted(qual, key=lambda c: (-int(c["x"].get("prio", 0)), -float(c["x"].get("sc", 0.0)), -c["cov"])):
+            d_ = c["x"].get("drop_i")
+            if d_ is not None and d_ not in seen_d:
+                seen_d.add(d_)
+                firsts.append(c)
+        order = firsts + [c for c in order if c not in firsts]
+    for c in order:
         x, ti = c["x"], c["ti"]
         gp = float(x.get("gp", 0.0))
-        if len(kept) >= mx or any(abs(gp - g_) < SKY_SPACING_S for g_ in kept):
+        if len(kept) >= mx or any(abs(gp - g_) < space for g_ in kept):
             continue
         try:
             if tmpdir is None:
@@ -12837,7 +13309,8 @@ def xfx_probe_sky(plan, tmpdir=None):
                 pal_why = f"{cov_why}; {pal_why}"
             else:
                 pal_why = f"{cov_why}: palette from the song feel only"
-            an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"), plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"))      # V8.7: the sky follows the song's hardness
+            an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"), plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"),
+                                  game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8 CS2 / R6S: wilder and locked to the beat
             alt_name, alt_rgb = sky_alt_colour(ranked, rgb) if an_["jump"] > 0 else (None, None)
             x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "grad_dark": 0.55 if gk == "dark" else 0.25, "beats": sky_take_beats(plan, plan["takes"][ti], x)})
             st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True)                  # (again: with the animation planes)
@@ -12859,9 +13332,9 @@ def xfx_probe_sky(plan, tmpdir=None):
         elif c["cov"] < XFX_SKY_MIN_COV or c["cov"] > XFX_SKY_MAX_COV:
             msg = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the picture ({c['info'].get('why') or c['info'].get('kind', 'none')}) -> no clear sky here, skipped"
         else:
-            msg = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% -> clear sky, but not chosen ({'enough sky recolours for this length' if len(kept) >= mx else 'within ' + format(SKY_SPACING_S, '.0f') + ' s of a better one'})"
+            msg = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% -> clear sky, but not chosen ({'enough sky recolours for this length' if len(kept) >= mx else 'within ' + format(space, '.0f') + ' s of a better one'})"
         out(f"SKY recolour take {c['ti'] + 1}: {msg}")
-    out(f"SKY recolour: {len(kept)} chosen of {len(cands)} candidate kills ({len(qual)} with a clear sky; at most {mx} for {plan.get('duration', 0):.0f} s, at least {SKY_SPACING_S:.0f} s apart, best role first)" if cands
+    out(f"SKY recolour: {len(kept)} chosen of {len(cands)} candidate kills ({len(qual)} with a clear sky; at most {mx} for {plan.get('duration', 0):.0f} s, at least {space:.0f} s apart, best role first)" if cands
         else "SKY recolour: no candidate kill")
 
 
@@ -14373,7 +14846,7 @@ def pair_time_index(recs, game="cs2"):
         if r.get("game", "cs2") != game or r.get("error") or not r.get("w"):
             continue
         dur = r.get("dur")
-        anc = clip_anchor(r["path"], dur) if dur else None                 # V6.9.7: the name time is START for DVR names, END (save time) for OBS names
+        anc = clip_anchor_best(r["path"], dur, game) if dur else None      # V6.9.7: the name time is START for DVR names, END (save time) for OBS names; V8.8 CS2 / R6S: the name time for a copied / touched file
         if anc is None or not anc["provable"]:
             skipped.append(r["path"])
             continue
@@ -14469,6 +14942,47 @@ def pair_find(cfg, recs, selected, store, det, used, deadline=None, kills_fn=Non
                 state[d] = j
                 res["partners"].append((nb[3], rec["path"], gap))
                 lines.append(f"pair partner of {Path(rec['path']).name}: {nm} (gap {gap:.1f} s)")
+    if game != "valorant":                                    # V8.8 (CS2 / R6S): the files' CREATED times are a second clock: a neighbour the modified / name time misses is found here
+        cidx = []
+        for r in recs:
+            if r.get("game", "cs2") != game or r.get("error") or not r.get("w") or not r.get("dur"):
+                continue
+            ca = clip_anchor_created(r["path"], r["dur"])
+            if ca:
+                cidx.append((ca["start"], _pkey(r["path"]), ca["end"], r))
+        cidx.sort(key=lambda x: (x[0], x[1]))
+        cpos = {k: i for i, (_, k, _, _) in enumerate(cidx)}
+        have_ = {_pkey(p_["path"]) for p_, _, _ in res["partners"]}
+        for key in sorted(selected):
+            if key not in cpos:
+                continue
+            i0 = cpos[key]
+            rec = cidx[i0][3]
+            ts = kills_fn(rec)
+            if not ts or (game == "cs2" and not pair_is_candidate(ts, cidx[i0][2] - cidx[i0][0])):
+                continue
+            n_mine = sum(1 for _p, of_, _g in res["partners"] if _pkey(of_) == key)
+            for d in (-1, 1):
+                j = i0
+                for _hop in range(PAIR_MAX_HOPS):
+                    cur, j = cidx[j], j + d
+                    if not 0 <= j < len(cidx) or n_mine >= PAIR_MAX_EXTRA:
+                        break
+                    nb = cidx[j]
+                    gap = (nb[0] - cur[2]) if d > 0 else (cur[0] - nb[2])
+                    if gap > pg or nb[1] in selected:
+                        break
+                    if nb[1] in have_ or nb[1] in added:
+                        continue                                  # already a companion (found by the first clock): walk on
+                    nk = kills_fn(nb[3])
+                    if not nk or (nb[1] in used and not allow_used):
+                        break
+                    nm = Path(nb[3]["path"]).name
+                    added.add(nb[1])
+                    have_.add(nb[1])
+                    n_mine += 1
+                    res["partners"].append((nb[3], rec["path"], gap))
+                    lines.append(f"pair partner of {Path(rec['path']).name}: {nm} (gap {gap:.1f} s, by the files' created times)")
     res["partners"].sort(key=lambda x: (save_key(x[0]), x[0]["path"]))       # V6.9.6: never in discovery order; V6.9.7.1: by save time
     return res
 
@@ -14769,10 +15283,12 @@ def ledger_plan_check(led, plan):
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False):
     """V8.5 full=True (Force New Full / Manual Auto): the montage fills the whole song (2:30 content at most, a long song uses its best 1:30 - 2:30 section)."""
     FULL_CTX["on"] = bool(full)
+    FULL_CTX["game"] = game
     try:
         return _make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, scan, pin, full)
     finally:
         FULL_CTX["on"] = False
+        FULL_CTX.pop("live", None)
 
 
 def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False):
@@ -15813,7 +16329,7 @@ def auto_fill_verified(cfg, game, cands, song_path, an, style, seed, rng=None, n
                    "n_used": sum(1 for p_ in final if (by.get(p_) or {}).get("used")), "full": bool(plan) and float(plan["duration"]) >= target - AUTO_TOL_S}
 
 
-def auto_fill_pick(cands, an, style, rng=None):
+def auto_fill_pick(cands, an, style, rng=None, game=None):
     """V8.5 Manual Auto: preselects enough clips to fill the whole song (or its best 1:30 - 2:30 section, FULL_CAP_S at most): unused clips first (random),
     then used ones (the oldest use first), until their estimated length covers the section. Returns (paths, info)."""
     import numpy as np
@@ -15825,7 +16341,10 @@ def auto_fill_pick(cands, an, style, rng=None):
     need = L * 1.15                                        # a little over: the planner leaves out the weakest that do not fit
     rname = style if style in RECIPES else "hype"
     fresh = [c for c in cands if not c.get("used")]
-    rng.shuffle(fresh)
+    if game in (None, "valorant") or not any("q" in c for c in fresh):
+        rng.shuffle(fresh)
+    else:                                                  # V8.8 (CS2 / R6S): a random order weighted by picture quality (60 fps / 1080p / full frame first; never a ban)
+        fresh.sort(key=lambda c: -(rng.random() ** (1.0 / max(0.01, float(c.get("q", 1.0)) ** 2))))
     old = sorted([c for c in cands if c.get("used")], key=lambda c: (str(c.get("used")), rng.random()))
     pick, tot = [], 0.0
     for c in fresh + old:
@@ -17624,7 +18143,7 @@ class App:
             rows.append({"path": r["path"], "name": Path(r["path"]).name, "folder": clip_folder(r["path"], cfg), "mtime": mt,
                          "dur": r.get("dur", 0), "kills": None if ks is None else len(ks), "ks": ks or [],
                          "used": ud.get(_pkey(r["path"]), ("", ""))[0], "used_label": ud.get(_pkey(r["path"]), ("", ""))[1],
-                         "util": bool(ovs) and clip_override_state(r["path"], ovs)[0] == "on"})
+                         "util": bool(ovs) and clip_override_state(r["path"], ovs)[0] == "on", "q": clip_quality(r, cfg)})
         rows.sort(key=lambda c: -c["mtime"])
         if PERF is not None:
             PERF.stages.append(((_t1 - PERF_T0) * 1000, (time.perf_counter() - _t1) * 1000, "load_clips: per-clip rows (kills lookup, compute_kills, getmtime)", threading.current_thread().name))
@@ -18019,7 +18538,7 @@ class App:
                 out(f"Auto: song map unavailable ({ex})")
                 return
             cands_ = cs2_dm_filter_cands(load_config(), cands, game)                  # V8.6.2: no CS2 deathmatch clips
-            paths, info = auto_fill_pick(cands_, an, style)
+            paths, info = auto_fill_pick(cands_, an, style, game=game)
             extra, plines = random_companions(load_config(), self._snap.get("m_game", "valorant"), paths)
             for l_ in plines:
                 out(l_)
@@ -18975,7 +19494,7 @@ def grab_gray_bgr(path, t, w, h):
 
 
 DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "VAL_BACKUP", "REGION_DEFAULTS", "JOB_LOCK", "USED_SONGS",
-                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE", "BORDER_DIR", "REPEAT_CACHE")
+                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE", "BORDER_DIR", "REPEAT_CACHE", "SKY_EV_CACHE")
 
 
 def use_data_dir(d):
