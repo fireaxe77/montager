@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8.1 - 2026-10-21: Long montages render again
+- Long montages with many clips or long file names no longer fail to start rendering, in every game; the picture and sound are exactly the same as before
+- Rainbow Six: every utility kill icon from your icon folder is now left out, wherever the icon sits in the kill row and however long the player names are
+- Your whole Rainbow Six library is checked once against all the icons, with progress shown; clips that were checked are skipped afterwards
+
 ## V8.8 - 2026-10-21: A sky that hits on every beat
 - In CS2 and Rainbow Six the sky now flashes and changes colour on the beat of the song, much wilder than before, and it goes on the drops first: every drop of the song can get one
 - Clean 60 fps, full-size clips are picked first; low-quality ones still make it in when the kill is special
