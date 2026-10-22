@@ -100,7 +100,7 @@ def main(clip, tm, out_jpg, style="hype", energy="0.8", bpm="128", colour="auto"
     new = frames(inp + M.sky_mask_input(x), f"[0:v]{pre}[src];" + ";".join(chains) + f";{nl}null[o]", nf)
     src = frames(inp, f"[0:v]{pre}[o]", nf)
     kf = int(round(p * 60))
-    ns = [n for n in ([kf, kf + 6, kf + 20, kf + 45, nf - 2] if os.environ.get("SKY_SHEET") != "beats" else range(kf + 4, nf, 6)) if n < min(len(new), len(src))][:10]
+    ns = [n for n in ([kf, kf + 6, kf + 20, kf + 45, nf - 2] if os.environ.get("SKY_SHEET") != "beats" else range(kf + int(os.environ.get("SKY_FROM", "4")), nf, int(os.environ.get("SKY_EVERY", "6")))) if n < min(len(new), len(src))][:10]
     raw = np.fromfile(mp, np.uint8).reshape(nf, -1, M.SKY_H, M.SKY_W)
     blot = []
     for n in ns[1:]:

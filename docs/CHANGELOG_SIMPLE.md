@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8.4 - 2026-10-22: Rainbow Six multikills stay together
+- In Rainbow Six every kill in a clip now stays in one take, however far apart the kills are, so no kill is lost any more
+- In every game a kill is timed by the moment its kill row appears, and a kill is never dropped just because no gunshot was heard
+- The sky colour now clearly changes from top to bottom, following the sky as the camera moves
+
 ## V8.8.3 - 2026-10-22: Every montage fills the whole song
 - When a song fits the montage length, every mode now runs from the start of the song to its end, adding clips when needed
 - Silent stretches at the start and end of a song are cut in every game and every mode

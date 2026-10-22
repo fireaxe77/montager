@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.8.3"
+APP_VERSION = "V8.8.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4731,7 +4731,7 @@ def gun_onsets(rec, cache=None, cfg=None):
 
 
 def verified_kills(pool_items, cfg):
-    """Gunshot audio is a SOFT signal now: it refines each kill to the shot time and adds a score bonus, never rejects.
+    """Gunshot audio is a SOFT signal now: a score bonus and a note, never a rejection and (V8.8.4) never the kill time (the kill row is).
     The only hard rule here is the death lock. Returns stats; every rejection is logged with its reason."""
     cache = load_json(ONSET_CACHE, {})
     todo = [it["rec"] for it in pool_items if it["rec"].get("audio") and _onset_key(it["rec"], cfg) not in cache]
@@ -4748,7 +4748,6 @@ def verified_kills(pool_items, cfg):
     lock = float(cfg.get("death_lock_s", 8.0))
     for it in pool_items:
         ons = gun_onsets(it["rec"], cache, cfg)
-        no_shots = it["rec"].get("game") == "cs2" and cs2_no_gunshots(it["rec"], ons)       # V6.7: nothing to confirm with
         keep = []
         name = Path(it["rec"]["path"]).name
         for k in it["kills"]:
@@ -4758,15 +4757,12 @@ def verified_kills(pool_items, cfg):
                 cand = [o for o in ons if k["t"] - 0.6 <= o[0] <= k["t"] + 0.05]
                 if cand:
                     shot = max(cand, key=lambda o: o[0])[0]
-            if shot is None and k.get("early_vic") and not no_shots and not any(k["t"] - 1.0 <= o[0] <= k["t"] + 0.05 for o in (ons or [])):    # V7.7.6: no shot within ~1 s before the row AND its victim is a row seen in the first 1.5 s: the same row, not a new kill
-                it["rej"].append({"t": k["t"], "reason": f"CS2 stale feed row: no gunshot heard and the victim [{k.get('victim')}] matches a row on screen at {k.get('seen_first', 0.0):.1f} s", "ks": k["ks"]})
-                st["stale"] = st.get("stale", 0) + 1
-                continue
-            if shot is None:
-                st["no_shot"] += 1
-                if k.get("needs_shot") and not (no_shots and len(_alnum(k.get("victim"))) >= 3):      # V6.7: CS2 clip without any gunshot: nothing to confirm with
-                    it["rej"].append({"t": k["t"], "reason": "1 sighting, name < 90 and no gunshot to confirm it", "ks": k["ks"]})
-                    continue
+            if shot is None:                               # V8.8.4: a missing gunshot never removes a kill that has a kill row (the V7.7.6 CS2 'stale feed row' and the V6.7
+                st["no_shot"] += 1                         # '1 sighting, no gunshot to confirm it' rejections are notes now): the row decides, the audio is only a hint
+                if k.get("early_vic"):
+                    it["rej"].append({"t": k["t"], "reason": f"no gunshot heard; the victim [{k.get('victim')}] matches a row on screen at {k.get('seen_first', 0.0):.1f} s (kept - the kill row decides)", "ks": k["ks"], "soft": True})
+                elif k.get("needs_shot"):
+                    it["rej"].append({"t": k["t"], "reason": "1 sighting, name < 90, no gunshot heard (kept - the kill row decides)", "ks": k["ks"], "soft": True})
                 it["rej"].append({"t": k["t"], "reason": "no gunshot heard (kept - audio is only a bonus)", "ks": k["ks"], "soft": True})
                 k = dict(k, shot=False, lag=0.0)
             else:                                              # V5: the kill time stays the ROW time (that is what lands on the beat)
@@ -8532,6 +8528,7 @@ def cmd_musicscan(args):
     print(f"(read-only; written to {HERE / 'musicscan.txt'})")
 
 
+R6S_ONE_FIGHT = [True]                  # V8.8.4: switch (tests): R6S never splits a clip / fight group into several fights
 FIGHT_SPLIT_S = {"valorant": 10.0, "r6s": 10.0}     # kills of one clip are one fight unless this far apart (and no revive between them)
 
 
@@ -8668,6 +8665,8 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
             gap_g = max(gap_g, pair_gap())
         if game == "cs2" and CS2_ROWID_ON[0]:              # V8.1 (CS2 only): the kills of one clip / fight group are one fight (a split dropped the second half: one event per clip)
             gap_g = max(gap_g, FIGHT_GAP_LONG_CLIP)
+        if game == "r6s" and R6S_ONE_FIGHT[0]:             # V8.8.4 (R6S): every kill of one clip / fight group is ONE fight whatever the gap (the 10 s split + one event per clip lost the later kill)
+            gap_g = float("inf")
         clusters, cur = [], [allk[0]]
         for k in allk[1:]:                                 # one fight = one event: split only on a long gap with no revive in it
             if k["tt"] - cur[-1]["tt"] <= gap_g or any(cur[-1]["tt"] < rv < k["tt"] for rv in revs):
@@ -8738,9 +8737,12 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
     return evs, notes
 
 
+KILL_AT_ROW = [True]                    # V8.8.4: the kill time is the moment the kill row appears (every game); False = the old shot-based time (tests only)
+
+
 def make_event(cl, parts, det, cfg, refine, verify=True):
     """One event from a kill cluster. parts = [(pool item, timeline offset), ...]; >1 part = stitched continuation.
-    times = the KILL MOMENTS (refined fatal shot; else the frame-exact row time minus this clip's measured shot->row lag);
+    times = the KILL MOMENTS: V8.8.4 the frame-exact time the kill ROW appears (every game; the gunshot is only a hint, it never sets or moves a kill; before: the refined fatal shot, else row - lag);
     rows = frame-exact first frames of the killfeed rows; times_v4 = V4's kill times (for synccompare)."""
     main, moff = parts[0]
     raw = []
@@ -8753,7 +8755,7 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
             except Exception:
                 pass
         shot = None
-        if k.get("shot_t") is not None:
+        if k.get("shot_t") is not None and not KILL_AT_ROW[0]:
             try:
                 shot = refine_shot(src["rec"], k["shot_t"], row, refine, cfg)
             except Exception:
@@ -8766,7 +8768,7 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
     lags = [r["row"] - r["shot"] for r in raw if r["shot"] is not None]
     lag = float(statistics.median(lags)) if lags else 0.10
     for r in raw:
-        r["t"] = r["shot"] if r["shot"] is not None else r["row"] - lag
+        r["t"] = r["row"] if KILL_AT_ROW[0] else (r["shot"] if r["shot"] is not None else r["row"] - lag)        # V8.8.4: the kill row is the kill time
     raw.sort(key=lambda r: r["t"])
     times = [round(r["t"], 4) for r in raw]
     rows = [round(r["row"], 4) for r in raw]
@@ -12595,9 +12597,10 @@ def sky_ranked(recipe, energy, bpm):
 
 
 SKY_FAMILIES = {                     # V8.8.3: one colour family per montage: (top of the sky, bottom = the take's horizon, the colour the beat jumps go to); clean, saturated, never muddy / brown
-    "orange": (0xE2541C, 0xF6A640, 0xFFC861), "red": (0xB0141E, 0xE4402C, 0xFF6A4A), "rose": (0x9C1F55, 0xE2648E, 0xFF8FB8), "amber": (0xC8761A, 0xF2B24A, 0xFFD27A),
-    "blue": (0x142C8C, 0x3C78DC, 0x7AB4FF), "teal": (0x0B5E66, 0x22A8A2, 0x5CE2D2), "violet": (0x40208C, 0x8C5CDC, 0xB890FF), "green": (0x0E6034, 0x34AA62, 0x70E49A),
-    "white": (0xD6D9E2, 0xFAFAFA, 0xFFFFFF), "black": (0x08080C, 0x24242C, 0x4A4A56)}
+    # V8.8.4: the two ends far apart (a deep top, a light bottom with a small hue step), so the gradient reads clearly under the bands and the mask feather
+    "orange": (0xC8360C, 0xFFC24A, 0xFFC861), "red": (0x8C0A18, 0xF2643C, 0xFF6A4A), "rose": (0x781244, 0xF27CA8, 0xFF8FB8), "amber": (0xA4560A, 0xFFD666, 0xFFD27A),
+    "blue": (0x0A1A66, 0x4C94F2, 0x7AB4FF), "teal": (0x064650, 0x38C8B6, 0x5CE2D2), "violet": (0x2C1270, 0xA474F2, 0xB890FF), "green": (0x08482A, 0x4CCC7A, 0x70E49A),
+    "white": (0xB4B8C6, 0xFFFFFF, 0xFFFFFF), "black": (0x000000, 0x34343E, 0x4A4A56)}
 SKY_NAME_FAMILY = {"ember": "red", "hazy orange": "orange", "amber": "amber", "rose": "rose", "violet": "violet", "deep blue": "blue", "teal": "teal", "emerald": "green",
                    "white": "white", "black": "black"}
 SKY_FAM_EVEN = 0.35                  # V8.8.3: share of the sky's own brightness variation the family colours keep (a clean, even gradient)
@@ -13416,6 +13419,7 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     fam_ = bool(x.get("fam")) and ramp and an_ is not None              # V8.8.3: the family look: regular beat-locked bands (no cloud blobs) + the colour gradient in a 4th plane
     clouds = sky_cloud_field(w, h, nf, OUT_FPS, an_["drift"], an_["period"], x.get("seed", 1), soft=SKY_CLOUD_SOFT) if (ramp and an_ and not fam_) else None
     bands = sky_band_rows(h, hor, nf, f0, x.get("beats") or [], an_) if fam_ else None
+    ramps = sky_frame_ramps(sm, h, w, hor) if fam_ else None        # V8.8.4: the gradient follows each frame's own sky region (its top row -> its lowest row), smoothed over time
     mid_b = np.full((h * w,), 128, np.uint8).tobytes()
     gdark = x.get("grad_dark", 0.35)                       # the gradient: how much darker the top of the sky is than its horizon (0.55 'dark' = red to black, 0.25 'sunset')
     rr_ = np.clip(np.arange(h, dtype=np.float32) / max(1.0, float(hor)), 0.0, 1.0)[:, None] * np.ones((1, w), np.float32)      # 0 at the top .. 1 at the horizon
@@ -13454,7 +13458,7 @@ def sky_take_mask(t, x, zone, path, ramp=False):
                     sg = max(sg, float(sched["jump"][f]))                      # V8.7: the sky jumps to the second colour on the beats
                 fh.write(np.full((h * w,), int(round(255 * min(1.0, sg))), np.uint8).tobytes())
                 if fam_:
-                    fh.write(ramp_b)                                           # V8.8.3: alpha plane = the top -> bottom colour gradient (0 at the top, 255 at the take's horizon)
+                    fh.write(ramps[f - f0] if f0 <= f < f1 and k else ramp_b)  # V8.8.3: alpha plane = the top -> bottom colour gradient (0 at the top, 255 at the bottom of the sky)
     if ramp:
         x["mask_fmt"] = "yuva444p" if fam_ else "yuv444p"
     cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm])) if segm else 0.0
@@ -13464,6 +13468,35 @@ def sky_take_mask(t, x, zone, path, ramp=False):
 SKY_BANDS = {"n0": 3.0, "n1": 5.0, "depth0": 0.30, "depth1": 0.55, "step": 0.5, "ease_s": 0.12, "drift": 0.12, "edge": (0.50, 0.80)}
 # V8.8.3: the sky's regular pattern: n0 .. n1 even horizontal bands between the top and the horizon (more for a harder song), depth0 .. depth1 of shade, each beat moves them `step` of a band
 # (eased over ease_s), a slow drift of `drift` bands a second in between; the band edge is a smoothstep between the two `edge` levels of a cosine (clean, soft-edged stripes, never blobs)
+
+
+SKY_RAMP_SMOOTH = 8                  # V8.8.4: frames (+-) the sky region's top / bottom rows are averaged over for the gradient (the gradient glides with the camera, never jumps)
+
+
+def sky_frame_ramps(sm, h, w, hor):
+    """V8.8.4: the colour gradient plane of every frame of a sky window (list of bytes, h x w uint8): 0 at the frame's highest sky row, 255 at its lowest (smoothstep), from the soft masks `sm`;
+    the rows are averaged over +-SKY_RAMP_SMOOTH frames; a frame without sky uses the take's horizon `hor`. So the colour changes from top to bottom inside the painted region itself, even
+    when the camera turns and the region sits lower in the picture."""
+    import numpy as np
+    tops, bots = [], []
+    for m_ in sm:
+        rows_ = np.where(m_.max(1) > 0.5)[0]
+        if len(rows_) > 4:
+            tops.append(float(rows_.min()))
+            bots.append(float(rows_.max()))
+        else:
+            tops.append(None)
+            bots.append(None)
+    out_ = []
+    y = np.arange(h, dtype=np.float32)
+    for i in range(len(sm)):
+        tw = [t_ for t_ in tops[max(0, i - SKY_RAMP_SMOOTH):i + SKY_RAMP_SMOOTH + 1] if t_ is not None]
+        bw = [b_ for b_ in bots[max(0, i - SKY_RAMP_SMOOTH):i + SKY_RAMP_SMOOTH + 1] if b_ is not None]
+        top, bot = (float(np.mean(tw)), float(np.mean(bw))) if tw else (0.0, float(hor))
+        r = np.clip((y - top) / max(8.0, bot - top), 0.0, 1.0)
+        r = r * r * (3 - 2 * r)
+        out_.append(np.repeat(np.clip(r * 255.0 + 0.5, 0, 255).astype(np.uint8)[:, None], w, axis=1).tobytes())
+    return out_
 
 
 def sky_band_rows(h, hor, nf, f0, beats, an):
