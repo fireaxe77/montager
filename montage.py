@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.8.4"
+APP_VERSION = "V8.8.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6588,6 +6588,7 @@ def synth_song(path, bpm=128.0, layout=(("intro", 8), ("verse", 8), ("build", 4)
             n = np.arange(int(0.15 * sr))
             if click:
                 add((np.sin(2 * np.pi * 1500 * n[:int(0.03 * sr)] / sr) * np.exp(-n[:int(0.03 * sr)] / (0.004 * sr)) * 0.9).astype(np.float32))
+                add((np.sin(2 * np.pi * (50 + 60 * np.exp(-n / 400)) * n / sr) * np.exp(-n / (0.05 * sr)) * 0.6).astype(np.float32))      # V8.8.5: a kick under the click: the V2 song map finds the beat (a bare click has none)
             else:
                 kick_amp = {"intro": 0.25, "verse": 0.5, "build": 0.6, "drop": 0.95, "bump": 0.95, "breakdown": 0.0, "outro": 0.3}[name]
                 add((np.sin(2 * np.pi * (50 + 60 * np.exp(-n / 400)) * n / sr) * np.exp(-n / (0.05 * sr)) * kick_amp).astype(np.float32))
@@ -6611,6 +6612,8 @@ def synth_song(path, bpm=128.0, layout=(("intro", 8), ("verse", 8), ("build", 4)
     sf.write(wav, y, sr)
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", wav, "-c:a", "libmp3lame", "-b:a", "192k", str(path)], check=True)
     os.remove(wav)
+    t_old = time.time() - 120                              # V8.8.5: a finished test song, not one "still being written" (V6.1.3 skips songs modified < 15 s ago: the smoketest's sync / revive / tone songs were never used)
+    os.utime(str(path), (t_old, t_old))
     return beats
 
 
@@ -8903,6 +8906,7 @@ def _min_take_s(x):
 TAIL = (0.2, 0.5)                       # after the last kill (no dead air)
 ROW_TAIL, ROW_SLACK = 0.4, 0.3          # V5.42B: the take lasts >= 0.4 s after my last kill ROW appears (+ up to 0.3 s to a tick)
 SLOW_FLOOR = 0.4                        # V7.6.1: the slowest speed a footage-limited tail plays at
+SLOW_KEEP_FIRST = [True]                # V8.8.5 switch (tests): a slowed multikill anchored on its first kill keeps that kill on its beat (V7.6.1 - V8.8.4 moved it ~2 frames early)
 EASE_FR = 9                             # V7.6.1: output frames (0.15 s) of the smooth slow-down that leads into a slow tail
 LEAD_SOFT = 0.12                        # V7.6.1: shortest run-up (s) used as a last resort for a kill with almost no footage before it
 RX_LADDER = ({}, {"slowtail": True}, {"half": True}, {"slowtail": True, "half": True}, {"lead_min": LEAD_SOFT}, {"slowtail": True, "lead_min": LEAD_SOFT},
@@ -11078,13 +11082,15 @@ def take_segments(tk, f_c, f_k, f_x):
     n_lead = f_k - f_c
     nr = 0
     slow_ex = ease_extra(SLOW_V0) if (tk["slow"] and not tk.get("tailmode")) else 0     # V7.6.1: the smooth slow-down into the last kill takes slow_ex frames the 1.0x run does not show:
-    if tk["ramp"] > 1.0 and n_lead > OUT_FPS + 6:                                      # the take starts that much later in the source, the last kill stays on its frame
+    keep_first = bool(slow_ex) and tk.get("anchor") != "last" and kl > k0 + 1e-6 and SLOW_KEEP_FIRST[0]     # the take starts that much later in the source, the last kill stays on its frame;
+    sh_ = 0 if keep_first else slow_ex                     # V8.8.5: a multikill anchored on its FIRST kill keeps the first kill on its beat (the last kill comes slow_ex frames later instead)
+    if tk["ramp"] > 1.0 and n_lead > OUT_FPS + 6:
         n1 = OUT_FPS
         nr = n_lead - n1
-        a1 = k0 - n1 / OUT_FPS + slow_ex / OUT_FPS
+        a1 = k0 - n1 / OUT_FPS + sh_ / OUT_FPS
         segs.append([round(a1 - nr / OUT_FPS * tk["ramp"], 6), round(a1, 6), tk["ramp"], nr])
     else:
-        a1 = k0 - n_lead / OUT_FPS + slow_ex / OUT_FPS
+        a1 = k0 - n_lead / OUT_FPS + sh_ / OUT_FPS
     cuts = tk.get("cuts") or []
     n_kill = int(round(tk.get("ospan", kl - k0) * OUT_FPS))
 
@@ -11115,7 +11121,7 @@ def take_segments(tk, f_c, f_k, f_x):
         segs.append([round(kl2, 6), round(kl2 + rem / OUT_FPS * v, 6), v, rem])
         return [s_ for s_ in segs if s_[3] > 0]
     if tk["slow"]:                                         # V7.6.1: 1.0x, a smooth slow-down in the 9 frames before the last kill, slow through the impact, released to 1.0x about 1 s after it
-        n_to_last = (f_k - f_c - nr) + n_kill
+        n_to_last = (f_k - f_c - nr) + n_kill + (slow_ex if keep_first else 0)
         n_1x = n_to_last - (EASE_FR if slow_ex > 0 else 0)
         if cuts:
             p1, ae = run_1x(n_1x)
@@ -11368,6 +11374,7 @@ def game_level(cfg, game=None):
 
 
 GAME_LIFT_MAX, GAME_CUT_MAX = 24.0, 12.0     # V8.8.2 (was +8 / 0): every clip's game sound is brought to the same loudness (song - 12 LU): quiet clips up to +24 dB, loud ones down by up to 12 dB
+GAME_LEVEL_REF_DB = 20 * math.log10(0.6)   # V8.8.5: the default Game audio level (0.6): at it clips are leveled to song - 12 LU; another level moves that target by its own dB difference
 GAME_PEAK_CEIL = -1.0                       # ... never so far that the clip's own loudest sample (or the kill boost) goes above -1 dBFS: no clipping
 
 
@@ -11392,12 +11399,14 @@ def clip_peak_db(path, stream=0):
 def _game_gain(cfg, song_lufs, clip_lufs, game=None, peak_db=None):
     """V4 balance (game under the music), slightly louder than V4; quiet clips (CS2) lifted by up to +8 dB, never lowered.
     V8.8.2: every clip is brought to the same loudness: lifted by up to GAME_LIFT_MAX or lowered by up to GAME_CUT_MAX; with the clip's peak (`peak_db`, dBFS) the lift stops where that peak would
-    reach GAME_PEAK_CEIL (no clipping). A silent clip (no loudness) is not changed: digital silence stays silence."""
+    reach GAME_PEAK_CEIL (no clipping). A silent clip (no loudness) is not changed: digital silence stays silence.
+    V8.8.5: the level every clip is brought to follows the per-game Game audio level again (song - 12 LU at the default 0.6, 6 dB less at 0.3, ...): since V8.8.2 the leveling pulled every
+    clip back to song - 12 whatever the setting, so the setting did nothing. At the default level the gains are exactly the V8.8.2 ones."""
     gv = game_level(cfg, game)
     base = 20 * math.log10(max(gv, 1e-3))
     lift = 0.0
     if clip_lufs is not None and song_lufs is not None and clip_lufs > SILENT_LUFS:
-        lift = max(-GAME_CUT_MAX, min(GAME_LIFT_MAX, (song_lufs - 12.0) - (clip_lufs + base)))
+        lift = max(-GAME_CUT_MAX, min(GAME_LIFT_MAX, (song_lufs - 12.0 + base - GAME_LEVEL_REF_DB) - (clip_lufs + base)))
         if peak_db is not None and lift > 0:
             lift = max(0.0, min(lift, GAME_PEAK_CEIL - float(peak_db) - base))
     return round(base + lift, 2), round(lift, 2)
@@ -13326,7 +13335,67 @@ def sky_anim_schedule(an, x, f0, nf):
     return {"black": black, "jump": jump, "swing": swing}
 
 
-def sky_take_mask(t, x, zone, path, ramp=False):
+def sky_take_graph(plan, t, f0, f1, size=(SKY_W, SKY_H)):
+    """V8.8.5: (ffmpeg inputs, filter chains) that give the take's output frames f0 .. f1 - 1 as [skyv]: the render's own chains of the take's video (build_filter on a plan holding only
+    this take, no effects but the slow-mo), unchanged, then trimmed and scaled down."""
+    mini = {k_: v_ for k_, v_ in plan.items() if k_ not in ("takes", "xfx_drop")}
+    mini["takes"] = [dict(t, xfx=[], pulses=[], trans="hard")]
+    mini["effects"] = "default"
+    mini["duration"] = round(float(t["nf"]) / OUT_FPS, 4)
+    inp, graph = build_filter(mini, {}, False, ("slow",) if "slow" in FX_ALL else ())
+    parts = [p_.strip() for p_ in graph.split(";")]
+    keep = [p_ for p_ in parts if re.search(r"\[s\d+v\]$", p_) or p_.endswith("[t0c]")]
+    w, h = size
+    keep.append(f"[t0c]trim=start_frame={int(f0)}:end_frame={int(f1)},setpts=PTS-STARTPTS,scale={w}:{h}:flags=area,format=rgb24[skyv]")
+    return inp, keep
+
+
+def sky_take_frames(plan, t, f0, f1, size=(SKY_W, SKY_H)):
+    """V8.8.5: the take's own output frames f0 .. f1 - 1 (RGB arrays at `size`), made by the render's own take chain: build_filter on a plan holding only this take (no effects but the
+    slow-mo), its video chains up to the take's [t0c], then trimmed and scaled down. So every mask frame is the picture the render shows on that output frame (the same seek, frame
+    timing, slow-mo and source switches), never a frame earlier or later. Raises when ffmpeg gives fewer frames."""
+    import tempfile
+    import numpy as np
+    _inp, keep = sky_take_graph(plan, t, f0, f1, size)
+    w, h = size
+    vin = sorted({int(i_) for p_ in keep for i_ in re.findall(r"\[(\d+):v:0\]", p_)})
+    gp = Path(tempfile.mkstemp(prefix="skyframes_", suffix=".txt")[1])
+    try:
+        gp.write_text(";\n".join(keep), encoding="utf-8")
+        r = run(["ffmpeg", "-v", "error"] + _inp + ["-filter_complex_script", str(gp), "-map", "[skyv]", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], timeout=900)
+    finally:
+        try:
+            gp.unlink()
+        except OSError:
+            pass
+    buf = r.stdout or b""
+    n = len(buf) // (w * h * 3)
+    if n < int(f1) - int(f0) or not vin:
+        raise RuntimeError(f"take frames {f0}-{f1}: ffmpeg gave {n} frames: " + (r.stderr or b"").decode("utf-8", "ignore")[-300:])
+    return [np.frombuffer(buf[i * w * h * 3:(i + 1) * w * h * 3], np.uint8).reshape(h, w, 3) for i in range(int(f1) - int(f0))]
+
+
+def sky_shot_breaks(imgs, fr_src=None, thr=None):
+    """V8.8.5: the frames of a sky window that start a new shot (a cut between two clips, a jump in the source time, or a picture that changes at once: a flick / a scene switch). Returns the set
+    of frame indices i (1 .. len - 1) where frame i belongs to another shot than frame i - 1; the mask is never averaged, held or carried over such a break."""
+    import cv2
+    import numpy as np
+    thr = SKY_SHOT_DIFF if thr is None else thr
+    br = set()
+    small = [cv2.resize(cv2.cvtColor(im_, cv2.COLOR_RGB2GRAY), (96, 54), interpolation=cv2.INTER_AREA).astype(np.float32) for im_ in imgs]
+    for i in range(1, len(imgs)):
+        if fr_src and i < len(fr_src) and (fr_src[i][0] != fr_src[i - 1][0] or abs(fr_src[i][1] - fr_src[i - 1][1]) > 0.25):
+            br.add(i)
+        elif float(np.mean(np.abs(small[i] - small[i - 1]))) > thr:
+            br.add(i)
+    return br
+
+
+SKY_SHOT_DIFF = 28.0                 # V8.8.5: mean grey change (0-255, on a 96 x 54 thumbnail) between two frames above which they are two shots (a cut / an instant flick)
+SKY_GUARD_GROW = 1                   # V8.8.5: mask pixels the painted region may reach past the frame's own sky (the soft edge); never more
+
+
+def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
     """V8.4.4 / V8.5.1: writes the sky mask of one take for the render: a raw video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take). V8.5.1: the window is x['t0'] .. x['t1'] = the KILL frame to the
     END of the take (the frames before the kill are 0); every frame's mask is the V8.4.1 colour rule (sky_rule_mask) of the take's own source frame (so slow-mo and speed-ups are followed), a frame whose region
     collapses while its neighbours (+- SKY_HOLD_FRAMES) have one takes the nearest good frame's mask (dropout: hold the last good mask), the masks are averaged over +-4 frames and cut again at a soft threshold (the edge
@@ -13339,16 +13408,30 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     f0, f1 = max(0, int(round(x["t0"] * OUT_FPS))), min(nf, int(round(x["t1"] * OUT_FPS)) + 1)
     fr_src = sky_src_frames(t, f0, f1)
     srcs = t.get("srcs") or [{"path": t["path"], "rect": t["rect"], "wh": t["wh"]}]
-    tmin, tmax = {}, {}
-    for si, st in fr_src:
-        tmin[si] = min(tmin.get(si, st), st)
-        tmax[si] = max(tmax.get(si, st), st)
-    grabbed = {si: (tmin[si] - 0.03, sky_grab_frames(srcs[si]["path"], tmin[si] - 0.03, tmax[si] + 0.06, srcs[si]["rect"], srcs[si]["wh"], fps=60)) for si in tmin}
     w, h = SKY_W, SKY_H
-    imgs = []
-    for si, st in fr_src:
-        base, frs = grabbed[si]
-        imgs.append(frs[min(len(frs) - 1, max(0, int(round((st - base) * 60))))])
+    imgs = None
+    if plan is not None and f1 > f0:                       # V8.8.5: the render's own frames (exactly the picture of every output frame)
+        try:
+            imgs = sky_take_frames(plan, t, f0, f1)
+            x["frames_src"] = "render"
+        except Exception as ex:                            # noqa: BLE001
+            LOGONLY(f"sky mask: render frames not readable ({type(ex).__name__}: {ex}); source frames used")
+            imgs = None
+    if imgs is None:
+        tmin, tmax = {}, {}
+        for si, st in fr_src:
+            tmin[si] = min(tmin.get(si, st), st)
+            tmax[si] = max(tmax.get(si, st), st)
+        grabbed = {si: (tmin[si] - 0.03, sky_grab_frames(srcs[si]["path"], tmin[si] - 0.03, tmax[si] + 0.06, srcs[si]["rect"], srcs[si]["wh"], fps=60)) for si in tmin}
+        imgs = []
+        for si, st in fr_src:
+            base, frs = grabbed[si]
+            imgs.append(frs[min(len(frs) - 1, max(0, int(round((st - base) * 60))))])
+        x["frames_src"] = "source"
+    breaks = sky_shot_breaks(imgs, fr_src)                 # V8.8.5: nothing is averaged, held or carried over a cut / an instant change of the picture
+    shot = []
+    for i in range(len(imgs)):
+        shot.append(0 if i == 0 else shot[-1] + (1 if i in breaks else 0))
     from concurrent.futures import ThreadPoolExecutor
     pool_ = ThreadPoolExecutor(max_workers=SKY_THREADS)    # V8.8.2: every frame on its own (OpenCV / numpy release the GIL): the same masks, several frames at a time
     samples = list(pool_.map(sky_eyedrop_sample, imgs))
@@ -13372,27 +13455,37 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     status = [r_[0] for r_ in res_]
     segm = [r_[1] for r_ in res_]
     ys = [r_[2] for r_ in res_ if r_[2] is not None]
-    imgs = None
+    smp = sky_smooth_samples(samples)
     ymean = float(np.mean(ys)) if ys else 120.0
     k = len(segm)
     cv = [float(m_.mean()) for m_ in segm]
     good = []
     for i in range(k):
-        win = sorted(cv[max(0, i - SKY_HOLD_FRAMES):i + SKY_HOLD_FRAMES + 1])
+        win = sorted(cv[j] for j in range(max(0, i - SKY_HOLD_FRAMES), min(k, i + SKY_HOLD_FRAMES + 1)) if shot[j] == shot[i])
         ref = win[len(win) // 2]
         good.append(not (ref > 0.03 and cv[i] < 0.35 * ref))
     held = 0
     n_bad = sum(1 for q in status if q == "bad")
+    held_i = set()
     if any(good):
         gi = [i for i in range(k) if good[i] and status[i] == "ok"]          # a held mask is only a mask that passed every check itself
         if not gi:
             good = [True] * k
         for i in range(k):
             if not good[i]:
-                j = min(gi, key=lambda q: abs(q - i))
+                same = [q for q in gi if shot[q] == shot[i]]                   # V8.8.5: only from the same shot
+                if not same:
+                    continue
+                j = min(same, key=lambda q: abs(q - i))
                 if abs(j - i) <= SKY_HOLD_FRAMES:
-                    segm[i] = segm[j]
+                    sp_ = smp[j] if j < len(smp) else None                     # V8.8.5: the held mask keeps only what still looks like that sky in THIS frame (a camera turned away from the sky: nothing)
+                    own_ = sky_eyedrop_mask(imgs[i], sp_) if sp_ is not None else np.zeros((h, w), bool)
+                    if own_.any():
+                        own_ = cv2.dilate(own_.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+                    segm[i] = (segm[j].astype(bool) & own_).astype(np.uint8)
+                    held_i.add(i)
                     held += 1
+    imgs = None
     segm = list(pool_.map(sky_mask_even, segm))           # V8.8.2: one even region per frame: small gaps closed, enclosed holes (cloud specks, cut-out texture) filled, so the tint has no patches inside the sky
     pool_.shutdown()
     if k > 4:                                              # V8.7: temporal stabilisation: pixels that flicker in and out of the sky mask (a smoke grenade drifting in front of the sky, noise) are taken out for the whole window
@@ -13401,9 +13494,13 @@ def sky_take_mask(t, x, zone, path, ramp=False):
         if unst is not None:
             segm = [np.where(unst[i], 0, segm[i]).astype(np.uint8) for i in range(k)]
     sm = []
-    for i in range(k):                                     # +-4 frames, then a soft threshold: the edge settles where most of the neighbouring frames agree
-        a_ = np.mean(segm[max(0, i - 4):i + 5], axis=0)
-        sm.append(np.clip((a_ - 0.35) / 0.30, 0.0, 1.0).astype(np.float32))
+    gk = np.ones((2 * SKY_GUARD_GROW + 1, 2 * SKY_GUARD_GROW + 1), np.uint8)
+    for i in range(k):                                     # +-4 frames OF THE SAME SHOT, then a soft threshold: the edge settles where most of the neighbouring frames agree
+        nb_ = [segm[j] for j in range(max(0, i - 4), min(k, i + 5)) if shot[j] == shot[i]]
+        a_ = np.mean(nb_, axis=0)
+        s_ = np.clip((a_ - 0.35) / 0.30, 0.0, 1.0).astype(np.float32)
+        own_ = cv2.dilate(segm[i], gk) if segm[i].any() else segm[i]          # V8.8.5: never past the frame's OWN sky (+ the soft edge): no mask where this picture has no sky
+        sm.append(s_ * own_.astype(np.float32))
     bottoms = []
     for m_ in sm:
         rows_ = np.where(m_.max(1) > 0.5)[0]
@@ -13418,7 +13515,7 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     an_ = x.get("anim")
     fam_ = bool(x.get("fam")) and ramp and an_ is not None              # V8.8.3: the family look: regular beat-locked bands (no cloud blobs) + the colour gradient in a 4th plane
     clouds = sky_cloud_field(w, h, nf, OUT_FPS, an_["drift"], an_["period"], x.get("seed", 1), soft=SKY_CLOUD_SOFT) if (ramp and an_ and not fam_) else None
-    bands = sky_band_rows(h, hor, nf, f0, x.get("beats") or [], an_) if fam_ else None
+    pats = sky_pattern_frames(x.get("pattern") or "bands", h, w, hor, nf, f0, x.get("beats") or [], an_, x.get("seed", 1)) if fam_ else None      # V8.8.5: the montage's pattern, moving on every frame
     ramps = sky_frame_ramps(sm, h, w, hor) if fam_ else None        # V8.8.4: the gradient follows each frame's own sky region (its top row -> its lowest row), smoothed over time
     mid_b = np.full((h * w,), 128, np.uint8).tobytes()
     gdark = x.get("grad_dark", 0.35)                       # the gradient: how much darker the top of the sky is than its horizon (0.55 'dark' = red to black, 0.25 'sunset')
@@ -13437,8 +13534,8 @@ def sky_take_mask(t, x, zone, path, ramp=False):
                 sw = float(sched["swing"][f]) if sched else 0.0                  # V8.7: the gradient's dark end swings between the top (0) and the horizon (1)
                 gcol = ((1.0 - rr_) * (1.0 - sw) + rr_ * sw) * gdark
                 cmul = 1.0 - 0.55 * max(0.0, float(an_.get("hard", 0.0)) - 0.4) / 0.6 if an_ else 1.0                # V8.7: on a hard song the strobe / jumps / swing carry the look, not slow soft blobs
-                if fam_:                                                       # V8.8.3: the colour gradient is its own plane; the shade is only the regular bands
-                    dens = np.repeat(bands[f][:, None], w, axis=1)
+                if fam_:                                                       # V8.8.3: the colour gradient is its own plane; the shade is only the pattern (V8.8.5: the montage's own, moving on every frame)
+                    dens = next(pats)
                 else:
                     dens = np.clip(1.0 - (1.0 - gcol) * (1.0 - (cl if cl is not None else 0.0) * SKY_CLOUD_SOFT["max"] * cmul), 0.0, 1.0)
                 if an_ and x.get("beats") and f >= f0:                         # V8.6.2: after the kill the density pulses on the beats of the song (strong beats more), depth from the song's energy; between the pulses it is steady
@@ -13462,7 +13559,7 @@ def sky_take_mask(t, x, zone, path, ramp=False):
     if ramp:
         x["mask_fmt"] = "yuva444p" if fam_ else "yuv444p"
     cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm])) if segm else 0.0
-    return {"mean_y": ymean, "frames": nf, "cov": cov, "held": held, "horizon": x["horizon"], "bad": n_bad, "window": k, "ok_frames": sum(1 for q in status if q == "ok")}
+    return {"mean_y": ymean, "frames": nf, "cov": cov, "held": held, "horizon": x["horizon"], "bad": n_bad, "window": k, "ok_frames": sum(1 for q in status if q == "ok"), "breaks": len(breaks)}
 
 
 SKY_BANDS = {"n0": 3.0, "n1": 5.0, "depth0": 0.30, "depth1": 0.55, "step": 0.5, "ease_s": 0.12, "drift": 0.12, "edge": (0.50, 0.80)}
@@ -13525,6 +13622,158 @@ def sky_band_rows(h, hor, nf, f0, beats, an):
         v = np.clip((c - e0) / (e1 - e0), 0.0, 1.0)
         out_.append((v * v * (3 - 2 * v) * depth).astype(np.float32))
     return out_
+
+
+SKY_PATTERNS = ("bands", "amoebas", "rings", "rays", "aurora")
+# V8.8.5: the sky's pattern, ONE per montage (sky_pattern_for): bands = horizontal stripes that flow down and ripple sideways; amoebas = the V8.7 soft cloud spots drifting in two layers
+# and breathing; rings = soft circles rippling out from a point above the sky; rays = a fan of soft beams from above the sky, turning; aurora = vertical curtains that sway and flow sideways
+SKY_FLOW = {"speed0": 0.35, "speed1": 0.80, "wave": 0.22, "wave_len": 0.65, "wave_hz": 0.35}
+# V8.8.5: every pattern moves on EVERY frame: speed0 .. speed1 pattern cycles a second (more for a harder song), plus the beat steps of SKY_BANDS; bands also ripple sideways (wave: share of a band,
+# over wave_len of the picture width, travelling at wave_hz)
+SKY_PATTERN_FEEL = {"bands": (0.75, 128.0, ()), "amoebas": (0.35, 85.0, ("black",)), "rings": (0.92, 155.0, ("white",)),
+                    "rays": (0.65, 105.0, ("orange", "red", "amber", "rose")), "aurora": (0.50, 95.0, ("blue", "teal", "violet", "green"))}
+# V8.8.5: (energy, BPM, cover families) each pattern suits best; sky_pattern_for scores every pattern against the song and picks the best one
+SKY_PATTERN_JITTER = 0.45            # the song's own fixed share of the score (a hash of artist + title): similar songs still get different patterns, the same song always the same
+
+
+def sky_pattern_for(plan):
+    """V8.8.5: the ONE sky pattern of a montage (SKY_PATTERNS), chosen once per montage from the song alone: its energy, tempo, danceability and the album cover (its colour family, or white /
+    black), plus a fixed per-song share (a hash of artist + title), so different songs get different patterns and the same song always gets the same one, whatever the seed, style or game.
+    Returns (pattern, why)."""
+    import hashlib
+    song = plan.get("song") or {}
+    try:
+        e = max(0.0, min(1.0, float(song.get("energy") if song.get("energy") is not None else 0.6)))
+    except (TypeError, ValueError):
+        e = 0.6
+    try:
+        b = max(60.0, min(200.0, float(song.get("bpm") or 120.0)))
+    except (TypeError, ValueError):
+        b = 120.0
+    try:
+        d = float(song.get("dance")) if song.get("dance") is not None else 0.6
+    except (TypeError, ValueError):
+        d = 0.6
+    cover = None
+    try:
+        tone_, _w = sky_cover_tone(song.get("path"))
+        if tone_:
+            cover = tone_
+        else:
+            rgb_, _w = sky_cover_colour(song.get("path"))
+            cover = sky_family_from_hue(_hue_deg(rgb_)) if rgb_ is not None else None
+    except Exception:                                      # noqa: BLE001
+        cover = None
+    ident = " | ".join(" ".join(str(song.get(k_) or "").casefold().split()) for k_ in ("artist", "title")) if (song.get("title") or song.get("artist")) else Path(str(song.get("path") or "")).stem.casefold()
+    sc = {}
+    for p_, (pe, pb, pcov) in SKY_PATTERN_FEEL.items():
+        s_ = 1.0 - 1.2 * abs(e - pe) - abs(b - pb) / 80.0 + (0.15 if cover in pcov else 0.0)
+        if p_ == "rings":
+            s_ += 0.10 * (d - 0.6)
+        jit = int(hashlib.md5(f"{ident}#{p_}".encode("utf-8")).hexdigest()[:8], 16) / float(16 ** 8)
+        sc[p_] = s_ + SKY_PATTERN_JITTER * jit
+    best = max(SKY_PATTERNS, key=lambda p_: (sc[p_], p_))
+    return best, f"energy {e:.2f}, {b:.0f} BPM" + (f", cover {cover}" if cover else "") + f" -> {best} ({', '.join(f'{p_} {sc[p_]:.2f}' for p_ in SKY_PATTERNS)})"
+
+
+def _sky_phase(t, t0, spd, bts):
+    """V8.8.5: a pattern's position at t (seconds): spd cycles a second from t0 on (it never stands still) plus SKY_BANDS['step'] of a cycle on every beat (eased over ease_s)."""
+    ph = spd * (t - t0)
+    for b_ in bts:
+        if b_ <= t:
+            u = min(1.0, (t - b_) / SKY_BANDS["ease_s"])
+            ph += SKY_BANDS["step"] * u * u * (3 - 2 * u)
+    return ph
+
+
+def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
+    """V8.8.5: the shade of the sky's pattern for every output frame of a take (a generator of nf float32 h x w arrays, 0 .. the pattern's depth). Zero before the kill frame f0; from it the
+    pattern moves smoothly on every frame (SKY_FLOW) and takes a step on every beat of `beats` ([(seconds from the take start, strength)]). Soft edges everywhere (smoothsteps), deterministic
+    for the seed. `pattern` is one of SKY_PATTERNS (anything else = bands)."""
+    import cv2
+    import numpy as np
+    hd = float((an or {}).get("hard", 0.6))
+    depth = SKY_BANDS["depth0"] + (SKY_BANDS["depth1"] - SKY_BANDS["depth0"]) * hd
+    e0, e1 = SKY_BANDS["edge"]
+    bts = sorted(float(b_) for b_, _s in beats)
+    spd = SKY_FLOW["speed0"] + (SKY_FLOW["speed1"] - SKY_FLOW["speed0"]) * hd
+    hor = max(24.0, float(hor))
+    t0 = f0 / float(OUT_FPS)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    rng = np.random.RandomState(int(seed) % (2 ** 31))
+    sw0 = float(rng.uniform(0, 2 * np.pi))
+
+    def soft(c):
+        v = np.clip((c - e0) / (e1 - e0), 0.0, 1.0)
+        return (v * v * (3 - 2 * v) * depth).astype(np.float32)
+    if pattern == "amoebas":                               # the V8.7 cloud field (two layers of soft fractal noise against each other, breathing), drifting by sub-pixel steps
+        try:
+            bpm = 240.0 / float(an.get("period") or 2.0)
+        except (TypeError, ValueError, ZeroDivisionError):
+            bpm = 120.0
+        drift = 25.0 + 110.0 * hd + 0.1 * (max(60.0, min(200.0, bpm)) - 60.0)      # the V8.7 speed (mask pixels a second)
+        period = 8 * 60.0 / max(60.0, min(200.0, bpm))
+        ww = w * 3
+
+        def layer():
+            base = np.zeros((h, ww), np.float32)
+            for sz, amp in ((16, 1.0), (32, 0.55), (64, 0.3)):
+                n = rng.rand(max(2, h // sz + 1), max(2, ww // sz + 1)).astype(np.float32)
+                base += amp * cv2.resize(n, (ww, h), interpolation=cv2.INTER_CUBIC)
+            return (base - base.min()) / max(1e-6, float(base.max() - base.min()))
+        la, lb = layer(), layer()
+        cmul = 1.0 - 0.55 * max(0.0, hd - 0.4) / 0.6
+        amp = SKY_CLOUD_MAX * cmul
+
+        def shifted(lay, off):
+            off = float(off) % float(ww - w - 1)
+            i0 = int(off)
+            fr = off - i0
+            return (1.0 - fr) * lay[:, i0:i0 + w] + fr * lay[:, i0 + 1:i0 + 1 + w]
+        for f in range(nf):
+            if f < f0:
+                yield np.zeros((h, w), np.float32)
+                continue
+            t = f / float(OUT_FPS)
+            ph = _sky_phase(t, t0, 0.0, bts) * 24.0            # a beat nudges the clouds 12 mask pixels on (eased)
+            win = 0.62 * shifted(la, t * drift + ph) + 0.38 * shifted(lb, (ww - w) - t * drift * 0.55 - 0.5 * ph)
+            th = 0.50 + 0.17 * np.sin(2 * np.pi * t / max(1.0, period))
+            yield (np.clip((win - th) * 6.0 + 0.5, 0.0, 1.0) * amp).astype(np.float32)
+        return
+    if pattern == "rings":
+        per = max(16.0, hor / (2.5 + 2.0 * hd))
+    elif pattern == "rays":
+        nvis = 6.0 + 5.0 * hd
+    elif pattern == "aurora":
+        perx = w / (4.0 + 3.0 * hd)
+    else:
+        nb = SKY_BANDS["n0"] + (SKY_BANDS["n1"] - SKY_BANDS["n0"]) * hd
+        per = max(12.0, hor / nb)
+    for f in range(nf):
+        if f < f0:
+            yield np.zeros((h, w), np.float32)
+            continue
+        t = f / float(OUT_FPS)
+        ph = _sky_phase(t, t0, spd, bts)
+        if pattern == "rings":                             # circles from a point above the sky that sways slowly sideways: they ripple outwards all the time, a beat pushes them out half a ring
+            cx = w * (0.5 + 0.12 * np.sin(2 * np.pi * 0.11 * t + sw0))
+            cy = -0.35 * hor
+            c = 0.5 + 0.5 * np.cos(2 * np.pi * (np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / per - ph))
+        elif pattern == "rays":                            # a fan of soft beams from a point above the sky, turning on and swaying back and forth
+            cx = w * (0.5 + 0.10 * np.sin(2 * np.pi * 0.07 * t + sw0))
+            cy = -1.2 * hor
+            span = 2.0 * np.arctan2(w * 0.6, 1.2 * hor + hor)
+            ang = np.arctan2(xx - cx, yy - cy)
+            c = 0.5 + 0.5 * np.cos(2 * np.pi * (ang * nvis / span - ph) + 0.6 * np.sin(2 * np.pi * 0.23 * t))
+            yield soft(0.5 + (c - 0.5) * 0.8)              # the beams a little softer than the other patterns (they meet above the sky)
+            continue
+        elif pattern == "aurora":                          # vertical curtains that sway (the bend runs down the sky) and flow sideways
+            u = xx / perx + 0.45 * np.sin(2 * np.pi * (yy / (hor * 1.3) + 0.40 * t) + sw0) + 0.25 * np.sin(2 * np.pi * (xx / (w * 0.8) - 0.23 * t)) - ph
+            c = 0.5 + 0.5 * np.cos(2 * np.pi * u)
+        else:                                              # bands: horizontal stripes that flow down all the time, ripple sideways and step on the beat
+            wv = SKY_FLOW["wave"] * per * np.sin(2 * np.pi * (xx / (w * SKY_FLOW["wave_len"]) - SKY_FLOW["wave_hz"] * t) + sw0)
+            c = 0.5 + 0.5 * np.cos(2 * np.pi * ((yy + wv) / per - ph))
+        yield soft(c)
 
 
 def sky_mask_even(m):
@@ -13590,13 +13839,13 @@ def xfx_sky_chain(chains, base, lab, x, kin):
         chains.append(f"[{base}kG1][{base}kDa]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}kG2]")
         chains.append(f"[{base}KJ][{base}kvs]alphamerge[{base}kJa]")
         chains.append(f"[{base}kG2][{base}kJa]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}kG]")
-        chains.append(f"[{base}kG][{base}kys]alphamerge[{base}kGa]")
         pk, pp = float(x.get("push", 0.03)), float(x["p"])
         sc_ = f"(1+{pk:.4f}*gt(t,{pp:.4f})*exp(-(t-{pp:.4f})/{SKY_SURGE_S / 2.5:.3f}))"
         dec_ = f"(gt(t,{pp:.4f})*exp(-(t-{pp:.4f})/0.09))"
-        chains.append(f"[{base}kGa]scale=w='trunc(1920*{sc_}/2)*2':h='trunc(1080*{sc_}/2)*2':eval=frame:flags=bicubic,"
-                      f"crop=1920:1080:x='(in_w-1920)/2*(1+0.8*{dec_}*sin(2*PI*17*(t-{pp:.4f})))':y='(in_h-1080)/2*(1+0.8*{dec_}*sin(2*PI*13*(t-{pp:.4f})+1))'[{base}kGp]")
-        chains.append(f"[{base}ka][{base}kGp]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}ks2]")
+        chains.append(f"[{base}kG]scale=w='trunc(1920*{sc_}/2)*2':h='trunc(1080*{sc_}/2)*2':eval=frame:flags=bicubic,"           # V8.8.5: the push + shake move the COLOUR inside the
+                      f"crop=1920:1080:x='(in_w-1920)/2*(1+0.8*{dec_}*sin(2*PI*17*(t-{pp:.4f})))':y='(in_h-1080)/2*(1+0.8*{dec_}*sin(2*PI*13*(t-{pp:.4f})+1))',format=yuv420p[{base}kGp]")      # sky; the mask stays on the sky
+        chains.append(f"[{base}kGp][{base}kys]alphamerge[{base}kGa]")
+        chains.append(f"[{base}ka][{base}kGa]overlay=format=yuv420:eof_action=pass,format=yuv420p[{base}ks2]")
         return f"[{base}ks2]"
     if "dark" in gr:                                       # V8.6: steady colour + dark clouds / gradient + the impact surge, pushed slightly, over the original through the mask
         def lut2(g):
@@ -13751,6 +14000,8 @@ def xfx_probe_sky(plan, tmpdir=None):
     qual = [c for c in cands if c["cov"] is not None and XFX_SKY_MIN_COV <= c["cov"] <= XFX_SKY_MAX_COV]
     kept, used_ = [], []
     fam, fam_why = sky_family_for(plan, ranked, qual)      # V8.8.3: ONE colour family for every sky of the montage (song vibe or cover art), chosen once
+    pat, pat_why = sky_pattern_for(plan)                   # V8.8.5: ONE pattern for every sky of the montage (from the song: tempo, energy, vibe, cover), chosen once
+    plan["xfx_sky_pattern"] = pat
     order = sorted(qual, key=lambda c: (-int(c["x"].get("prio", 0)), -c["cov"]))
     if any(c["x"].get("drop_i") is not None for c in qual):           # V8.8 (CS2 / R6S): first the best sky kill of EVERY drop (headline, then the strongest beat), then the rest by role
         firsts, seen_d = [], set()
@@ -13772,8 +14023,8 @@ def xfx_probe_sky(plan, tmpdir=None):
             mp = Path(tmpdir) / f"sky_take{ti + 1}.gray"
             an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"), plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"),
                                   game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8: locked to the beat
-            x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "beats": sky_take_beats(plan, plan["takes"][ti], x), "fam": fam})
-            st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True)                  # (again: with the animation planes; V8.8.3: bands + the gradient plane)
+            x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "beats": sky_take_beats(plan, plan["takes"][ti], x), "fam": fam, "pattern": pat})
+            st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True, plan=plan)                  # (again: with the animation planes; V8.8.3: bands + the gradient plane)
             if st["bad"] > SKY_MAX_BAD * max(1, st["window"]):                           # V8.6.2: a wrong sky is worse than none
                 raise RuntimeError(f"the sky mask was a wall in {st['bad']} of {st['window']} frames of the take - no sky for this take")
             x.update({"ok": True, "mask": str(mp), "hue": fam, "hue_why": fam_why, "grade": sky_family_grade(fam, st["mean_y"]), "alt_hue": fam if an_["jump"] > 0 else None,
@@ -13782,7 +14033,7 @@ def xfx_probe_sky(plan, tmpdir=None):
             used_.append(fam)
             c["kept"] = (f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the picture -> {fam} family ({fam_why}): gradient 0x{SKY_FAMILIES[fam][0]:06X} -> 0x{SKY_FAMILIES[fam][1]:06X}, jumps to 0x{SKY_FAMILIES[fam][2]:06X}; "
                          f"from the kill frame to the end of the take: {st['frames']} frames, mean coverage {st['cov'] * 100:.0f}%, {st['held']} dropout frame(s) held, horizon at {st['horizon'] * 100:.0f}% of the height; "
-                         f"animation hardness {an_['hard']:.2f} (regular bands on the beat" + (f", strobe {an_['strobe_hz']:g}/s, drops to black, colour jumps" if an_["jump"] > 0 else "") + ")")
+                         f"animation hardness {an_['hard']:.2f} ({pat} pattern ({pat_why}), moving on every frame and stepping on the beat" + (f", strobe {an_['strobe_hz']:g}/s, drops to black, colour jumps" if an_["jump"] > 0 else "") + ")")
         except Exception as ex:                        # noqa: BLE001
             x["ok"] = False
             c["kept"] = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% but the mask could not be made ({type(ex).__name__}: {ex}), skipped"
@@ -15876,7 +16127,10 @@ def ledger_plan_check(led, plan):
 
 
 SONG_FILL_END_S = 3.0                   # V8.8.3: a full-song montage ends at most this far before the trimmed end of the song (more: clips are added even under AUTO_TOL_S, when the run-in extend rule could not close it)
-SONG_FILL_ROUNDS = 2                    # V8.8.3: a montage meant to cover the whole song that ends more than AUTO_TOL_S short gets more clips and is planned again, at most this many times
+AUTO_TOPUP_ALL = [True]                 # V8.8.5 switch (tests): the Auto top-up with previously used clips (60 s minimum, fixed length) runs for every game, not only CS2
+AUTO_FIXED_SHARE = 0.9                  # V8.8.5: an Auto montage with a fixed slider length is topped up until it reaches this share of it
+SONG_FILL_MIN_ADD = 8.0                 # V8.8.5: seconds of clips a fill round adds at least (was 4: the last rounds added one short clip and stopped a few seconds before the end)
+SONG_FILL_ROUNDS = 6                    # V8.8.3: a montage meant to cover the whole song that ends more than AUTO_TOL_S short gets more clips and is planned again, at most this many times (V8.8.5: 6, was 2: with a mostly used library two rounds did not reach the end of the song; a round adds at least SONG_FILL_MIN_ADD s of clips)
 
 
 def song_fill_target(an, full, target):
@@ -16045,7 +16299,7 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
             if manual and extra_pool is None:              # Manual: the ticked clips first, then the game's other clips (unused first) - the same order as Auto
                 pool_all, _st = game_pool(cfg, game)
                 extra_pool, _n = build_events(pool_all, game, cfg, random.Random(seed))
-            add, reused_ = weekly_more(extra_pool if manual else all_events, picked, style, game, max(short_ * AUTO_TOPUP_X, 4.0))
+            add, reused_ = weekly_more(extra_pool if manual else all_events, picked, style, game, max(short_ * AUTO_TOPUP_X, SONG_FILL_MIN_ADD))
             if not add:
                 notes.append(f"song fill: the montage is {short_:.0f} s short of the song but no other clip is left to add")
                 break
@@ -16064,8 +16318,13 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
                 notes.append(f"song fill: the plan of round {SONG_FILL_ROUNDS} was {short_of(plan):.1f} s short, the closer one ({best[0]:.1f} s short) is kept")
                 _s, plan, pool_ev, fixes, events = best
     rounds = 0
-    floor_s = (min(FULL_CAP_S, need_full / 1.25) * 0.9) if need_full else WEEKLY_MIN_S
-    while not manual and (game == "cs2" or need_full) and want_s is None and (plan is None or plan["duration"] < floor_s - 0.5) and rounds < 6:
+    try:
+        fixed_s = float(target) if target not in (None, "", "optimal") else None
+    except (TypeError, ValueError):
+        fixed_s = None
+    floor_s = (min(FULL_CAP_S, need_full / 1.25) * 0.9) if need_full else (max(WEEKLY_MIN_S, AUTO_FIXED_SHARE * min(fixed_s, LEN_MAX_S)) if fixed_s else WEEKLY_MIN_S)
+    while not manual and (game == "cs2" or need_full or AUTO_TOPUP_ALL[0]) and want_s is None and (plan is None or plan["duration"] < floor_s - 0.5) and rounds < 6:
+        # V8.8.5: every game (was CS2 / full only: a Valorant / R6S Auto montage with a mostly used library stayed under 60 s), and a fixed slider length is reached (AUTO_FIXED_SHARE of it)
         # V7.3: CS2 reaches the 60 s weekly minimum with the SAME mechanism as Valorant (weekly_pick: unused first, then previously used clips)
         # - weekly_pick() only counts estimated seconds, and the planner may not be able to place every event (no run-up / tail fits the song's beats)
         dur_ = plan["duration"] if plan is not None else 0.0
@@ -16077,7 +16336,7 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
         notes.append(f"weekly pick: the planner placed only {dur_:.0f} s - {len(add) - len(reused_)} more unused event(s) added (best multikills first, then singles)")
         out(notes[-1])
         if reused_:
-            notes.append(f"reused {len(reused_)} previously used clip(s) to reach the {WEEKLY_MIN_S:.0f} s minimum")
+            notes.append(f"reused {len(reused_)} previously used clip(s) to reach the {floor_s:.0f} s " + ("length" if fixed_s and floor_s > WEEKLY_MIN_S else "minimum"))
             out(notes[-1])
         events, pair = companions(list(picked), pair)
         try:
@@ -18229,9 +18488,9 @@ class App:
                      big=True, primary=True, name=f"auto:{g}:make").pack(side="left", padx=10, pady=4)
             col = ttk.Frame(lf)
             col.pack(side="left", fill="x", expand=True, padx=8)
+            sm = ttk.Frame(col)                                    # V8.8.5: the buttons above the status text: in a small window (3 games since V8.0) the text is cut, never the buttons
+            sm.pack(anchor="w", pady=(4, 2))
             ttk.Label(col, textvariable=sv, justify="left").pack(anchor="w")
-            sm = ttk.Frame(col)
-            sm.pack(anchor="w", pady=4)
             for text, kw in (("Force new", dict(weekly=True, force=True)), ("Force New Full", dict(weekly=True, force=True, full=True)), ("Dry plan", dict(mode="dry", weekly=True)),
                              ("Preview 720p / 20 s", dict(mode="preview", weekly=True))):
                 self.btn(sm, text, lambda g=g, kw=kw, text=text: self.run_task(f"{g} {text}", self.job_video(g, **kw)),
@@ -20335,7 +20594,7 @@ def measure_sync(outfile, plan, row_frames=None):
     on = song_click_onsets(plan["song"]["path"]) - plan["song"]["start_t"] + off
     codes = read_barcodes(outfile)
     rows = []
-    shot_lag = plan.get("_shot_lag", SHOT_LAG)
+    shot_lag = plan.get("_shot_lag", 0.0 if KILL_AT_ROW[0] else SHOT_LAG)      # V8.8.4: the kill moment is the kill row itself (before: the row minus the shot -> row lag)
     for t in plan["takes"]:
         a = t["f0"]
         want = (row_frames or {}).get(Path(t["path"]).name)
@@ -20346,19 +20605,24 @@ def measure_sync(outfile, plan, row_frames=None):
             lo = a + max(0, int(round((t["kills_out"][0] - 0.9) * OUT_FPS)))
             hi = a + int(round((t["kills_out"][0] - 0.05) * OUT_FPS))
             vals = [(i, codes[i]) for i in range(lo, min(hi, len(codes))) if 0 < codes[i] < 60000]
-            run_ = vals[-1:]                               # longest consistent run ending at the last clean frame
-            for j in range(len(vals) - 2, -1, -1):
-                if vals[j + 1][1] - vals[j][1] == vals[j + 1][0] - vals[j][0]:
-                    run_.insert(0, vals[j])
+            runs_, cur_ = [], vals[:1]                     # V8.8.5: the longest consistent 1.0x run of the window (the V7.6.1 slow-down into a slowed kill repeats frames at its end)
+            for j in range(1, len(vals)):
+                if vals[j][1] - vals[j - 1][1] == vals[j][0] - vals[j - 1][0]:
+                    cur_.append(vals[j])
                 else:
-                    break
+                    runs_.append(cur_)
+                    cur_ = [vals[j]]
+            runs_.append(cur_)
+            run_ = max(runs_, key=len) if vals else []
             if len(run_) >= 10:
                 i, c = run_[-1]
-                f_row = i + (want - c)
+                segs_ = [list(sg) for sg in t["segs"]]       # the plan's own source -> output timing carries the row past the slow-down (1.0x run: the same as i + want - c)
+                off_ = (i - a) - int(round(src_to_out(segs_, c / 60.0) * OUT_FPS))
+                f_row = a + int(round(src_to_out(segs_, want / 60.0) * OUT_FPS)) + off_
         if f_row is None:
             rows.append((t, None, None, None))
             continue
-        tk = f_row / OUT_FPS - shot_lag                     # kill moment = the row's first frame minus the shot->row lag
+        tk = f_row / OUT_FPS - shot_lag                     # kill moment = the row's first frame (minus the shot->row lag before V8.8.4)
         near = on[np.argmin(np.abs(on - tk))] if len(on) else None
         rows.append((t, tk, near, None if near is None else (tk - near) * 1000))
     return rows, on
@@ -20649,6 +20913,8 @@ def sync_e2e_test(workdir=None, keep=False, verbose=True):
             p = clips / f"VALORANT 2026.01.0{i + 1} - 20.1{i}.00.00.DVR.mp4"
             if not p.exists():
                 synth_clip(p, [(kf, l, r)])
+            ts_ = datetime.datetime(2026, 1, i + 1, 20, 10 + i).timestamp()          # V8.8.5: saved on the days their names say (V6.9.7.1 links clips saved seconds apart into one fight)
+            os.utime(str(p), (ts_, ts_))
         song = mp3 / "Test Artist - Click Song.mp3"
         if not song.exists():
             synth_song(song, 120.0, layout=(("verse", 32),), click=True)
@@ -20657,11 +20923,12 @@ def sync_e2e_test(workdir=None, keep=False, verbose=True):
             w.writerow(["Track URI", "Track Name", "Artist Name(s)", "Added At", "Duration (ms)", "Danceability", "Energy", "Tempo"])
             w.writerow(["u:1", "Click Song", "Test Artist", datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), "65000", "0.7", "0.8", "120.000"])
         cfg = dict(DEFAULT_CONFIG, clip_dirs={"valorant": [str(clips)], "cs2": []}, mp3_dir=str(mp3), playlist_dir=str(wd),
-                   output_root=str(wd / "out"), bar_checked=True, bar=None, sync_report=False, length_s=60)
+                   output_root=str(wd / "out"), bar_checked=True, bar=None, sync_report=False, length_s=60,
+                   songmap_mode="v2_fallback")          # V8.8.5: the click track has no kick for the V2 map; since V7.7.1 'V2' alone has no V1 fallback
         save_json(CONFIG_PATH, cfg)
         if verbose:
             out(f"  sync test material ready in {time.time() - t0:.0f}s")
-        outfile = run_job("valorant", "render", force=True, seed=7, lock=1.0, encoder="fast", outfile=wd / "out" / "sync_test.mp4")
+        outfile = run_job("valorant", "render", force=True, seed=7, lock=1.0, encoder="fast", outfile=wd / "out" / "sync_test.mp4", song_path=str(song))      # V8.8.5: its own click song (a click track scores too low to be picked)
         if not outfile or not Path(outfile).exists():
             return ["sync test: the render failed"], []
         plan = LAST_PLAN["valorant"]
@@ -20669,7 +20936,7 @@ def sync_e2e_test(workdir=None, keep=False, verbose=True):
         rows, on = measure_sync(outfile, plan, {f"VALORANT 2026.01.0{i + 1} - 20.1{i}.00.00.DVR.mp4": kf
                                                  for i, (kf, l, r) in enumerate(specs)})
         for t, tk, near, err in rows:
-            msg = f"  take at {t['out_start']:6.2f}s ({Path(t['path']).name[-28:]}): kill moment (row frame - {SHOT_LAG}s) " + \
+            msg = f"  take at {t['out_start']:6.2f}s ({Path(t['path']).name[-28:]}): kill moment (row frame{'' if KILL_AT_ROW[0] else ' - ' + str(SHOT_LAG) + 's'}) " + \
                   (f"{tk:7.3f}s, beat onset {near:7.3f}s, error {err:+6.1f} ms" if err is not None else "NOT FOUND")
             if verbose:
                 out(msg)
@@ -20710,9 +20977,10 @@ def revive_fight_test(workdir=None, verbose=True):
             w.writerow(["Track URI", "Track Name", "Artist Name(s)", "Added At", "Duration (ms)", "Danceability", "Energy", "Tempo"])
             w.writerow(["u:1", "Click Song", "Test Artist", datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), "65000", "0.7", "0.8", "120.000"])
         cfg = dict(DEFAULT_CONFIG, clip_dirs={"valorant": [str(clips)], "cs2": []}, mp3_dir=str(mp3), playlist_dir=str(wd),
-                   output_root=str(wd / "out"), bar_checked=True, bar=None, sync_report=False, length_s=60)
+                   output_root=str(wd / "out"), bar_checked=True, bar=None, sync_report=False, length_s=60,
+                   songmap_mode="v2_fallback")          # V8.8.5: the click track has no kick for the V2 map; since V7.7.1 'V2' alone has no V1 fallback
         save_json(CONFIG_PATH, cfg)
-        plan, _ = make_plan(cfg, "valorant", seed=7, lock=1.0)
+        plan, _ = make_plan(cfg, "valorant", seed=7, lock=1.0, song_path=str(song))      # V8.8.5: its own click song
         pool, _ = game_pool(cfg, "valorant")
         it = pool[0] if pool else {"kills": [], "deaths": [], "revives": []}
         if verbose:
@@ -20931,15 +21199,20 @@ def planner_selftest(verbose=True):
                 fails.append(f"seed {seed}: " + "; ".join(bad))
             takes = plan["takes"]
             beats = np.array(plan["beats_out"])
-            errs = [abs(beats - (t["out_start"] + t["kills_out"][0])).min() * 1000 for t in takes]
+            drop_t = {int(m_.group(1)) - 1 for n_ in plan.get("notes", []) for m_ in [re.search(r"anchored: take (\d+) kill", n_)] if m_}
+            errs = []                                      # V8.8.5: the anchored kill (V7.3: the last kill of a multikill on a drop, else the first) sits on its beat; V7.6.1 lever d: a take next to a drop may drift DRIFT_FR frames
+            for i_, t in enumerate(takes):
+                e_ = min(abs(beats - (t["out_start"] + k_)).min() for k_ in (t["kills_out"][0], t["kills_out"][-1])) * 1000
+                errs.append(0.0 if (i_ - 1 in drop_t or i_ + 1 in drop_t) and e_ <= DRIFT_FR * 1000 / OUT_FPS + 0.5 else e_)
             if max(errs) > 1000 / OUT_FPS / 2 + 0.5:
-                fails.append(f"seed {seed}: a first kill is {max(errs):.1f} ms off its beat")
+                fails.append(f"seed {seed}: a take's anchored kill is {max(errs):.1f} ms off its beat")
             hl = [t for t in takes if t["role"] == "headline"]
             best = max(e["score"] for e in evs)
+            kidx = (len(hl[0]["kills_out"]) - 1 if (plan.get("drop_anchor") or {}).get("anchor") == "last" else 0) if hl else 0
             if not hl or hl[0]["score"] < 0.9 * best:
                 fails.append(f"seed {seed}: the drop does not carry the best multikill")
-            elif plan["song"]["drop_t"] is not None and abs(hl[0]["out_start"] + hl[0]["kills_out"][0] - plan["song"]["drop_t"]) > 0.02:
-                fails.append(f"seed {seed}: the headline's first kill is not on the drop downbeat")
+            elif plan["song"]["drop_t"] is not None and abs(hl[0]["out_start"] + hl[0]["kills_out"][kidx] - plan["song"]["drop_t"]) > 0.02:
+                fails.append(f"seed {seed}: the headline's anchored kill is not on the drop downbeat")
             last = takes[-1]
             if not last["ending"] or not last["slow"] or last["n"] < 2:
                 fails.append(f"seed {seed}: the last take is not a strong slow-mo ending")
@@ -21011,7 +21284,7 @@ REQUIRED_BUTTONS.update({
     "manual:render": ("Manual", "task:manual render"),
     "Tick all shown": ("Manual", "ticked"), "Untick all": ("Manual", "unticked"), "Tick clips with kills": ("Manual", "ticked"),
     "Tick newest": ("Manual", "ticked"), "Reload list": ("Manual", "task:clips"),
-    "Random pick": ("Manual", "task:random pick"), "manual:auto_fill": ("Manual", "task:auto fill"), "Used filter": ("Manual", None),
+    "Random pick": ("Manual", "task:random pick"), "manual:auto_fill": ("Manual", "info"), "Used filter": ("Manual", None),
     "Play selected song": ("Manual", "open:song.mp3"),
     "Refresh": ("Songs", "task:matches"), "Change match for selected file...": ("Songs", "info"),
     "Play selected file": ("Songs", "open:song.mp3"), "Open song_matches.csv": ("Songs", "open:song_matches.csv"),
@@ -21281,7 +21554,7 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
                 time.sleep(0.12)
         pump()
         logged_rt = app.run_task
-        app.run_task = lambda name, fn, *a: fn(*a)
+        app.run_task = lambda name, fn, *a: (app.snap_vars(), fn(*a))[1]          # V8.8.5: the real run_task takes the UI snapshot the workers read (V6.1.2)
         try:
             for inc, n_txt, want in ((False, "7", 7), (True, "7", 7), (False, "50", 20), (True, "50", 40)):
                 app.m_incl_used.set(inc)
@@ -21313,7 +21586,7 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
         n_during = len(app.ctree.get_children())
         pump(6)
         n_after = len(app.ctree.get_children())
-        if n_during != 0 or n_after != 40 or app._resizing:
+        if n_during not in (0, 40) or n_after != 40 or app._resizing:                 # V8.8.5: 40 = the same rows left alone (V5.58: no refill with the same data); never a half-filled list
             fails.append(f"resize debounce: list had {n_during} rows during the resize (expected 0), {n_after} after (expected 40), resizing={app._resizing}")
         if not (PAL["bg"].startswith("#") and PAL["acc"].lower() == "#a3e635") or "theme" in load_config():
             fails.append("theme: not the single grey + lime theme")
@@ -21377,8 +21650,8 @@ def settings_persist_test():
             time.sleep(0.08)
         app.root.destroy()                                         # no Save click, no on_close: only the save-on-change counts
         LOG_SINK[0] = PROGRESS[0] = None
-        r = subprocess.run([sys.executable, str(HERE / "montage.py"), "cfgdump"], cwd=str(other), capture_output=True, text=True, timeout=120,
-                           env=dict(os.environ, MONTAGER_DATA=str(tmpd / "data")))
+        r = subprocess.run([sys.executable, str(HERE / "montage.py"), "cfgdump"], cwd=str(other), capture_output=True, text=True, timeout=120, encoding="utf-8", errors="replace",
+                           env=dict(os.environ, MONTAGER_DATA=str(tmpd / "data"), PYTHONIOENCODING="utf-8", PYTHONUTF8="1"))      # V8.8.5: the child prints UTF-8 (player names)
         try:
             d = json.loads(r.stdout.strip().splitlines()[-1])
         except Exception:
@@ -21390,8 +21663,8 @@ def settings_persist_test():
                 fails.append(f"after a restart from another folder {k} = {d['cfg'].get(k)!r}, expected {v!r}")
         if (d["cfg"].get("game_audio_track") or {}).get("cs2") != "2" or "theme" in d["cfg"]:
             fails.append(f"game_audio_track / theme not as expected: {d['cfg'].get('game_audio_track')} {d['cfg'].get('theme')}")
-        r0 = subprocess.run([sys.executable, str(HERE / "montage.py"), "cfgdump"], cwd=str(other), capture_output=True, text=True, timeout=120,
-                            env={k: v for k, v in os.environ.items() if k != "MONTAGER_DATA"})
+        r0 = subprocess.run([sys.executable, str(HERE / "montage.py"), "cfgdump"], cwd=str(other), capture_output=True, text=True, timeout=120, encoding="utf-8", errors="replace",
+                            env=dict({k: v for k, v in os.environ.items() if k != "MONTAGER_DATA"}, PYTHONIOENCODING="utf-8", PYTHONUTF8="1"))
         p0 = json.loads(r0.stdout.strip().splitlines()[-1])["config_path"]
         if Path(p0) != HERE / "montage_data" / "config.json":
             fails.append(f"the default config path depends on the working folder: {p0}")
