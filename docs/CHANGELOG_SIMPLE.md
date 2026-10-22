@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8.5 - 2026-10-22: Five moving sky patterns, one per song
+- The sky now moves smoothly on every frame, and each montage gets one of five patterns picked from its song: flowing bands, drifting amoebas, rippling rings, turning rays or swaying aurora curtains
+- The sky colour no longer flashes onto walls or buildings for a frame when it starts, after a cut or when the camera turns
+- The final multikill of a montage lands on the beat again, and Auto montages fill the whole song even when most of your clips were used before
+- The Game audio level setting changes the game sound again in every game
+
 ## V8.8.4 - 2026-10-22: Rainbow Six multikills stay together
 - In Rainbow Six every kill in a clip now stays in one take, however far apart the kills are, so no kill is lost any more
 - In every game a kill is timed by the moment its kill row appears, and a kill is never dropped just because no gunshot was heard
