@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8.3 - 2026-10-22: Every montage fills the whole song
+- When a song fits the montage length, every mode now runs from the start of the song to its end, adding clips when needed
+- Silent stretches at the start and end of a song are cut in every game and every mode
+- The sky has one colour family per montage, picked from the song or its album cover, as a clean top-to-bottom gradient
+- The sky's pattern is now even, regular bands that move on the beat instead of blotchy shapes
+
 ## V8.8.2 - 2026-10-22: Smoother, more colourful sky everywhere
 - Valorant, CS2 and Rainbow Six now share one sky look: an even, smooth tint with soft edges instead of blotchy patches
 - More sky colours, with a hazy orange sky as a favourite; white or black skies when the song or its cover art suits them and the picture stays clear

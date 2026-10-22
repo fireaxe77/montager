@@ -3,6 +3,7 @@ python tests/sky882.py <clip> <kill time s> <out jpg> [style = hype] [energy = 0
     -> 2 rows of 5 frames from the kill on (source above, sky below) and the facts: colour + why, mask frames, the time the mask took, the mean |frame - blurred frame| inside the sky (blotchiness).
 Works with older montage.py files (MONTAGER_ROOT=<older worktree>): missing V8.8.2 arguments are left out."""
 import inspect
+import os
 import subprocess
 import sys
 import tempfile
@@ -63,11 +64,15 @@ def main(clip, tm, out_jpg, style="hype", energy="0.8", bpm="128", colour="auto"
     if not info["ok"]:
         return
     ranked, rwhy = M.sky_ranked(style, float(energy), float(bpm))
-    if colour != "auto":
+    fams = getattr(M, "SKY_FAMILIES", {})
+    if colour in fams or (fams and colour == "family"):                              # V8.8.3: one colour family (forced, or chosen like the render: cover / song vibe)
+        name, cwhy = (colour, "forced") if colour in fams else M.sky_family_for({"song": {"path": song}}, M.sky_ranked(style, float(energy), float(bpm))[0])
+        rgb = fams[name][0]
+    elif colour != "auto":
         name, rgb, cwhy = colour, M.SKY_PALETTE[colour], "forced"
     else:
         name, rgb, cwhy = M.sky_colour_for(ranked, info.get("sky_rgb"), info.get("scene_hue"), **kw(M.sky_colour_for, info=info, k=k))
-    if song != "none" and name not in getattr(M, "SKY_NEUTRAL", ()):
+    if song != "none" and name not in getattr(M, "SKY_NEUTRAL", ()) and name not in fams:
         cr, _w = M.sky_cover_colour(song)
         if cr is not None:
             rgb, _b = M.sky_blend_cover(rgb, cr)
@@ -81,11 +86,13 @@ def main(clip, tm, out_jpg, style="hype", energy="0.8", bpm="128", colour="auto"
         i += 1
     take = {"nf": nf, "segs": [[ss, ss + secs, 1.0, nf, 0]], "srcs": [{"path": clip, "shift": 0.0, "rect": rect, "wh": wh}], "path": clip, "rect": rect, "wh": wh}
     x = {"k": "sky", "p": p, "t0": p, "t1": secs, "anim": an, "push": an["push"], "seed": 7, "grad_dark": 0.55 if gk == "dark" else 0.25, "beats": beats}
+    if name in fams:
+        x["fam"] = name
     mp = Path(tempfile.mkdtemp()) / "mask.yuv"
     t0 = time.time()
     st = M.sky_take_mask(take, x, zone, mp, ramp=True)
     tmask = time.time() - t0
-    x.update({"mask": str(mp), "ok": True, "grade": M.sky_grade_v2(rgb, gk, alt_rgb, an["hard"], **kw(M.sky_grade_v2, mean_y=st["mean_y"], name=name))})
+    x.update({"mask": str(mp), "ok": True, "grade": M.sky_family_grade(name, st["mean_y"]) if name in fams else M.sky_grade_v2(rgb, gk, alt_rgb, an["hard"], **kw(M.sky_grade_v2, mean_y=st["mean_y"], name=name))})
     pre = f"scale=1920:1080:flags=lanczos,setsar=1,fps=60,format=yuv420p,setpts=PTS-STARTPTS,trim=end_frame={nf},setpts=PTS-STARTPTS"
     inp = ["-ss", f"{ss:.3f}", "-t", f"{secs + 0.2:.3f}", "-i", clip]
     chains = []
@@ -93,16 +100,15 @@ def main(clip, tm, out_jpg, style="hype", energy="0.8", bpm="128", colour="auto"
     new = frames(inp + M.sky_mask_input(x), f"[0:v]{pre}[src];" + ";".join(chains) + f";{nl}null[o]", nf)
     src = frames(inp, f"[0:v]{pre}[o]", nf)
     kf = int(round(p * 60))
-    ns = [n for n in (kf, kf + 6, kf + 20, kf + 45, nf - 2) if n < min(len(new), len(src))]
-    raw = np.fromfile(mp, np.uint8).reshape(nf, 3, M.SKY_H, M.SKY_W)
+    ns = [n for n in ([kf, kf + 6, kf + 20, kf + 45, nf - 2] if os.environ.get("SKY_SHEET") != "beats" else range(kf + 4, nf, 6)) if n < min(len(new), len(src))][:10]
+    raw = np.fromfile(mp, np.uint8).reshape(nf, -1, M.SKY_H, M.SKY_W)
     blot = []
     for n in ns[1:]:
         m_ = cv2.resize(raw[n, 0], (384, 216)) > 200
         g = cv2.cvtColor(new[n], cv2.COLOR_RGB2GRAY).astype(np.float32)
         if m_.sum() > 50:
             blot.append(float(np.abs(g - cv2.GaussianBlur(g, (0, 0), 6))[m_].mean()))
-    rows = [np.concatenate([label(src[n], f"SRC {(n - kf) / 60:+.2f}s") for n in ns], 1),
-            np.concatenate([label(new[n], f"{name} {(n - kf) / 60:+.2f}s") for n in ns], 1)]
+    rows = [np.concatenate([label(src[n], f"SRC {(n - kf) / 60:+.2f}s") for n in ns[:5]], 1)] +         [np.concatenate([label(new[n], f"{name} {(n - kf) / 60:+.2f}s") for n in ns[i_:i_ + 5]] + [np.zeros_like(new[0])] * (5 - len(ns[i_:i_ + 5])), 1) for i_ in range(0, len(ns), 5)]
     cv2.imwrite(str(out_jpg), cv2.cvtColor(np.concatenate(rows, 0), cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
     print(f"colour {name} 0x{rgb:06X} ({cwhy}); alt {alt_name}; ranked {ranked[:6]}")
     print(f"mask: {st['window']} frames in {tmask:.1f} s ({tmask / max(1, st['window']) * 1000:.0f} ms a frame), mean coverage {st['cov'] * 100:.0f}%, {st['held']} held, {st['bad']} wall frames")
