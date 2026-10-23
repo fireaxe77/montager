@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.8.5"
+APP_VERSION = "V8.8.6"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -12345,10 +12345,10 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None, sky_
         sky_c.append(dict(c, why=why_))
         if len(sky_c) >= XFX_SKY_CANDS:
             break
-    if sky_on and SKY_MORE_CANDS[0] and len(sky_c) < XFX_SKY_CANDS:    # V8.8.6: after every role candidate, the last kill of every other take (never the first take, a calm take or a middle kill):
-        for c in sorted(cands, key=lambda c: -c["sc"]):            # a montage of indoor 1ks had 19 candidates and no sky, while its other takes were never looked at
+    if sky_on and SKY_MORE_CANDS[0] and len(sky_c) < XFX_SKY_CANDS:    # V8.8.6: after every role candidate, the last kill of every other take (never the first take or a middle kill; calm takes last):
+        for c in sorted(cands, key=lambda c: (takes[c["ti"]].get("role") == "calm", -c["sc"])):      # a montage of indoor 1ks had 19 candidates and no sky, while its other takes were never looked at
             t = takes[c["ti"]]
-            if c["ti"] == 0 or t.get("role") == "calm" or c["i"] != len(t.get("kills_out") or [0]) - 1 or any(c["ti"] == o["ti"] for o in sky_c):
+            if c["ti"] == 0 or c["i"] != len(t.get("kills_out") or [0]) - 1 or any(c["ti"] == o["ti"] for o in sky_c):
                 continue
             sky_c.append(dict(c, why="kill", more=True))
             if len(sky_c) >= XFX_SKY_CANDS:
@@ -14526,7 +14526,7 @@ def build_filter(plan, cfg, preview, fx=None):
 
 
 DROP_GIVE_WAY = [True]               # V8.8.6 switch (tests): the drop's extras are compressed by music + game (the music is never lowered at a drop)
-DROP_GW = (0.03, 20, 1, 80)          # V8.8.6: threshold (linear), ratio, attack ms, release ms of that compressor
+DROP_GW = (0.005, 20, 0.05, 150)    # V8.8.6: threshold (linear), ratio, attack ms, release ms of that compressor (measured on real plans: the music within 0.1 dB of no drop effect)
 
 
 def drop_audio_filters(drops):
@@ -15682,6 +15682,44 @@ def _ev_paths(e):
     return {e["path"]} | {x["path"] for x in e.get("srcs", []) if isinstance(x, dict) and x.get("path")}
 
 
+MANUAL_PAIR_ALL = [True]                # V8.8.6 switch (tests): Manual pulls in the companion clips of ticked clips in every game (was CS2 only)
+PICK_MULTI_FIRST = [True]               # V8.8.6 switch (tests): Auto / Force New / fill picks take every multikill (unused, then used) before any single
+
+
+SKY_PICK_FIRST = [True]                 # V8.8.6 switch (tests): with the sky on, multikills whose last kill shows a clear sky come first within their group
+SKY_PICK_PROBE = 120                    # ... at most this many of a group are looked at per job (one cached frame each)
+
+
+def _sky_first(evs):
+    """V8.8.6: the events with a clear sky on their last kill first, the order kept otherwise (stable). Only while FULL_CTX['sky_pick'] holds the job's config
+    (the sky recolour on for the game, extra effects); the first SKY_PICK_PROBE events are looked at (event_sky_cov: one cached frame each)."""
+    cfg = FULL_CTX.get("sky_pick")
+    if not cfg or not SKY_PICK_FIRST[0] or not evs:
+        return list(evs)
+    head = list(evs[:SKY_PICK_PROBE])
+    try:
+        with ThreadPoolExecutor(max_workers=min(6, SKY_THREADS)) as ex_:
+            clear = list(ex_.map(lambda e: sky_clear(event_sky_cov(e, cfg)), head))
+    except Exception:                                      # noqa: BLE001
+        return list(evs)
+    return [e for e, c in zip(head, clear) if c] + [e for e, c in zip(head, clear) if not c] + list(evs[SKY_PICK_PROBE:])
+
+
+def _tiered(fresh, old):
+    """V8.8.6: the pick order over unused (`fresh`) and previously used (`old`, already in the allowed order) events: unused multikills, used multikills (companion fights
+    included), unused singles (headshot / flick first), used singles."""
+    r = _pick_rank
+    return _sky_first([e for e in fresh if r(e) == 0]) + _sky_first([e for e in old if r(e) == 0]) + [e for e in fresh if r(e) > 0] + [e for e in old if r(e) > 0]
+
+
+def _pick_rank(e):
+    """V8.8.6: the pick order of an event: 0 = a multikill (a stitched companion fight included), 1 = a headshot / flick single, 2 = a plain single (V6.0: unused first;
+    V8.8.6: also among used clips a multikill comes before any single, then the oldest use)."""
+    if not PICK_MULTI_FIRST[0]:
+        return 1 if e.get("plain") else 0
+    return 0 if int(e.get("n") or 1) >= 2 else (2 if e.get("plain") else 1)
+
+
 def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None):
     """V6.0 weekly / Auto clip pick: this week's (last 7 days) new clips come first; if they do not reach the minimum length, older
     UNUSED clips of the same game follow - best multikills first, then best singles - only as many as needed. V6.5.1: if the unused
@@ -15700,7 +15738,7 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None)
         except OSError:
             return 0.0
     new = [e for e in unused if now_ts - mt(e) <= 7 * 86400]
-    old = sorted([e for e in unused if e not in new], key=lambda e: (bool(e.get("plain")), -e["score"]))
+    old = sorted([e for e in unused if e not in new], key=lambda e: (_pick_rank(e), -e["score"]))
     optimal = target in (None, "", "optimal", 0)
     need = OPT_RANGE[0] + 8.0 if optimal else float(target) * 1.1
     if need_s:                                             # V8.5 Force New Full: enough material to fill the song / the 2:30 section (unused first, then the oldest-used ones)
@@ -15708,13 +15746,28 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None)
     rn = style if style in RECIPES else "hype"
     est = lambda lst: sum(take_estimate(e, 0.47, rn) for e in lst)
     pick = list(new)
+    reused = []
+    if PICK_MULTI_FIRST[0]:                                # V8.8.6: used multikills come before unused plain singles (a mostly used library gave 75 singles of 78 takes)
+        last_ = hist_list(USED_CLIPS, game)[-1:] if game else []
+        prev_ = {_pkey(c) for h in last_ for c in h.get("clips", [])}
+        used_mk = sorted([e for e in events if _pkey(e["path"]) in used and _pick_rank(e) == 0 and not any(_pkey(q) in prev_ for q in _ev_paths(e))],
+                         key=lambda e: (used.get(_pkey(e["path"]), ""), -e["score"]))
+        order_ = _sky_first([e for e in old if _pick_rank(e) == 0]) + _sky_first(used_mk) + [e for e in old if _pick_rank(e) > 0]
+    else:
+        order_ = old
+    taken_ = set().union(*[_ev_paths(e) for e in pick]) if pick else set()
     if est(pick) < need:
-        for e in old:
+        for e in order_:
             if est(pick) >= need:
                 break
+            ps_ = _ev_paths(e)
+            if ps_ & taken_:
+                continue
             pick.append(e)
-    n_old = len(pick) - len(new)
-    reused = []
+            taken_ |= ps_
+            if _pkey(e["path"]) in used:
+                reused.append(e)
+    n_old = len(pick) - len(new) - len(reused)
     floor_need = max(WEEKLY_MIN_S * 1.1, float(need_s or 0))
     if est(pick) < floor_need:
         last = hist_list(USED_CLIPS, game)[-1:] if game else []
@@ -15722,7 +15775,7 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None)
         taken = set().union(*[_ev_paths(e) for e in pick]) if pick else set()
         cands = [e for e in events if e not in pick and _pkey(e["path"]) in used and not (_ev_paths(e) & taken)
                  and not any(_pkey(q) in prev for q in _ev_paths(e))]
-        cands.sort(key=lambda e: (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"]))
+        cands.sort(key=lambda e: ((_pick_rank(e), used.get(_pkey(e["path"]), ""), -e["score"]) if PICK_MULTI_FIRST[0] else (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"])))
         for e in cands:
             if est(pick) >= floor_need:
                 break
@@ -15736,7 +15789,9 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None)
                  + (f"; only ~{est(pick):.0f} s of unused material - the montage is shorter (nothing is padded)"
                     if not reused and est(pick) < (OPT_RANGE[0] if optimal else float(target)) - 0.5 else ""))
     if reused:
-        notes.append(f"reused {len(reused)} previously used clip(s) to reach the {WEEKLY_MIN_S:.0f} s minimum")
+        n_mk_ = sum(1 for e in reused if _pick_rank(e) == 0)
+        notes.append(f"reused {len(reused)} previously used clip(s)" + (f" ({n_mk_} multikill(s), taken before unused singles)" if PICK_MULTI_FIRST[0] and n_mk_ else "")
+                     + f" to reach the {'song' if need_s else format(WEEKLY_MIN_S, '.0f') + ' s minimum'}")
     if est(pick) < WEEKLY_MIN_S:
         notes.append(f"the whole library only gives ~{est(pick):.0f} s ({len(pick) - len(reused)} unused + {len(reused)} reused usable event(s); "
                      f"the rest are clips of the previous montage or too short) - below the {WEEKLY_MIN_S:.0f} s minimum, so this is all there is; "
@@ -15755,11 +15810,11 @@ def weekly_more(events, pick, style, game, need_s):
     taken = set().union(*[_ev_paths(e) for e in pick]) if pick else set()
     last = hist_list(USED_CLIPS, game)[-1:] if game else []
     prev = {_pkey(c) for h in last for c in h.get("clips", [])}
-    fresh = sorted([e for e in events if id(e) not in in_pick and _pkey(e["path"]) not in used], key=lambda e: (bool(e.get("plain")), -e["score"]))
+    fresh = sorted([e for e in events if id(e) not in in_pick and _pkey(e["path"]) not in used], key=lambda e: (_pick_rank(e), -e["score"]))
     old = sorted([e for e in events if id(e) not in in_pick and _pkey(e["path"]) in used and not any(_pkey(q) in prev for q in _ev_paths(e))],
-                 key=lambda e: (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"]))
+                 key=lambda e: ((_pick_rank(e), used.get(_pkey(e["path"]), ""), -e["score"]) if PICK_MULTI_FIRST[0] else (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"])))
     add, reused = [], []
-    for e in fresh + old:
+    for e in (_tiered(fresh, old) if PICK_MULTI_FIRST[0] else fresh + old):
         if est(add) >= need_s:
             break
         ps = _ev_paths(e)
@@ -16301,6 +16356,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         FULL_CTX.pop("live", None)
         FULL_CTX.pop("est_scale", None)
         FULL_CTX.pop("fill_over", None)
+        FULL_CTX.pop("sky_pick", None)
         FULL_CTX.pop("last_est", None)
 
 
@@ -16323,8 +16379,8 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
         run_scan(cfg, [game], paths)
     pair = None
     pool_paths = set(paths) if manual else None
-    if game == "cs2" and manual and paths:                 # V6.9: neighbour clips of the ticked clips join the candidate pool
-        pair = pairing_run(cfg, tagged, paths, quiet=not scan)
+    if (game == "cs2" or MANUAL_PAIR_ALL[0]) and manual and paths:      # V6.9: neighbour clips of the ticked clips join the candidate pool (V8.8.6: every game, not only CS2)
+        pair = pairing_run(cfg, tagged, paths, quiet=not scan, game=game)
         if pair and pair["partners"]:
             pool_paths |= {p_["path"] for p_, _, _ in pair["partners"]}
     pool, st = game_pool(cfg, game, pool_paths)
@@ -16359,6 +16415,8 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
         avail_ = float(an_.get("dur") or 0) - float((an_.get("beats") or [0])[0])
         need_full = min(FULL_CAP_S, avail_) * 1.25
         out(f"Force New Full: song {pre_song[0].get('title') or Path(pre_song[0]['path']).stem} ({avail_:.0f} s): filling {min(FULL_CAP_S, avail_):.0f} s, ~{need_full:.0f} s of clips wanted")
+    if effects_mode(cfg, game) == "extra" and sky_enabled(cfg, game):
+        FULL_CTX["sky_pick"] = cfg                         # V8.8.6: the pick prefers clear-sky multikills within their group (_sky_first)
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
         events, wk_notes = weekly_pick(events, cfg, cfg.get("length_s", "optimal") if target is None else target,
                                        cfg.get("style", "auto") if style is None else style, game=game, need_s=need_full)
