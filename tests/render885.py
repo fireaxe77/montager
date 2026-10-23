@@ -66,6 +66,8 @@ print("plan checks")
 st, end = float(plan["song"]["start_t"]), float(plan["song"]["start_t"]) + float(plan["duration"])
 if mode == "fixed":
     check(f"fixed length: {plan['duration']:.1f} s for 90 s (at least 85 %, never longer)", 0.85 * 90 <= plan["duration"] <= 93)
+elif M.song_fill_target(an, mode in ("force_full", "manual_auto"), "optimal") is None:
+    print(f"  (the song is longer than the maximum: a {plan['duration']:.0f} s section is used, no whole-song check)")
 else:
     check(f"the montage covers the trimmed song: {st:.2f} - {end:.2f} s of {max(lv0, an['beats'][0]):.2f} - {lv1:.2f} s", st >= lv0 - 0.05 and st - max(lv0, an["beats"][0]) <= 3.0 and lv1 - 3.0 <= end <= lv1 + 0.05)
 bad = [b_ for b_ in M.verify_cutlist(plan, log=False)]
@@ -92,6 +94,8 @@ if not do_render:
     print("\nFAILED: " + ", ".join(FAILS) if FAILS else "\nall checks passed")
     sys.exit(1 if FAILS else 0)
 out = outd / f"render885_{game}_{mode}.mp4"
+import json as _json
+(outd / f"render885_{game}_{mode}.plan.json").write_text(_json.dumps(plan, default=str), encoding="utf-8")
 log0 = (M.LOG_DIR / "montage.log").stat().st_size if (M.LOG_DIR / "montage.log").exists() else 0
 t0 = time.time()
 if reuse and out.exists():
