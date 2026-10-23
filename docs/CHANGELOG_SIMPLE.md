@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8.8 - 2026-10-23: Faster renders and instant clip switching
+- Montages render about 35 to 45 percent faster, with exactly the same picture and sound as before
+- Switching between CS2, Valorant and Rainbow Six clips is now nearly instant, and the app opens faster
+- New "High performance" look in Settings: the same app with a lighter, flat style (Standard stays the default)
+- You can choose where the move icon puts clips, and every montage now gets one of all five sky patterns and ten colours, picked from its song
+
 ## V8.8.7 - 2026-10-23: Move bad clips out of your montages
 - A new arrow icon next to the trash icon in the clip list moves a clip into a folder for its game, so it is never used in a montage again but is not deleted
 - Moved clips are kept in E:\Movies\Montager moved clips, with one folder each for Valorant, CS2 and Rainbow Six

@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.8.7"
+APP_VERSION = "V8.8.8"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -332,6 +332,10 @@ def norm(p):
 
 def walk_files(roots, exts, min_size, cfg):
     skip_out = norm(cfg["output_root"])
+    try:
+        skip_mv = norm(moved_root(cfg)) if cfg.get("moved_dir") else None          # V8.8.8: the Settings folder of moved clips is never scanned, wherever it is
+    except Exception:                                      # noqa: BLE001
+        skip_mv = None
     for root in roots:
         stack = [root]
         while stack:
@@ -346,6 +350,8 @@ def walk_files(roots, exts, min_size, cfg):
                         if e.is_dir(follow_symlinks=False):
                             nl = e.name.lower()
                             if nl in SKIP_DIR_NAMES or norm(e.path) == skip_out or norm(e.path).startswith(skip_out + os.sep):
+                                continue
+                            if skip_mv and (norm(e.path) == skip_mv or norm(e.path).startswith(skip_mv + os.sep)):
                                 continue
                             stack.append(e.path)
                         elif e.is_file(follow_symlinks=False):
@@ -4888,6 +4894,87 @@ def ts(t):
 def kills_key(rec, game, det):
     b = hashlib.md5(rec.get("bar_sig", "").encode()).hexdigest()[:6] if rec.get("bars") else "nb"
     return f"{file_key(rec['path'])}|{game}|{det.d['stamp']}{ALGO}{b}"
+
+
+CLIP_ROWS_ON = [True]                  # V8.8.8 switch: the clip list's kill times per clip kept in memory + on disk (clip_rows_v1.json) and recomputed only for a clip whose inputs changed
+CLIP_ROWS_UI_KEYS = ("ui_layout", "ui_mode", "accent", "base", "ui_scale", "update_on_start", "moved_dir", "sync_report", "post_checks")   # look / window only: never in the kill times
+CLIP_ROWS_MEMO = {}                    # {data folder: {"games": {game: {"sig", "rows": {clip key: kill times or None}}}}}
+_CLIP_ROWS_LOCK = threading.Lock()
+
+
+def _fstat_sig(p):
+    try:
+        st = os.stat(p)
+        return f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        return "-"
+
+
+def clip_rows_sig(cfg, game):
+    """V8.8.8: everything the clip list's kill times of one game depend on besides the clip's own files: the settings, this program file, the game's detector file,
+    the per-clip utility overrides (Valorant / R6S) and the CS2 dating memo. Any change = every clip of that game is analysed again (as before V8.8.8)."""
+    cfg_ = {k: v for k, v in cfg.items() if k not in CLIP_ROWS_UI_KEYS}
+    parts = [APP_VERSION, ALGO, game, json.dumps(cfg_, sort_keys=True, default=str), _fstat_sig(__file__), _fstat_sig(DATA / f"detect_{game}.json")]
+    if game in ("valorant", "r6s"):
+        parts.append(_fstat_sig(_util_overrides_file()))
+    if game == "cs2":
+        parts += [_fstat_sig(_dating_file()), str(CS2_PRESENCE_ON[0]), str(CS2_EDGE_DATING[0])]
+    return hashlib.md5("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def clip_row_kills(scanned, g, cfg, det, kc, ovs):
+    """V8.8.8: {clip path: [kill times] or None (not scanned)} of one game's clips, exactly as the clip list computed them before (analyse_clip_entry + the utility
+    override), taken from the memo when the clip's kill entry (and its CS2 row sidecar) and clip_rows_sig are unchanged. The memo is kept in memory and in
+    montage_data\\clip_rows_v1.json, so the next switch / launch reads it straight away."""
+    out_ = {}
+    f_ = DATA / "clip_rows_v1.json"
+    with _CLIP_ROWS_LOCK:
+        mem = CLIP_ROWS_MEMO.get(str(DATA))
+        if mem is None and CLIP_ROWS_ON[0]:
+            mem = load_json(f_, {}) if f_.exists() else {}
+            if not isinstance(mem, dict) or mem.get("v") != 1:
+                mem = {}
+            mem.setdefault("v", 1)
+            mem.setdefault("games", {})
+            CLIP_ROWS_MEMO[str(DATA)] = mem
+    sig = clip_rows_sig(cfg, g) if CLIP_ROWS_ON[0] else None
+    gm = (mem or {}).get("games", {}).get(g) if CLIP_ROWS_ON[0] else None
+    old = gm["rows"] if gm and gm.get("sig") == sig else {}
+    new, changed = {}, not gm or gm.get("sig") != sig
+    for r in scanned:
+        if r.get("error") or r.get("game") != g:
+            continue
+        try:
+            key = kills_key(r, g, det) if det else None
+        except OSError:
+            continue
+        ck = None
+        if key is not None and CLIP_ROWS_ON[0]:
+            ck = f"{key}|{_fstat_sig(kc._p(key))}" + (f"|{_fstat_sig(border_path(r, det)[0])}" if g == "cs2" else "")
+            if ck in old:
+                new[ck] = out_[r["path"]] = old[ck]
+                continue
+        e = kc.get(key) if key is not None else None
+        ks = None
+        if e and not e.get("error"):
+            a_ = analyse_clip_entry(r, e, cfg, g)
+            if ovs:
+                a_ = apply_utility_override(r, e, a_, cfg, g, ovs)
+            ks = [k["t"] for k in a_["kills"]]
+        out_[r["path"]] = ks
+        if ck is not None:
+            new[ck] = ks
+            changed = True
+    if CLIP_ROWS_ON[0] and (changed or len(new) != len(old)):
+        with _CLIP_ROWS_LOCK:
+            mem["games"][g] = {"sig": sig, "rows": new}
+            try:
+                tmp = Path(str(f_) + f".{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(mem, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, f_)
+            except Exception as ex_:                         # noqa: BLE001
+                LOGONLY(f"clip_rows_v1.json not saved: {ex_}")
+    return out_
 
 
 def load_dets(only=None):
@@ -12753,6 +12840,15 @@ def sky_family_for(plan, ranked, qual=None):
                 fam, why = sky_family_from_hue(_hue_deg(cov_rgb)), cov_why
     except Exception:                                      # noqa: BLE001
         fam = None
+    if fam is None and SKY_PICK_SPREAD[0]:                 # V8.8.8: the vibe's families in its order, picked by the song's own number (preference squared + an even share): every family is used
+        fams_ = []
+        for n_ in ranked:
+            f_ = SKY_NAME_FAMILY.get(n_)
+            if f_ and f_ not in fams_:
+                fams_.append(f_)
+        if fams_:
+            fam = _sky_weighted_pick(fams_, [(len(fams_) - i) ** 2 for i in range(len(fams_))], _sky_song_u(_sky_ident(plan.get("song") or {}), "family"))
+            why = f"song vibe ({', '.join(fams_[:3])} first; this song: {fam})"
     if fam is None:
         n_ = next((n_ for n_ in ranked if n_ in SKY_NAME_FAMILY), "hazy orange")
         fam, why = SKY_NAME_FAMILY[n_], f"song vibe ({n_} first)"
@@ -13814,9 +13910,40 @@ def sky_pattern_for(plan):
         if p_ == "rings":
             s_ += 0.10 * (d - 0.6)
         jit = int(hashlib.md5(f"{ident}#{p_}".encode("utf-8")).hexdigest()[:8], 16) / float(16 ** 8)
-        sc[p_] = s_ + SKY_PATTERN_JITTER * jit
-    best = max(SKY_PATTERNS, key=lambda p_: (sc[p_], p_))
+        sc[p_] = s_ + (0.0 if SKY_PICK_SPREAD[0] else SKY_PATTERN_JITTER * jit)
+    if SKY_PICK_SPREAD[0]:                                 # V8.8.8: a weighted pick (the song's preference + an even share) by the song's own fixed number: every pattern is used across a library
+        ws = [math.exp(sc[p_] / SKY_PICK_TAU) for p_ in SKY_PATTERNS]
+        best = _sky_weighted_pick(list(SKY_PATTERNS), ws, _sky_song_u(ident, "pattern"))
+    else:
+        best = max(SKY_PATTERNS, key=lambda p_: (sc[p_], p_))
     return best, f"energy {e:.2f}, {b:.0f} BPM" + (f", cover {cover}" if cover else "") + f" -> {best} ({', '.join(f'{p_} {sc[p_]:.2f}' for p_ in SKY_PATTERNS)})"
+
+
+SKY_PICK_SPREAD = [True]             # V8.8.8 switch (tests): pattern and colour family by a weighted per-song pick instead of the top score (V8.8.5 - V8.8.7: 85 % of the library orange / red,
+SKY_PICK_MIX = 0.6                   # bands + rings 70 %, amoebas 3 %); share of the song's own preference in the pick (the rest is spread evenly)
+SKY_PICK_TAU = 0.3                   # softness of the pattern preference (score differences / this, exponentiated)
+
+
+def _sky_song_u(ident, what):
+    """V8.8.8: the song's own fixed number 0..1 for one choice (a hash of artist + title): the same song always gets the same pattern / family."""
+    return int(hashlib.md5(f"{ident}##{what}".encode("utf-8")).hexdigest()[:8], 16) / float(16 ** 8)
+
+
+def _sky_weighted_pick(names, weights, u, mix=None):
+    """V8.8.8: the name at u (0..1) on the cumulative probabilities mix x weights / sum + (1 - mix) / n: the song's preference, with an even share for every option."""
+    mix = SKY_PICK_MIX if mix is None else mix
+    tot = float(sum(weights)) or 1.0
+    c = 0.0
+    for nm, w in zip(names, weights):
+        c += mix * float(w) / tot + (1.0 - mix) / len(names)
+        if u < c:
+            return nm
+    return names[-1]
+
+
+def _sky_ident(song):
+    """V8.8.8: the song's identity for its fixed choices (artist + title, else the file name), as sky_pattern_for has used since V8.8.5."""
+    return " | ".join(" ".join(str(song.get(k_) or "").casefold().split()) for k_ in ("artist", "title")) if (song.get("title") or song.get("artist")) else Path(str(song.get("path") or "")).stem.casefold()
 
 
 def _sky_phase(t, t0, spd, bts):
@@ -14154,20 +14281,59 @@ def xfx_probe_sky(plan, tmpdir=None):
                 seen_d.add(d_)
                 firsts.append(c)
         order = firsts + [c for c in order if c not in firsts]
+    def mask_one(c, x):
+        """one candidate's mask (x is the candidate's dict or a copy of it): (mask path, animation, mask stats)."""
+        ti = c["ti"]
+        if tmpdir is None:
+            raise RuntimeError("no temp folder for the mask")
+        Path(tmpdir).mkdir(parents=True, exist_ok=True)
+        mp = Path(tmpdir) / f"sky_take{ti + 1}.gray"
+        an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"), plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"),
+                              game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8: locked to the beat
+        x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "beats": sky_take_beats(plan, plan["takes"][ti], x), "fam": fam, "pattern": pat})
+        st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True, plan=plan)                  # (again: with the animation planes; V8.8.3: bands + the gradient plane)
+        return mp, an_, st
+
+    def mask_copy(c):
+        xc = dict(c["x"])
+        try:
+            return xc, mask_one(c, xc), None
+        except Exception as ex_:                           # noqa: BLE001
+            return xc, None, ex_
+    spec = {}                                              # V8.8.8: the masks the choice below will ask for are made beforehand, several at a time (on copies; the
+    if SKY_MASK_PAR[0] and tmpdir is not None:             # choice itself runs exactly as before and takes each result in its turn)
+        while True:
+            kept_s, want = [], []
+            for c in order:
+                gp = float(c["x"].get("gp", 0.0))
+                if len(kept_s) >= mx or any(abs(gp - g_) < space for g_ in kept_s):
+                    continue
+                r_ = spec.get(id(c))
+                if r_ is None:
+                    want.append(c)
+                    kept_s.append(gp)
+                elif r_[2] is None and not r_[1][2]["bad"] > SKY_MAX_BAD * max(1, r_[1][2]["window"]):
+                    kept_s.append(gp)
+            if not want:
+                break
+            with ThreadPoolExecutor(max_workers=min(SKY_MASK_PAR_N, len(want))) as pool_:
+                for c, r_ in zip(want, pool_.map(mask_copy, want)):
+                    spec[id(c)] = r_
     for c in order:
         x, ti = c["x"], c["ti"]
         gp = float(x.get("gp", 0.0))
         if len(kept) >= mx or any(abs(gp - g_) < space for g_ in kept):
             continue
         try:
-            if tmpdir is None:
-                raise RuntimeError("no temp folder for the mask")
-            Path(tmpdir).mkdir(parents=True, exist_ok=True)
-            mp = Path(tmpdir) / f"sky_take{ti + 1}.gray"
-            an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"), plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"),
-                                  game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8: locked to the beat
-            x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "beats": sky_take_beats(plan, plan["takes"][ti], x), "fam": fam, "pattern": pat})
-            st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True, plan=plan)                  # (again: with the animation planes; V8.8.3: bands + the gradient plane)
+            r_ = spec.get(id(c))
+            if r_ is not None:
+                for k_, v_ in r_[0].items():               # the copy's keys, in the order the mask added them
+                    x[k_] = v_
+                if r_[2] is not None:
+                    raise r_[2]
+                mp, an_, st = r_[1]
+            else:
+                mp, an_, st = mask_one(c, x)
             if st["bad"] > SKY_MAX_BAD * max(1, st["window"]):                           # V8.6.2: a wrong sky is worse than none
                 raise RuntimeError(f"the sky mask was a wall in {st['bad']} of {st['window']} frames of the take - no sky for this take")
             x.update({"ok": True, "mask": str(mp), "hue": fam, "hue_why": fam_why, "grade": sky_family_grade(fam, st["mean_y"]), "alt_hue": fam if an_["jump"] > 0 else None,
@@ -14193,6 +14359,10 @@ def xfx_probe_sky(plan, tmpdir=None):
         out(f"SKY recolour take {c['ti'] + 1}: {msg}")
     out(f"SKY recolour: {len(kept)} chosen of {len(cands)} candidate kills ({len(qual)} with a clear sky; at most {mx} for {plan.get('duration', 0):.0f} s, at least {space:.0f} s apart, best role first)" if cands
         else "SKY recolour: no candidate kill")
+
+
+SKY_MASK_PAR = [True]                # V8.8.8 switch: the sky masks of a render made several at a time (same masks, same choice)
+SKY_MASK_PAR_N = 4
 
 
 def _zone_weight(zone, f=0.012):
@@ -14719,7 +14889,7 @@ def fit_cmd(cmd, work, limit=CMD_LIMIT):
     return c2, str(work), extras
 
 
-def _run_ffmpeg(cmd, D, elog, cwd=None):
+def _run_ffmpeg(cmd, D, elog, cwd=None, prog=(0.0, 1.0)):
     RUN_MEM["min_free"], RUN_MEM["total"] = _free_mem_gb()
     RUN_PROG["t"] = 0.0
     tick = 0
@@ -14731,7 +14901,7 @@ def _run_ffmpeg(cmd, D, elog, cwd=None):
                 try:
                     RUN_PROG["t"] = max(0.0, int(line.split("=")[1]) / 1e6)
                     fr = min(1.0, int(line.split("=")[1]) / 1e6 / D)
-                    progress(fr, f"rendering {int(100 * fr)}%")
+                    progress(prog[0] + prog[1] * fr, f"rendering {int(100 * (prog[0] + prog[1] * fr))}%")
                 except ValueError:
                     pass
                 tick += 1
@@ -15419,6 +15589,678 @@ def failing_take_text(plan, graph, out_t):
         return f"(could not name the failing take: {type(ex).__name__}: {ex})"
 
 
+
+FAST_RENDER = [True]                 # V8.8.8 switch: every take's own chains run in parallel ffmpeg processes into lossless files, then one light final pass (the same filters, the same frames)
+RENDER_JOBS = max(2, min(8, (os.cpu_count() or 4) // 4))      # parts rendered at the same time (measured on 16 threads: 4 = 207 s, 5 = 212 s, 6 = 223 s, 8 = 226 s for a 146 s CS2 montage)
+_GLAB = re.compile(r"\[([^\]]+)\]")
+_TAKE_LAB = re.compile(r"^(?:t(\d+)(?:v|a|hd|tl)|h(\d+)[ab])$")
+
+
+def _split_inputs(inputs):
+    """V8.8.8: the ffmpeg input argument list as one argument group per input (each ends with '-i <path>')."""
+    groups, cur, i = [], [], 0
+    while i < len(inputs):
+        cur.append(inputs[i])
+        if inputs[i] == "-i":
+            cur.append(inputs[i + 1])
+            groups.append(cur)
+            cur, i = [], i + 2
+            continue
+        i += 1
+    if cur:
+        raise ValueError("input arguments after the last -i")
+    return groups
+
+
+def _chain_io(c):
+    m1 = re.match(r"((?:\[[^\]]+\])+)", c)
+    m2 = re.search(r"((?:\[[^\]]+\])+)$", c)
+    return (_GLAB.findall(m1.group(1)) if m1 else []), (_GLAB.findall(m2.group(1)) if m2 else [])
+
+
+def render_colour_probe(inputs, graph, awork):
+    """V8.8.8: the colour space + range ffmpeg negotiates for the picture chain of the WHOLE render graph (one run up to the first frame, -v verbose): the
+    clips' scalers convert into it (e.g. a 4:3 smpte170m CS2 clip -> bt709 when a bt709 clip is in the same chain). A take rendered on its own would keep its
+    clips' own colour space, so every take is pinned to this one. None (= render in one run as before) when the picture chain has more than one, or an automatic
+    converter changes the colour space somewhere (the split would place that conversion elsewhere)."""
+    gp_ = Path(awork) / "probe.filter.txt"
+    Path(awork).mkdir(parents=True, exist_ok=True)
+    gp_.write_text(graph, encoding="utf-8")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "verbose", "-nostats"] + inputs + ["-filter_complex_script", str(gp_), "-map", "[vout]", "-map", "[aout]",
+                                                                                 "-frames:v", "1", "-f", "null", "-"]
+    run_cmd, cwd_, extras_ = fit_cmd(cmd, Path(awork) / "alias")
+    try:
+        pr = subprocess.Popen(run_cmd, cwd=cwd_, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        PROCS.append(pr)
+        _o, err = pr.communicate(timeout=600)
+        if pr in PROCS:
+            PROCS.remove(pr)
+    finally:
+        clean_alias(Path(awork) / "alias", extras_)
+    txt = (err or b"").decode("utf-8", "ignore")
+    if pr.returncode != 0:
+        raise RuntimeError("colour probe failed: " + txt[-300:])
+    return colour_pin_from_log(txt), txt
+
+
+def colour_pin_same(guess, pin, txt):
+    """V8.8.8: True when the takes made with the colour space / range `guess` are what the probe's `pin` asks for: the same pin, or no conversion at all with every
+    clip already in `guess` (pinning them to it then changes nothing)."""
+    if pin is None:
+        return False
+    if tuple(pin[:2]) == tuple(guess[:2]):
+        return True
+    if tuple(pin[:2]) != ("", ""):
+        return False
+    cs = re.findall(r"\[graph \d+ input from stream [^\]]+\] w:\d+ h:\d+ pixfmt:(\S+) .*?csp:(\S+) range:(\S+)", txt)
+    vid = [(c_, r_) for f_, c_, r_ in cs if not f_.startswith("gray") and c_ != "unknown"]
+    return bool(vid) and all((c_, r_) == tuple(guess[:2]) for c_, r_ in vid)
+
+
+def colour_pin_from_log(txt):
+    """V8.8.8: (colour space, range) of the picture chain from ffmpeg's -v verbose log of the whole render graph (render_colour_probe); ('', '') when no
+    picture chain converts anything; None when it is not one single value or an automatic converter changes it inside the graph."""
+    at_input = set(re.findall(r"auto-inserting filter '(auto_scale_\d+)' between the filter 'graph \d+ input from stream", txt))     # converters on a clip's own input link
+    main = set()
+    for nm, a_, b_ in re.findall(r"\[(\w+?_\d+) @ [0-9a-fA-Fx]+\] w:\d+ h:\d+ fmt:(\S+ csp:\S+ range:\S+) .*?-> w:\d+ h:\d+ fmt:(\S+ csp:\S+ range:\S+)", txt):
+        fa, ca, ra = a_.split()
+        fb, cb, rb = b_.split()
+        if fb.startswith("gray") or ca == "csp:unknown" and cb == "csp:unknown":
+            continue                                       # the sky mask planes (grey, no colour space) are their own chain
+        if nm.startswith("auto_scale") and (ca, ra) != (cb, rb) and nm not in at_input:
+            return None                                    # a converter inside the graph (not on a clip's input): the split could not place it the same way
+        main.add((cb.split(":", 1)[1], rb.split(":", 1)[1]))
+    if len(main) != 1:
+        return None if main else ("", "")
+    return next(iter(main))
+
+
+def split_take_graphs(inputs, graph, pin=None, audio_final=False):
+    """V8.8.8: the render graph split into one sub-graph per take (everything that feeds the take's own outputs: t<i>v / t<i>a / t<i>hd / t<i>tl / h<i>a / h<i>b, its clips,
+    slow-mo, zoom, sky, effects, game audio) and the final graph (dissolves, concat, fades, music, mix: the chains left), with every filter string unchanged. Returns
+    (jobs, final_chains, final_groups): jobs = [{"ti", "groups", "chains", "outs": [(label, 'v'|'a')]}]; the final chains still name the takes' outputs, read back by
+    render_parts. Raises ValueError when the graph does not split cleanly (the caller then renders in one run as before)."""
+    groups = _split_inputs(inputs)
+    chains = [c.strip() for c in graph.split(";\n") if c.strip()]
+    io_ = [_chain_io(c) for c in chains]
+    prod = {}
+    for i, (_ins, outs) in enumerate(io_):
+        for l_ in outs:
+            if l_ in prod:
+                raise ValueError(f"label {l_} produced twice")
+            prod[l_] = i
+    is_stream = lambda l_: re.match(r"^\d+(:|$)", l_) is not None
+    owner = {}
+    jobs = {}
+    for l_ in prod:
+        m = _TAKE_LAB.match(l_)
+        if not m or (audio_final and re.match(r"^t\d+a$", l_)):
+            continue                                       # (audio_final: a take's game sound stays in the final graph, made from the clips as in the one-run graph)
+        ti = int(m.group(1) if m.group(1) is not None else m.group(2))
+        jobs.setdefault(ti, {"ti": ti, "outs": [], "chains": set(), "inputs": set()})
+        jobs[ti]["outs"].append((l_, "a" if re.match(r"^t\d+a$", l_) else "v"))
+        todo = [l_]
+        while todo:
+            x = todo.pop()
+            if is_stream(x):
+                jobs[ti]["inputs"].add(int(x.split(":")[0]))
+                continue
+            ci = prod.get(x)
+            if ci is None:
+                raise ValueError(f"label {x} has no producer")
+            if ci in jobs[ti]["chains"]:
+                continue
+            if owner.get(ci, ti) != ti:
+                raise ValueError(f"chain {ci} feeds two takes")
+            owner[ci] = ti
+            jobs[ti]["chains"].add(ci)
+            todo += io_[ci][0]
+    if not jobs:
+        raise ValueError("no take outputs found")
+    for ci, ti in owner.items():                           # nothing of a take may leave it except its named outputs
+        for l_ in io_[ci][1]:
+            users = [j for j, (ins, _o) in enumerate(io_) if l_ in ins]
+            if any(owner.get(j) != ti for j in users) and not _TAKE_LAB.match(l_):
+                raise ValueError(f"label {l_} of take {ti} is used outside it")
+    final = [chains[i] for i in range(len(chains)) if i not in owner]
+    used_final = sorted({int(l_.split(":")[0]) for i in range(len(chains)) if i not in owner for l_ in io_[i][0] if is_stream(l_)})
+    take_inputs = set().union(*[j["inputs"] for j in jobs.values()])
+    if set(used_final) & take_inputs and not audio_final:
+        raise ValueError("an input is used by a take and by the final graph")
+
+    def remap(cs, old):
+        mp = {o: n for n, o in enumerate(old)}
+        return [re.sub(r"\[(\d+)(:[^\]]*)?\]", lambda m: f"[{mp[int(m.group(1))]}{m.group(2) or ''}]", c) for c in cs]
+    out_jobs = []
+    for ti in sorted(jobs):
+        j = jobs[ti]
+        old = sorted(j["inputs"])
+        cs_ = remap([chains[i] for i in sorted(j["chains"])], old)
+        opt_ = ":".join(o_ for o_ in ((f"pix_fmts={pin[2]}" if pin and len(pin) > 2 and pin[2] else ""),
+                                      (f"color_spaces={pin[0]}:color_ranges={pin[1]}" if pin and pin[0] else "")) if o_)
+        if opt_:                                           # V8.8.8: the take's picture outputs in the pixel format / colour space / range the whole graph negotiates (render_colour_probe, the final format)
+            for l_, k_ in j["outs"]:
+                if k_ != "v":
+                    continue
+                cs_ = [re.sub(r"\[" + re.escape(l_) + r"\]$", "[" + l_ + "_pin]", c) for c in cs_]
+                cs_.append(f"[{l_}_pin]format={opt_}[{l_}]")
+        out_jobs.append({"ti": ti, "groups": [groups[k] for k in old], "chains": cs_, "outs": j["outs"]})
+    return out_jobs, remap(final, used_final), [groups[k] for k in used_final]
+
+
+FAST_VCODEC = ["-c:v", "utvideo", "-pred", "median"]     # V8.8.8: lossless intermediate picture codec (decodes ~5x faster than FFV1; yuv420p kept bit for bit)
+FAST_THREADS = [2, 2]                                    # V8.8.8: filter / encoder threads of each part (many parts run at once: more threads only fight for the cores)
+FAST_HEAVY = ("minterpolate",)                           # V8.8.8: a take's chain with one of these (slow motion: motion interpolation, one thread) runs as its own job
+
+
+def _concat_list(paths, p):
+    Path(p).write_text("ffconcat version 1.0\n" + "".join("file '" + str(Path(x).as_posix()).replace("'", "'\\''") + "'\n" for x in paths), encoding="utf-8")
+    return p
+
+
+def _plan_sequences(jobs, final):
+    """V8.8.8: the final graph's picture sequence (the one big video concat of take bodies and dissolves): (its chain, [(label, None | closure chain indices of a
+    dissolve)], the chains left). ValueError when the graph is not built that way."""
+    io_ = [_chain_io(c) for c in final]
+    prod = {l_: i for i, (_a, outs) in enumerate(io_) for l_ in outs}
+    kind = {l_: k_ for j in jobs for l_, k_ in j["outs"]}
+    vc = [i for i, c in enumerate(final) if re.search(r"concat=n=\d+:v=1:a=0\[[^\]]+\]$", c) and len(io_[i][0]) >= len(jobs)]
+    if len(vc) != 1:
+        raise ValueError("no single picture sequence in the final graph")
+    vci = vc[0]
+    used, segs = {vci}, []
+    for L in io_[vci][0]:
+        if L in kind:
+            segs.append((L, None))
+            continue
+        todo, cl = [L], set()
+        while todo:
+            x = todo.pop()
+            if x in kind:
+                continue
+            ci = prod.get(x)
+            if ci is None:
+                raise ValueError(f"segment label {x} has no producer (reads an input?)")
+            if ci in cl:
+                continue
+            if ci in used:
+                raise ValueError(f"chain {ci} shared between segments")
+            cl.add(ci)
+            todo += io_[ci][0]
+        used |= cl
+        segs.append((L, sorted(cl)))
+    rest = [i for i in range(len(final)) if i not in used]
+    if {l_ for i in rest for l_ in io_[i][0]} & set(kind):
+        raise ValueError("a chain outside the picture sequence reads a take output")
+    return vci, segs, rest
+
+
+def _part(chains, groups, want, files, kinds):
+    """V8.8.8: the closure of the labels `want` inside one take's chains (input streams stay inputs, labels in `files` are read back from their files):
+    {'chains' (inputs renumbered, the file reads first after them), 'groups', 'reads': [labels read from files]}."""
+    io_ = [_chain_io(c) for c in chains]
+    prod = {l_: i for i, (_a, outs) in enumerate(io_) for l_ in outs}
+    cl, ins, reads, todo = set(), set(), [], list(want)
+    while todo:
+        x = todo.pop()
+        if re.match(r"^\d+(:|$)", x):
+            ins.add(int(x.split(":")[0]))
+            continue
+        if x in files and x not in want:
+            if x not in reads:
+                reads.append(x)
+            continue
+        ci = prod.get(x)
+        if ci is None:
+            raise ValueError(f"label {x} has no producer")
+        if ci not in cl:
+            cl.add(ci)
+            todo += io_[ci][0]
+    old = sorted(ins)
+    mp = {o: n for n, o in enumerate(old)}
+    cs = [re.sub(r"\[(\d+)(:[^\]]*)?\]", lambda m: f"[{mp[int(m.group(1))]}{m.group(2) or ''}]", chains[i]) for i in sorted(cl)]
+    n0 = len(old)
+    rd = [f"[{n0 + k}:v:0]null[{l_}]" for k, l_ in enumerate(reads)]          # read back with their own exact timestamps (NUT, microseconds)
+    return {"chains": rd + cs, "groups": [groups[k] for k in old], "reads": reads, "cl": cl}
+
+
+def _est_frames(chains, default=300):
+    ends = [int(x) for c in chains for x in re.findall(r"trim=(?:start_frame=\d+:)?end_frame=(\d+)", c)]
+    return max(ends) if ends else default
+
+
+_SEG_PASS = ("format", "setsar", "scale", "lutyuv", "geq", "perspective", "crop", "split", "alphamerge", "colorchannelmixer", "eq", "hue", "boxblur", "gblur", "unsharp", "vignette",
+         "colorbalance", "curves", "noise", "setparams", "null", "pad", "rotate", "zoompan_never", "drawbox", "lut", "lutrgb", "colorlevels", "extractplanes", "mergeplanes")
+
+
+def _chain_filters(c):
+    body = re.sub(r"\[[^\]]+\]", "", c)
+    out_, cur, q = [], "", False
+    for ch in body:
+        if ch == "'":
+            q = not q
+        if ch == "," and not q:
+            out_.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out_.append(cur)
+    return [f.split("=", 1)[0].strip() for f in out_ if f.strip()], [f.strip() for f in out_ if f.strip()]
+
+
+def seg_frames(label, chains):
+    """V8.8.8: frames of a picture label of the render graph, from its filters (the last trim / concat / blend / overlay deciding the count): None when the graph does not say."""
+    prod = {}
+    for c in chains:
+        m = re.search(r"((?:\[[^\]]+\])+)$", c)
+        if m:
+            for l_ in re.findall(r"\[([^\]]+)\]", m.group(1)):
+                prod[l_] = c
+    memo = {}
+
+    def nf(L, depth=0):
+        if L in memo:
+            return memo[L]
+        c = prod.get(L)
+        if c is None or depth > 60:
+            return None
+        ins = re.findall(r"\[([^\]]+)\]", re.match(r"((?:\[[^\]]+\])*)", c).group(1))
+        names, full = _chain_filters(c)
+        res = None
+        for i in range(len(names) - 1, -1, -1):          # the last filter that decides the count
+            n_, f_ = names[i], full[i]
+            if n_ in _SEG_PASS or (n_ == "setpts" and "PTS-STARTPTS" in f_) or (n_ == "settb"):
+                continue
+            if n_ == "trim":
+                m = re.fullmatch(r"trim=(?:start_frame=(\d+):)?end_frame=(\d+)", f_)
+                if m:
+                    res = int(m.group(2)) - int(m.group(1) or 0)
+                break
+            if n_ == "fps" and i > 0:
+                continue                                   # fps=60 on a 60 fps sequence (after a blend / setpts=PTS-STARTPTS) keeps the count
+            if n_ == "concat" and i == 0:
+                xs = [nf(x, depth + 1) for x in ins]
+                res = sum(xs) if all(x is not None for x in xs) else None
+                break
+            if n_ == "blend" and i == 0 and len(ins) == 2:
+                xs = [nf(x, depth + 1) for x in ins]
+                res = max(xs) if all(x is not None for x in xs) else None
+                break
+            if n_ == "overlay" and i == 0 and "eof_action=pass" in f_:
+                res = nf(ins[0], depth + 1)
+                break
+            break
+        else:
+            res = nf(ins[0], depth + 1) if len(ins) == 1 else None
+        memo[L] = res
+        return res
+    return nf(label)
+
+
+FAST_URGENT = 2                      # V8.8.8: running parts (the ones the encoder needs soonest) given a higher process priority than the rest
+_PRIO_SET = {}
+
+
+def _set_prio(pr, high):
+    """V8.8.8: Windows process priority of a part: above normal (needed soon / the encoder) or below normal (the rest); elsewhere nothing."""
+    if os.name != "nt" or _PRIO_SET.get(pr.pid) == high or pr.poll() is not None:
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetPriorityClass(int(pr._handle), 0x8000 if high else 0x4000)
+        _PRIO_SET[pr.pid] = high
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+class PinWrong(RuntimeError):
+    """V8.8.8: the colour pin the parts were started with is not the one the probe found (render_parts stops before the encoder got a frame)."""
+
+
+def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=None):
+    """V8.8.8: the fast render (one attempt; the caller renders in one run as before when this raises):
+      1. every take's picture: its slow-motion chains as their own jobs, then the take, then each dissolve once both of its takes are there; RENDER_JOBS at a
+         time, in the order the encoder needs them (the ones needed soonest also run at a higher process priority); every part into its own lossless file
+         (utvideo picture in NUT with a microsecond time base: every frame and every timestamp exactly as the one-run graph makes them, so the dissolves,
+         fades and every timed effect see the very same times);
+      2. at the same time the final pass: the encoder starts at once and reads the picture sequence through one concat list whose entries are local ports,
+         one per part, each answered (with the part's file, byte for byte) once the part is made and checked; the sequence is cut back into the takes /
+         dissolves at their exact frame counts and the final graph's own chains run unchanged - the picture concat, the fades, the game sound chains straight
+         from the clips (as in the one-run graph), the music, the drop sounds and the mix - encoded with exactly the one-run command's output arguments.
+    Returns ffmpeg's return code of the final pass. gate (optional): called before the encoder gets its first frame; False = PinWrong (the colour pin the
+    parts were made with is not the probe's)."""
+    import threading as th_
+    tdir = Path(tdir)
+    tdir.mkdir(parents=True, exist_ok=True)
+    jobs, final, fgroups = split_take_graphs(inputs, graph, pin, audio_final=True)
+    vci, segs, rest = _plan_sequences(jobs, final)
+    opt_ = ":".join(o_ for o_ in ((f"pix_fmts={pin[2]}" if len(pin) > 2 and pin[2] else ""), (f"color_spaces={pin[0]}:color_ranges={pin[1]}" if pin[0] else "")) if o_)
+    kinds = {l_: k_ for j in jobs for l_, k_ in j["outs"]}
+    fpath = lambda l_: tdir / f"{l_}.nut"
+    tasks = {}
+    allc0 = [c.strip() for c in graph.split(";\n") if c.strip()]
+    seg_pos, pos_ = {}, 0.0
+    for L, _c in segs:
+        seg_pos[L] = pos_
+        pos_ += (seg_frames(L, allc0) or 300) / 60.0
+    tpos = {j["ti"]: min([seg_pos[l_] for l_, _k in j["outs"] if l_ in seg_pos] or [pos_]) for j in jobs}
+
+    def add(name, part, outs, deps, prio):
+        gp_ = tdir / f"{name}.filter.txt"
+        gp_.write_text(";\n".join(part["chains"]), encoding="utf-8")
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats"] + [a for g in part["groups"] for a in g] + sum([["-i", str(fpath(l_))] for l_ in part["reads"]], [])
+        cmd += ["-filter_threads", str(FAST_THREADS[0]), "-filter_complex_script", str(gp_)]
+        for l_, _k in outs:
+            cmd += ["-map", f"[{l_}]"] + FAST_VCODEC + ["-threads", str(FAST_THREADS[1]), "-enc_time_base:v", "1:1000000", "-fps_mode", "passthrough", "-f", "nut", str(fpath(l_))]
+        tasks[name] = {"cmd": cmd, "deps": set(deps), "prio": prio}
+        (tdir / f"{name}.cmd.json").write_text(json.dumps(cmd, ensure_ascii=False), encoding="utf-8")       # (kept with the part: a failed part can be rerun by hand)
+
+    made_by = {}
+    for j in jobs:
+        ti = j["ti"]
+        v_outs = [(l_, k_) for l_, k_ in j["outs"] if k_ == "v"]
+        pv = _part(j["chains"], j["groups"], [l_ for l_, _k in v_outs], set(), kinds)
+        heavy = []
+        for c in [j["chains"][i] for i in sorted(pv["cl"])]:
+            ins_, outs_ = _chain_io(c)
+            if any(h_ in c for h_ in FAST_HEAVY) and len(outs_) == 1 and ins_ and all(re.match(r"^\d+:", x) for x in ins_) and outs_[0] not in kinds:
+                heavy.append(outs_[0])
+        hk = {}
+        for k, L in enumerate(heavy):
+            ph = _part(j["chains"], j["groups"], [L], set(), {**kinds, L: "v"})
+            if opt_:
+                ph["chains"] = [re.sub(r"\[" + re.escape(L) + r"\]$", "[" + L + "_pin]", c) for c in ph["chains"]] + [f"[{L}_pin]format={opt_}[{L}]"]
+            nm = f"slow{ti}_{k}"
+            add(nm, ph, [(L, "v")], [], tpos[ti] - 0.3 * _est_frames(ph["chains"]) / 2.0)
+            hk[L] = "v"
+            made_by[L] = nm
+        pv = _part(j["chains"], j["groups"], [l_ for l_, _k in v_outs], set(hk), {**kinds, **hk})
+        add(f"take{ti}", pv, v_outs, [made_by[l_] for l_ in pv["reads"]], tpos[ti] - 0.03 * _est_frames(j["chains"]))
+        for l_, _k in v_outs:
+            made_by[l_] = f"take{ti}"
+    for L, cl in segs:
+        if cl is None:
+            continue
+        need = sorted({l_ for i in cl for l_ in _chain_io(final[i])[0] if l_ in kinds})
+        part = {"chains": [f"[{n}:v:0]null[{l_}]" for n, l_ in enumerate(need)] + [final[i] for i in cl], "groups": [], "reads": need}
+        add(f"dissolve_{L}", part, [(L, "v")], [made_by[l_] for l_ in need], seg_pos[L])
+        made_by[L] = f"dissolve_{L}"
+    # ---- RENDER_JOBS workers, a ready task with the lowest priority value (the slowest work) first
+    cv = th_.Condition()
+    done, running, failed, procs, took, t_done = set(), set(), [], [], {}, {}
+    pr_of = {}
+    t0 = time.time()
+
+    def runner():
+        while True:
+            with cv:
+                while True:
+                    if failed or CANCEL.is_set():
+                        return
+                    ready = [n for n, t_ in tasks.items() if n not in done and n not in running and t_["deps"] <= done]
+                    if ready:
+                        nm = min(ready, key=lambda n: (tasks[n]["prio"], n))
+                        running.add(nm)
+                        break
+                    if len(done) == len(tasks):
+                        return
+                    cv.wait(0.5)
+            ts = time.time()
+            try:
+                pr = subprocess.Popen(tasks[nm]["cmd"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                PROCS.append(pr)
+                procs.append(pr)
+                pr_of[nm] = pr
+                _o, err = pr.communicate()
+                if pr in PROCS:
+                    PROCS.remove(pr)
+                if pr.returncode != 0:
+                    raise RuntimeError(f"{nm}: ffmpeg failed: " + (err or b"").decode("utf-8", "ignore")[-400:])
+            except Exception as ex:                        # noqa: BLE001
+                with cv:
+                    failed.append(str(ex))
+                    cv.notify_all()
+                return
+            with cv:
+                running.discard(nm)
+                done.add(nm)
+                took[nm] = time.time() - ts
+                t_done[nm] = time.time()
+                cv.notify_all()
+    # ---- the final pass needs every picture segment's frame count (from the graph; each made part is checked against it before the encoder gets it)
+    allc = [c.strip() for c in graph.split(";\n") if c.strip()]
+    nfs = [seg_frames(L, allc) for L, _c in segs]
+    if any(n_ is None or n_ <= 0 for n_ in nfs):
+        raise ValueError("a picture segment's frame count is not in the graph")
+    seg_n = {L: n_ for (L, _c), n_ in zip(segs, nfs)}
+    workers = [th_.Thread(target=runner, daemon=True) for _ in range(RENDER_JOBS)]
+    for w_ in workers:
+        w_.start()
+
+    def rebalance():
+        """the encoder and the FAST_URGENT running parts the encoder needs soonest run above the others (same work, done in the order it is needed)."""
+        while not stop_srv.is_set():
+            with cv:
+                run_ = sorted([n for n in running if n in pr_of], key=lambda n: (tasks[n]["prio"], n))
+            for k_, n in enumerate(run_):
+                _set_prio(pr_of[n], k_ < FAST_URGENT)
+            for pr in list(PROCS):
+                if pr not in procs:
+                    _set_prio(pr, True)
+            stop_srv.wait(0.5)
+    # ---- every picture segment is served to the encoder on its own local port the moment it is made and checked (the concat list opens one at a time,
+    #      in order, so the encoder starts at once and waits only where a part is not ready yet; the bytes are the part's file exactly)
+    import socket
+    stop_srv = th_.Event()
+    srv_fail = []
+
+    def wait_made(nm):
+        with cv:
+            while nm not in done:
+                if failed or CANCEL.is_set() or stop_srv.is_set():
+                    return False
+                cv.wait(0.5)
+        return True
+
+    def check_seg(L):
+        r_ = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts", "-of", "csv=p=0", str(fpath(L))])
+        pts = [int(x) for x in (r_.stdout or b"").decode().split() if x.strip().lstrip("-").isdigit()]
+        if len(pts) != seg_n[L] or not pts or pts[0] != 0:
+            raise RuntimeError(f"{L}: {len(pts)} frames from {pts[0] if pts else None}, the graph says {seg_n[L]} from 0")
+
+    gate_ok, gate_lock = [None], th_.Lock()
+
+    def gated():
+        if gate is None:
+            return True
+        with gate_lock:                                    # (not the scheduler's lock: the parts go on while the probe finishes)
+            if gate_ok[0] is None:
+                gate_ok[0] = bool(gate())
+        if not gate_ok[0]:
+            srv_fail.append("PIN")
+            with cv:
+                failed.append("the colour pin was not the probe's")
+                cv.notify_all()
+        return gate_ok[0]
+
+    def serve(L, sk):
+        ok = None
+        sk.settimeout(0.5)
+        while not stop_srv.is_set():
+            try:
+                conn, _a = sk.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                if ok is None:
+                    ok = gated() and wait_made(made_by[L])
+                    if ok:
+                        try:
+                            check_seg(L)
+                        except Exception as ex:            # noqa: BLE001
+                            srv_fail.append(str(ex))
+                            ok = False
+                if ok:
+                    with open(fpath(L), "rb") as fh:
+                        while True:
+                            b_ = fh.read(1 << 22)
+                            if not b_:
+                                break
+                            conn.sendall(b_)
+            except OSError:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+        try:
+            sk.close()
+        except OSError:
+            pass
+    socks, sthreads = [], []
+    try:
+        for L, _c in segs:
+            sk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sk.bind(("127.0.0.1", 0))
+            sk.listen(4)
+            socks.append((L, sk))
+        for L, sk in socks:
+            t_ = th_.Thread(target=serve, args=(L, sk), daemon=True)
+            t_.start()
+            sthreads.append(t_)
+        th_.Thread(target=rebalance, daemon=True).start()
+        lst = tdir / "picture.ffconcat"
+        lst.write_text("ffconcat version 1.0\n" + "".join(f"file 'tcp://127.0.0.1:{sk.getsockname()[1]}'\nduration {(seg_n[L] + 2) / 30.0:.6f}\n" for L, sk in socks), encoding="utf-8")
+        n0 = len(fgroups)
+        reads, a_ = [f"[{n0}:v:0]" + (f"split={len(segs)}" + "".join(f"[sv{k_}]" for k_ in range(len(segs))) if len(segs) > 1 else "null[sv0]")], 0
+        for k_, ((L, _c), n_) in enumerate(zip(segs, nfs)):
+            reads.append(f"[sv{k_}]trim=start_frame={a_}:end_frame={a_ + n_},setpts=PTS-STARTPTS[{L}]")
+            a_ += n_
+        fgp = LOG_DIR / f"{stem}.final.filter.txt"
+        fgp.write_text(";\n".join(reads + [final[i] for i in sorted(rest + [vci])]), encoding="utf-8")
+        cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"] + [a for g in fgroups for a in g]
+               + ["-f", "concat", "-safe", "0", "-protocol_whitelist", "file,tcp", "-i", str(lst)] + ["-filter_complex_script", str(fgp)] + tail_)
+        extras_ = []
+        t1 = time.time()
+        try:
+            run_cmd, cwd_, extras_ = fit_cmd(cmd, awork)
+            rc = _run_ffmpeg(run_cmd, D, elog, cwd_)
+        finally:
+            clean_alias(awork, extras_)
+        for w_ in workers:
+            w_.join(5)
+        if "PIN" in srv_fail:
+            raise PinWrong("the colour pin was not the probe's")
+        if failed or srv_fail:
+            raise RuntimeError("fast render: " + (srv_fail or failed)[0])
+        if CANCEL.is_set():
+            raise RuntimeError("cancelled")
+        if len(done) != len(tasks):
+            raise RuntimeError("not every part was made")
+    except BaseException:
+        with cv:
+            failed.append("stopped")
+            cv.notify_all()
+        for pr in procs:
+            try:
+                pr.kill()
+            except Exception:                              # noqa: BLE001
+                pass
+        raise
+    finally:
+        stop_srv.set()
+        for _L, sk in socks:
+            try:
+                sk.close()
+            except OSError:
+                pass
+    slow = sorted(took.items(), key=lambda kv: -kv[1])[:3]
+    LOGONLY(f"fast render: {len([n for n in tasks if n.startswith('take')])} takes, {len([n for n in tasks if n.startswith('slow')])} slow-motion parts, "
+            f"{len([n for n in tasks if n.startswith('dissolve')])} dissolves, {RENDER_JOBS} at a time (longest: " + ", ".join(f"{k} {v:.1f} s" for k, v in slow)
+            + f"); all parts made after {max(t_done.values() or [0]) - t0:.1f} s, encoder done after {time.time() - t0:.1f} s (started at {t1 - t0:.1f} s), rc {rc}")
+    return rc
+
+
+def _save_pin(game, pin):
+    """V8.8.8: remember the colour pin a game's render used (montage_data\\render_pins.json): the next render of that game starts its parts with it."""
+    try:
+        d = load_json(DATA / "render_pins.json", {})
+        d = d if isinstance(d, dict) else {}
+        if d.get(str(game)) != [pin[0], pin[1]]:
+            d[str(game)] = [pin[0], pin[1]]
+            save_json(DATA / "render_pins.json", d)
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
+FAST_MIN_TAKES = 4                   # V8.8.8: fewer takes than this: one run (the split would not pay for its colour probe)
+FAST_MB_PER_S = 60.0                 # disk the lossless take files need per second of montage (measured ~50 MB/s at 1080p60)
+
+
+def _render_fast(inputs, graph, tail_, tmp, D, elog, stem, tdir, game=None):
+    """V8.8.8: the render in parts (render_parts): the takes in parallel, then the final pass, encoded exactly like the one-run render. Returns ffmpeg's return code
+    of the final pass, or None = not used / given up before the final pass (the caller then renders in one run as before): too few takes, too little free disk,
+    a graph that does not split cleanly, more than one colour space, or a take that failed. The take files are removed afterwards."""
+    t0 = time.time()
+    tdir = Path(tdir)
+    try:
+        if len(set(re.findall(r"\[t(\d+)v\]", graph))) < FAST_MIN_TAKES:
+            return None
+        tdir.mkdir(parents=True, exist_ok=True)
+        need = FAST_MB_PER_S * D * 1.3 / 1024 + 2.0
+        free = shutil.disk_usage(tdir).free / 1024 ** 3
+        if free < need:
+            LOGONLY(f"fast render not used: {free:.1f} GB free next to the output, {need:.1f} GB needed for the take files")
+            return None
+        progress(0.0, "preparing the takes")
+        m_ = re.search(r"format=(\w+)\[vout\]\s*(?:;|$)", graph)
+        if not m_ or m_.group(1) not in ("yuv420p", "yuv422p", "yuv444p"):
+            LOGONLY("fast render not used: the picture's final pixel format is not one the lossless take files keep (one run as before)")
+            return None
+        pins_ = load_json(DATA / "render_pins.json", {})     # the pin this game's last render confirmed (CS2 / Valorant mostly bt709, R6S smpte170m)
+        g_pin = pins_.get(str(game)) if isinstance(pins_, dict) else None
+        guess = (g_pin[0], g_pin[1], m_.group(1)) if isinstance(g_pin, list) and len(g_pin) == 2 else ("bt709", "tv", m_.group(1))
+        # the parts start at once, the probe runs beside them and the encoder gets
+        res_, ev_ = {}, threading.Event()                  # nothing until the probe has confirmed it
+
+        def probe_():
+            try:
+                res_["pin"], txt_ = render_colour_probe(inputs, graph, tdir / "probe")
+                res_["ok"] = colour_pin_same(guess, res_["pin"], txt_)
+            except Exception as ex_:                       # noqa: BLE001
+                res_["err"], res_["ok"] = ex_, False
+            finally:
+                res_["s"] = time.time() - t0
+                ev_.set()
+        threading.Thread(target=probe_, daemon=True).start()
+        alias_ = DATA / f"cmdalias_{os.getpid()}_fast"
+        try:
+            rc = render_parts(inputs, graph, tdir / "parts", D, elog, guess, tail_, stem, alias_, gate=lambda: ev_.wait() and res_.get("ok"))
+            LOGONLY(f"fast render: colour probe {res_.get('s', 0):.1f} s beside the parts ({guess[0] or 'no colour space'} {guess[1]} {guess[2]} confirmed)")
+            _save_pin(game, guess)
+            return rc
+        except PinWrong:
+            pin = res_.get("pin")
+            if pin is None:
+                LOGONLY(f"fast render not used: the render graph has more than one colour space ({res_.get('err', '')}) - one run as before")
+                return None
+            pin = (pin[0], pin[1], m_.group(1))
+            LOGONLY(f"fast render: the probe found {pin[0] or 'no colour space'} {pin[1]}: the parts are made again with it")
+            shutil.rmtree(tdir / "parts", ignore_errors=True)
+            _save_pin(game, pin)
+            return render_parts(inputs, graph, tdir / "parts2", D, elog, pin, tail_, stem, alias_)
+    except Exception as ex:                                # noqa: BLE001
+        if CANCEL.is_set():
+            raise RuntimeError("cancelled")
+        LOGONLY(f"fast render not used ({type(ex).__name__}: {str(ex)[:300]}): one run as before")
+        return None
+    finally:
+        shutil.rmtree(tdir, ignore_errors=True)
+
+
 def _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, fx, D):
     """V8.4.4: a render is exactly ONE attempt (DEFAULT and EXTRA alike): one filter graph, one ffmpeg run, one encoder. No second or third attempt, no effect dropped, no fallback render, no
     encoder switch. When ffmpeg fails the render stops and says where: the failing filter text, the take (from ffmpeg's last output time) and ffmpeg's error; stderr, filter graph and
@@ -15428,18 +16270,19 @@ def _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, el
     gp = LOG_DIR / f"{stem}.filter.txt"
     gp.write_text(graph, encoding="utf-8")
     (LOG_DIR / "last_filter.txt").write_text(graph, encoding="utf-8")
-    cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"] + inputs +
-           ["-filter_complex_script", str(gp), "-map", "[vout]", "-map", "[aout]", "-t", f"{D:.4f}"] +
-           enc_args(maxq, preview, nvenc) + (["-preset", "veryfast"] if encoder == "fast" else []) + [str(tmp)])
+    tail_ = ["-map", "[vout]", "-map", "[aout]", "-t", f"{D:.4f}"] + enc_args(maxq, preview, nvenc) + (["-preset", "veryfast"] if encoder == "fast" else []) + [str(tmp)]
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"] + inputs + ["-filter_complex_script", str(gp)] + tail_
     awork = DATA / f"cmdalias_{os.getpid()}"
-    extras_ = []
-    try:
-        run_cmd, cwd_, extras_ = fit_cmd(cmd, awork)        # V8.8.1: a command over the Windows limit gets short input names (the same files); a short one is unchanged
-        if cwd_:
-            LOGONLY(f"render command {_cmd_len(cmd)} characters: input files renamed to short aliases ({_cmd_len(run_cmd)} characters)")
-        rc = _run_ffmpeg(run_cmd, D, elog, cwd_)
-    finally:
-        clean_alias(awork, extras_)
+    rc = _render_fast(inputs, graph, tail_, tmp, D, elog, stem, render_tmpdir(outfile) / "takes", pr_.get("game")) if FAST_RENDER[0] and not preview else None
+    if rc is None:
+        extras_ = []
+        try:
+            run_cmd, cwd_, extras_ = fit_cmd(cmd, awork)        # V8.8.1: a command over the Windows limit gets short input names (the same files); a short one is unchanged
+            if cwd_:
+                LOGONLY(f"render command {_cmd_len(cmd)} characters: input files renamed to short aliases ({_cmd_len(run_cmd)} characters)")
+            rc = _run_ffmpeg(run_cmd, D, elog, cwd_)
+        finally:
+            clean_alias(awork, extras_)
     if CANCEL.is_set():
         raise RuntimeError("cancelled")
     txt = ""
@@ -17312,7 +18155,9 @@ MOVED_GAME_DIR = {"valorant": "Valorant", "cs2": "CS2", "r6s": "Rainbow Six"}
 def moved_root(cfg):
     """V8.8.7: the folder the clip list's move icon moves clips into: <clip_root>\\Montager moved clips (E:\\Movies\\Montager moved clips by default), one subfolder per game.
     When that place would be inside a scanned clip folder, it goes next to montage_data instead (montage_data\\..\\Montager moved clips)."""
-    base = (cfg or {}).get("moved_dir") or os.path.join((cfg or {}).get("clip_root") or str(DATA.parent), MOVED_DIR_NAME)
+    if str((cfg or {}).get("moved_dir") or "").strip():     # V8.8.8: the folder chosen in Settings (also inside a scanned clip folder: walk_files never enters it)
+        return str(cfg["moved_dir"]).strip()
+    base = os.path.join((cfg or {}).get("clip_root") or str(DATA.parent), MOVED_DIR_NAME)
     for d in clip_roots(cfg or {}) if (cfg or {}).get("clip_dirs") else []:
         if norm(base) == norm(d) or norm(base).startswith(norm(d) + os.sep):
             return os.path.join(str(DATA.parent), MOVED_DIR_NAME)
@@ -17609,6 +18454,15 @@ def F(size):
 
 SIMPLE_THEME = os.environ.get("MONTAGE_SIMPLE_THEME") == "1"      # V6.2: A/B test switch: built-in clam theme instead of Sun Valley
 SV_THEME = [False]                                    # True when the Sun Valley ttk theme (sv-ttk) is active
+EARLY_LOAD = [True]                                   # V8.8.8 switch: the first clip / song load runs beside the hidden window's tab layout (not after it)
+UI_MODES = {"standard": "Standard", "performance": "High performance"}      # V8.8.8: Settings > Appearance > UI mode (config 'ui_mode'; Standard = the look as before)
+PERF_UI = [False]                                     # V8.8.8: True while the High performance look is active (flat clam theme, no image elements, no hover effects)
+
+
+def ui_mode_of(cfg):
+    """V8.8.8: 'standard' (default) or 'performance' (MONTAGE_UI_MODE overrides the setting: the smoketest in both looks)."""
+    m = str(os.environ.get("MONTAGE_UI_MODE") or (cfg or {}).get("ui_mode") or "standard")
+    return m if m in UI_MODES else "standard"
 THEME_VER = "t4"
 
 
@@ -17684,12 +18538,18 @@ def lime_theme_dir(accent="lime", base="grey"):
     return dst
 
 
-def apply_theme(root, scale=None, accent="lime", base="grey"):
+def apply_theme(root, scale=None, accent="lime", base="grey", mode="standard"):
     """V5.57: Sun Valley dark (pip: sv-ttk, offline) recoloured to a base (grey | black) and an accent colour; the plain clam
-    fallback uses the same palette. Returns the palette (log, canvases, tags)."""
+    fallback uses the same palette. Returns the palette (log, canvases, tags). V8.8.8: mode 'performance' = the flat look (same palette,
+    fonts, row heights and paddings; no Sun Valley image elements, no hover effects)."""
     if scale:
         UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
     pal = make_palette(accent, base)
+    PERF_UI[0] = mode == "performance"
+    if PERF_UI[0]:
+        SV_THEME[0] = False
+        with pstage("apply_theme: high performance (flat clam)"):
+            return _apply_theme_clam(root, scale, pal, flat=True)
     if SIMPLE_THEME:                                               # V6.2 A/B: ttk "clam" + the same palette, no sv_ttk image elements
         SV_THEME[0] = False
         with pstage("apply_theme: clam theme_use + style configure/map"):
@@ -17733,13 +18593,21 @@ def apply_theme(root, scale=None, accent="lime", base="grey"):
         return _apply_theme_clam(root, scale, pal)
 
 
-def _apply_theme_clam(root, scale=None, pal=None):
-    """Plain dark theme with the same palette (used when sv-ttk is not installed)."""
+def _apply_theme_clam(root, scale=None, pal=None, flat=False):
+    """Plain dark theme with the same palette (used when sv-ttk is not installed). V8.8.8 flat=True: the High performance UI mode: the
+    Standard look's fonts, row height and tab padding (the same layout), flat solid colours, no hover changes."""
     pal = dict(pal or PAL)
     if scale:
         UI_SCALE[0] = max(0.7, min(2.5, float(scale)))
     st = ttk.Style(root)
     st.theme_use("clam")
+    if flat:
+        import tkinter.font as tkfont
+        for nm, sz, bold in (("TkDefaultFont", 10, 0), ("TkTextFont", 10, 0), ("TkMenuFont", 10, 0), ("TkHeadingFont", 10, 1)):
+            try:
+                tkfont.nametofont(nm, root).configure(size=F(sz))
+            except Exception:                              # noqa: BLE001
+                pass
     root.configure(bg=pal["bg"])
     root.option_add("*Font", ("Segoe UI", F(10)))
     root.option_add("*TCombobox*Listbox.background", pal["field"])
@@ -17788,6 +18656,20 @@ def _apply_theme_clam(root, scale=None, pal=None):
            foreground=[("disabled", pal["dim"]), ("active", pal["sel_fg"])])
     st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
     st.configure("Dim.TLabel", foreground=pal["dim"])
+    if flat:                                               # V8.8.8: the Standard sizes; solid flat elements; pressed / selected / disabled states only (no hover)
+        st.configure("Treeview", rowheight=int(26 * UI_SCALE[0]), borderwidth=0)
+        st.configure("Treeview.Heading", relief="flat")
+        st.configure("TNotebook.Tab", padding=(16, 5))
+        st.configure("TLabelframe.Label", foreground=pal["acc"])
+        for w in ("TButton", "Big.TButton"):
+            st.configure(w, relief="flat", lightcolor=pal["btn"], darkcolor=pal["btn"])
+        st.map("TButton", background=[("disabled", pal["bg"]), ("pressed", pal["sel"])], foreground=[("disabled", pal["dim"])],
+               bordercolor=[("focus", pal["acc"])])
+        for w in ("Accent.TButton", "Big.Accent.TButton"):
+            st.configure(w, relief="flat")
+            st.map(w, background=[("disabled", pal["head"]), ("pressed", pal["sel"])], foreground=[("disabled", pal["dim"]), ("pressed", pal["sel_fg"])])
+        for w in ("TCheckbutton", "TRadiobutton"):
+            st.map(w, indicatorcolor=[("selected", pal["check"]), ("pressed", pal["sel"])], background=[], indicatorbackground=[("selected", pal["check"])])
     return pal
 
 
@@ -18079,7 +18961,7 @@ class App:
         PROGRESS[0] = lambda f, t: self.q.put(("prog", (f, t)))
         self.cfg = load_config()
         with pstage("apply_theme (App.__init__)"):
-            self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0), self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"))
+            self.pal = apply_theme(self.root, self.cfg.get("ui_scale", 1.0), self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"), ui_mode_of(self.cfg))
         sc = UI_SCALE[0]
         self._shown = False                                        # V6.1: the main window is shown once, after the first fill
         with pstage("splash build + paint"):
@@ -18144,6 +19026,12 @@ class App:
         if PERF is not None:
             PERF.attach(self.root)
         self._lay = lay
+        self._started_early = False
+        if startup and EARLY_LOAD[0]:                             # V8.8.8: the clip / song loading starts now, in its threads, while the tabs are laid out (still hidden)
+            self._startup_t0 = time.monotonic()
+            with pstage("App.startup (UI thread; run_task starts the scan threads)"):
+                self.startup()
+            self._started_early = True
         with pstage("prerealize (layout of every tab)"):
             self.prerealize(start_tab, lay)                       # V5.58: every tab is laid out once before the window is visible
         self.switch_ms = []                                       # V5.58: (tab, ms) of every tab switch until the layout is idle again
@@ -18152,6 +19040,8 @@ class App:
         self.root.bind("<Configure>", self.on_root_configure, add="+")
         self.root.after(100, self.poll)
         self.first_show(startup)                                  # V6.1: startup work + first fill behind the splash, then show once
+
+    EARLY_LOAD_DOC = "V8.8.8: EARLY_LOAD (module switch) starts the first clip / song load before the tab layout"
 
     # ---- tab switching (V5.58): all tabs are built once in __init__ and only shown / hidden afterwards
     def prerealize(self, start_tab, lay):
@@ -18207,9 +19097,10 @@ class App:
             if startup:
                 self.splash_set(0.05, f"{APP_NAME} - checking setup ...")
                 self._splash.update()
-                self._startup_t0 = time.monotonic()
-                with pstage("App.startup (UI thread; run_task starts the scan threads)"):
-                    self.startup()
+                if not self._started_early:
+                    self._startup_t0 = time.monotonic()
+                    with pstage("App.startup (UI thread; run_task starts the scan threads)"):
+                        self.startup()
                 self.splash_set(0.15, f"{APP_NAME} - loading clips and songs ...")
                 while not self.first_fill_done():
                     if time.monotonic() - self._startup_t0 > 12:
@@ -18420,7 +19311,9 @@ class App:
         """Fill cfg from every settings control (Manual and Settings tab share the length / style / quality controls)."""
         for k, v in self.sv.items():
             cfg[k] = v.get().strip()
-        cfg["clip_dirs"] = {g: [x.strip() for x in v.get().split(";") if x.strip()] for g, v in self.sl.items()}
+        if "moved_dir" in cfg and norm(cfg["moved_dir"] or ".") == norm(moved_root(dict(cfg, moved_dir=""))):
+            cfg["moved_dir"] = ""                                  # V8.8.8: the default folder stays the default (it follows the clip root)
+        cfg["clip_dirs"] ={g: [x.strip() for x in v.get().split(";") if x.strip()] for g, v in self.sl.items()}
         for k, v in self.sn.items():
             try:
                 cfg[k] = float(v.get()) if "." in v.get() else int(v.get())
@@ -18446,6 +19339,7 @@ class App:
         cfg["audio_mode"] = next((k for k, lab in AUDIO_MODES.items() if lab == self.set_audio.get()), "auto")
         cfg["accent"] = next((k for k, lab in ACCENT_NAMES.items() if lab == self.set_accent.get()), "lime")
         cfg["base"] = "black" if self.set_base.get().lower() == "black" else "grey"
+        cfg["ui_mode"] = next((k for k, lab in UI_MODES.items() if lab == self.set_uimode.get()), "standard")      # V8.8.8
         return cfg
 
     def autosave(self, *_):
@@ -18807,15 +19701,30 @@ class App:
             return None                                            # nothing changed since the last collect
         recs = [v for v in load_json(CLIPS_CACHE, {}).values() if isinstance(v, dict) and v.get("path")]
         kc = load_kills_cache()
+        try:
+            have = {e.name for e in os.scandir(kc.dir)}        # V8.8.8: one listing of the kill files instead of one look-up per clip
+        except OSError:
+            have = None
         texts = {}
         for g in GAMES:
             det = load_dets(g).get(g)
-            mine = [r for r in recs if tag_game(r["path"], cfg)[0] == g and not r.get("error") and r.get("dur", 0) <= cfg["max_dur_s"] and os.path.exists(r["path"])]
+            mine, keys = [], []
+            for r in recs:
+                if tag_game(r["path"], cfg)[0] != g or r.get("error") or r.get("dur", 0) > cfg["max_dur_s"]:
+                    continue
+                try:
+                    fk = file_key(r["path"])                   # (the clip still exists: one stat for both questions)
+                except OSError:
+                    continue
+                mine.append(r)
+                keys.append(fk)
             done = 0
             if det:
-                for r in mine:
+                for r, fk in zip(mine, keys):
                     r.setdefault("game", g)
-                    if kills_key(r, g, det) in kc:
+                    b_ = hashlib.md5(r.get("bar_sig", "").encode()).hexdigest()[:6] if r.get("bars") else "nb"
+                    key = f"{fk}|{g}|{det.d['stamp']}{ALGO}{b_}"
+                    if (kc._p(key).name in have) if have is not None else (key in kc):
                         done += 1
             ex = weekly_existing(cfg, g)
             d = Path(cfg["output_root"]) / GAME_DIR[g]
@@ -19372,16 +20281,11 @@ class App:
         with pstage("load_clips: scan_clips (total)"):
             scanned = scan_clips(load_config())
         _t1 = time.perf_counter()
+        kmap = clip_row_kills(scanned, g, cfg, det, kc, ovs)         # V8.8.8: memo (memory + disk): only changed clips are analysed again
         for r in scanned:
-            if r.get("error") or r.get("game") != g:
+            if r.get("error") or r.get("game") != g or r["path"] not in kmap:
                 continue
-            e = kc.get(kills_key(r, g, det)) if det else None
-            ks = None
-            if e and not e.get("error"):
-                a_ = analyse_clip_entry(r, e, cfg, g)
-                if ovs:
-                    a_ = apply_utility_override(r, e, a_, cfg, g, ovs)
-                ks = [k["t"] for k in a_["kills"]]
+            ks = kmap[r["path"]]
             try:
                 mt = os.path.getmtime(r["path"])
             except OSError:
@@ -20239,8 +21143,9 @@ class App:
             r[0] += 1
 
         section("Folders")
-        for k, lab in (("mp3_dir", "MP3 folder"), ("playlist_dir", "Exportify CSV folder"), ("output_root", "Output folder")):
-            v = tk.StringVar(value=self.cfg.get(k, ""))
+        for k, lab in (("mp3_dir", "MP3 folder"), ("playlist_dir", "Exportify CSV folder"), ("output_root", "Output folder"),
+                       ("moved_dir", "Moved clips folder (move icon)")):              # V8.8.8: where the move icon puts clips (one folder per game inside; never scanned)
+            v = tk.StringVar(value=self.cfg.get(k, "") if k != "moved_dir" else (self.cfg.get("moved_dir") or moved_root(self.cfg)))
             self.sv[k] = v
             folder_row(lab, v, "Browse", lambda v=v: v.set(filedialog.askdirectory(initialdir=v.get() or None) or v.get()))
         for g, lab in (("valorant", "Valorant clip folders (separated by ;)"), ("cs2", "CS2 clip folders (separated by ;)"),
@@ -20398,6 +21303,12 @@ class App:
         cb_ = ttk.Combobox(h, textvariable=self.set_base, values=["Grey", "Black"], width=14, state="readonly")
         cb_.pack(side="left", padx=(0, PX))
         r[0] += 1
+        self.set_uimode = tk.StringVar(value=UI_MODES[ui_mode_of(self.cfg)])        # V8.8.8
+        label("UI mode")
+        h = holder()
+        ttk.Combobox(h, textvariable=self.set_uimode, values=list(UI_MODES.values()), width=18, state="readonly").pack(side="left", padx=(0, PX))
+        hint(h, "High performance: the same app with a flat, lighter look (switches at once)")
+        r[0] += 1
         label("UI scale (font + row height)")
         h = holder()
         v = tk.StringVar(value=str(self.cfg.get("ui_scale", 1.0)))
@@ -20418,8 +21329,9 @@ class App:
         self.set_last = f.grid_slaves(row=r[0] + 1, column=0)[0]
         self.set_accent.trace_add("write", self.on_theme_pick)      # V5.58: the theme switches at once (the picker and code alike)
         self.set_base.trace_add("write", self.on_theme_pick)
+        self.set_uimode.trace_add("write", self.on_theme_pick)      # V8.8.8
         for v in [*self.sv.values(), *self.sl.values(), *self.sn.values(), *self.set_track.values(), *self.set_names.values(), self.set_opt, self.set_len,
-                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_post, *self.set_fx.values(), *self.set_sky.values(), self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base]:
+                  self.set_style, self.set_q, self.set_place, self.set_sync, self.set_post, *self.set_fx.values(), *self.set_sky.values(), self.set_interp, self.set_music, self.set_music_db, self.set_smmode, self.set_upd, self.set_audio, self.set_accent, self.set_base, self.set_uimode]:
             v.trace_add("write", self.autosave)
 
     def names_changed(self, *_):
@@ -20622,7 +21534,7 @@ class App:
                 except tk.TclError:
                     pass                                          # the widget has no such option
 
-    def retheme(self, accent=None, base=None):
+    def retheme(self, accent=None, base=None, mode=None):
         """Re-apply the Sun Valley theme (a unique theme per accent x base, sourced into the running window) and recolour every widget:
         ttk styles come from the theme; every classic tk widget is recoloured by its registered role (see recolour)."""
         cfg = self.cfg
@@ -20640,7 +21552,7 @@ class App:
                                 tags[(t, opt)] = v
                     tagsnap.append((w, tags))
         with pstage("retheme: apply_theme (total)"):
-            self.pal = apply_theme(self.root, UI_SCALE[0], accent, base)     # the scale in use (a changed scale applies after restart)
+            self.pal = apply_theme(self.root, UI_SCALE[0], accent, base, mode or ui_mode_of(cfg))     # the scale in use (a changed scale applies after restart)
         PAL.clear()
         PAL.update(self.pal)
         with pstage("retheme: registry recolour (classic tk widgets)"):
@@ -20663,11 +21575,12 @@ class App:
         """Accent colour / base picked in Settings: switch the running window at once."""
         acc = next((k for k, lab in ACCENT_NAMES.items() if lab == self.set_accent.get()), "lime")
         base = "black" if self.set_base.get().lower() == "black" else "grey"
-        if (acc, base) == (self.cfg.get("accent", "lime"), self.cfg.get("base", "grey")):
+        mode = next((k for k, lab in UI_MODES.items() if lab == self.set_uimode.get()), "standard") if hasattr(self, "set_uimode") else ui_mode_of(self.cfg)
+        if (acc, base, mode) == (self.cfg.get("accent", "lime"), self.cfg.get("base", "grey"), ui_mode_of(self.cfg)):
             return
-        self.cfg["accent"], self.cfg["base"] = acc, base
+        self.cfg["accent"], self.cfg["base"], self.cfg["ui_mode"] = acc, base, mode
         try:
-            self.retheme(acc, base)
+            self.retheme(acc, base, mode)
         except Exception as ex:
             out(f"Theme not applied: {ex}")
         self.autosave()
@@ -21784,7 +22697,10 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
         # V5.55: theme, dividers (move + remembered), used column / filter, Random pick
         try:
             import sv_ttk                                          # noqa: F401
-            if not SV_THEME[0] or "mt-" not in ttk.Style(root).theme_use():
+            if PERF_UI[0]:                                         # V8.8.8: High performance = the flat theme
+                if ttk.Style(root).theme_use() != "clam":
+                    fails.append(f"High performance look did not load (theme {ttk.Style(root).theme_use()})")
+            elif not SV_THEME[0] or "mt-" not in ttk.Style(root).theme_use():
                 fails.append(f"Sun Valley theme did not load (theme {ttk.Style(root).theme_use()})")
         except ImportError:
             out("  (sv-ttk not installed - the plain fallback theme is in use; pip install sv-ttk)")
