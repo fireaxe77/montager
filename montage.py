@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.8.5"
+APP_VERSION = "V8.8.6"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4029,7 +4029,7 @@ def border_analysis(sc, cfg, deaths=None):
                 if why:
                     break
             if why:
-                rej.append({"t": k["t"], "reason": "CS2 stale feed row: " + why, "ks": k["ks"]})
+                rej.append({"t": k["t"], "reason": "CS2 stale feed row: " + why, "ks": k["ks"], "_kill": k, "_ef": ef})
                 continue
             if real:                                         # looser name match: only used with the gunshot check (verified_kills)
                 for ef, ev_, eid, pre in early:
@@ -4417,6 +4417,89 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
     b["kills"].sort(key=lambda k: k["t"])
 
 
+CS2_PRESENCE_ON = [True]           # V8.8.6 switch (tests): the presence check of cs2_presence_check
+CS2_PRESENCE_GAP_S = 1.5           # V8.8.6: a victim's row not read for longer than this is gone (CS2 rows last ~5 - 7 s; a respawned bot killed again 12 s later is a new row)
+CS2_PRE_SAME_F_S = 3.0             # V8.8.6: rows the outline tracker first finds in the same frame within this many seconds were already there together (two kills never land on one frame)
+
+
+def cs2_victim_times(entry, victim):
+    """V8.8.6: the times (s) of the cached name-scan OCR frames that show a row whose victim reads like `victim` (cs2_same_victim or a close OCR ratio)."""
+    off = float(entry.get("v_off", 0.0) or 0.0)
+    out_ = []
+    for f, _since, boxes, blobs in entry.get("ocr", []):
+        for r in ocr_rows(boxes, blobs, "cs2"):
+            vt = r.get("vtext") or ""
+            if vt and (cs2_same_victim(vt, victim) or ocr_ratio(vt, victim) >= 80):
+                out_.append(f / FPS + off)
+                break
+    return out_
+
+
+def cs2_continuous(times, t_a, t_b, gap=None):
+    """V8.8.6: True when `times` (sorted) cover t_a .. t_b without a hole longer than `gap` (the row stayed on screen the whole time)."""
+    gap = CS2_PRESENCE_GAP_S if gap is None else gap
+    ts = [t for t in times if t_a - gap <= t <= t_b + 0.3]
+    if not ts or ts[0] > t_a + gap or ts[-1] < t_b - gap:
+        return False
+    return all(b_ - a_ <= gap for a_, b_ in zip(ts, ts[1:]))
+
+
+def cs2_presence_check(entry, a, b, cfg):
+    """V8.8.6 (CS2): the cached name scan decides whether a row of the same victim was STILL on screen, so a stale row and a new kill of a respawned player are told apart
+    without a rescan. (A) a kill linked to an earlier row of its victim (seen_first: the plan-time 'already on screen' check) keeps that link only while the victim's row stayed
+    visible in between; (B) a kill rejected as a 'stale feed row' comes back when the earlier row had gone; (C) a kill whose victim the name scan saw on screen from the clip's
+    first frames, continuously up to the kill, is a pre-clip row (the outline tracker can miss an outline on a bright sky for a second), and so are the rows the tracker first
+    found in that same frame. Changes b in place; returns the number of kills removed."""
+    pres = {}
+
+    def times(v):
+        if v not in pres:
+            pres[v] = cs2_victim_times(entry, v)
+        return pres[v]
+    real = lambda v: bool(v) and not v.startswith("(unread") and len(_alnum(v)) >= 3
+    for k in b["kills"]:                                                     # (A)
+        if k.get("seen_first") is not None and real(k.get("victim")) and not cs2_continuous(times(k["victim"]), float(k["seen_first"]), float(k["t"])):
+            for kk in ("seen_first", "seen_strict", "seen_lead", "early_vic"):
+                k.pop(kk, None)
+            k["seen_gone"] = True
+    back = []
+    for r in list(b.get("rej") or []):                                         # (B)
+        k = r.get("_kill")
+        if k is not None and r.get("_ef") is not None and real(k.get("victim")) and not cs2_continuous(times(k["victim"]), float(r["_ef"]), float(k["t"])):
+            b["rej"].remove(r)
+            back.append(k)
+    for k in back:
+        k["stale_undone"] = True
+    pre_v = []                                                               # (C)
+    for r in (a.get("rej") or []):
+        if str(r.get("reason", "")).startswith("pre-clip") and float(r.get("t", 99)) <= 0.5:
+            m_ = re.search(r"\] (?:gun|util) \[(.*)\]\)?$", r["reason"])
+            if m_ and real(m_.group(1).strip()):
+                pre_v.append(m_.group(1).strip())
+    keep, gone = [], []
+    for k in sorted(b["kills"] + back, key=lambda k: k["t"]):
+        v = k.get("victim") or ""
+        hit = next((pv for pv in pre_v if real(v) and (cs2_same_victim(v, pv) or ocr_ratio(v, pv) >= 80) and cs2_continuous(times(pv), 0.0, float(k["t"]))), None)
+        (gone if hit else keep).append((k, hit))
+    if gone:
+        firsts = {round(float(k["t"]), 2) for k, _h in gone if float(k["t"]) <= CS2_PRE_SAME_F_S}
+        keep2 = []
+        for k, h in keep:
+            if round(float(k["t"]), 2) in firsts:                           # found in the same frame as a pre-clip row: it was there with it
+                gone.append((k, "found in the same frame as a pre-clip row"))
+            else:
+                keep2.append((k, h))
+        keep = keep2
+    for k, why in gone:
+        b["rej"].append({"t": k["t"], "reason": f"pre-clip: row already on screen when the clip starts ({k.get('row', '')}; on screen from 0.0 s in the name scan" +
+                         (f", [{why}])" if why and why.startswith("found") else ", its outline was found only at " + format(float(k['t']), ".2f") + " s)"), "ks": k.get("ks", 0.0)})
+    b["kills"] = [k for k, _h in keep]
+    b["rej"] = sorted(b["rej"], key=lambda r: r["t"])
+    if back or gone:
+        b["presence"] = {"restored": [round(float(k["t"]), 2) for k in back], "removed": [round(float(k["t"]), 2) for k, _w in gone]}
+    return len(gone)
+
+
 def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
     """analyse_entry() plus the CS2 red-border list: when the clip's sidecar exists (or `build` creates it), the border-based list replaces the
     name-based one (deaths stay the name-based ones); otherwise - and for every other game - this IS analyse_entry(). A clip whose sidecar holds
@@ -4456,6 +4539,11 @@ def analyse_clip_entry(rec, entry, cfg, game=None, build=False):
             cs2_kill_times_earlier(rec, Detector("cs2"), cfg, sc, b, Path(rec.get("path", "")).name)
         except Exception:
             pass
+        if CS2_PRESENCE_ON[0]:
+            try:
+                cs2_presence_check(entry, a, b, cfg)       # V8.8.6: stale / pre-clip rows decided by whether the victim's row really stayed on screen (cached name scan)
+            except Exception as ex_:                        # noqa: BLE001
+                LOGONLY(f"CS2 presence check skipped: {Path(rec.get('path', '')).name}: {type(ex_).__name__}: {ex_}")
         for k in b["kills"]:                                 # V7.7.6: how long a row of this victim had been on screen before the (dated) kill time: the plan-time check compares it with the take start
             if k.get("seen_strict"):
                 k["seen_lead"] = round(max(0.0, k["t"] - k["seen_first"]), 3)
@@ -10177,15 +10265,18 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     avail = song_end - float(bt[b_lo])
     mx = min(FULL_CAP_S if full else OPT_RANGE[1], avail)
     rng_lo, cap_v = (FULL_MIN_S, FULL_CAP_S) if full else OPT_RANGE
-    est = {id(e): take_estimate(e, bd, rname) for e in clips}
+    sc_e = float(FULL_CTX.get("est_scale") or 1.0)         # V8.8.6: the song fill's measured correction (planned / estimated length of the last round; 1.0 otherwise)
+    est = {id(e): take_estimate(e, bd, rname) * sc_e for e in clips}
     end_x = (END_FADE[0] + END_FADE[1]) / 2 - 0.4           # the slow-mo ending runs longer than a normal tail
     total = lambda lst: sum(est[id(e)] for e in lst) + (end_x if len(lst) >= 3 else 0.0)
     chosen = sorted(clips, key=lambda e: (1 if e.get("_rx") else 0, -e["score"]))      # V7.6.1: events that need a relaxed rule come after the plain ones, so they never push a plain event out of a full montage
     left = []
-    while len(chosen) > 1 and total(chosen) > mx - bd:         # one beat of room for the drop alignment
+    over_ = float(np.median(list(est.values()))) if (FULL_CTX.get("fill_over") and est) else 0.0      # V8.8.6: a song-fill round offers one take more than the estimate fits (the planner leaves out what does not fit)
+    while len(chosen) > 1 and total(chosen) > mx - bd + over_:         # one beat of room for the drop alignment
         e = chosen.pop()
         left.append((e, f"don't fit in {mx:.0f} s ({'the whole song' if mx < cap_v else f'the {cap_v:.0f} s maximum'})"))
     L = min(mx, total(chosen))
+    FULL_CTX["last_est"] = round(float(total(chosen)), 2)   # V8.8.6: what the chosen clips were estimated to fill (the song fill compares it with the real plan)
     last_b0 = int(np.searchsorted(bt, song_end, side="right") - 1)
     if full:                                               # V8.5: the whole song when it fits the cap; a long song tries every length from 1:30 up to the cap
         L = min(L, float(bt[last_b0] - bt[b_lo]))
@@ -12002,6 +12093,7 @@ FEEL_PROFILES = {                    # V8.4.4: how a style's montage is dressed:
     "smooth": {"w": {"punch": 0.35, "flash": 0.2, "split": 0.1}, "k": (1, 2), "share": 0.3, "settle": 0.5, "mirror": 0.0, "sky": 1},
     "chill": {"w": {"punch": 0.25, "flash": 0.1, "split": 0.05}, "k": (1, 1), "share": 0.22, "settle": 0.4, "mirror": 0.0, "sky": 1}}
 FEEL_PROFILES["mix"] = FEEL_PROFILES["hype"]
+SKY_MORE_CANDS = [True]              # V8.8.6 switch (tests): the last kill of every other (not first, not calm) take is a sky candidate after the role candidates
 XFX_SKY_CANDS = 60                   # kills that are looked at for a clear sky (drop / headline / ending / flick kills; the render keeps the clear ones, SKY_SPACING_S apart, at most sky_max_for(length))
 
 
@@ -12253,11 +12345,19 @@ def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None, sky_
         sky_c.append(dict(c, why=why_))
         if len(sky_c) >= XFX_SKY_CANDS:
             break
+    if sky_on and SKY_MORE_CANDS[0] and len(sky_c) < XFX_SKY_CANDS:    # V8.8.6: after every role candidate, the last kill of every other take (never the first take or a middle kill; calm takes last):
+        for c in sorted(cands, key=lambda c: (takes[c["ti"]].get("role") == "calm", -c["sc"])):      # a montage of indoor 1ks had 19 candidates and no sky, while its other takes were never looked at
+            t = takes[c["ti"]]
+            if c["ti"] == 0 or c["i"] != len(t.get("kills_out") or [0]) - 1 or any(c["ti"] == o["ti"] for o in sky_c):
+                continue
+            sky_c.append(dict(c, why="kill", more=True))
+            if len(sky_c) >= XFX_SKY_CANDS:
+                break
     for c in sky_c:
         t = takes[c["ti"]]
         dur = float(t.get("dur") or 0)
         per_take[c["ti"]].append({"k": "sky", "p": round(c["p"], 4), "t0": round(c["p"], 4), "t1": round(dur, 4),            # V8.5.1: from the kill frame to the end of the take
-                                  "ok": None, "gp": round(c["gp"], 3), "why": c["why"], "prio": prio(c),
+                                  "ok": None, "gp": round(c["gp"], 3), "why": c["why"], "prio": 0 if c.get("more") else prio(c),
                                   **({"sc": round(float(c["sc"]), 3), "drop_i": _drop_index(plan, c["gp"])} if sky88 else {})})
     plan["xfx_sky_max"] = sky_max
     plan["xfx_drop"] = drops_audio
@@ -13087,14 +13187,20 @@ def sky_eyedrop_sample(img):
     return {"lab": np.median(px, 0), "std": px.std(0), "area": best[1] / float(sm.shape[0] * sm.shape[1])}
 
 
+SKY_SAMPLE_NEAR = 30.0               # V8.8.6: Lab distance within which two frames' sky samples are the same sky (smoothed together); further apart = another surface
+
+
 def sky_smooth_samples(samples, half=12):
     """V8.6.1: the eyedropper colour of every frame of a take, smoothed over time (median of the samples within +-half frames): the colour follows a gradual change of the sky, but does not jump from frame
     to frame; a frame without a sample takes the nearest one within `half` frames, else None (the sky is not in the picture)."""
     import numpy as np
     n = len(samples)
     out = []
+    near = lambda a_, b_: float(np.linalg.norm(np.asarray(a_["lab"], float) - np.asarray(b_["lab"], float))) <= SKY_SAMPLE_NEAR
     for i in range(n):
         win = [samples[j] for j in range(max(0, i - half), min(n, i + half + 1)) if samples[j] is not None]
+        if samples[i] is not None and SKY_SAMPLE_NEAR > 0:    # V8.8.6: only samples that look like this frame's own (a camera swing onto a wall must not pull the sky's colour onto the wall)
+            win = [w_ for w_ in win if near(w_, samples[i])] or [samples[i]]
         if not win or samples[i] is None and not any(samples[j] is not None for j in range(max(0, i - half), min(n, i + half + 1))):
             out.append(None)
             continue
@@ -13392,6 +13498,9 @@ def sky_shot_breaks(imgs, fr_src=None, thr=None):
 
 
 SKY_SHOT_DIFF = 28.0                 # V8.8.5: mean grey change (0-255, on a 96 x 54 thumbnail) between two frames above which they are two shots (a cut / an instant flick)
+SKY_WARM_FRAME = [True]              # V8.8.6 switch (tests): a frame whose smooth region is warm is a wall in the mask too (as in the kill-frame probe)
+SKY_CUT_ON = [True]                  # V8.8.6 switch (tests): the sky ends where the camera leaves it instead of the take losing its sky
+SKY_CUT_MIN_F = 18                   # V8.8.6: ... when at least this many frames (0.3 s) of clean sky come first
 SKY_GUARD_GROW = 1                   # V8.8.5: mask pixels the painted region may reach past the frame's own sky (the soft edge); never more
 
 
@@ -13443,6 +13552,8 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
         if sp is not None:
             if float(sp["lab"][0]) < SKY_MIN_L:
                 st_ = "bad"                                            # a smooth region that is too dark for a sky (a wall)
+            elif SKY_WARM_FRAME[0] and float(sp["lab"][2]) - 128.0 > 8.0 and float(sp["lab"][0]) < 200:
+                st_ = "bad"                                            # V8.8.6: warm (orange / yellow): a wall, the same rule as the kill-frame probe (sky_eyedrop)
             else:
                 m = sky_eyedrop_mask(img, sp)
                 if m.any() and (float(m.mean()) > SKY_FRAME_MAX_COV or float(np.where(m.any(1))[0].max()) / h > 0.72):          # a region that fills the picture / runs far down it is a wall, not a sky
@@ -13466,13 +13577,30 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
         good.append(not (ref > 0.03 and cv[i] < 0.35 * ref))
     held = 0
     n_bad = sum(1 for q in status if q == "bad")
+    cut = k
+    if k and n_bad > SKY_MAX_BAD * k and SKY_CUT_ON[0]:    # V8.8.6: the camera leaves the sky after the kill (a wall comes in): the sky is kept while it is really there and fades out where
+        run_ = 0                                           # the walls start (3 bad frames in a row), when that stretch is long enough and clean; else the take gets no sky, as before
+        for i in range(k):
+            run_ = run_ + 1 if status[i] == "bad" else 0
+            if run_ >= 3:
+                cut = i - 2
+                break
+        pre_bad = sum(1 for q in status[:cut] if q == "bad")
+        if cut < k and cut >= SKY_CUT_MIN_F and pre_bad <= SKY_MAX_BAD * cut:
+            for i in range(cut, k):
+                segm[i] = np.zeros((h, w), np.uint8)
+                status[i] = "cut"
+            n_bad = pre_bad
+            x["sky_cut"] = round(cut / float(OUT_FPS), 3)
+        else:
+            cut = k
     held_i = set()
     if any(good):
         gi = [i for i in range(k) if good[i] and status[i] == "ok"]          # a held mask is only a mask that passed every check itself
         if not gi:
             good = [True] * k
         for i in range(k):
-            if not good[i]:
+            if not good[i] and i < cut:
                 same = [q for q in gi if shot[q] == shot[i]]                   # V8.8.5: only from the same shot
                 if not same:
                     continue
@@ -13527,6 +13655,8 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
             if f0 <= f < f1 and k:
                 a = 1.0 if SKY_IMPACT_F <= 0 else min(1.0, (f - f0 + 1) / float(SKY_IMPACT_F))          # the kill frame itself shows the first third, the third frame is complete
                 m = cv2.GaussianBlur(sm[f - f0], (0, 0), SKY_MASK_FEATHER) * a
+                if cut < k and f - f0 >= cut - SKY_IMPACT_F:   # V8.8.6: fading out over the last frames before the walls start
+                    m = m * max(0.0, (cut - (f - f0)) / float(SKY_IMPACT_F + 1))
                 fh.write(np.clip(m * (255.0 * SKY_OPACITY) + 0.5, 0, 255).astype(np.uint8).tobytes())
             else:
                 fh.write(zero)
@@ -13558,8 +13688,9 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                     fh.write(ramps[f - f0] if f0 <= f < f1 and k else ramp_b)  # V8.8.3: alpha plane = the top -> bottom colour gradient (0 at the top, 255 at the bottom of the sky)
     if ramp:
         x["mask_fmt"] = "yuva444p" if fam_ else "yuv444p"
-    cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm])) if segm else 0.0
-    return {"mean_y": ymean, "frames": nf, "cov": cov, "held": held, "horizon": x["horizon"], "bad": n_bad, "window": k, "ok_frames": sum(1 for q in status if q == "ok"), "breaks": len(breaks)}
+    cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm[:max(1, cut)]])) if segm else 0.0
+    return {"mean_y": ymean, "frames": nf, "cov": cov, "held": held, "horizon": x["horizon"], "bad": n_bad, "window": cut, "ok_frames": sum(1 for q in status if q == "ok"), "breaks": len(breaks),
+            "cut": cut if cut < k else None}
 
 
 SKY_BANDS = {"n0": 3.0, "n1": 5.0, "depth0": 0.30, "depth1": 0.55, "step": 0.5, "ease_s": 0.12, "drift": 0.12, "edge": (0.50, 0.80)}
@@ -14375,6 +14506,14 @@ def build_filter(plan, cfg, preview, fx=None):
             chains.append(f"{h_}[hit{i_}]")
         chains.append("".join(f"[hit{i_}]" for i_ in range(len(hits))) + (f"amix=inputs={len(hits)}:duration=longest:normalize=0" if len(hits) > 1 else "anull") + "[bm]")
         music_l, extra_in = "[sg]", "[bm]"
+        if DROP_GIVE_WAY[0]:                               # V8.8.6: the drop's extras (the low hit and the gunshot lift's extra part) give way to the music: they go through a compressor keyed by
+            chains[-1 - len(hits) - 1] = f"[gc]volume={head:.4f},asplit=3[gh][gx][gk]"          # music + game, so the safety limiter never has to turn the whole mix (the music) down at a drop.
+            chains.append(f"[gx]volume='{lift}-1':eval=frame[gl]")                               # The game sound itself (gh) and the music (sg) pass unchanged; game + lift part = the old lifted game.
+            chains.append("[gl][bm]amix=inputs=2:duration=first:normalize=0[dx]")
+            chains.append("[sg]asplit=2[sgm][sgk]")
+            chains.append("[sgk][gk]amix=inputs=2:duration=first:normalize=0[dk]")
+            chains.append(f"[dx][dk]sidechaincompress=threshold={DROP_GW[0]}:ratio={DROP_GW[1]}:attack={DROP_GW[2]}:release={DROP_GW[3]}:detection=peak:level_sc=1:makeup=1[dxc]")
+            music_l, extra_in = "[sgm]", "[dxc]"
     else:
         chains.append(f"[gc]volume={head:.4f}[gh]")
         music_l, extra_in = "[sg]", ""
@@ -14384,6 +14523,10 @@ def build_filter(plan, cfg, preview, fx=None):
     chains.append(f"{music_l}[gh]{extra_in}{mix},{lim},atrim=duration={D:.4f},afade=t=in:st=0:d={FADE_IN},"
                   f"afade=t=out:st={fo:.3f}:d={max(0.3, D - fo):.3f}[aout]")
     return inputs, ";\n".join(chains)
+
+
+DROP_GIVE_WAY = [True]               # V8.8.6 switch (tests): the drop's extras are compressed by music + game (the music is never lowered at a drop)
+DROP_GW = (0.005, 20, 0.05, 150)    # V8.8.6: threshold (linear), ratio, attack ms, release ms of that compressor (measured on real plans: the music within 0.1 dB of no drop effect)
 
 
 def drop_audio_filters(drops):
@@ -15539,6 +15682,44 @@ def _ev_paths(e):
     return {e["path"]} | {x["path"] for x in e.get("srcs", []) if isinstance(x, dict) and x.get("path")}
 
 
+MANUAL_PAIR_ALL = [True]                # V8.8.6 switch (tests): Manual pulls in the companion clips of ticked clips in every game (was CS2 only)
+PICK_MULTI_FIRST = [True]               # V8.8.6 switch (tests): Auto / Force New / fill picks take every multikill (unused, then used) before any single
+
+
+SKY_PICK_FIRST = [True]                 # V8.8.6 switch (tests): with the sky on, multikills whose last kill shows a clear sky come first within their group
+SKY_PICK_PROBE = 120                    # ... at most this many of a group are looked at per job (one cached frame each)
+
+
+def _sky_first(evs):
+    """V8.8.6: the events with a clear sky on their last kill first, the order kept otherwise (stable). Only while FULL_CTX['sky_pick'] holds the job's config
+    (the sky recolour on for the game, extra effects); the first SKY_PICK_PROBE events are looked at (event_sky_cov: one cached frame each)."""
+    cfg = FULL_CTX.get("sky_pick")
+    if not cfg or not SKY_PICK_FIRST[0] or not evs:
+        return list(evs)
+    head = list(evs[:SKY_PICK_PROBE])
+    try:
+        with ThreadPoolExecutor(max_workers=min(6, SKY_THREADS)) as ex_:
+            clear = list(ex_.map(lambda e: sky_clear(event_sky_cov(e, cfg)), head))
+    except Exception:                                      # noqa: BLE001
+        return list(evs)
+    return [e for e, c in zip(head, clear) if c] + [e for e, c in zip(head, clear) if not c] + list(evs[SKY_PICK_PROBE:])
+
+
+def _tiered(fresh, old):
+    """V8.8.6: the pick order over unused (`fresh`) and previously used (`old`, already in the allowed order) events: unused multikills, used multikills (companion fights
+    included), unused singles (headshot / flick first), used singles."""
+    r = _pick_rank
+    return _sky_first([e for e in fresh if r(e) == 0]) + _sky_first([e for e in old if r(e) == 0]) + [e for e in fresh if r(e) > 0] + [e for e in old if r(e) > 0]
+
+
+def _pick_rank(e):
+    """V8.8.6: the pick order of an event: 0 = a multikill (a stitched companion fight included), 1 = a headshot / flick single, 2 = a plain single (V6.0: unused first;
+    V8.8.6: also among used clips a multikill comes before any single, then the oldest use)."""
+    if not PICK_MULTI_FIRST[0]:
+        return 1 if e.get("plain") else 0
+    return 0 if int(e.get("n") or 1) >= 2 else (2 if e.get("plain") else 1)
+
+
 def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None):
     """V6.0 weekly / Auto clip pick: this week's (last 7 days) new clips come first; if they do not reach the minimum length, older
     UNUSED clips of the same game follow - best multikills first, then best singles - only as many as needed. V6.5.1: if the unused
@@ -15557,7 +15738,7 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None)
         except OSError:
             return 0.0
     new = [e for e in unused if now_ts - mt(e) <= 7 * 86400]
-    old = sorted([e for e in unused if e not in new], key=lambda e: (bool(e.get("plain")), -e["score"]))
+    old = sorted([e for e in unused if e not in new], key=lambda e: (_pick_rank(e), -e["score"]))
     optimal = target in (None, "", "optimal", 0)
     need = OPT_RANGE[0] + 8.0 if optimal else float(target) * 1.1
     if need_s:                                             # V8.5 Force New Full: enough material to fill the song / the 2:30 section (unused first, then the oldest-used ones)
@@ -15565,13 +15746,28 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None)
     rn = style if style in RECIPES else "hype"
     est = lambda lst: sum(take_estimate(e, 0.47, rn) for e in lst)
     pick = list(new)
+    reused = []
+    if PICK_MULTI_FIRST[0]:                                # V8.8.6: used multikills come before unused plain singles (a mostly used library gave 75 singles of 78 takes)
+        last_ = hist_list(USED_CLIPS, game)[-1:] if game else []
+        prev_ = {_pkey(c) for h in last_ for c in h.get("clips", [])}
+        used_mk = sorted([e for e in events if _pkey(e["path"]) in used and _pick_rank(e) == 0 and not any(_pkey(q) in prev_ for q in _ev_paths(e))],
+                         key=lambda e: (used.get(_pkey(e["path"]), ""), -e["score"]))
+        order_ = _sky_first([e for e in old if _pick_rank(e) == 0]) + _sky_first(used_mk) + [e for e in old if _pick_rank(e) > 0]
+    else:
+        order_ = old
+    taken_ = set().union(*[_ev_paths(e) for e in pick]) if pick else set()
     if est(pick) < need:
-        for e in old:
+        for e in order_:
             if est(pick) >= need:
                 break
+            ps_ = _ev_paths(e)
+            if ps_ & taken_:
+                continue
             pick.append(e)
-    n_old = len(pick) - len(new)
-    reused = []
+            taken_ |= ps_
+            if _pkey(e["path"]) in used:
+                reused.append(e)
+    n_old = len(pick) - len(new) - len(reused)
     floor_need = max(WEEKLY_MIN_S * 1.1, float(need_s or 0))
     if est(pick) < floor_need:
         last = hist_list(USED_CLIPS, game)[-1:] if game else []
@@ -15579,7 +15775,7 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None)
         taken = set().union(*[_ev_paths(e) for e in pick]) if pick else set()
         cands = [e for e in events if e not in pick and _pkey(e["path"]) in used and not (_ev_paths(e) & taken)
                  and not any(_pkey(q) in prev for q in _ev_paths(e))]
-        cands.sort(key=lambda e: (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"]))
+        cands.sort(key=lambda e: ((_pick_rank(e), used.get(_pkey(e["path"]), ""), -e["score"]) if PICK_MULTI_FIRST[0] else (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"])))
         for e in cands:
             if est(pick) >= floor_need:
                 break
@@ -15593,7 +15789,9 @@ def weekly_pick(events, cfg, target, style, now_ts=None, game=None, need_s=None)
                  + (f"; only ~{est(pick):.0f} s of unused material - the montage is shorter (nothing is padded)"
                     if not reused and est(pick) < (OPT_RANGE[0] if optimal else float(target)) - 0.5 else ""))
     if reused:
-        notes.append(f"reused {len(reused)} previously used clip(s) to reach the {WEEKLY_MIN_S:.0f} s minimum")
+        n_mk_ = sum(1 for e in reused if _pick_rank(e) == 0)
+        notes.append(f"reused {len(reused)} previously used clip(s)" + (f" ({n_mk_} multikill(s), taken before unused singles)" if PICK_MULTI_FIRST[0] and n_mk_ else "")
+                     + f" to reach the {'song' if need_s else format(WEEKLY_MIN_S, '.0f') + ' s minimum'}")
     if est(pick) < WEEKLY_MIN_S:
         notes.append(f"the whole library only gives ~{est(pick):.0f} s ({len(pick) - len(reused)} unused + {len(reused)} reused usable event(s); "
                      f"the rest are clips of the previous montage or too short) - below the {WEEKLY_MIN_S:.0f} s minimum, so this is all there is; "
@@ -15612,11 +15810,11 @@ def weekly_more(events, pick, style, game, need_s):
     taken = set().union(*[_ev_paths(e) for e in pick]) if pick else set()
     last = hist_list(USED_CLIPS, game)[-1:] if game else []
     prev = {_pkey(c) for h in last for c in h.get("clips", [])}
-    fresh = sorted([e for e in events if id(e) not in in_pick and _pkey(e["path"]) not in used], key=lambda e: (bool(e.get("plain")), -e["score"]))
+    fresh = sorted([e for e in events if id(e) not in in_pick and _pkey(e["path"]) not in used], key=lambda e: (_pick_rank(e), -e["score"]))
     old = sorted([e for e in events if id(e) not in in_pick and _pkey(e["path"]) in used and not any(_pkey(q) in prev for q in _ev_paths(e))],
-                 key=lambda e: (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"]))
+                 key=lambda e: ((_pick_rank(e), used.get(_pkey(e["path"]), ""), -e["score"]) if PICK_MULTI_FIRST[0] else (used.get(_pkey(e["path"]), ""), bool(e.get("plain")), -e["score"])))
     add, reused = [], []
-    for e in fresh + old:
+    for e in (_tiered(fresh, old) if PICK_MULTI_FIRST[0] else fresh + old):
         if est(add) >= need_s:
             break
         ps = _ev_paths(e)
@@ -16129,6 +16327,7 @@ def ledger_plan_check(led, plan):
 SONG_FILL_END_S = 3.0                   # V8.8.3: a full-song montage ends at most this far before the trimmed end of the song (more: clips are added even under AUTO_TOL_S, when the run-in extend rule could not close it)
 AUTO_TOPUP_ALL = [True]                 # V8.8.5 switch (tests): the Auto top-up with previously used clips (60 s minimum, fixed length) runs for every game, not only CS2
 AUTO_FIXED_SHARE = 0.9                  # V8.8.5: an Auto montage with a fixed slider length is topped up until it reaches this share of it
+SONG_FILL_SCALE = [True]                # V8.8.6 switch (tests): the fill corrects the length estimate by what the last plan really filled
 SONG_FILL_MIN_ADD = 8.0                 # V8.8.5: seconds of clips a fill round adds at least (was 4: the last rounds added one short clip and stopped a few seconds before the end)
 SONG_FILL_ROUNDS = 6                    # V8.8.3: a montage meant to cover the whole song that ends more than AUTO_TOL_S short gets more clips and is planned again, at most this many times (V8.8.5: 6, was 2: with a mostly used library two rounds did not reach the end of the song; a round adds at least SONG_FILL_MIN_ADD s of clips)
 
@@ -16155,6 +16354,10 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     finally:
         FULL_CTX["on"] = False
         FULL_CTX.pop("live", None)
+        FULL_CTX.pop("est_scale", None)
+        FULL_CTX.pop("fill_over", None)
+        FULL_CTX.pop("sky_pick", None)
+        FULL_CTX.pop("last_est", None)
 
 
 def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False):
@@ -16176,8 +16379,8 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
         run_scan(cfg, [game], paths)
     pair = None
     pool_paths = set(paths) if manual else None
-    if game == "cs2" and manual and paths:                 # V6.9: neighbour clips of the ticked clips join the candidate pool
-        pair = pairing_run(cfg, tagged, paths, quiet=not scan)
+    if (game == "cs2" or MANUAL_PAIR_ALL[0]) and manual and paths:      # V6.9: neighbour clips of the ticked clips join the candidate pool (V8.8.6: every game, not only CS2)
+        pair = pairing_run(cfg, tagged, paths, quiet=not scan, game=game)
         if pair and pair["partners"]:
             pool_paths |= {p_["path"] for p_, _, _ in pair["partners"]}
     pool, st = game_pool(cfg, game, pool_paths)
@@ -16212,6 +16415,8 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
         avail_ = float(an_.get("dur") or 0) - float((an_.get("beats") or [0])[0])
         need_full = min(FULL_CAP_S, avail_) * 1.25
         out(f"Force New Full: song {pre_song[0].get('title') or Path(pre_song[0]['path']).stem} ({avail_:.0f} s): filling {min(FULL_CAP_S, avail_):.0f} s, ~{need_full:.0f} s of clips wanted")
+    if effects_mode(cfg, game) == "extra" and sky_enabled(cfg, game):
+        FULL_CTX["sky_pick"] = cfg                         # V8.8.6: the pick prefers clear-sky multikills within their group (_sky_first)
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
         events, wk_notes = weekly_pick(events, cfg, cfg.get("length_s", "optimal") if target is None else target,
                                        cfg.get("style", "auto") if style is None else style, game=game, need_s=need_full)
@@ -16304,6 +16509,11 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
                 notes.append(f"song fill: the montage is {short_:.0f} s short of the song but no other clip is left to add")
                 break
             picked = picked + add
+            est_ = float(FULL_CTX.get("last_est") or 0.0)
+            if SONG_FILL_SCALE[0] and est_ > 1.0 and float(plan["duration"]) < est_:        # V8.8.6: the clips came out shorter than estimated: the next fit counts them that much shorter,
+                FULL_CTX["est_scale"] = round(max(0.5, float(FULL_CTX.get("est_scale") or 1.0) * float(plan["duration"]) / est_), 4)     # so the added clips are kept instead of 'don't fit'
+            if SONG_FILL_SCALE[0]:
+                FULL_CTX["fill_over"] = True
             notes.append(f"song fill: the plan covers {plan['duration']:.0f} of {want_s:.0f} s of the (trimmed) song ({short_:.1f} s short): {len(add)} more clip(s) added"
                          + (f" ({len(reused_)} used before)" if reused_ else "") + f", planned again ({r_ + 1} of {SONG_FILL_ROUNDS})")
             out(notes[-1])
@@ -16317,6 +16527,17 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
             if short_of(plan) > best[0]:
                 notes.append(f"song fill: the plan of round {SONG_FILL_ROUNDS} was {short_of(plan):.1f} s short, the closer one ({best[0]:.1f} s short) is kept")
                 _s, plan, pool_ev, fixes, events = best
+        if short_of(plan) > SONG_FILL_END_S:                # V8.8.6: still short: say exactly why (the reasons the planner gave for the clips it could not place)
+            why_ = {}
+            for n_ in (plan.get("notes") or []):
+                m_ = re.match(r"\s*(?:NOTE\s+)?NOT PLACED .*?\.(?:mp4|mov|mkv|avi): (.*)$", str(n_))
+                if m_:
+                    k_ = re.sub(r"[\d.]+ ?s\b", "N s", m_.group(1))[:110]
+                    why_[k_] = why_.get(k_, 0) + 1
+            top_ = "; ".join(f"{v_} x {k_}" for k_, v_ in sorted(why_.items(), key=lambda kv: -kv[1])[:3])
+            notes.append(f"song fill: the montage still ends {short_of(plan):.1f} s before the end of the (trimmed) song after {SONG_FILL_ROUNDS} rounds"
+                         + (f"; the clips that were offered but not placed: {top_}" if top_ else "; no other usable clip was left to add"))
+            out(notes[-1])
     rounds = 0
     try:
         fixed_s = float(target) if target not in (None, "", "optimal") else None

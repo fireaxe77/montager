@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8.6 - 2026-10-23: More multikills, real kills only
+- Montages are now built from multikills first: every multikill, unused or used before, comes before any single kill, and clips saved right after each other are joined into one fight in every mode and game
+- CS2 kills that were already in the kill feed when a clip started are no longer shown as kills, while bots or players killed again later in the same clip now count, so real multikills are no longer dropped
+- Full-song montages reach the end of the song again, and the drop no longer turns the music down
+- The sky is looked for on more kills and fades out when the camera turns away from it, and it never slides onto a wall
+
 ## V8.8.5 - 2026-10-22: Five moving sky patterns, one per song
 - The sky now moves smoothly on every frame, and each montage gets one of five patterns picked from its song: flowing bands, drifting amoebas, rippling rings, turning rays or swaying aurora curtains
 - The sky colour no longer flashes onto walls or buildings for a frame when it starts, after a cut or when the camera turns
