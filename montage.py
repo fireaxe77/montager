@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.8.6"
+APP_VERSION = "V8.8.7"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -76,7 +76,7 @@ VIDEO_EXT = {".mov", ".mp4", ".mkv"}
 AUDIO_EXT = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".opus"}
 MIN_VIDEO = 1 * 1024 * 1024
 SKIP_DIR_NAMES = {"windows", "program files", "program files (x86)", "appdata", "programdata", "snipping tool",
-                  "$recycle.bin", "system volume information", "montage_data", "node_modules", ".git"}
+                  "$recycle.bin", "system volume information", "montage_data", "node_modules", ".git", "montager moved clips"}     # V8.8.7: the move folder is never scanned
 BAR_THRESHOLD = 12        # pixel brightness (0-255) counted as content
 BAR_FRAMES = 24
 GAMES = ("valorant", "cs2", "r6s")        # V8.0.0: r6s = Rainbow Six Siege (own folders, own icon-template detection, nothing shared with the other two)
@@ -1733,7 +1733,11 @@ def scan_clip(path, rec, det, cfg, scale=None):
     return e
 
 
-def _row_match(t, r, prev_f):
+EMPTY_NAME_GAP_S = 1.0           # V8.8.7: a row with an unreadable name is the same row as a track at its height only if that track was seen this recently (not a new row in a freed slot)
+EMPTY_NAME_GAP_ON = [True]       # V8.8.7 switch (tests / library audit)
+
+
+def _row_match(t, r, prev_f, f=None):
     """Similarity (0-100) of a tracked row and a row in the current OCR frame: killer text + victim text + weapon, with a bonus
     when the row's pixels did not change since the previous OCR frame at the same height (OCR noise on short names).
     An unreadable (empty) name only matches a track that is still at the same height; names whose length differs by 2+
@@ -1749,6 +1753,8 @@ def _row_match(t, r, prev_f):
     if (va and not vb) or (vb and not va) or (ka and not kb_) or (kb_ and not ka):
         if not same_y:
             return 0.0
+        if EMPTY_NAME_GAP_ON[0] and f is not None and f - t["last"] > EMPTY_NAME_GAP_S * FPS:
+            return 0.0                                     # V8.8.7: the old row had gone (the feed was empty for seconds): a row in its slot now is a new row
     if va and vb and abs(len(va) - len(vb)) >= 2 and fuzz.ratio(va, vb) < 90:
         return 0.0
     sk = fuzz.ratio(t["k"], r["ktext"].lower()) if (ka and kb_) else 100.0
@@ -1942,10 +1948,16 @@ def merge_variants(tracks, game=None):
         for m in out_:
             a, b = _alnum(t["v"]), _alnum(m["v"])
             if (not a) != (not b) and not (t.get("frames", set()) & m.get("frames", set())) and \
-                    min(t["first"], m["first"]) + 0 <= max(t["first"], m["first"]) <= min(t["last"], m["last"]) + 4.5 * FPS and \
+                    min(t["first"], m["first"]) + 0 <= max(t["first"], m["first"]) <= min(t["last"], m["last"]) + (EMPTY_NAME_GAP_S if (EMPTY_NAME_GAP_ON[0] and game != "cs2") else 4.5) * FPS and \
                     (t["ks"] >= 0.8) == (m["ks"] >= 0.8) and (t["vs"] >= 0.8) == (m["vs"] >= 0.8) and \
                     fuzz.ratio(_alnum(t["k"]), _alnum(m["k"])) >= 70:
                 hit = m                                    # the same row: its name was unreadable at first, read later
+                break
+            if EMPTY_NAME_GAP_ON[0] and game != "cs2" and not a and not b and not (t.get("frames", set()) & m.get("frames", set())) and \
+                    t["first"] - m["last"] <= EMPTY_NAME_GAP_S * FPS and (t["first"] - m["last"] >= 0 or abs(t["y"] - m["y"]) <= 6) and \
+                    (t["ks"] >= 0.8) == (m["ks"] >= 0.8) and \
+                    fuzz.ratio(_alnum(t["k"]), _alnum(m["k"])) >= 70:
+                hit = m                                    # V8.8.7: one unreadable row: moved up when the row above it expired, or re-read at its own height in frames the track missed (never on screen together)
                 break
             if abs(t["first"] - m["first"]) > 1.5 * FPS:
                 continue
@@ -2124,7 +2136,7 @@ def analyse_entry(entry, cfg, game=None):
             pairs = sorted(((_row_match_cs2(t, r, prev_f, f, bool(dy)), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
                             if f - t["last"] <= TRACK_KEEP_S * FPS), reverse=True)
         else:
-            pairs = sorted(((_row_match(t, r, prev_f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
+            pairs = sorted(((_row_match(t, r, prev_f, f), i, j) for i, (r, v) in enumerate(cand) for j, t in enumerate(tracks)
                             if f - t["last"] <= TRACK_KEEP_S * FPS), reverse=True)
         used_r, used_t, got = set(), set(), {}
         for sc, i, j in pairs:                                 # one-to-one: two rows in one frame are never the same row
@@ -17293,6 +17305,33 @@ def trash_file(path):
         raise OSError("the file is still there after the move")
 
 
+MOVED_DIR_NAME = "Montager moved clips"     # V8.8.7: the move icon's folder (in SKIP_DIR_NAMES: never scanned for clips)
+MOVED_GAME_DIR = {"valorant": "Valorant", "cs2": "CS2", "r6s": "Rainbow Six"}
+
+
+def moved_root(cfg):
+    """V8.8.7: the folder the clip list's move icon moves clips into: <clip_root>\\Montager moved clips (E:\\Movies\\Montager moved clips by default), one subfolder per game.
+    When that place would be inside a scanned clip folder, it goes next to montage_data instead (montage_data\\..\\Montager moved clips)."""
+    base = (cfg or {}).get("moved_dir") or os.path.join((cfg or {}).get("clip_root") or str(DATA.parent), MOVED_DIR_NAME)
+    for d in clip_roots(cfg or {}) if (cfg or {}).get("clip_dirs") else []:
+        if norm(base) == norm(d) or norm(base).startswith(norm(d) + os.sep):
+            return os.path.join(str(DATA.parent), MOVED_DIR_NAME)
+    return base
+
+
+def move_clip_file(path, game, cfg):
+    """V8.8.7: move a clip file into moved_root(cfg)\\<game folder> (a name already there gets ' (2)', ' (3)' ...). Returns the new path; raises on failure. Never deletes."""
+    dest_dir = os.path.join(moved_root(cfg), MOVED_GAME_DIR.get(game or "", "Other"))
+    os.makedirs(dest_dir, exist_ok=True)
+    stem, ext = os.path.splitext(os.path.basename(path))
+    dest, n = os.path.join(dest_dir, stem + ext), 2
+    while os.path.exists(dest):
+        dest = os.path.join(dest_dir, f"{stem} ({n}){ext}")
+        n += 1
+    shutil.move(path, dest)
+    return dest
+
+
 def forget_clip(path, fk=None):
     """V6.7.4: drop everything stored about a clip file that is gone: its scan-cache entries (kills, clip record), its used flag and title.
     fk = file_key(path) taken BEFORE the file was moved (the key holds its size and time)."""
@@ -18888,12 +18927,12 @@ class App:
         self.btn(top, "Clear", lambda: self.m_csearch.set(""), name="manual:clear_search").pack(side="left", padx=4)
         self.m_cshown = tk.StringVar(value="")
         ttk.Label(top, textvariable=self.m_cshown, style="Dim.TLabel").pack(side="left", padx=8)
-        fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used", "open", "trash"), height=20, selectmode="none")
+        fr, self.ctree = make_tree(s1, ("date", "len", "kills", "used", "open", "move", "trash"), height=20, selectmode="none")
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 400, "Clip"), ("date", 100, "Date"), ("len", 64, "Length"), ("kills", 90, "Kills"), ("used", 230, "Used"),
-                        ("open", 74, ""), ("trash", 40, "")):
-            self.ctree.column(c, width=w, minwidth=(56 if c not in ("open", "trash") else 36 if c == "trash" else 64), stretch=(c == "#0"),
-                              anchor="center" if c in ("open", "trash") else "w")
+                        ("open", 74, ""), ("move", 40, ""), ("trash", 40, "")):
+            self.ctree.column(c, width=w, minwidth=(56 if c not in ("open", "move", "trash") else 36 if c in ("move", "trash") else 64), stretch=(c == "#0"),
+                              anchor="center" if c in ("open", "move", "trash") else "w")
             self.ctree.heading(c, text=t)
         self.make_sortable(self.ctree, self.apply_filter, {"#0": "Clip", "date": "Date", "len": "Length", "kills": "Kills",
                                                            "used": "Used"})
@@ -18997,9 +19036,11 @@ class App:
         self.reveal(win)
 
     OPEN_COL = "#5"                                        # the "▶ Open" column
-    TRASH_COL = "#6"                                       # V6.7.4: the Recycle Bin column (last)
+    MOVE_COL = "#6"                                        # V8.8.7: the move icon (the clip goes to the game's folder in moved_root, out of every montage)
+    TRASH_COL = "#7"                                       # V6.7.4: the Recycle Bin column (last)
     USED_COL = "#4"                                        # the Used column (V6.7.4: title of the montage the clip was used in)
     TRASH_GLYPH = "\U0001F5D1"
+    MOVE_GLYPH = "\u27A1"
 
     def unflag_all(self):
         """V6.5.1: every used flag (Valorant and CS2) is cleared after a Yes; a dated backup of the flags file is written first."""
@@ -19047,6 +19088,37 @@ class App:
             self.ctree.set(iid, "used", "")
         getattr(self, "_fill_sig", {}).pop(self.ctree, None)
         out(f"unflagged {c.get('name') or Path(iid).name}")
+
+    def move_clip(self, iid):
+        """V8.8.7: the move cell: after a Yes the clip file goes to moved_root\\<game> (kept, not deleted, never scanned again), so it is out of every montage;
+        the row leaves the list. Refused while a scan or render runs; on failure the error is shown and the row stays."""
+        c = self.byp.get(iid)
+        if not c:
+            return
+        name = c.get("name") or Path(iid).name
+        if self.busy or getattr(self, "est_running", False) or getattr(self, "scan_active", False):
+            self.status_flash("Busy (scan or render running) - try again when it is done")
+            out(f"not moved (a scan or render is running): {name}")
+            return
+        cfg = load_config()
+        game = c.get("game") or (tag_game(iid, cfg) or (None,))[0] or self.m_game.get()
+        dest_dir = os.path.join(moved_root(cfg), MOVED_GAME_DIR.get(game or "", "Other"))
+        if not messagebox.askyesno("Move clip", f"Move {name} out of your montages, into\n{dest_dir}?\n\nThe file is kept there and never used again (move it back to use it)."):
+            return
+        try:
+            dest = move_clip_file(iid, game, cfg)
+        except Exception as ex:
+            out(f"move failed for {name}: {ex}")
+            messagebox.showerror("Move clip", f"Could not move {name}:\n{ex}")
+            return
+        self.clips = [x for x in self.clips if x["path"] != iid]
+        self.byp.pop(iid, None)
+        self.ticked.discard(iid)
+        if self.last_click == iid:
+            self.last_click = None
+        getattr(self, "_fill_sig", {}).pop(self.ctree, None)
+        self.apply_filter()
+        out(f"moved out of the montages: {name} -> {dest}")
 
     def trash_clip(self, iid):
         """V6.7.4: the trash cell: after a Yes the clip file goes to the Recycle Bin (never a permanent delete); the row, its scan-cache
@@ -19156,8 +19228,8 @@ class App:
         if self.ctree.identify_region(e.x, e.y) in ("heading", "separator"):
             return None
         iid = self.ctree.identify_row(e.y)
-        if iid and self.ctree.identify_column(e.x) == self.TRASH_COL:
-            return "break"                                 # the trash cell never opens the clip
+        if iid and self.ctree.identify_column(e.x) in (self.TRASH_COL, self.MOVE_COL):
+            return "break"                                 # the trash / move cells never open the clip
         if iid:
             self.open_clip_player(iid)
         return "break"
@@ -19174,6 +19246,9 @@ class App:
             return "break"
         if iid and self.ctree.identify_column(e.x) == self.TRASH_COL:
             self.trash_clip(iid)                           # V6.7.4: the trash cell never ticks or unticks the row
+            return "break"
+        if iid and self.ctree.identify_column(e.x) == self.MOVE_COL:
+            self.move_clip(iid)                            # V8.8.7: the move cell never ticks or unticks the row
             return "break"
         if iid:
             if (e.state & 0x1) and self.last_click and self.ctree.exists(self.last_click):
@@ -19377,7 +19452,7 @@ class App:
             rows.append((c["path"], self.row_text(c["path"]),
                          (time.strftime("%Y-%m-%d", time.localtime(c["mtime"])), f"{int(c['dur'] // 60)}:{int(c['dur'] % 60):02d}",
                           "not scanned" if c["kills"] is None else str(c["kills"]), c.get("used_label") or c.get("used", ""), "\u25b6 Open",
-                          self.TRASH_GLYPH)))
+                          self.MOVE_GLYPH, self.TRASH_GLYPH)))
         self.fill_chunked(self.ctree, self.sorted_rows(self.ctree, rows))
         self.update_status()
 

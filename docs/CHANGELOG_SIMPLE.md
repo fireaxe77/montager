@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V8.8.7 - 2026-10-23: Move bad clips out of your montages
+- A new arrow icon next to the trash icon in the clip list moves a clip into a folder for its game, so it is never used in a montage again but is not deleted
+- Moved clips are kept in E:\Movies\Montager moved clips, with one folder each for Valorant, CS2 and Rainbow Six
+- Valorant kills right after a stretch with an empty kill feed are no longer lost when an earlier kill's name could not be read
+
 ## V8.8.6 - 2026-10-23: More multikills, real kills only
 - Montages are now built from multikills first: every multikill, unused or used before, comes before any single kill, and clips saved right after each other are joined into one fight in every mode and game
 - CS2 kills that were already in the kill feed when a clip started are no longer shown as kills, while bots or players killed again later in the same clip now count, so real multikills are no longer dropped
