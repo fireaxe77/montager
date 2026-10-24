@@ -10360,29 +10360,12 @@ GAME_TAG = {"valorant": "VALORANT", "cs2": "CS2", "r6s": "R6S"}
 
 
 def series_next(game, cfg):
-    """V9.0: the series number N of the next Auto / weekly / Force montage of a game: the montages that already exist when the counter starts + the ones finished since + 1 (persistent)."""
+    """The series number N of the next Auto / weekly / Force montage of a game: the finished montages of that game directly inside its output folder (no subfolders, no stored counter) + 1."""
     try:
-        d = load_json(SERIES_FILE, {})
-        e = d.get(game)
-        if not isinstance(e, dict):
-            base = len(montage_videos(Path(cfg["output_root"]) / GAME_DIR[game], game))
-            e = d[game] = {"base": base, "done": 0}
-            save_json(SERIES_FILE, d)
-        return int(e["base"]) + int(e["done"]) + 1
+        return len(montage_videos(Path(cfg["output_root"]) / GAME_DIR[game], game)) + 1
     except Exception as ex:                                # noqa: BLE001
         LOGONLY(f"series number not read: {type(ex).__name__}: {ex}")
         return 1
-
-
-def series_done(game, cfg):
-    """V9.0: one more finished Auto / weekly / Force montage of this game."""
-    try:
-        series_next(game, cfg)                             # (creates the counter from the existing montages when it does not exist yet)
-        d = load_json(SERIES_FILE, {})
-        d[game]["done"] = int(d[game]["done"]) + 1
-        save_json(SERIES_FILE, d)
-    except Exception as ex:                                # noqa: BLE001
-        LOGONLY(f"series counter not saved: {type(ex).__name__}: {ex}")
 
 
 def save_last_seed(plan):
@@ -18140,8 +18123,6 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
         save_json(logs / (outfile.stem + ".plan.json"), plan)
         record_history(plan, outfile.stem)
         save_last_seed(plan)                               # V9.0: the Manual tab's 'Last seed' button
-        if paths is None:                                  # V9.0: the series number counts the finished Auto / weekly / Force montages of this game
-            series_done(game, cfg)
         try:                                               # V6.0: flagged used only now, after the render succeeded
             mark_used({t["path"] for t in plan["takes"]} | {x["path"] for t in plan["takes"] for x in t.get("srcs", [])}, title=outfile.stem)
         except Exception as ex:
