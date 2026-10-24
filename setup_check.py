@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+FROZEN = bool(getattr(sys, "frozen", False))            # inside the packaged Montager.exe (Python and every package are bundled)
+REINSTALL = "reinstall Montager from https://github.com/fireaxe77/montager/releases/latest"
 DATA = Path(os.environ.get("MONTAGER_DATA") or (HERE / "montage_data")).resolve()     # the same rule as montage.py
 CONFIG = DATA / "config.json"
 GAMES = (("valorant", "Valorant"), ("cs2", "CS2"), ("r6s", "Rainbow Six Siege"))
@@ -77,6 +79,9 @@ def tool(name):
 
 def check_python():
     section("Python")
+    if FROZEN:
+        ok(f"bundled Python {sys.version.split()[0]} (nothing to install)")
+        return
     v = sys.version_info
     bits = 64 if sys.maxsize > 2 ** 32 else 32
     txt = f"Python {v.major}.{v.minor}.{v.micro} ({bits}-bit) at {sys.executable}"
@@ -107,7 +112,7 @@ def check_packages():
             missing.append(pip)
             bad(f"{pip} is missing or broken ({type(ex).__name__})")
     if missing:
-        print(f"            Fix: python -m pip install --user {' '.join(missing)}")
+        print(f"            Fix: {REINSTALL}" if FROZEN else f"            Fix: python -m pip install --user {' '.join(missing)}")
     rec = []
     for mod, pip, why in RECOMMENDED:
         try:
@@ -116,7 +121,7 @@ def check_packages():
         except Exception:                              # noqa: BLE001
             rec.append(pip)
             warn(f"{pip} not installed: recommended for {why}")
-    if rec:
+    if rec and not FROZEN:
         print(f"            Fix: python -m pip install --user {' '.join(rec)}")
     for mod, pip, why in OPTIONAL:
         try:
@@ -148,15 +153,15 @@ def check_ffmpeg():
     else:
         bad("this ffmpeg has no libx264 encoder", "use the gyan.dev 'essentials' or 'full' build (see above)")
     if "h264_nvenc" not in enc:
-        warn("no NVIDIA encoder (h264_nvenc) in this ffmpeg: use Quality 'Max (x264)' - slower, same result")
+        warn("no NVIDIA encoder (h264_nvenc) in this ffmpeg: renders use x264 on the CPU - slower, same result")
         return
     r = run([ff, "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30:d=0.2",
              "-c:v", "h264_nvenc", "-f", "null", "-"])
     if r is not None and r.returncode == 0:
         ok("NVIDIA GPU encoder works (Quality: Fast (NVENC))")
     else:
-        warn("NVIDIA encoder present but the test encode failed (no NVIDIA GPU, or an old driver)",
-             "update the NVIDIA driver, or use Quality 'Max (x264)' in Montager")
+        warn("no working NVIDIA GPU encoder (no NVIDIA GPU, or an old driver)" + (": Montager renders with x264 on the CPU instead (slower, same result)" if FROZEN else ""),
+             "nothing to do; with an NVIDIA GPU, update its driver: https://www.nvidia.com/Download/index.aspx" if FROZEN else "update the NVIDIA driver, or use Quality 'Max (x264)' in Montager")
 
 
 def check_ocr():
@@ -165,7 +170,7 @@ def check_ocr():
         from rapidocr_onnxruntime import RapidOCR
     except Exception as ex:                            # noqa: BLE001
         bad(f"RapidOCR cannot be loaded ({type(ex).__name__}: {str(ex)[:120]})",
-            "python -m pip install --user rapidocr-onnxruntime")
+            REINSTALL if FROZEN else "python -m pip install --user rapidocr-onnxruntime")
         return
     try:
         import numpy as np
@@ -181,7 +186,7 @@ def check_ocr():
                  "reinstall it: python -m pip install --user --force-reinstall rapidocr-onnxruntime")
     except Exception as ex:                            # noqa: BLE001
         bad(f"RapidOCR failed on a test image ({type(ex).__name__}: {str(ex)[:120]})",
-            "python -m pip install --user --force-reinstall rapidocr-onnxruntime onnxruntime")
+            REINSTALL if FROZEN else "python -m pip install --user --force-reinstall rapidocr-onnxruntime onnxruntime")
 
 
 def load_cfg():
@@ -217,6 +222,10 @@ def check_settings():
     section("Settings (montage_data\\config.json)")
     cfg = load_cfg()
     if cfg is None:
+        if FROZEN:
+            bad(f"no settings saved yet ({CONFIG} does not exist)",
+                "start Montager once from the Start menu: it creates your settings, then fill them in on its Settings tab")
+            return
         bad(f"no settings saved yet ({CONFIG} does not exist): Montager would start with the developer's own example folders and names",
             "start Montager with Start_Montager.bat (it creates the file from config.example.json), or copy config.example.json "
             "to montage_data\\config.json, then fill in Settings")
@@ -299,7 +308,7 @@ def main():
     print("Montager setup check (read-only: nothing is changed)")
     print(f"  app folder:  {HERE}")
     print(f"  data folder: {DATA}")
-    if not (HERE / "montage.py").is_file():
+    if not FROZEN and not (HERE / "montage.py").is_file():
         bad("montage.py is not next to this script", "unzip the whole Montager folder and run this from inside it")
     check_python()
     check_packages()
