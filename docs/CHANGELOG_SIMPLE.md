@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.0 - 2026-10-24: An intro and an outro for every montage
+- Every montage now opens with a 7 second intro: your first clip, slowed down and blurred while the song fades in and the song title appears over it, then the picture sharpens and speeds up into the clip
+- Six looks for the title, chosen from the style of the montage; two of them take their colours from the montage's sky colours. In Manual you can type your own intro text, or untick the intro (Dry plan is now a small button next to it)
+- Montages end with a slow-motion release of the last kill, a long smooth fade to black and a longer music tail, using a clip with a few quiet seconds after its last kill
+- A montage is never longer than 3 minutes, intro and outro included. A new "Last seed" button next to the seed box in Manual brings back the seed of the last montage you rendered
+
 ## V8.8.8 - 2026-10-23: Faster renders and instant clip switching
 - Montages render about 35 to 45 percent faster, with exactly the same picture and sound as before
 - Switching between CS2, Valorant and Rainbow Six clips is now nearly instant, and the app opens faster
