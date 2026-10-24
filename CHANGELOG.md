@@ -783,14 +783,8 @@ Five items, one commit each:
 ## V3 - 2026-10-04
 - Row-first killer / victim detection, shared kill logic, per-clip atomic cache, real-time kills, one-to-one song matching, CSV tempo, GUI selection tools and theme. (Commit message only; no further details recorded.)
 
-## Megafix (no version number) - 2026-10-04
+## V2 - 2026-10-04
 - Folder-only clips, real multi-scale detection with raw-frame cache, killer-only / gunshot / death rules, song-anchored frame-exact planner, effect fallbacks, sync report, rebuilt GUI. (Commit message only; no further details recorded.)
 
-## First builder (no version number) - 2026-10-04
+## V1 - 2026-10-04
 - "Complete montage builder": GUI, kill detection, song analysis, planner, render engine. (Commit message only; no further details recorded.)
-
-## Stage 0 - 2026-10-04
-- `montage.py` with setup, selfcheck, inventory, tag.
-
-## Initial commit - 2026-10-04
-Details not recorded.
