@@ -217,4 +217,4 @@ More: [docs/guides/TROUBLESHOOTING.md](docs/guides/TROUBLESHOOTING.md) · Projec
 - Fonts: Anton, Bebas Neue, Montserrat, Oswald, Playfair Display and Unbounded, under the SIL Open Font License 1.1 ([fonts/OFL.txt](fonts/OFL.txt)).
 - Uses Python, FFmpeg, RapidOCR / ONNX Runtime, OpenCV, NumPy, SciPy, librosa, soundfile, mutagen, RapidFuzz, Pillow and sv-ttk (installed separately; see [CREDITS.md](CREDITS.md)).
 - Montager is a fan project, not affiliated with Riot Games, Valve or Ubisoft.
-- Montager's own license: not chosen yet.
+- Montager itself is released under the [MIT License](LICENSE). The bundled fonts keep their own license (SIL OFL 1.1).
