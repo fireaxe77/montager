@@ -494,14 +494,8 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 ## V3 - 2026-10-04: Row-first kill detection
 - Kills are read row by row (killer and victim), results are cached per clip, and songs are matched one to one.
 
-## Megafix (no version number) - 2026-10-04: Folder-only clips and a rebuilt GUI
+## V2 - 2026-10-04: Folder-only clips and a rebuilt GUI
 - Clips come from folders only, detection checks several scales, and the planner places kills on the song frame-exactly.
 
-## First builder (no version number) - 2026-10-04: First complete montage builder
+## V1 - 2026-10-04: First complete montage builder
 - The first complete tool: GUI, kill detection, song analysis, planner and renderer.
-
-## Stage 0 (no version number) - 2026-10-04: Setup commands
-- Setup, self-check, inventory and tag commands.
-
-## Initial commit (no version number) - 2026-10-04: Repository created
-- Details not recorded.
