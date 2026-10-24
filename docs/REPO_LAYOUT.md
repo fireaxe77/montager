@@ -4,6 +4,8 @@
 montage.py                 the app (GUI + engine) - run everything from the repo root
 songmap_compare.py         `montage.py songmapcompare` (imported by montage.py by name, so it sits next to it)
 songmap_v2/                the SONGMAPV2 package (reached only through get_songmap())
+intro90.py                 V9.0: the intro's title text (six looks), clean title, speed profile (imported lazily by montage.py)
+fonts/                     V9.0: the six free (SIL OFL) title fonts of the intro + their licence note
 CHANGELOG.md  README.md  CLAUDE.md  .gitignore
 Montager.vbs  Montage.vbs  Create_Desktop_Shortcut.vbs  Set_Shortcut_AppId.ps1     launchers / shortcut helpers (paths are relative to the root)
 montage.ico  montage.png   window / taskbar icon (opened next to montage.py)

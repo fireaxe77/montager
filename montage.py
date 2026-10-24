@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V8.8.8"
+APP_VERSION = "V9.0"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -9203,7 +9203,7 @@ def ease_in_segments(src_start, v0, E=EASE_FR, group=3):
         pos = b
     return segs, pos
 FADE_IN = 0.3                           # music + video fade-in at the very start
-END_FADE = (2.0, 3.0)                   # final slow-mo + music + video fade, from the final kill
+END_FADE = (3.0, 4.0)                   # final slow-mo release + music + video fade, from the final kill (V9.0: 3-4 s, was 2-3 s: a release of about 1.5 s of real footage, then an eased fade to black)
 RECIPES = {                             # all within V4's effect strength; they change pacing, run-ups, zooms, slow-mo, transitions
     "hype":       {"zoom_p": 0.60, "zoom_amp": 0.08, "ramp_p": 0.35, "flash": True, "slow_max": 1, "lead": (1, 2),
                    "trans": {"hard": 0.6, "flash": 0.2, "zoom": 0.2}},
@@ -9623,7 +9623,23 @@ def optimal_length(events, bd, notes):
 
 HEADLINE_RULES_V73 = True               # V7.3: headline anchor (finisher on the drop) + single-kill tie-break; False = the V7.2 planner (tests compare against it)
 
-FULL_CAP_S, FULL_MIN_S, FULL_TOTAL_S = 150.0, 90.0, 180.0     # V8.5: Force New Full / Manual Auto only: montage content at most 2:30 (3:00 with the ending), a long song's section is 1:30 .. 2:30; the one place to change it
+FULL_CAP_S, FULL_MIN_S, FULL_TOTAL_S = 180.0, 120.0, 180.0     # V8.5 / V9.0: Force New Full / Manual Auto only: the WHOLE montage (intro and outro included) at most 3:00, a long song's section is 2:00 .. 3:00; the one place to change it
+INTRO_S = 7.0                           # V9.0: the intro's fixed length (s); the montage's first clip, blurred and slowed, with the title over it (intro90.py)
+INTRO_ON = [True]                       # V9.0 test switch: False = no montage has an intro (every plan / render as before)
+INTRO_CTX = {"on": False, "text": None, "series": None}     # V9.0: set by make_plan for the plan it makes (like FULL_CTX): whether this montage gets an intro, its Manual text, the series number
+INTRO_MANUAL = {"on": True, "text": ""}                     # V9.0: the Manual tab's INTRO TEXT box and tickbox (the GUI writes it; make_plan reads it for a Manual plan)
+
+
+def manual_intro_cut():
+    """V9.0: the intro's seconds a Manual plan made now would have (the INTRO tickbox of the Manual tab), for the helpers that size a clip selection before make_plan runs."""
+    return INTRO_S if (INTRO_ON[0] and INTRO_MANUAL["on"]) else 0.0
+
+
+def intro_cut():
+    """V9.0: seconds the intro takes from the 3:00 total and from the song's start (0.0 when the plan in the making has no intro)."""
+    return INTRO_S if INTRO_CTX.get("on") else 0.0
+
+
 FULL_CTX = {"on": False}                # V8.5: True while make_plan(full=True) plans: optimal_fit() then uses the FULL_* range instead of OPT_RANGE
 SONG_DEAD_AMP = 0.002                   # V8.8 (full mode): a stretch of the song whose peak stays under this (about -54 dBFS) is dead silence ...
 SONG_DEAD_MIN_S = 0.25                  # ... and is cut from the start / end of the song when it lasts at least this long
@@ -10322,6 +10338,206 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
     return lines
 
 
+SERIES_FILE = DATA / "series_counts.json"
+LAST_SEED_FILE = DATA / "last_seed.json"
+GAME_TAG = {"valorant": "VALORANT", "cs2": "CS2", "r6s": "R6S"}
+
+
+def series_next(game, cfg):
+    """V9.0: the series number N of the next Auto / weekly / Force montage of a game: the montages that already exist when the counter starts + the ones finished since + 1 (persistent)."""
+    try:
+        d = load_json(SERIES_FILE, {})
+        e = d.get(game)
+        if not isinstance(e, dict):
+            base = len(montage_videos(Path(cfg["output_root"]) / GAME_DIR[game], game))
+            e = d[game] = {"base": base, "done": 0}
+            save_json(SERIES_FILE, d)
+        return int(e["base"]) + int(e["done"]) + 1
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"series number not read: {type(ex).__name__}: {ex}")
+        return 1
+
+
+def series_done(game, cfg):
+    """V9.0: one more finished Auto / weekly / Force montage of this game."""
+    try:
+        series_next(game, cfg)                             # (creates the counter from the existing montages when it does not exist yet)
+        d = load_json(SERIES_FILE, {})
+        d[game]["done"] = int(d[game]["done"]) + 1
+        save_json(SERIES_FILE, d)
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"series counter not saved: {type(ex).__name__}: {ex}")
+
+
+def save_last_seed(plan):
+    """V9.0: the seed of the most recently rendered montage (any game, any mode), kept for the Manual tab's 'Last seed' button."""
+    try:
+        save_json(LAST_SEED_FILE, {"seed": int(plan["seed"]), "game": plan.get("game"), "at": datetime.datetime.now().isoformat(timespec="seconds")})
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"last seed not saved: {type(ex).__name__}: {ex}")
+
+
+def load_last_seed():
+    """V9.0: the stored seed of the last rendered montage, or None when no montage has been rendered yet."""
+    v = load_json(LAST_SEED_FILE, {})
+    try:
+        return int(v["seed"]) if isinstance(v, dict) and v.get("seed") else None
+    except (TypeError, ValueError):
+        return None
+
+
+INTRO_SHOT_MIN = 8.0                 # V9.0: a gunshot transient this strong counts as a fight (weaker ones are footsteps, reloads, impacts: R6S / CS2 clips are full of them)
+
+
+def intro_fight_marks(ev, cfg):
+    """V9.0: ([clip times that mark a fight: my deaths (+0.2 s) and strong gunshots], a note when the sound could not be checked) of the event's first clip."""
+    rec = ev.get("rec") or {}
+    marks, note = [float(d) + 0.2 for d in (ev.get("deaths") or [])], ""
+    ons = None
+    try:
+        ons = gun_onsets(rec, None, cfg)
+    except Exception as ex:                                # noqa: BLE001
+        note = f"gunshots not checked ({type(ex).__name__})"
+    if ons is None:
+        return marks, note or "no sound: gunshots not checked"
+    try:
+        mute_ = not ons and rec.get("game") == "cs2" and cs2_no_gunshots(rec, ons)
+    except Exception:                                      # noqa: BLE001
+        mute_ = not ons
+    if mute_:
+        return marks, "the sound has no gunshots at all: not checked"
+    return marks + [float(o[0]) for o in ons if float(o[1]) >= INTRO_SHOT_MIN], note
+
+
+def intro_footage_safe(ev, a, b, cfg):
+    """V9.0: is the clip footage [a, b] free of a fight (my death, a strong gunshot)? (ok, why / note)."""
+    marks, note = intro_fight_marks(ev, cfg)
+    bad = [m for m in marks if a - 0.05 <= m <= b + 0.02]
+    if bad:
+        return False, f"a gunshot or my death at {bad[0]:.2f} s in the footage"
+    return True, note
+
+
+def intro_clean_start(ev, t1, cfg):
+    """V9.0: (the earliest clip time from which the footage up to t1 holds no fight = no strong gunshot, no death of mine, a note when the sound could not be checked). The intro is made from the
+    quiet stretch just before the first take."""
+    marks, note = intro_fight_marks(ev, cfg)
+    return max([0.08] + [m + 0.15 for m in marks if m <= t1 + 0.02]), note
+
+
+def intro_prepare(plan, ev, cfg, rname, song, seed):
+    """V9.0: the plan's intro, decided at plan time: the first take's footage just before its first kill (blurred, slowed to ~0.3x, frame blending only), the title over it, then an unblur and a speed ramp
+    to that take's own first speed. Writes plan['intro'] (never changes the takes: the render puts the intro in front, see with_intro) or a note when this montage cannot have one."""
+    if not INTRO_CTX.get("on"):
+        return
+    why_no = None
+    try:
+        import intro90
+        t = plan["takes"][0]
+        sg = t["segs"][0]
+        src = t["srcs"][sg[4] if len(sg) > 4 and sg[4] < len(t["srcs"]) else 0]
+        ev1 = ev
+        if len(ev.get("parts") or []) > 1 or ev.get("stitched"):          # a stitched first take: the intro comes from the clip it starts with
+            ev1 = dict(ev, parts=[ev["parts"][0]], stitched=False, rec=ev["parts"][0]["rec"])
+        if float(plan["song"]["start_t"]) < INTRO_S - 0.02:
+            why_no = "the song has no music for the intro before the first take"
+        elif int(sg[4]) if len(sg) > 4 else 0:
+            why_no = "the first take starts in its second clip"
+        elif sg[2] <= 0:
+            why_no = "the first take starts on a held frame"
+        else:
+            a1 = float(sg[0])
+            cs_, w2 = intro_clean_start(ev1, a1 - float(src.get("shift", 0.0)), cfg)          # the quiet footage right before the take: no gunshot, no death of mine in it
+            avail = a1 - float(src.get("shift", 0.0)) - cs_
+            ok, v0, hold, ramp, used = intro90.speeds(avail, sg[2])
+            if not ok:
+                why_no = f"only {max(0.0, avail):.2f} s of quiet footage before the first take (no shot, no death in it; the intro needs {used:.2f} s)"
+            else:
+                a0 = round(a1 - used, 4)
+        if why_no is None:
+            man_ = bool(INTRO_CTX.get("manual"))
+            title = (INTRO_CTX.get("text") or "").strip() if man_ else ""
+            title = title or intro90.clean_title(song.get("title") or Path(plan["song"]["path"]).stem, song.get("artist"))
+            sub = None if man_ else f"{GAME_TAG.get(plan['game'], plan['game'].upper())} \u00b7 SERIES #{int(INTRO_CTX.get('series') or 1)}"
+            look = intro90.pick_look(rname, f"{seed}|{Path(plan['song']['path']).stem}")
+            fam, fam_why, pal = None, "", None
+            if look in intro90.SKY_LOOKS:                  # the sky's own colour family choice (album cover, else the song's vibe): the same function, no second choice
+                ranked = (plan.get("xfx_sky_rank") or {}).get("names") or sky_ranked(rname, song.get("energy"), plan["song"].get("bpm"))[0]
+                fam, fam_why = sky_family_for(plan, ranked, None)
+                pal = intro90.fam_palette(fam, SKY_FAMILIES, look)
+            plan["intro"] = {"len": INTRO_S, "look": look, "title": title, "subline": sub, "family": fam, "family_why": fam_why, "pal": pal,
+                             "v0": round(v0, 4), "v_end": round(float(sg[2]), 4), "hold": hold, "ramp": ramp, "src_a": a0, "src_b": a1, "src_idx": int(sg[4]) if len(sg) > 4 else 0,
+                             "avail": round(avail, 3), "anim": "A"}
+            plan["notes"].append(f"INTRO {INTRO_S:.0f} s: {Path(t['path']).name} from {a0:.2f} s (blurred, {v0:.2f}x -> {sg[2]:.2f}x, frame blending), look {look}, text \"{title}\""
+                                 + (f" / {sub}" if sub else "") + (f", colours from the sky's {fam} family ({fam_why})" if fam else "") + (f"; {w2}" if w2 else ""))
+    except Exception as ex:                                # noqa: BLE001
+        why_no = f"{type(ex).__name__}: {ex}"
+    if why_no:
+        plan["notes"].append(f"INTRO skipped: {why_no}")
+        LOGONLY(f"intro skipped: {why_no}")
+        if any(k_ in why_no for k_ in ("footage", "clean", "second clip", "held frame")):
+            plan["_intro_retry"] = plan["takes"][0]["path"]          # plan_montage tries again with another first take
+
+
+def intro_take(it, plan):
+    """V9.0: the pseudo take that stands in front of the montage (labels t0v / t0a): its source window is the footage just before the first take; the render draws blur, speed and text."""
+    t1 = plan["takes"][0]
+    src = dict(t1["srcs"][it.get("src_idx", 0)], audio=False, mute=True)
+    nf = int(round(INTRO_S * OUT_FPS))
+    used = float(it["src_b"]) - float(it["src_a"])
+    z = {"intro": True, "path": src["path"], "srcs": [src], "rect": src["rect"], "audio": False, "wh": src["wh"],
+         "segs": [[it["src_a"], it["src_b"], round(used / INTRO_S, 5), nf, 0]], "f0": 0, "nf": nf, "out_start": 0.0, "dur": INTRO_S, "role": "intro", "section": "intro", "pulses": [],
+         "amp": 0.0, "flash": None, "trans": "hard", "slow_at": 0.0, "beat0": 0.0, "beat_end": 0.0, "beat_kill": 0.0, "song_beat": 0, "kill_down": False, "locked": True,
+         "kills": [], "rows": [], "kills_out": [], "rows_out": [], "victims": [], "lags": [], "n": 0, "score": 0.0, "hs": 0, "ramp": 1.0, "slow": False, "ending": False,
+         "snapped": 0, "stitched": False, "stitch_note": "", "death_after": None, "lag": 0.1, "level": 0, "intro_cfg": dict(it)}
+    return z
+
+
+def with_intro(plan):
+    """V9.0: the plan as the RENDER sees it: the intro take in front (frames 0 .. INTRO_S), everything else INTRO_S later, the song starting INTRO_S earlier (the intro's music). A plan without an
+    intro is returned unchanged. Planning, checks and the plan text always use the plan without the intro (identical to V8.8.8 apart from the intro, the outro and the length cap)."""
+    it = plan.get("intro")
+    if not it or plan.get("_intro_applied") or not plan.get("takes"):
+        return plan
+    S = INTRO_S
+    nf = int(round(S * OUT_FPS))
+    p = copy.deepcopy(plan)
+    for t in p["takes"]:
+        t["f0"] += nf
+        t["out_start"] = round(t["out_start"] + S, 4)
+    p["takes"].insert(0, intro_take(it, plan))
+    p["duration"] = round(plan["duration"] + S, 4)
+    p["total_frames"] = plan["total_frames"] + nf
+    sg = p["song"]
+    sg["start_t"] = round(float(sg["start_t"]) - S, 6)
+    sg["section_s"] = round(float(sg.get("section_s", 0.0)) + S, 3)
+    sg["fade_out_start"] = round(float(sg.get("fade_out_start", 0.0)) + S, 4)
+    sg["fade_in"] = INTRO_FADE_IN
+    if p.get("beats_out"):
+        p["beats_out"] = [round(b + S, 4) for b in p["beats_out"]]
+    if p.get("drops_out"):
+        p["drops_out"] = [round(d + S, 3) for d in p["drops_out"]]
+    if p.get("outro"):
+        p["outro"]["fade_start"] = round(p["outro"]["fade_start"] + S, 4)
+    for d_ in (p.get("xfx_drop") or []):
+        d_["t"] = round(float(d_["t"]) + S, 4)
+    for d_ in (p.get("drop_sync") or []):                  # (the drop / impact times are song times: they stay; the take numbers count the intro)
+        if d_.get("take"):
+            d_["take"] += 1
+    p["_intro_applied"] = True
+    return p
+
+
+INTRO_PRE_HINT = 8.0                 # V9.0: an event with this much footage before its first kill can start a montage with the intro (the take's own run-up takes up to ~4 s of it, the intro 1.2 - 2.7 s)
+INTRO_PREFER = [True]                # test switch
+
+
+def intro_pre_hint(e):
+    """V9.0: may this event be the montage's first take (the one the intro is made from)? Enough footage before its first kill, and not one that already failed the exact check."""
+    return e["path"] not in INTRO_CTX.get("avoid", ()) and float(e.get("pre") or 0.0) >= INTRO_PRE_HINT
+
+
+INTRO_FADE_IN = 0.5                  # V9.0: the music + picture fade-in of a montage that starts with the intro (the old FADE_IN otherwise)
 ENDING_MIN_POST = 0.9                # V7.7.5: footage (s) after the last kill the final slow-mo needs so it neither freezes nor runs into my death
 
 
@@ -10329,6 +10545,21 @@ def ending_safe(e):
     """V7.7.5: an event may end the montage only when at least ENDING_MIN_POST s of footage follow its last kill BEFORE my death / the clip end."""
     post = e["post"] if e.get("death_after") is None else min(e["post"], e["death_after"] - 0.05)
     return post >= ENDING_MIN_POST and not (e.get("unsure") or [False])[-1]          # V8.1.1: never a slow-mo ending on an uncertain kill time
+
+
+ENDING_PREF_POST = 1.6               # V9.0: the ending prefers an event with this much footage after its last kill before my death / the clip end (the slow-mo release shows real footage) ...
+OUTRO_PREFER = [True]                # ... and no new fight (no gunshot) in it; test switch
+OUTRO_EASED = [True]                 # V9.0: the fade to black is eased (cosine) and the music fade is a half sine; test switch (False = the linear fades of V8.8.8)
+
+
+def ending_good(e, cfg):
+    """V9.0: an event that ends the montage with a clean release: >= ENDING_PREF_POST s of footage after its last kill before my death or the clip end, no shot / death in the part of it the release shows."""
+    post = e["post"] if e.get("death_after") is None else min(e["post"], e["death_after"] - 0.05)
+    if post < ENDING_PREF_POST or not ending_safe(e):
+        return False
+    last = float(e["times"][-1])
+    ok, _why = intro_footage_safe(e, last + 0.4, last + min(post, ENDING_PREF_POST + 0.4), cfg)
+    return ok
 
 
 def ending_rank(e):
@@ -10359,11 +10590,12 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
         if full:
             FULL_CTX["live"] = (lv0, lv1)
         song_end = min(song_end, lv1 - 0.1)
-        b_lo = int(np.searchsorted(bt, lv0 - 0.02))
+        b_lo = int(np.searchsorted(bt, lv0 + intro_cut() - 0.02))      # V9.0: the first INTRO_S s of the audible song are the intro's music: the plan's first take starts after them
         b_lo = min(b_lo, max(0, len(bt) - 2))
+    ic_ = intro_cut()
     avail = song_end - float(bt[b_lo])
-    mx = min(FULL_CAP_S if full else OPT_RANGE[1], avail)
-    rng_lo, cap_v = (FULL_MIN_S, FULL_CAP_S) if full else OPT_RANGE
+    mx = min((FULL_CAP_S if full else OPT_RANGE[1]) - ic_, avail)      # V9.0: the 3:00 maximum counts the intro
+    rng_lo, cap_v = (FULL_MIN_S - ic_, FULL_CAP_S - ic_) if full else (OPT_RANGE[0] - ic_, OPT_RANGE[1] - ic_)
     sc_e = float(FULL_CTX.get("est_scale") or 1.0)         # V8.8.6: the song fill's measured correction (planned / estimated length of the last round; 1.0 otherwise)
     est = {id(e): take_estimate(e, bd, rname) * sc_e for e in clips}
     end_x = (END_FADE[0] + END_FADE[1]) / 2 - 0.4           # the slow-mo ending runs longer than a normal tail
@@ -10379,7 +10611,7 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
     last_b0 = int(np.searchsorted(bt, song_end, side="right") - 1)
     if full:                                               # V8.5: the whole song when it fits the cap; a long song tries every length from 1:30 up to the cap
         L = min(L, float(bt[last_b0] - bt[b_lo]))
-        Ls = [L] + ([x for x in range(int(L) - 10, int(FULL_MIN_S) - 1, -10)] if L > FULL_MIN_S + 5 and avail > FULL_CAP_S else [])
+        Ls = [L] + ([x for x in range(int(L) - 10, int(FULL_MIN_S - ic_) - 1, -10)] if L > FULL_MIN_S - ic_ + 5 and avail > FULL_CAP_S - ic_ else [])
     else:
         Ls = [L]
     L_top = L
@@ -10417,6 +10649,8 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
         elif inside:
             sc += 1.5
         sc += 0.5 * (E in sec_b) + 0.3 * (E == last_b) + 0.2 * float(np.mean(an["level"][S:E] if len(an.get("level", [])) >= E else [0]))
+        if ic_ and any(float(bt[S]) - ic_ - 0.3 <= float(bt[int(d_["beat"])]) < float(bt[S]) - 0.2 for d_ in drops if 0 <= int(d_["beat"]) < len(bt)):
+            sc -= 1.5                                      # V9.0: a drop of the song inside the intro's music (just before the first take) would be wasted on the blurred intro: such a section ranks lower
         allc.append((sc + (0.01 * L if full else 0.0), S, E, inside, L))
     L = L_top
     allc = sorted(allc, key=lambda c_: -c_[0])             # V7.6.1: every candidate section, best first; plan_montage tries the best few and keeps the one that places the most
@@ -10618,13 +10852,13 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     if FULL_CTX["on"]:                                     # V8.8.3: every mode (Auto, Manual, full modes, dry plan and render alike)
         FULL_CTX["live"] = FULL_CTX.get("live") or live_
     song_end = min(song_end, float(live_[1]) - 0.1)
-    t_lo = int(np.searchsorted(U, float(live_[0]) - 0.02))      # V8.8.3: the first tick inside the audible part: no take starts before it
+    t_lo = int(np.searchsorted(U, float(live_[0]) + intro_cut() - 0.02))      # V8.8.3: the first tick inside the audible part: no take starts before it (V9.0: nor inside the intro's first INTRO_S s of music)
     optimal = target_s in (None, "", "optimal", 0)
     fitm = optimal                                         # V6.0: Auto Optimal uses optimal_fit() too (same rule as Manual)
     if fitm:                                               # V5.42B: optimal_fit() below decides (80-180 s, never past the song)
-        target = min(OPT_RANGE[1], song_end - float(bt[0]))
+        target = min(OPT_RANGE[1] - intro_cut(), song_end - float(bt[0]))
     else:
-        target = max(30.0, min(float(LEN_MAX_S), float(target_s)))      # V6.7.2: the slider's maximum reaches the planner (was clamped to 120)
+        target = max(30.0, min(float(LEN_MAX_S), float(target_s)) - intro_cut())      # V6.7.2: the slider's maximum reaches the planner (was clamped to 120); V9.0: the slider's length is the whole montage, the intro counts
     strong = [e for e in evs if not e.get("plain")]
     plain = [e for e in evs if e.get("plain")]
     est = lambda e: 2 * bd + e["span"] + 0.4
@@ -10672,7 +10906,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     if fitm:                                 # V5.42B: THE shared Optimal rule picks length, section and clips
         fit = optimal_fit(usable, an, rname, song_path=song.get("path"), rank=fit_rank)
         if not manual and plain:                           # V6.0: best multikills first, then best singles, until >= 80 s (never padded)
-            need, added = (fit["max"] if FULL_CTX["on"] else min(OPT_RANGE[0], fit["max"])) - 0.5, 0
+            need, added = (fit["max"] if FULL_CTX["on"] else min(OPT_RANGE[0] - intro_cut(), fit["max"])) - 0.5, 0
             for e in sorted(plain, key=lambda e: -e["score"]):
                 if fit["length"] >= need:
                     break
@@ -10719,7 +10953,16 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         if pk_ and pk_[0] is not e0 and e0 in grp_:
             notes.append(f"CS2 ending: {nm(pk_[0])} (knife-out at +{pk_[0]['_knife']['hud_t']:.2f} s) preferred over {nm(e0)}: scores within 8 %")
             end_sorted = [pk_[0]] + [e for e in end_sorted if e is not pk_[0]]
-    ending = next((e for e in end_sorted if e["post"] >= 0.5 and not e.get("util") and ending_safe(e)), None)      # V7.7.5: verified, clean footage after the last kill first
+    ending = None
+    if OUTRO_PREFER[0]:                                    # V9.0: first one with 1.6 s of quiet footage after the last kill (best rank first), then the V7.7.5 rule
+        for e_ in end_sorted[:16]:
+            if e_["post"] >= 0.5 and not e_.get("util") and ending_good(e_, cfg):
+                ending = e_
+                if e_ is not end_sorted[0]:
+                    notes.append(f"ending: {nm(e_)} (>= {ENDING_PREF_POST:.1f} s of quiet footage after the last kill for the slow release) preferred over {nm(end_sorted[0])}")
+                break
+    if ending is None:
+        ending = next((e for e in end_sorted if e["post"] >= 0.5 and not e.get("util") and ending_safe(e)), None)      # V7.7.5: verified, clean footage after the last kill first
     if ending is None:
         ending = next((e for e in sorted(rest, key=lambda e: -e["score"]) if e["post"] >= 0.5 and not e.get("util")), None)
     if ending is None:                                     # V7.3: a utility take never ends the montage - unless every candidate is one (base behaviour, logged)
@@ -10795,6 +11038,18 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         if j_ is not None:
             post[-1], post[j_] = post[j_], post[-1]
     pre.sort(key=lambda e: (e["n"], e["score"] * jit[id(e)]))
+    if INTRO_CTX.get("on") and INTRO_PREFER[0] and not (pre and intro_pre_hint(pre[0])):
+        k_i = next((i_ for i_, e_ in enumerate(pre) if intro_pre_hint(e_)), None)      # V9.0: the first take must have the run-up footage the intro is made from (no death, no fight in it: checked exactly in intro_prepare)
+        if k_i is not None:
+            pre.insert(0, pre.pop(k_i))
+            notes.append(f"intro: {nm(pre[0])} first (enough footage before its first kill for the intro)")
+        else:
+            cand_i = [e_ for e_ in post if intro_pre_hint(e_)]
+            if cand_i:
+                e_i = min(cand_i, key=lambda e_: e_["score"])
+                post.remove(e_i)
+                pre.insert(0, e_i)
+                notes.append(f"intro: {nm(e_i)} moved to the start (the only kind of event with enough footage before its first kill for the intro)")
 
     def run_pre(order, s):
         takes, c = [], s
@@ -10905,10 +11160,13 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         E = float(U[end_take["fade_end"]]) if end_take else float(U[takes[-1]["end"]])
         if fit:                                            # V5.42B: within min(180 s, song), never just for a 'nice' length
             target = fit["max"]
-        for e in sorted(cut_len + left + left_song, key=lambda e: (1 if e.get("_rx") else 0, -e["score"])):      # V7.6.1: events that needed a relaxed rule come last
+        ihint = (lambda e_: 0 if not (INTRO_CTX.get("on") and INTRO_PREFER[0]) else (1 if intro_pre_hint(e_) else 0))      # V9.0: the event that ends up first (the last one put in front) is one with the footage for the intro
+        for e in sorted(cut_len + left + left_song, key=lambda e: (ihint(e), 1 if e.get("_rx") else 0, -e["score"])):      # V7.6.1: events that needed a relaxed rule come last
+            if INTRO_CTX.get("on") and INTRO_PREFER[0] and not intro_pre_hint(e) and intro_pre_hint(takes[0]["ev"]):
+                continue                                   # V9.0: the first take has the footage for the intro: an event without it is not put in front of it (it stays in the 'didn't fit' list)
             c1, got = takes[0]["c"], None
             reach = 48 + (nat(e) + int(e["span"] / td) if fit else 0)     # V5.42B: long fights need more room in front
-            cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - reach), -1) if E - U[cc] <= target + 1e-6]
+            cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - reach), -1) if E - U[cc] <= target + 1e-6 and cc >= t_lo]      # (V9.0: never before the first tick the song window allows: the intro's music comes before it)
             for xp in (False, True):                       # V5.43: the V5.42 tail window first; extending the end never shortens the run-up
                 for cc in sorted(cc_s, key=lambda cc: (cc % 2, -cc)):
                     got = place(e, U, down, rp, c=cc, end=c1, ext_only=xp)
@@ -10920,10 +11178,10 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             for sh in ((1, 2, 3) if fit and not got and not t0.get("ending") else ()):
                 # V5.42B repair: shift the neighbouring take's window (a slightly longer run-up) so this clip's tail can land
                 g0 = geom(t0["ev"], U, t0["c"] - sh, t0["kb"], t0["end"], t0["ramp"], t0["slow"], anchor=t0.get("anchor", "first"), tailmode=t0.get("tailmode", "plain"))
-                if not g0:
+                if not g0 or t0["c"] - sh < t_lo:
                     continue
                 for xp in (False, True):
-                    for cc in sorted([cc - sh for cc in cc_s if cc - sh >= 0], key=lambda cc: (cc % 2, -cc)):
+                    for cc in sorted([cc - sh for cc in cc_s if cc - sh >= max(0, t_lo)], key=lambda cc: (cc % 2, -cc)):
                         got = place(e, U, down, rp, c=cc, end=c1 - sh, ext_only=xp)
                         if got:
                             break
@@ -10955,6 +11213,8 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             if manual:                                     # V5.42B repair: a longer run-up (the take before ends earlier)
                 fixed = None
                 for sh in range(1, 9):
+                    if i == 0 and t["c"] - sh < t_lo:
+                        break                              # V9.0: the first take never starts before the song window (the intro's music)
                     g = geom(t["ev"], U, t["c"] - sh, t["kb"], t["end"], t["ramp"], t["slow"], anchor=t.get("anchor", "first"), tailmode=t.get("tailmode", "plain"))
                     gp = geom(takes[i - 1]["ev"], U, takes[i - 1]["c"], takes[i - 1]["kb"], t["c"] - sh, takes[i - 1]["ramp"],
                               takes[i - 1]["slow"], anchor=takes[i - 1].get("anchor", "first"), tailmode=takes[i - 1].get("tailmode", "plain")) if i > 0 else True
@@ -10978,7 +11238,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         # V8.8 (full mode; V8.8.2: every game; V8.8.3: every mode whose montage covers the whole trimmed song): the montage ends a few seconds short of the song: longer run-ins after
         # the drop fill it (never a song longer than the cap)
         last_b_ = int(np.searchsorted(bt, song_end, side="right") - 1)
-        if int(fit.get("end_beat", -1)) >= last_b_ - 1 and float(fit.get("max", 0.0)) < (FULL_CAP_S if FULL_CTX["on"] else OPT_RANGE[1]) - 0.5:
+        if int(fit.get("end_beat", -1)) >= last_b_ - 1 and float(fit.get("max", 0.0)) < (FULL_CAP_S if FULL_CTX["on"] else OPT_RANGE[1]) - intro_cut() - 0.5:
             et_ = next((t for t in takes if t.get("ending")), None)
             E_ = float(U[et_["fade_end"]]) if et_ and et_.get("fade_end") is not None else float(U[takes[-1]["end"]])
             gap_ = song_end - E_
@@ -11028,6 +11288,10 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
                             flicks={(str(e_["path"]), round(float(e_["times"][0]), 3)) for e_ in events if e_.get("flick") and e_.get("times")})
         except Exception as ex_:
             LOGONLY(f"extra effects skipped: {type(ex_).__name__}: {ex_}")
+    try:                                                   # V9.0: the intro (plan['intro']): decided from the finished first take; the takes themselves stay exactly as planned
+        intro_prepare(plan, takes[0]["ev"], cfg, rname, song, seed)
+    except Exception as ex_:                               # noqa: BLE001
+        LOGONLY(f"intro skipped: {type(ex_).__name__}: {ex_}")
     D, S0 = plan["duration"], plan["song"]["start_t"]
     on_ph = bool(end_take and end_take.get("on_phrase"))
     win_drops = [float(d_["t"]) for d_ in (an.get("drops") or []) if d_.get("t") is not None and S0 + 0.5 < float(d_["t"]) < S0 + D - 1.0]
@@ -11082,6 +11346,40 @@ SECTION_TRIES = 4                       # V7.6.1: candidate song sections evalua
 
 
 def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
+    """V9.0: plan_montage_tries(); when the intro could not be made because the first take's footage was too short or not clean (a shot / my death in it), the same montage is planned again with
+    another first take (up to INTRO_RETRIES times): the montage without its intro is kept only when no first take works."""
+    INTRO_CTX["avoid"] = set()
+    n0 = list(notes)
+    plan = plan_montage_tries(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock, placement, manual)
+    try:
+        for _i in range(INTRO_RETRIES):
+            if not (INTRO_CTX.get("on") and plan.get("_intro_retry") and not plan.get("intro")):
+                break
+            INTRO_CTX["avoid"].add(plan["_intro_retry"])
+            nl = list(n0)
+            try:
+                pl2 = plan_montage_tries(cfg, game, events, song, an, seed, style, target_s, hist_c, nl, lock, placement, manual)
+            except RuntimeError:
+                break
+            kills = lambda pl_: sum(len(t_["kills"]) for t_ in pl_["takes"])
+            if pl2.get("intro") and kills(pl2) >= 0.85 * kills(plan):
+                pl2["notes"].append(f"intro: planned again with another first take ({_i + 1} of {INTRO_RETRIES}): the first plan's first take had no clean footage for it")
+                plan = pl2
+                notes[:] = pl2["notes"]
+                break
+            if not pl2.get("_intro_retry"):
+                break
+            plan["_intro_retry"] = pl2["_intro_retry"]
+    finally:
+        INTRO_CTX.pop("avoid", None)
+    plan.pop("_intro_retry", None)
+    return plan
+
+
+INTRO_RETRIES = 5
+
+
+def plan_montage_tries(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
     """V7.6.1: plans the montage in the best-scored song section, then in the next best few, and keeps the plan that places the most kills (then the most drops anchored,
     then the better section score). The length and the section follow ALL the material, never the result of one first pass. Same inputs = same plan."""
     kw = dict(lock=lock, placement=placement, manual=manual)
@@ -11090,7 +11388,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
     plan = _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_c, first_notes, fit_rank=0, **kw)
     cands_n = (plan.get("fit") or {}).get("cands_n", 1)
     best = (plan, first_notes, 0)
-    key = lambda pl: (sum(len(t["kills"]) for t in pl["takes"]), sum(1 for x in (pl.get("drop_sync") or []) if x.get("take")))
+    key = lambda pl: (sum(len(t["kills"]) for t in pl["takes"]), sum(1 for x in (pl.get("drop_sync") or []) if x.get("take")), 1 if pl.get("intro") else 0)
     tried = [(0, key(plan), plan["song"]["start_t"], plan["duration"])]
     if cands_n > 1 and (plan.get("fit") or {}).get("optimal"):
         for rk in range(1, min(SECTION_TRIES, cands_n)):
@@ -11911,6 +12209,10 @@ def fmt_plan(plan, events, score_info, runners, unmatched, csvname):
              f"({plan['total_frames']} frames); {headline_report(plan)[1]}; "
              f"{'slow-mo ending, music fades from ' + format(sg['fade_out_start'], '.2f') + 's' if plan['ending'] else 'music fade-out over the last 2 s'}; "
              f"video fades from {outro_fade(plan)[0]:.2f}s over {outro_fade(plan)[1]:.2f}s")
+    if plan.get("intro"):
+        it_ = plan["intro"]
+        L.append(f"INTRO    {INTRO_S:.0f} s in front of the cut list below (the video is {plan['duration'] + INTRO_S:.1f} s in all; the music starts {INTRO_S:.0f} s earlier, at {ts(float(sg['start_t']) - INTRO_S)}): "
+                 f"look {it_['look']}, text \"{it_['title']}\"" + (f" / {it_['subline']}" if it_.get("subline") else "") + (f", sky colour family {it_['family']}" if it_.get("family") else ""))
     if score_info:
         fp = score_info["fit_parts"]
         L.append(f"SONG SCORE total {score_info['total']} = recency {score_info['recency']} (added {score_info['days']} days ago)"
@@ -11964,6 +12266,8 @@ def slice_plan(plan, length=20.0):
     takes = plan["takes"]
     centre = plan["song"]["drop_t"] if plan["song"].get("drop_t") is not None else plan["duration"] / 2
     t0 = max([t["f0"] for t in takes if t["f0"] <= (centre - 8.0) * OUT_FPS] or [0])
+    if t0 == 0 and plan.get("intro"):
+        length = max(6.0, length - INTRO_S)                # V9.0: a preview that starts at the beginning shows the intro, inside its 20 s
     sel = [t for t in takes if t["f0"] >= t0 and t["f0"] < t0 + length * OUT_FPS]
     nt = [dict(t, f0=t["f0"] - t0, out_start=round((t["f0"] - t0) / OUT_FPS, 4)) for t in sel]
     if nt:
@@ -11972,7 +12276,7 @@ def slice_plan(plan, length=20.0):
     tf = nt[-1]["f0"] + nt[-1]["nf"]
     sg["fade_out_start"] = max(0.0, min(sg["fade_out_start"] - t0 / OUT_FPS, tf / OUT_FPS - 1.0))
     drops = [dict(d_, t=round(float(d_["t"]) - t0 / OUT_FPS, 4)) for d_ in (plan.get("xfx_drop") or []) if 0 <= float(d_["t"]) - t0 / OUT_FPS <= tf / OUT_FPS]
-    return dict(plan, takes=nt, song=sg, duration=tf / OUT_FPS, total_frames=tf, preview=True, **({"xfx_drop": drops} if "xfx_drop" in plan else {}))
+    return dict(plan, takes=nt, song=sg, duration=tf / OUT_FPS, total_frames=tf, preview=True, **({"xfx_drop": drops} if "xfx_drop" in plan else {}), **({} if t0 == 0 else {"intro": None}))
 
 
 def _sum_expr(terms):
@@ -11980,15 +12284,15 @@ def _sum_expr(terms):
 
 
 OUTRO_TRIM_ON = [True]      # V7.6.0: test switch (trim_outro)
-OUTRO_FADE_LEN = 0.5        # V7.5.1.2: video fade-out = the last 0.5 s of the final take (music fade keeps fade_out_start .. end); no freeze / hold
+OUTRO_FADE_LEN = 1.6        # V7.5.1.2: video fade-out = the last part of the final take (music fade keeps fade_out_start .. end); no freeze / hold. V9.0: 1.6 s, eased (was 0.5 s)
 OUTRO_SHORT_TAIL = 0.8      # tail after the last kill shorter than this: shorter fade
 OUTRO_MIN_FADE = 0.3
 INTRO_PUNCH = (0.06, 0.25)  # first take: zoom amount on the first beat, settling time
 
 
-OUTRO_AFTER = 0.5           # V7.6.0: the fade to black starts this long after the last kill impact (never before the last kill row is readable)
+OUTRO_AFTER = 1.5           # V7.6.0: the fade to black starts this long after the last kill impact (never before the last kill row is readable); V9.0: 1.5 s of slow-mo release first (was 0.5 s)
 OUTRO_ROW_READ = 0.4        # the last kill row is readable this long after it appears
-OUTRO_MUSIC_MIN = 0.6       # the music fade (last kill -> final frame) is at least this long
+OUTRO_MUSIC_MIN = 3.0       # the music fade (last kill -> final frame) is at least this long (V9.0: a long music tail, was 0.6 s)
 
 
 def trim_outro(plan, notes=None):
@@ -14450,6 +14754,48 @@ def _xfx_chains(chains, base, lab, t, fx, soft_in, zone, feel=None):
     return lab
 
 
+def _intro_chains(t, ti, chains, inputs, k):
+    """V9.0: the filter chains of the intro take `t` (outputs [t<ti>v] and [t<ti>a]): the clip's footage just before the first take, time-remapped (a slow hold at ~0.3x, then a linear speed ramp
+    to the first take's own speed: exactly where the first take begins, so the handover is seamless), frame blending only (minterpolate blend, no optical flow), blurred (two box-free
+    gaussian levels cross-faded) until the text is gone, then unblurred over the ramp, the title (a video with alpha made by intro90.text_video) over it. Silence: the music is the song."""
+    it = t["intro_cfg"]
+    tx = it.get("_text")
+    if not tx:
+        raise RuntimeError("intro text video missing (intro_assets was not run)")
+    src = t["srcs"][0]
+    a0, a1 = t["segs"][0][0], t["segs"][0][1]
+    sa = a0 - src["shift"]
+    inputs += ["-threads", "2", "-ss", f"{max(0.0, sa):.4f}", "-t", f"{(a1 - a0) + 0.8:.4f}", "-i", src["path"]]
+    cx, cy, cw, ch = src["rect"]
+    crop = f"crop={cw}:{ch}:{cx}:{cy}," if [cx, cy, cw, ch] != [0, 0, src["wh"][0], src["wh"][1]] else ""
+    scl = "scale=1920:1080:flags=lanczos," if (crop or list(src["wh"]) != [1920, 1080]) else ""
+    inputs += ["-threads", "1", "-i", tx["file"]]
+    kc, kt = k, k + 1
+    v0, ve, hold, ramp = float(it["v0"]), float(it["v_end"]), float(it["hold"]), float(it["ramp"])
+    L = hold + ramp
+    d1 = v0 * hold
+    d2 = (v0 + ve) / 2 * ramp
+    kq = (ve - v0) / (2 * ramp)
+    ramp_pts = (f"(-{v0:.6f}+sqrt({v0 * v0:.8f}+4*{kq:.8f}*(PTS-STARTPTS)*TB))/(2*{kq:.8f})/TB" if abs(kq) > 1e-6 else f"(PTS-STARTPTS)/{v0:.6f}")
+    u = f"((T-{hold:.4f})/{ramp:.4f})"
+    w = f"if(lt(T,{hold:.4f}),1,if(gt(T,{L:.4f}),0,1-(3*{u}*{u}-2*{u}*{u}*{u})))"
+    n = int(t["nf"])
+    b = f"i{ti}"
+    chains.append(f"[{kc}:v:0]{crop}{scl}setsar=1,fps=60,format=yuv420p,split=2[{b}a][{b}b]")
+    nh, nr = int(round(hold * OUT_FPS)), int(round(ramp * OUT_FPS))
+    chains.append(f"[{b}a]trim=0:{d1 + 0.3:.6f},setpts=(PTS-STARTPTS)/{v0:.6f},framerate=fps=60:scene=100,trim=end_frame={nh},setpts=PTS-STARTPTS[{b}c]")      # (+0.3 s of source: the blend at the end of a piece needs the frames after it; the piece is cut to its exact length)
+    chains.append(f"[{b}b]trim={d1:.6f}:{d1 + d2 + 0.3:.6f},setpts={ramp_pts},framerate=fps=60:scene=100,trim=end_frame={nr},setpts=PTS-STARTPTS[{b}d]")
+    chains.append(f"[{b}c][{b}d]concat=n=2:v=1:a=0,fps=60,tpad=stop_mode=clone:stop_duration=0.3,trim=end_frame={n},setpts=PTS-STARTPTS,split=3[{b}s][{b}m0][{b}b0]")
+    chains.append(f"[{b}m0]scale=640:360,gblur=sigma=4,scale=1920:1080,eq=brightness=-0.05[{b}m]")
+    chains.append(f"[{b}b0]scale=640:360,gblur=sigma=14,scale=1920:1080,eq=brightness=-0.16:saturation=0.85[{b}h]")
+    en = f"enable='gte(t,{hold:.4f})'"                                             # the per-pixel cross-fades only run inside the ramp (the hold is the heavy blur as it is)
+    chains.append(f"[{b}h][{b}m]blend=all_expr='A*clip(2*{w}-1,0,1)+B*(1-clip(2*{w}-1,0,1))':{en}[{b}x]")
+    chains.append(f"[{b}x][{b}s]blend=all_expr='A*min(1,2*{w})+B*(1-min(1,2*{w}))':{en},format=yuv420p[{b}y]")
+    chains.append(f"[{b}y][{kt}:v:0]overlay=0:{int(tx['y0'])}:format=yuv420:eof_action=pass,format=yuv420p,trim=end_frame={n},setpts=PTS-STARTPTS[t{ti}v]")
+    chains.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={n / OUT_FPS:.4f},asetpts=PTS-STARTPTS[t{ti}a]")
+    return k + 2
+
+
 def build_filter(plan, cfg, preview, fx=None):
     """ONE filter graph (V4 engine). Effects sit on each take's own output timeline: centred V4 zoom punches on kills (overlaid
     only inside the punch), ramps before kills, V4 slow-mo (frame blending only inside slow-mo segments). V5.2: no flashes, no
@@ -14465,6 +14811,11 @@ def build_filter(plan, cfg, preview, fx=None):
     soft = [False] + [bool("transition" in fx and takes[i].get("trans") == "soft" and soft_cut_ok(plan, i)[0]) for i in range(1, len(takes))] + [False]       # soft[i]: the cut INTO take i is a dissolve (V7.6.1)
     vparts = []                                                                         # video pieces in order when any cut is soft
     for ti, t in enumerate(takes):
+        if t.get("intro"):                                                              # V9.0: the intro take: blurred + slowed footage, the title over it (labels t0v / t0a like every take)
+            k = _intro_chains(t, ti, chains, inputs, k)
+            vl.append(f"[t{ti}v][t{ti}a]")
+            vparts.append(f"[t{ti}v]")
+            continue
         srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0, "rect": t["rect"], "wh": t["wh"], "audio": t["audio"],
                                   "a_stream": 0, "gain_db": -6.0}]
         segs = [list(s) for s in t["segs"]]
@@ -14668,8 +15019,10 @@ def build_filter(plan, cfg, preview, fx=None):
         chains.append("".join(vl) + f"concat=n={len(takes)}:v=1:a=1[vc][gc]")
     vfo, vlen = outro_fade(plan)
     LOGONLY(f"outro fade: video fades from {vfo:.2f}s over {vlen:.2f}s (music from {fo:.2f}s)")
-    chains.append(f"[vc]{'scale=1280:720:flags=bicubic,' if preview else ''}fade=t=in:st=0:d={FADE_IN},"
-                  f"fade=t=out:st={vfo:.3f}:d={vlen:.3f},format=yuv420p[vout]")
+    fi_ = INTRO_FADE_IN if takes and takes[0].get("intro") else FADE_IN
+    fade_out_ = (f"eq=contrast='1-P_':brightness='-0.5*P_':saturation='1-P_':eval=frame:enable='gte(t,{vfo:.3f})'".replace("P_", f"((1-cos(PI*clip((t-{vfo:.3f})/{vlen:.3f},0,1)))/2)")      # V9.0: an eased (cosine) fade to black
+                 if OUTRO_EASED[0] else f"fade=t=out:st={vfo:.3f}:d={vlen:.3f}")
+    chains.append(f"[vc]{'scale=1280:720:flags=bicubic,' if preview else ''}fade=t=in:st=0:d={fi_},{fade_out_},format=yuv420p[vout]")
     sidx = len([x for x in inputs if x == "-i"])
     inputs += ["-i", plan["song"]["path"]]
     head = 10 ** (-2.0 / 20)                               # 2 dB headroom on BOTH music and game (same balance), so the
@@ -14702,8 +15055,8 @@ def build_filter(plan, cfg, preview, fx=None):
     n_in = 3 if extra_in else 2
     mix = f"amix=inputs={n_in}:duration=first:normalize=0" if amix_has_normalize() else f"amix=inputs={n_in}:duration=first,volume={n_in}"
     lim = "alimiter=limit=0.99:attack=2:release=40:level=disabled" + (":latency=1" if _alimiter_latency() else "")
-    chains.append(f"{music_l}[gh]{extra_in}{mix},{lim},atrim=duration={D:.4f},afade=t=in:st=0:d={FADE_IN},"
-                  f"afade=t=out:st={fo:.3f}:d={max(0.3, D - fo):.3f}[aout]")
+    chains.append(f"{music_l}[gh]{extra_in}{mix},{lim},atrim=duration={D:.4f},afade=t=in:st=0:d={fi_},"
+                  f"afade=t=out:st={fo:.3f}:d={max(0.3, D - fo):.3f}{':curve=hsin' if OUTRO_EASED[0] else ''}[aout]")
     return inputs, ";\n".join(chains)
 
 
@@ -15516,6 +15869,15 @@ def render_tmpdir(outfile):
     return Path(outfile).with_name(Path(outfile).stem + ".interp")
 
 
+def intro_assets(p, tdir):
+    """V9.0: the intro's text as a video with alpha (intro90.text_video) in the render's temp folder; its file / band go to p['intro']['_text'] (removed again after the render)."""
+    import intro90
+    it = p["intro"]
+    Path(tdir).mkdir(parents=True, exist_ok=True)
+    it["_text"] = intro90.text_video(Path(tdir) / "intro_text.mkv", it["look"], it["title"], it.get("subline"), it.get("pal"), ffmpeg="ffmpeg", cancel=CANCEL)
+    out(f"intro text: {it['look']} look, {it['_text'].get('font')}")
+
+
 def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, effects=True):
     """Encode the plan in ONE attempt (V8.4.4: no retry, no effect dropped, no fallback render; a failure prints the failing filter, take and ffmpeg error).
     The finished file must last exactly as long as the plan (else it is reported as a failure, never silently kept)."""
@@ -15541,6 +15903,16 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     if bad:
         shutil.rmtree(itmp, ignore_errors=True)
         raise RuntimeError("cut list problem, not rendering: " + "; ".join(bad))
+    if p.get("intro"):                                     # V9.0: the intro's text (a video with alpha) first, then the plan as the render sees it (the intro take in front)
+        try:
+            intro_assets(p, itmp)
+        except Exception as ex_:                           # noqa: BLE001
+            if CANCEL.is_set():
+                shutil.rmtree(itmp, ignore_errors=True)
+                raise RuntimeError("cancelled")
+            out(f"INTRO skipped (the text could not be made: {type(ex_).__name__}: {ex_}): the montage starts as the plan shows without it")
+            p = dict(p, intro=None)
+    p = with_intro(p)
     D = p["duration"]
     nvenc = ff_has("encoders", "h264_nvenc") if encoder is None else encoder == "nvenc"
     tmp = outfile.with_name(outfile.stem + ".part.mp4")
@@ -15557,6 +15929,8 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     try:
         return _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, fx, D)
     finally:
+        if isinstance(plan.get("intro"), dict):
+            plan["intro"].pop("_text", None)               # the temporary text video is gone with the temp folder: never saved in the plan
         shutil.rmtree(itmp, ignore_errors=True)
 
 
@@ -16345,6 +16719,7 @@ def transition_spikes(plan, y):
 def sync_report(plan, outfile, cfg):
     """Runs the kill detector on the finished montage; each first kill vs its beat, the drop, effects and tails."""
     import numpy as np
+    plan = with_intro(plan)                                # V9.0: the plan as the render saw it (intro in front)
     game = plan["game"]
     det = load_dets(game).get(game)
     if not det:
@@ -16363,6 +16738,8 @@ def sync_report(plan, outfile, cfg):
         f"drop at {plan['song'].get('drop_t')}s  drops in the song window: {plan.get('drops_out')}")
     tot_rows = [0, 0, 0]                                   # planned rows, seen within 0.2 s, seen within 0.5 s (the detector needs a few stable frames: it reports a row up to ~0.4 s after it appears)
     for i, t in enumerate(plan["takes"], 1):
+        if t.get("intro"):
+            continue
         tp = t["out_start"] + t["kills_out"][0]
         kb = int(np.argmin(np.abs(beats - tp)))
         rows = [t["out_start"] + r for r in t["rows_out"]]
@@ -16421,6 +16798,7 @@ def ssim_gray(a, b):
 def quality_check(plan, outfile, cfg, preview=False):
     """SSIM of the rendered frames vs the source frames on one effect-free stretch (1.0x, no zoom/flash/transition, away from the
     fades). Target >= 0.97. Returns the value (or None when no clean stretch exists)."""
+    plan_in, plan = plan, with_intro(plan)                 # V9.0: the plan as the render saw it (intro in front)
     takes = plan["takes"]
     D = plan["duration"]
     fo = plan["song"].get("fade_out_start", D)
@@ -16472,7 +16850,7 @@ def quality_check(plan, outfile, cfg, preview=False):
     al, wo = float(np.mean(vals)), float(min(vals))
     out(f"QUALITY CHECK: SSIM {al:.4f} (worst frame {wo:.4f}) output vs source, each output frame against its best-matching source frame (timing-independent), on an effect-free stretch at {g0:.2f}s"
         f" - {'OK (>= 0.97)' if al >= 0.97 else 'BELOW 0.97'}")
-    plan["ssim"] = round(al, 4)
+    plan_in["ssim"] = round(al, 4)
     return al
 
 
@@ -17197,16 +17575,22 @@ def song_fill_target(an, full, target):
     bt0 = float((an.get("beats") or [0.0])[0])
     avail = lv1 - 0.1 - max(lv0, bt0)
     cap = FULL_CAP_S if full else OPT_RANGE[1]
-    return round(avail, 2) if avail <= cap else None
+    return round(avail - intro_cut(), 2) if avail <= cap else None          # V9.0: the plan itself is the montage without its intro (the song fits with the intro in front)
 
 
-def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False):
-    """V8.5 full=True (Force New Full / Manual Auto): the montage fills the whole song (2:30 content at most, a long song uses its best 1:30 - 2:30 section)."""
+def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False, intro=None, intro_text=None):
+    """V8.5 full=True (Force New Full / Manual Auto): the montage fills the whole song (V9.0: 3:00 at most with intro and outro, a long song uses its best 2:00 - 3:00 section).
+    V9.0 intro=None: every mode has the intro, a Manual one as the INTRO tickbox says; intro_text = the Manual box (the main line, no subline)."""
     FULL_CTX["on"] = bool(full)
     FULL_CTX["game"] = game
+    man_ = paths is not None
+    on_ = (INTRO_MANUAL["on"] if man_ else True) if intro is None else bool(intro)
+    INTRO_CTX.update({"on": bool(INTRO_ON[0] and on_), "text": (intro_text if intro_text is not None else (INTRO_MANUAL["text"] if man_ else None)),
+                      "series": None if man_ else series_next(game, cfg), "manual": man_})
     try:
         return _make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, scan, pin, full)
     finally:
+        INTRO_CTX.update({"on": False, "text": None, "series": None})
         FULL_CTX["on"] = False
         FULL_CTX.pop("live", None)
         FULL_CTX.pop("est_scale", None)
@@ -17268,8 +17652,8 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
             pre_song = weekly_song_fit(*pre_song)
         an_ = pre_song[1]
         avail_ = float(an_.get("dur") or 0) - float((an_.get("beats") or [0])[0])
-        need_full = min(FULL_CAP_S, avail_) * 1.25
-        out(f"Force New Full: song {pre_song[0].get('title') or Path(pre_song[0]['path']).stem} ({avail_:.0f} s): filling {min(FULL_CAP_S, avail_):.0f} s, ~{need_full:.0f} s of clips wanted")
+        need_full = (min(FULL_CAP_S, avail_) - intro_cut()) * 1.25
+        out(f"Force New Full: song {pre_song[0].get('title') or Path(pre_song[0]['path']).stem} ({avail_:.0f} s): filling {min(FULL_CAP_S, avail_):.0f} s (intro and outro included), ~{need_full:.0f} s of clips wanted")
     if effects_mode(cfg, game) == "extra" and sky_enabled(cfg, game):
         FULL_CTX["sky_pick"] = cfg                         # V8.8.6: the pick prefers clear-sky multikills within their group (_sky_first)
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
@@ -17525,7 +17909,7 @@ def plan_summary_text(plan, n_clips):
     """The one-line Manual summary of a plan (what the status line / log show before a render). Module level so the summary and the render print the same thing from the same plan."""
     fit, sg = plan.get("fit", {}), plan["song"]
     used = len({p["path"] for t in plan["takes"] for p in (t.get("srcs") or [t])})
-    txt = (f"montage {plan['duration']:.0f} s from {used} of {n_clips} clips ({fit.get('usable', '?')} usable events, "
+    txt = (f"montage {plan['duration'] + (INTRO_S if plan.get('intro') else 0.0):.0f} s from {used} of {n_clips} clips ({fit.get('usable', '?')} usable events, "
            f"song section {sg['section_s']:.0f} s), song: {sg['title'] or Path(sg['path']).stem}, style: {plan['recipe']}")
     if fit.get("song_short") and fit.get("optimal"):
         txt = (f"{len(fit['song_short'])} ticked clips didn't fit in this song: " + ", ".join(fit["song_short"][:4]) +
@@ -17556,7 +17940,7 @@ def video_ready(path):
 
 
 def run_job(game, mode="render", force=False, paths=None, song_path=None, target=None, style=None,
-            seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True, pin=None, full=False):
+            seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True, pin=None, full=False, intro=None, intro_text=None):
     """mode: dry | preview | render. weekly=True is Auto. Always prints a plan or a plain-language reason.
     pin: the song / summary the Manual status line showed for exactly these inputs (V7.6.1, see make_plan)."""
     try:
@@ -17583,7 +17967,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             except Exception as ex:                        # noqa: BLE001
                 LOGONLY(f"kill ledger skipped: {type(ex).__name__}: {ex}")
         else:
-            plan, text = make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, pin=pin, full=full)
+            plan, text = make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, pin=pin, full=full, intro=intro, intro_text=intro_text)
         out(text)
         if paths is not None:                              # V7.6.1: the summary of THIS plan, printed from the plan that is rendered, and compared with the one shown before
             now_sum = plan_summary_text(plan, len(paths))
@@ -17621,6 +18005,9 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
         (logs / (outfile.stem + ".plan.txt")).write_text(text, encoding="utf-8")
         save_json(logs / (outfile.stem + ".plan.json"), plan)
         record_history(plan, outfile.stem)
+        save_last_seed(plan)                               # V9.0: the Manual tab's 'Last seed' button
+        if paths is None:                                  # V9.0: the series number counts the finished Auto / weekly / Force montages of this game
+            series_done(game, cfg)
         try:                                               # V6.0: flagged used only now, after the render succeeded
             mark_used({t["path"] for t in plan["takes"]} | {x["path"] for t in plan["takes"] for x in t.get("srcs", [])}, title=outfile.stem)
         except Exception as ex:
@@ -17831,7 +18218,7 @@ try:
 except Exception:          # selfcheck reports this; CLI still works
     tk = None
 
-PIP_PKGS = [("numpy", "numpy"), ("cv2", "opencv-python"), ("librosa", "librosa"), ("soundfile", "soundfile"),
+PIP_PKGS = [("numpy", "numpy"), ("PIL", "Pillow"), ("cv2", "opencv-python"), ("librosa", "librosa"), ("soundfile", "soundfile"),
             ("scipy", "scipy"), ("mutagen", "mutagen"), ("rapidfuzz", "rapidfuzz"), ("rapidocr_onnxruntime", "rapidocr-onnxruntime")]
 
 
@@ -18279,7 +18666,7 @@ def auto_fill_verified(cfg, game, cands, song_path, an, style, seed, rng=None, n
     bt = np.array(an["beats"], float)
     bd = float(np.median(np.diff(bt)))
     avail = float(an.get("dur") or (bt[-1] + bd)) - 0.1 - float(bt[0])
-    target = min(FULL_CAP_S, avail)
+    target = min(FULL_CAP_S, avail) - manual_intro_cut()
     rname = style if style in RECIPES else "hype"
     fresh = [c for c in cands if not c.get("used")]
     rng.shuffle(fresh)
@@ -18348,7 +18735,7 @@ def auto_fill_pick(cands, an, style, rng=None, game=None):
     bt = np.array(an["beats"], float)
     bd = float(np.median(np.diff(bt)))
     avail = float(an.get("dur") or (bt[-1] + bd)) - 0.1 - float(bt[0])
-    L = min(FULL_CAP_S, avail)
+    L = min(FULL_CAP_S, avail) - manual_intro_cut()
     need = L * AUTO_PICK_X                                 # a little over: the planner leaves out the weakest that do not fit
     rname = style if style in RECIPES else "hype"
     fresh = [c for c in cands if not c.get("used")]
@@ -18378,7 +18765,7 @@ def auto_fill_topup(cfg, game, picked, song_path, an, style, seed, info, note=No
     AUTO_TOL_S short of the song (its audible part, at most FULL_CAP_S), more clips are ticked from the same order (unused first, then the oldest used; their companions too) and it is planned again,
     at most AUTO_TOPUP_ROUNDS times. Nothing is ever unticked (the V8.6.1 loop that unticked clips could stall or empty the montage). Returns (paths, {'length', 'target', 'added', 'rounds'})."""
     lv0, lv1 = song_live_range(an)
-    target = min(FULL_CAP_S, lv1 - max(lv0, float(an["beats"][0])) - 0.1)
+    target = min(FULL_CAP_S, lv1 - max(lv0, float(an["beats"][0])) - 0.1) - manual_intro_cut()
     rest = list(info.get("rest") or [])
     allp, added, rounds, dur = list(picked), 0, 0, 0.0
     for rounds in range(AUTO_TOPUP_ROUNDS + 1):
@@ -19746,9 +20133,27 @@ class App:
         s3.pack(side="bottom", fill="x", padx=2, pady=(6, 2))          # packed FIRST so it can never be pushed off-screen
         bb = ttk.Frame(s3)
         bb.pack(fill="x", pady=(2, 6))
-        for text, mode in (("Dry plan", "dry"), ("Preview (720p, 20 s)", "preview"), ("Render", "render")):
+        ttk.Label(bb, text="INTRO TEXT", font=("Segoe UI", F(9), "bold")).pack(side="left", padx=(6, 0))        # V9.0: the intro's text (the main line, nothing else) and its tickbox, on the row of the big buttons
+        self.m_intro_text = tk.StringVar(value=INTRO_MANUAL["text"])
+        self.e_intro = ttk.Entry(bb, textvariable=self.m_intro_text, width=26)
+        self.e_intro.pack(side="left", padx=(6, 4))
+        self.named["Intro text"] = self.e_intro
+        self.m_intro_on = tk.BooleanVar(value=INTRO_MANUAL["on"])
+        cbi = ttk.Checkbutton(bb, text="Intro", variable=self.m_intro_on, command=lambda: intro_changed())
+        cbi.pack(side="left", padx=(2, 8))
+        self.named["Intro tickbox"] = cbi
+        for text, mode in (("Preview (720p, 20 s)", "preview"), ("Render", "render")):
             self.btn(bb, text, lambda m=mode: self.manual(m), big=True, primary=(mode == "render"),
                      name=f"manual:{mode}").pack(side="left", expand=True, fill="x", padx=6)
+        self.btn(bb, "Dry plan", lambda: self.manual("dry"), name="manual:dry").pack(side="right", padx=6)      # a small secondary action (it was a big button)
+
+        def intro_changed(*_):
+            INTRO_MANUAL["on"] = bool(self.m_intro_on.get())
+            INTRO_MANUAL["text"] = self.m_intro_text.get().strip()
+            if hasattr(self, "m_status"):
+                self.update_status()
+        self.m_intro_text.trace_add("write", intro_changed)
+        self.m_intro_on.trace_add("write", intro_changed)
         c3 = ttk.Frame(s3)
         c3.pack(fill="x", pady=2)
         ttk.Label(c3, text="Length").pack(side="left")
@@ -19775,6 +20180,7 @@ class App:
         ttk.Label(c3, text="Seed").pack(side="left", padx=(12, 2))
         self.m_seed = tk.StringVar()
         ttk.Entry(c3, textvariable=self.m_seed, width=8).pack(side="left")
+        self.btn(c3, "Last seed", self.fill_last_seed, name="manual:last_seed").pack(side="left", padx=(4, 0))         # V9.0: the seed of the most recently rendered montage
         for v_ in (self.m_seed, self.m_style):
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
         self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
@@ -20530,6 +20936,13 @@ class App:
         if kills:
             self._est_after = self.root.after(700, self.start_estimate)
 
+    def fill_last_seed(self):
+        """V9.0: puts the seed of the most recently rendered montage (any game, any mode; stored, so it survives a restart) in the Seed box; nothing to do when no montage was rendered yet."""
+        v = load_last_seed()
+        if v:
+            self.m_seed.set(str(v))
+            self._result = f"seed {v}"
+
     def est_seed(self):
         """The seed the estimate AND the render use (typed seed, else one kept until the next render)."""
         if self.m_seed.get().strip().isdigit():
@@ -20565,7 +20978,7 @@ class App:
                 pin_ = {"sig": sig_, "song": plan["song"]["path"], "at": time.strftime("%H:%M:%S"), "summary": msg, "plan": plan, "text": _,
                         "cfg": cfg_sig(), "ledger": LAST_LEDGER[0]}
                 sg_ = plan["song"]
-                msg_short = f"montage {plan['duration']:.0f} s \u00b7 song: {sg_['title'] or Path(sg_['path']).stem} \u00b7 {plan['recipe']}"
+                msg_short = f"montage {plan['duration'] + (INTRO_S if plan.get('intro') else 0.0):.0f} s \u00b7 song: {sg_['title'] or Path(sg_['path']).stem} \u00b7 {plan['recipe']}"
             except Exception as ex:
                 msg = f"cannot plan yet: {ex}"
                 msg_short = "cannot plan yet (see log)"
@@ -20593,7 +21006,7 @@ class App:
         sel = self.stree.selection()
         return (self.m_game.get(), tuple(sorted(p for p in paths if p in getattr(self, "byp", {}) and self.byp[p]["kills"])),
                 None if not sel or sel[0] == "auto" else sel[0], "optimal" if self.m_opt.get() else int(self.m_len.get()), self.m_style.get(), self.est_seed(),
-                self.full_flag(None if not sel or sel[0] == "auto" else sel[0]))
+                self.full_flag(None if not sel or sel[0] == "auto" else sel[0]), INTRO_MANUAL["on"], INTRO_MANUAL["text"])
 
     def pick_count(self):
         """N from the number box next to 'Random pick' (its own box, never the 'Tick newest' one); None = empty / not a number
@@ -20736,7 +21149,8 @@ class App:
         style = self.m_style.get()
         self.run_task("manual " + mode, self.job_video(
             self.m_game.get(), mode=mode, force=True, paths=paths, song_path=song,
-            target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=style, seed=seed, maxq=(self.m_q.get() == "max"), pin=pin, full=self.full_flag(song)))
+            target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=style, seed=seed, maxq=(self.m_q.get() == "max"), pin=pin, full=self.full_flag(song),
+            intro=bool(self.m_intro_on.get()), intro_text=self.m_intro_text.get().strip()))
 
     # ------------------------------------------------------------ Songs tab
     def build_songs(self):
@@ -21660,7 +22074,7 @@ def grab_gray_bgr(path, t, w, h):
 
 
 DATA_GLOBALS = ("DATA", "CONFIG_PATH", "CLIPS_CACHE", "AUDIO_CACHE", "KILLS_CACHE", "LOG_DIR", "SONG_CACHE", "USED_CLIPS", "USED_FLAGS", "USED_TITLES", "VAL_BACKUP", "REGION_DEFAULTS", "JOB_LOCK", "USED_SONGS",
-                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE", "BORDER_DIR", "REPEAT_CACHE", "SKY_EV_CACHE")
+                "FLICK_CACHE", "ONSET_CACHE", "SCALES", "REFINE_CACHE", "LOUD_CACHE", "BORDER_DIR", "REPEAT_CACHE", "SKY_EV_CACHE", "SERIES_FILE", "LAST_SEED_FILE")
 
 
 def use_data_dir(d):
@@ -21799,12 +22213,15 @@ def measure_sync(outfile, plan, row_frames=None):
     """From the RENDERED FILE: each take's kill moment (first frame its kill row is visible, minus the shot->row lag) vs the beat
     onsets of the music as it actually sits in the file (located by cross-correlation with the clean song)."""
     import numpy as np
+    plan = with_intro(plan)                                # V9.0: the plan as the render saw it (intro in front; its music starts INTRO_S earlier)
     off = music_offset(outfile, plan["song"]["path"], plan["song"]["start_t"]) or 0.0
     on = song_click_onsets(plan["song"]["path"]) - plan["song"]["start_t"] + off
     codes = read_barcodes(outfile)
     rows = []
     shot_lag = plan.get("_shot_lag", 0.0 if KILL_AT_ROW[0] else SHOT_LAG)      # V8.8.4: the kill moment is the kill row itself (before: the row minus the shot -> row lag)
     for t in plan["takes"]:
+        if t.get("intro"):
+            continue
         a = t["f0"]
         want = (row_frames or {}).get(Path(t["path"]).name)
         f_row = None
@@ -21864,6 +22281,8 @@ def speed_check(outfile, plan):
     fxw, probs = _fx_windows(plan), []
     fo = plan["song"].get("fade_out_start", plan["duration"])
     for ti, t in enumerate(plan["takes"]):
+        if t.get("intro"):
+            continue
         a = t["f0"]
         lo = a + max(0, int(round((t["kills_out"][0] - 1.0) * OUT_FPS)))
         hi = a + int(round(t["kills_out"][-1] * OUT_FPS))
@@ -21882,6 +22301,7 @@ def measure_render(outfile, plan, cfg, refine=True):
     60 fps), the kill moment (row - the take's measured shot->row lag), where the music really sits (cross-correlation with the
     clean song) and the nearest beat / strong song onset. Also: duration, music audible from the start, music gaps, tails."""
     import numpy as np
+    plan = with_intro(plan)                                # V9.0: the plan as the render saw it (intro in front)
     game = plan["game"]
     det = load_dets(game).get(game)
     rec = probe_video(str(outfile))
@@ -21891,6 +22311,8 @@ def measure_render(outfile, plan, cfg, refine=True):
     fxw = _fx_windows(plan)
     kills_clean = []                                       # second pass without the effect frames (a zoomed row can be misread)
     for ti, t in enumerate(plan["takes"]):                 # a montage cut ends every killfeed row: one analysis per take
+        if t.get("intro"):
+            continue
         fa, fb = int(math.ceil(t["out_start"] * FPS)), int(math.ceil((t["out_start"] + t["dur"]) * FPS))
         sub = [[f - fa, sn - fa, [b[:6] + [v if isinstance(v, str) else v - fa for v in b[6:]] for b in bx], bl]
                for f, sn, bx, bl in entry["ocr"] if fa <= f < fb]
@@ -21920,6 +22342,8 @@ def measure_render(outfile, plan, cfg, refine=True):
     strong = local_onsets(plan["song"]["path"]) - plan["song"]["start_t"] + off   # strong hits for THEIR part of the song
     rows = []
     for i, t in enumerate(plan["takes"], 1):
+        if t.get("intro"):
+            continue
         t0, t1 = t["out_start"], t["out_start"] + t["dur"]
         planned = [t0 + r for r in t["rows_out"]]
         got, hid = [], []
@@ -21965,6 +22389,7 @@ def render_check(outfile, plan, cfg, verbose=True):
     """Checks a finished montage ON THE FILE: duration = plan, music audible within the first 0.5 s, no music gaps, every take
     shows its kills (detector run on the output), no tail longer than 0.5 s after a take's last kill (the ending excepted), and the
     ending's slow-mo + fades start on the final kill. Returns (fails, measurements)."""
+    plan = with_intro(plan)                                # V9.0: the plan as the render saw it (intro in front; its music starts INTRO_S earlier)
     m = measure_render(outfile, plan, cfg)
     fails = []
     if abs(m["duration"] - m["planned"]) > 1.5 / OUT_FPS:
@@ -24041,6 +24466,23 @@ def main():
     except Exception as ex:
         out(f"ERROR: {ex}\n{traceback.format_exc()}")
         sys.exit(1)
+
+
+def v8_compat():
+    """V9.0 TESTS ONLY (env MONTAGER_V8_COMPAT=1, or call it): everything V9.0 changed in what a plan or a render contains switched back to V8.8.8: no intro, the old caps, the 2-3 s ending, the old outro
+    numbers and fades, no ending preference. The V8 test files and tests/guard90_vc.py use it to prove the rest is unchanged."""
+    global FULL_CAP_S, FULL_MIN_S, END_FADE, OUTRO_AFTER, OUTRO_FADE_LEN, OUTRO_MUSIC_MIN
+    INTRO_ON[0] = False
+    OUTRO_PREFER[0] = False
+    OUTRO_EASED[0] = False
+    INTRO_PREFER[0] = False
+    FULL_CAP_S, FULL_MIN_S = 150.0, 90.0
+    END_FADE = (2.0, 3.0)
+    OUTRO_AFTER, OUTRO_FADE_LEN, OUTRO_MUSIC_MIN = 0.5, 0.5, 0.6
+
+
+if os.environ.get("MONTAGER_V8_COMPAT"):
+    v8_compat()
 
 
 if __name__ == "__main__":
