@@ -41,7 +41,7 @@ def part0():
     check("APP_VERSION = V9.0", M.APP_VERSION == "V9.0", M.APP_VERSION)
     check("the intro is 7 s", M.INTRO_S == 7.0 and I.INTRO_S == 7.0)
     check("the whole montage is 3:00 at most (full modes 2:00 - 3:00)", M.FULL_CAP_S == 180.0 and M.FULL_MIN_S == 120.0 and M.OPT_RANGE[1] == 180.0 and M.LEN_MAX_S == 180)
-    check("outro: slow-mo release 1.5 s, eased fade 1.6 s, music tail >= 3 s, ending fade 3-4 s", M.OUTRO_AFTER == 1.5 and M.OUTRO_FADE_LEN == 1.6 and M.OUTRO_MUSIC_MIN == 3.0 and M.END_FADE == (3.0, 4.0))
+    check("outro: slow-mo held to the end, fade from the final kill over 2.0 s, music fade from the final kill, ending 2.5-3 s", M.OUTRO_AFTER == 0.0 and M.OUTRO_FADE_LEN == 2.0 and M.OUTRO_MUSIC_MIN == 2.5 and M.END_FADE == (2.5, 3.0) and M.ENDING_HOLD_SLOW[0])
     check("intro music + picture fade-in 0.5 s", M.INTRO_FADE_IN == 0.5 and I.FADE_IN == 0.5)
     check("no intro context outside a plan in the making", M.intro_cut() == 0.0)
     M.INTRO_CTX["on"] = True
@@ -135,7 +135,7 @@ def fake_plan(n=3, intro=True):
     plan = {"game": "valorant", "seed": 5, "recipe": "hype", "placement": "v5", "params": {}, "song": {"path": "C:/s.mp3", "artist": "a", "title": "t", "bpm": 120.0, "start_t": 20.0, "drop_t": 10.0,
             "drop_beat": 3, "fade_in": 0.3, "fade_out_start": f0 / 60 - 3.0, "lufs": -9.0, "section_s": 120.0}, "takes": takes, "duration": f0 / 60, "total_frames": f0, "notes": [],
             "beats_out": [0.0, 0.5, 1.0], "drops_out": [4.0], "beats_n": 3, "headline": "C:/c1.mp4", "ending": True, "lock": 1.0, "audio_mode": "auto", "audio_fallback": [], "audio_clip_fallback": [],
-            "outro": {"fade_start": f0 / 60 - 1.6, "fade_len": 1.6, "trimmed": 0.0}, "xfx_drop": [{"t": 4.0}], "drop_sync": [{"drop": 24.0, "take": 2, "impact": 24.0}], "effects": "default"}
+            "outro": {"fade_start": f0 / 60 - 2.0, "fade_len": 2.0, "trimmed": 0.0}, "xfx_drop": [{"t": 4.0}], "drop_sync": [{"drop": 24.0, "take": 2, "impact": 24.0}], "effects": "default"}
     if intro:
         plan["intro"] = {"len": 7.0, "look": "rgb", "title": "Title", "subline": "VALORANT \u00b7 SERIES #1", "family": None, "pal": None, "v0": 0.3, "v_end": 1.0, "hold": 6.0, "ramp": 1.0,
                          "src_a": 5.55, "src_b": 8.0, "src_idx": 0, "avail": 7.9, "anim": "A", "_text": {"file": "C:/t.mov", "y0": 300, "h": 480, "font": "x"}}
@@ -254,7 +254,7 @@ def part4():
 
 def part5():
     print("5) outro")
-    check("the ending prefers >= 1.6 s of quiet footage after the last kill", M.ENDING_PREF_POST == 1.6 and M.OUTRO_PREFER[0])
+    check("the ending prefers >= 1.6 s of quiet footage after the last kill", M.ENDING_PREF_POST == 1.3 and M.OUTRO_PREFER[0])
     e_ok = {"post": 3.0, "death_after": None, "times": [5.0], "unsure": [False]}
     e_short = dict(e_ok, post=1.0)
     e_death = dict(e_ok, death_after=1.2)
@@ -274,7 +274,7 @@ def part5():
     p = fake_plan()
     inputs, graph = M.build_filter(M.with_intro(p), dict(M.DEFAULT_CONFIG), False)
     m = re.search(r"eq=contrast='1-\(\(1-cos\(PI\*clip\(\(t-([\d.]+)\)/([\d.]+),0,1\)\)\)/2\)'", graph)
-    check("outro fade: an eased fade to black from the planned moment over 1.6 s", bool(m) and abs(float(m.group(2)) - 1.6) < 1e-6, str(m))
+    check("outro fade: an eased fade to black from the planned moment over 2.0 s", bool(m) and abs(float(m.group(2)) - 2.0) < 1e-6, str(m))
 
 
 def partr():

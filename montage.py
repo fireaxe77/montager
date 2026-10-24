@@ -9203,7 +9203,7 @@ def ease_in_segments(src_start, v0, E=EASE_FR, group=3):
         pos = b
     return segs, pos
 FADE_IN = 0.3                           # music + video fade-in at the very start
-END_FADE = (3.0, 4.0)                   # final slow-mo release + music + video fade, from the final kill (V9.0: 3-4 s, was 2-3 s: a release of about 1.5 s of real footage, then an eased fade to black)
+END_FADE = (2.5, 3.0)                   # final slow-mo release + music + video fade, from the final kill (V9.0: 3-4 s, was 2-3 s: a release of about 1.5 s of real footage, then an eased fade to black)
 RECIPES = {                             # all within V4's effect strength; they change pacing, run-ups, zooms, slow-mo, transitions
     "hype":       {"zoom_p": 0.60, "zoom_amp": 0.08, "ramp_p": 0.35, "flash": True, "slow_max": 1, "lead": (1, 2),
                    "trans": {"hard": 0.6, "flash": 0.2, "zoom": 0.2}},
@@ -10547,7 +10547,8 @@ def ending_safe(e):
     return post >= ENDING_MIN_POST and not (e.get("unsure") or [False])[-1]          # V8.1.1: never a slow-mo ending on an uncertain kill time
 
 
-ENDING_PREF_POST = 1.6               # V9.0: the ending prefers an event with this much footage after its last kill before my death / the clip end (the slow-mo release shows real footage) ...
+ENDING_PREF_POST = 1.3               # V9.0: the ending prefers an event with this much footage after its last kill before my death / the clip end (the slow-mo release shows real footage) ...
+ENDING_HOLD_SLOW = [True]            # the ending's slow-mo is held at one speed from the last kill to the end (no release to 1.0x); test switch
 OUTRO_PREFER = [True]                # ... and no new fight (no gunshot) in it; test switch
 OUTRO_EASED = [True]                 # V9.0: the fade to black is eased (cosine) and the music fade is a half sine; test switch (False = the linear fades of V8.8.8)
 
@@ -11629,6 +11630,10 @@ def take_segments(tk, f_c, f_k, f_x):
                 tk["cs2ramp"]["v_hi"], tk["cs2ramp"]["why"] = rr_[1], rr_[2]
             else:
                 tk["cs2ramp"]["why"] = "the take is too short for the ramp: normal slow-mo release"
+        if tk.get("ending") and ENDING_HOLD_SLOW[0] and rem > 0:       # the ending stays at the slow-mo speed from the last kill to the very end (it fades out over it); less footage is needed than for a release
+            v_ = min(SLOW_V0, (post - 0.017) / (rem / OUT_FPS))
+            if v_ >= SLOW_FLOOR:
+                spd_ = [v_] * rem
         if spd_ is None:
             spd_ = release_speeds(rem, SLOW_V0, post)
         if spd_ is not None:
@@ -12284,15 +12289,15 @@ def _sum_expr(terms):
 
 
 OUTRO_TRIM_ON = [True]      # V7.6.0: test switch (trim_outro)
-OUTRO_FADE_LEN = 1.6        # V7.5.1.2: video fade-out = the last part of the final take (music fade keeps fade_out_start .. end); no freeze / hold. V9.0: 1.6 s, eased (was 0.5 s)
+OUTRO_FADE_LEN = 2.0        # V7.5.1.2: video fade-out = the last part of the final take (music fade keeps fade_out_start .. end); no freeze / hold. V9.0: 1.6 s, eased (was 0.5 s)
 OUTRO_SHORT_TAIL = 0.8      # tail after the last kill shorter than this: shorter fade
 OUTRO_MIN_FADE = 0.3
 INTRO_PUNCH = (0.06, 0.25)  # first take: zoom amount on the first beat, settling time
 
 
-OUTRO_AFTER = 1.5           # V7.6.0: the fade to black starts this long after the last kill impact (never before the last kill row is readable); V9.0: 1.5 s of slow-mo release first (was 0.5 s)
+OUTRO_AFTER = 0.0           # V7.6.0: the fade to black starts this long after the last kill impact (never before the last kill row is readable); V9.0: 1.5 s of slow-mo release first (was 0.5 s)
 OUTRO_ROW_READ = 0.4        # the last kill row is readable this long after it appears
-OUTRO_MUSIC_MIN = 3.0       # the music fade (last kill -> final frame) is at least this long (V9.0: a long music tail, was 0.6 s)
+OUTRO_MUSIC_MIN = 2.5       # the music fade (last kill -> final frame) is at least this long (V9.0: a long music tail, was 0.6 s)
 
 
 def trim_outro(plan, notes=None):
@@ -24474,6 +24479,7 @@ def v8_compat():
     global FULL_CAP_S, FULL_MIN_S, END_FADE, OUTRO_AFTER, OUTRO_FADE_LEN, OUTRO_MUSIC_MIN
     INTRO_ON[0] = False
     OUTRO_PREFER[0] = False
+    ENDING_HOLD_SLOW[0] = False
     OUTRO_EASED[0] = False
     INTRO_PREFER[0] = False
     FULL_CAP_S, FULL_MIN_S = 150.0, 90.0
