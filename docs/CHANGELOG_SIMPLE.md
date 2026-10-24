@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.0.1 - 2026-10-24: Every drop gets a kill, also right after the intro
+- A drop in the song that comes right after the intro now gets a kill on it, even when the first clip had no room for it before
+- The first clip after the intro no longer needs its own run-up, because the intro already shows it
+- When a drop cannot be reached, the montage plan now says exactly why instead of skipping it silently
+- The ending of a montage now stays in slow motion until it fades out, and the fade starts right after the last kill
+
 ## V9.0 - 2026-10-24: An intro and an outro for every montage
 - Every montage now opens with a 7 second intro: your first clip, slowed down and blurred while the song fades in and the song title appears over it, then the picture sharpens and speeds up into the clip
 - Six looks for the title, chosen from the style of the montage; two of them take their colours from the montage's sky colours. In Manual you can type your own intro text, or untick the intro (Dry plan is now a small button next to it)
