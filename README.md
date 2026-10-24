@@ -10,6 +10,14 @@ Montager turns your own Valorant, CS2 and Rainbow Six Siege clips into kill mont
 
 <p align="center"><img src="docs/images/demo.gif" alt="Montager demo" width="320"></p>
 
+## Download
+
+**[⬇ Download Montager for Windows (installer)](https://github.com/fireaxe77/montager/releases/latest/download/Montager-Setup.exe)**: Windows 10 / 11, 64-bit. Everything is included (Python, FFmpeg, the OCR engine); no admin rights needed.
+
+- No installer wanted: [portable ZIP](https://github.com/fireaxe77/montager/releases/latest/download/Montager-Portable.zip) (unzip, double-click `Montager.exe`).
+- Plain Python version: [Montager-Python.zip](https://github.com/fireaxe77/montager/releases/latest/download/Montager-Python.zip) (see [Install with Python](#install-with-python)).
+- All versions and notes: [Releases](https://github.com/fireaxe77/montager/releases).
+
 ## Screenshots
 
 | Auto tab | Manual tab |
@@ -20,26 +28,38 @@ Montager turns your own Valorant, CS2 and Rainbow Six Siege clips into kill mont
 
 ## Contents
 
-[Requirements](#requirements) · [Install](#install) · [First-time setup](#first-time-setup) · [Your first montage](#your-first-montage) ·
+[Download](#download) · [Requirements](#requirements) · [Install](#install) · [First-time setup](#first-time-setup) · [Your first montage](#your-first-montage) ·
 [Settings](#settings-overview) · [Calibration and limitations](#calibration-and-limitations) · [Troubleshooting](#troubleshooting) · [Credits](#credits-and-licenses)
 
 ## Requirements
 
 | What | Version / notes |
 |---|---|
-| Windows | Windows 10 or 11, 64-bit. The launchers are Windows-only. |
+| Windows | Windows 10 or 11, 64-bit. |
+| Installer / portable ZIP | Nothing else: Python, FFmpeg and the OCR engine are inside (about 700 MB installed). The rows below are only for the Python version. |
 | Python | **3.12, 64-bit** from python.org, with tcl/tk (tkinter) installed. 3.10 / 3.11 may work but are not tested. |
 | FFmpeg | A recent build with `ffmpeg` and `ffprobe`, for example the gyan.dev "essentials" build. |
 | Python packages (required) | `numpy opencv-python Pillow librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime` |
 | Python packages (recommended) | `sv-ttk` (the dark theme), `psutil` (memory readings), `fonttools` (intro titles in other alphabets) |
 | OCR engine | RapidOCR (the `rapidocr-onnxruntime` package). Runs offline on the CPU; no separate install. |
-| GPU (optional) | An NVIDIA GPU makes rendering faster (NVENC). Without one, pick Quality "Max (x264)": slower, same result. |
+| GPU (optional) | An NVIDIA GPU makes rendering faster (NVENC). The installed app switches to x264 by itself when there is no working NVIDIA encoder (slower, same result); the Python version: pick Quality "Max (x264)". |
 | Disk / RAM | Space for the montages (about 100 to 400 MB each). 16 GB RAM recommended: a long render with effects can use about 10 GB. |
 | Songs | Your own audio files plus a playlist CSV from [Exportify](https://exportify.app) (see [Songs](#1-songs)). |
 
 More detail: [docs/guides/INSTALL.md](docs/guides/INSTALL.md).
 
 ## Install
+
+### With the installer (recommended)
+
+1. Download **[Montager-Setup.exe](https://github.com/fireaxe77/montager/releases/latest/download/Montager-Setup.exe)** and run it. Windows may show "Windows protected your PC" because the file is not code-signed: click **More info > Run anyway**.
+2. Start **Montager** from the Start menu (or the desktop shortcut, if you ticked it).
+3. The first start shows a short list of what is still missing (clip folders, songs, your in-game name). Click **Open Montager** and fill them in under Settings (next section).
+
+- Your settings, caches and logs live in `%LOCALAPPDATA%\Montager\montage_data`. Updates and uninstalling keep them.
+- Start menu > **Montager setup check** shows the full check at any time.
+
+### Install with Python
 
 1. **Python 3.12**: install it from [python.org](https://www.python.org/downloads/). Tick **"Add python.exe to PATH"**.
 2. **FFmpeg**: open a terminal (cmd) and run
@@ -125,7 +145,7 @@ Everything below is in Montager's **Settings** tab. Changes are saved as you mak
 
 ## Your first montage
 
-1. Open **Settings**: songs, CSV, clip folders, player names, output folder (see above). Re-run `Start_Montager.bat` or `python setup_check.py` until it says **ready**.
+1. Open **Settings**: songs, CSV, clip folders, player names, output folder (see above). Run the setup check (Start menu > **Montager setup check**; Python version: `python setup_check.py`) until it says **ready**.
 2. **Troubleshoot > Selfcheck**: every line should say OK.
 3. **Troubleshoot > Scan all clips now** (or skip this and let step 5 scan in smaller steps).
 4. **Troubleshoot > Self-test detection**: shows what the OCR read and why each row counted or not. This is the quickest way to see your player names work.
@@ -200,7 +220,7 @@ Prefer to choose yourself? Use the **Manual** tab:
 
 | Problem | Fix |
 |---|---|
-| Nothing happens on double-click | Run `Start_Montager.bat`: it shows what's missing. Or open a terminal in the folder and run `python montage.py` to see the error. |
+| Nothing happens on double-click | Installed app: Start menu > Montager setup check. Python version: run `Start_Montager.bat`: it shows what's missing. Or open a terminal in the folder and run `python montage.py` to see the error. |
 | "Missing packages" | Click Yes to install, or run the `pip install` line from [Install](#install). |
 | `ffmpeg not found` | Install it (step 2), then open a **new** terminal / restart Montager. Or put `ffmpeg.exe` + `ffprobe.exe` into `montage_data\bin`. |
 | NVENC test fails | Update the NVIDIA driver, or choose Quality "Max (x264)". |

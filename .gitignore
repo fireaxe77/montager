@@ -52,3 +52,7 @@ used_*.json
 /release/
 /dist/
 *.zip
+
+# packaging build output
+/build/
+packaging/build/

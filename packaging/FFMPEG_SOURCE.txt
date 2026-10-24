@@ -1,0 +1,13 @@
+FFmpeg in this folder (ffmpeg.exe, ffprobe.exe) is an unmodified static Windows build from https://www.gyan.dev/ffmpeg/builds/
+("essentials" build). It is licensed under the GNU General Public License version 3 (see LICENSE in this folder); the
+included libraries and their versions are listed in README.txt in this folder.
+
+Montager runs ffmpeg.exe / ffprobe.exe as separate programs; it does not link to them. Montager's own code is MIT-licensed.
+
+Corresponding source code:
+  FFmpeg:              https://github.com/FFmpeg/FFmpeg  (the exact commit is in README.txt: "Source Code: ...")
+  Release tarballs:    https://ffmpeg.org/download.html#releases
+  Build of this binary: https://www.gyan.dev/ffmpeg/builds/  (build scripts and per-library source links)
+  x264:                https://code.videolan.org/videolan/x264
+
+Questions about the source of this binary: open an issue at https://github.com/fireaxe77/montager/issues
