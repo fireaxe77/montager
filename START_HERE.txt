@@ -1,0 +1,31 @@
+MONTAGER V9.0.1 - kill montages from your own Valorant, CS2 and Rainbow Six Siege clips, cut to a song.
+
+1. Install Python 3.12 (64-bit) from https://www.python.org/downloads/
+   Tick "Add python.exe to PATH" in the installer.
+
+2. Install FFmpeg. In a terminal (cmd):
+       winget install --id Gyan.FFmpeg -e --scope user
+   Then close the terminal.
+
+3. Install the Python packages. Open a terminal IN THIS FOLDER and run:
+       python -m pip install --user numpy opencv-python Pillow librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime sv-ttk psutil fonttools
+
+4. Double-click Start_Montager.bat.
+   The first time it creates your settings and an empty songs folder (Music\Montager songs),
+   checks your setup (read-only) and lists anything still missing, then opens Montager.
+
+5. In Montager > Settings:
+   - MP3 folder: your songs, named "<title> - <artists>.mp3"
+   - Exportify CSV folder: the playlist .csv from https://exportify.app
+   - Valorant / CS2 / R6S clip folders: where your recorder saves clips
+   - Player names: your in-game name exactly as the killfeed shows it
+   - Output folder: where the montages go
+
+6. Troubleshoot > Scan all clips now (first time only; roughly 7-17 s per clip, cached afterwards).
+   Then Auto tab > Dry plan, Preview, and "Make this week's montage".
+
+Full guide: README.md (or https://github.com/fireaxe77/montager).
+Problems: docs\guides\TROUBLESHOOTING.md, or run "python setup_check.py" in this folder.
+
+Note: kill detection was tested mainly on the developer's setup (1920x1080, default HUD, NVIDIA / OBS recordings).
+Other setups may need the killfeed calibration (Troubleshoot > Calibrate killfeed region).
