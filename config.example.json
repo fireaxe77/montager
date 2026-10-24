@@ -1,0 +1,18 @@
+{
+ "cfg_version": 5,
+ "mp3_dir": "%USERPROFILE%\\Music\\Montager songs",
+ "playlist_dir": "%USERPROFILE%\\Music\\Montager songs",
+ "output_root": "%USERPROFILE%\\Videos\\Montages",
+ "clip_root": "%USERPROFILE%\\Videos",
+ "clip_dirs": {
+  "valorant": [],
+  "cs2": [],
+  "r6s": []
+ },
+ "player_names": {
+  "valorant": ["YourName"],
+  "cs2": ["YourName"],
+  "r6s": ["YourName"]
+ },
+ "update_on_start": false
+}
