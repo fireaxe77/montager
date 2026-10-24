@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.0"
+APP_VERSION = "V9.0.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -10200,7 +10200,7 @@ def take_tail_bounds(t):
 TAIL_REPAIR_MAX_FR = 30              # V7.7.0: a tail repair moves at most this many frames
 
 
-def repair_tails(plan, notes):
+def repair_tails(plan, notes, skip_first=False):
     """V7.7.0: a take whose tail broke the max (or min) tail rule is REPAIRED before anything is skipped: the tail is cut (lengthened) inside the window the rule allows and the take
     after it takes over the frames as a longer (shorter) run-up, so every kill of every take keeps its exact time, the length and the order never change. Returns the log lines;
     a take no repair fits is left as it is (the caller then skips it and lists the rule)."""
@@ -10211,6 +10211,8 @@ def repair_tails(plan, notes):
         t = takes[i]
         if t.get("ending") or not t.get("kills_out") or i + 1 >= len(takes):
             continue
+        if i == 0 and skip_first:
+            continue                                       # V9.0.1: the extended first take keeps its long tail until the drop levers have used it (the repair after them cuts what is left)
         tail, lo, hi = take_tail_bounds(t)
         if lo - 1.0 / fps - 1e-9 <= tail <= hi + 1.0 / fps + 1e-9:
             continue
@@ -10276,7 +10278,13 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
     hdrop = s0 + hd if hd is not None else None
     order = sorted(drops, key=lambda d: (0 if (hdrop is not None and abs(d[0] - hdrop) < 1.0) else 1, -d[1], d[0]))
     for t_d, _st, src_ in order:
-        if not (s0 + 0.5 < t_d < s0 + D - 1.0):
+        lo_m = (INTRO_LEAD_MIN + 0.02) if INTRO_CTX.get("on") else 0.5          # V9.0.1: with the intro the first take only needs the minimum run-up before a kill on an early drop
+        if not (s0 + lo_m < t_d < s0 + D - 1.0):
+            if INTRO_CTX.get("on") and s0 - INTRO_S - 0.5 < t_d <= s0 + lo_m:      # V9.0: a drop of the intro's music / right at the first take: said, never silently skipped
+                why_i = (f"falls {s0 - t_d:.2f} s before the first take, inside the intro's music (song {s0 - INTRO_S:.2f}-{s0:.2f} s): the intro shows no kill and the plan cannot start earlier"
+                         if t_d <= s0 else f"only {t_d - s0:.2f} s after the first take starts: a kill needs a {LEAD_MIN} s run-up and {ROW_TAIL} s of tail inside it")
+                sync.append({"drop": round(t_d, 3), "source": src_, "take": None, "kill": None, "impact": None, "err_ms": None, "lever": None, "why": why_i, "intro_zone": True})
+                lines.append(f"drop {t_d:.3f} not anchorable: {why_i}")
             continue
         if grid is not None and len(grid):
             gb = float(grid[int(np.argmin(np.abs(np.asarray(grid) - t_d)))])
@@ -10296,6 +10304,14 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
         why, best = f"no kill of a selected take within {DROP_SEARCH} s of the drop", None
         for _tier, _n, _e, ti, kj in sorted(cands):
             new, lev, r = move_kill(plan, ti, kj, t_d, fps, protected=used)
+            if new is None and ti == 0 and INTRO_CTX.get("on") and plan["takes"][0].get("f0", 0) == 0 and "rx" not in plan["takes"][0]:
+                tk0 = plan["takes"][0]                     # V9.0.1: the intro shows the first take's run-up: its own run-up may be as short as INTRO_LEAD_MIN for a kill on a drop
+                tk0["rx"] = {"lead_min": INTRO_LEAD_MIN}
+                new, lev, _r2 = move_kill(plan, ti, kj, t_d, fps, protected=used)
+                if new is None:
+                    tk0.pop("rx", None)
+                else:
+                    lev += "+i"
             if new is None:
                 if why.startswith("no kill"):
                     why = f"take {ti + 1} kill {kj + 1}/{len(plan['takes'][ti]['kills'])}: {r}"
@@ -11006,22 +11022,36 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         return None
     head_take = None
     drop_note = ""
+    head_fb = None
     for e in head_cands[:10]:
         slow_ok = rp["slow_max"] > 0 and not e.get("util")      # V7.3: a utility take gets no slow-mo
         head_take = (place(e, U, down, rp, kb=drop, slow=True) if slow_ok else None) or place(e, U, down, rp, kb=drop)
         if head_take:
             if e["n"] >= 3 and HEADLINE_RULES_V73:         # V7.3: the FINISHER (last kill) lands on the drop when a valid run-up fits before it, else the first kill
                 up = next((u for u in (place(e, U, down, rp, kb=drop, slow=sl, anchor="last") for sl in ((True, False) if head_take["slow"] else (False,))) if u), None)
-                if up:
+                if up and INTRO_CTX.get("on") and INTRO_PREFER[0] and up["c"] < t_lo <= head_take["c"]:
+                    up = None                                  # V9.0: the finisher on the drop would start the take before the intro's music ends: the first kill stays on the drop
+                    drop_note = "drop anchor: kept (first kill: the finisher's run-up would start inside the intro's music)"
+                elif up:
                     head_take = up
                 else:
                     why_k = ("the drop is too early in the song for the finisher's run-up" if drop - 2 * (e["span"] / max(1e-3, bd)) < 4
                              else "no valid run-up / tail window for the finisher on this drop")
                     drop_note = f"drop anchor: kept (first kill: {why_k})"
+            if INTRO_CTX.get("on") and INTRO_PREFER[0] and head_take["c"] < t_lo and e is not head_cands[:10][-1]:
+                if head_fb is None:
+                    head_fb = (e, head_take, drop_note)
+                head_take = None                               # V9.0: this clip would start before the intro's music ends: the next candidate (the first one kept if none is better)
+                continue
             if e is not head:
                 rest = [x for x in rest if x is not e] + ([head] if head not in rest and head is not ending else [])
                 head = e
             break
+    if not head_take and head_fb is not None:
+        e, head_take, drop_note = head_fb
+        if e is not head:
+            rest = [x for x in rest if x is not e] + ([head] if head not in rest and head is not ending else [])
+            head = e
     if not head_take:
         raise RuntimeError("no clip could be placed on the drop")
     c_h = head_take["c"]
@@ -11248,10 +11278,19 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     if drop_note:
         notes.append(drop_note)
     # (V7.6.1: the 'second drop' note is written at the end, from the window the montage really covers)
+    ef_ = int(INTRO_CTX.get("extend_first", 0)) if INTRO_CTX.get("on") else 0
+    ext_ = None
+    if ef_ and len(takes) >= 2:                            # V9.0.1 retry variant: the first take is ef_ ticks (whole beats) longer, every take after it starts ef_ ticks later (see _extend_first)
+        ext_ = _extend_first(takes, ef_, U, song_end)
+        if ext_ is not None:
+            old_head = head_take
+            takes = ext_
+            head_take = next((t_ for t_ in takes if t_["ev"] is old_head["ev"]), old_head)
+            notes.append(f"intro: the first take is {ef_ / 2:g} beat(s) longer so an early drop can have a kill on it")
     plan = finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, why, notes, total_ev, rng, placement, lock,
                       used_drop_beat=(fit["drop_beat"] if fit else None))       # V7.4.7: TIMELINE / song.drop_t print the drop actually used
     try:                                                   # V7.7.0: a tail the planner's tick grid left outside the allowed window is repaired first (the drop levers need valid takes)
-        repair_tails(plan, plan["notes"])
+        repair_tails(plan, plan["notes"], skip_first=bool(ef_ and ext_ is not None))
     except Exception as ex_:
         LOGONLY(f"tail repair skipped: {type(ex_).__name__}: {ex_}")
     if HEADLINE_RULES_V73:                                 # which kill sits on which drop (read by `montage.py dropcheck`)
@@ -11346,6 +11385,37 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
 SECTION_TRIES = 4                       # V7.6.1: candidate song sections evaluated per plan (Optimal length)
 
 
+def _extend_first(takes, n, U, song_end):
+    """V9.0.1: the first take n ticks longer at its END (its tail grows; whole beats keep every later first kill on its beat) and every take after it n ticks later, each re-checked with geom
+    (the ending's fade must still end inside the song). None when any take no longer fits."""
+    def keep(t, g):
+        return dict(g, **{k_: v_ for k_, v_ in t.items() if k_ not in g and k_ not in ("c", "kb", "end", "lead_t", "ramp", "dur")})
+    t0 = takes[0]
+    if t0.get("ending") or t0.get("end") is None:
+        return None
+    ev0 = t0["ev"]
+    if t0.get("tailmode") or t0.get("slow") or t0.get("anchor") == "last":
+        return None
+    tail = float(U[t0["end"] + n]) - (float(U[t0["kb"]]) + float(t0.get("ospan", ev0["times"][-1] - ev0["times"][0])))
+    post = ev0["post"] if ev0.get("death_after") is None else min(ev0["post"], ev0["death_after"] - 0.05)
+    if tail > post - 0.1 or t0["end"] + n >= len(U):
+        return None                                        # the footage after its last kill would not last
+    out = [dict(t0, end=t0["end"] + n, dur=float(U[t0["end"] + n] - U[t0["c"]]))]
+    for t in takes[1:]:
+        if t.get("ending"):
+            fe = t.get("fade_end")
+            g = geom(t["ev"], U, t["c"] + n, t["kb"] + n, None, 1.0, True, ending=True)
+            if not g or fe is None or fe + n >= len(U) or float(U[fe + n]) > song_end:
+                return None
+            out.append(dict(t, **{x_: g[x_] for x_ in ("c", "kb", "lead_t", "ramp", "dur") if x_ in g}, fade_end=fe + n))
+            continue
+        g = geom(t["ev"], U, t["c"] + n, t["kb"] + n, t["end"] + n, t["ramp"], t["slow"], anchor=t.get("anchor", "first"), tailmode=t.get("tailmode", "plain"))
+        if not g:
+            return None
+        out.append(keep(t, g))
+    return out
+
+
 def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, notes, lock=None, placement="v5", manual=False):
     """V9.0: plan_montage_tries(); when the intro could not be made because the first take's footage was too short or not clean (a shot / my death in it), the same montage is planned again with
     another first take (up to INTRO_RETRIES times): the montage without its intro is kept only when no first take works."""
@@ -11371,10 +11441,69 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
             if not pl2.get("_intro_retry"):
                 break
             plan["_intro_retry"] = pl2["_intro_retry"]
+        if INTRO_CTX.get("on") and INTRO_ANCHOR_TRIES[0] and plan.get("intro"):
+            plan = _drop_retry(plan, notes, n0, (cfg, game, events, song, an, seed, style, target_s, hist_c), (lock, placement, manual))
     finally:
         INTRO_CTX.pop("avoid", None)
+        INTRO_CTX.pop("extend_first", None)
     plan.pop("_intro_retry", None)
     return plan
+
+
+INTRO_LEAD_MIN = 0.05                # V9.0.1: the first take after the intro needs no run-up of its own: its first kill may come this soon after it starts (the usual minimum LEAD_MIN is 0.3 s)
+INTRO_ANCHOR_TRIES = [True]          # V9.0.1 test switch
+
+
+def _unanchored(plan):
+    return [x for x in (plan.get("drop_sync") or []) if not x.get("take") and not (x.get("intro_zone") and "inside the intro" in (x.get("why") or ""))]
+
+
+def _drop_retry(plan, notes, n0, args, kw):
+    """V9.0.1: every drop of the song inside the montage gets a kill on its exact time, also the one right after the intro. A drop the planner could not anchor is tried again with a different
+    take structure: (1) another clip as the FIRST take (the intro already shows its run-up: the first take only has to carry its kill on the drop, and its length, kills and so the structure after
+    it change), up to INTRO_FIRST_TRIES clips; (2) the first take put on the early drop directly; (3) the plan starting 1 / 2 ticks later. The variant with the most anchored drops and no kill less
+    wins; a drop nothing can serve keeps its exact reason in the plan."""
+    base_bad = _unanchored(plan)
+    if not base_bad:
+        return plan
+    kills = lambda pl_: sum(len(t_["kills"]) for t_ in pl_["takes"])
+    anch = lambda pl_: sum(1 for x in (pl_.get("drop_sync") or []) if x.get("take"))
+    best, best_key = plan, (anch(plan), 0)
+    s0 = float(plan["song"]["start_t"])
+    cfg, game, events, song, an, seed, style, target_s, hist_c = args
+    lock, placement, manual = kw
+    avoid0 = set(INTRO_CTX.get("avoid", ()))
+    seen_first = {plan["takes"][0]["path"]}
+    variants = [("the first take one beat longer", {"extend_first": 2}), ("the first take two beats longer", {"extend_first": 4}), ("the first take three beats longer", {"extend_first": 6})]
+    variants += [(f"another first clip ({i + 1})", None) for i in range(INTRO_FIRST_TRIES)]
+    for name, ctx in variants:
+        INTRO_CTX.pop("extend_first", None)
+        INTRO_CTX["avoid"] = avoid0 | (seen_first if ctx is None else set())
+        if ctx:
+            INTRO_CTX.update(ctx)
+        nl = list(n0)
+        try:
+            pl2 = plan_montage_tries(cfg, game, events, song, an, seed, style, target_s, hist_c, nl, lock, placement, manual)
+        except RuntimeError:
+            continue
+        finally:
+            INTRO_CTX.pop("extend_first", None)
+        seen_first.add(pl2["takes"][0]["path"])
+        if not pl2.get("intro") or kills(pl2) < kills(plan) or abs(pl2["duration"] - plan["duration"]) > 3.0:
+            continue
+        key = (anch(pl2), -len(_unanchored(pl2)))
+        if key > best_key:
+            best, best_key = pl2, key
+            best["notes"].append(f"drop anchoring: planned again with {name}: {anch(pl2)} of {len(pl2.get('drop_sync') or [])} drops anchored (the first plan: {anch(plan)})")
+            if not _unanchored(pl2):
+                break
+    INTRO_CTX["avoid"] = avoid0
+    if best is not plan:
+        notes[:] = best["notes"]
+    return best
+
+
+INTRO_FIRST_TRIES = 6                # V9.0.1: other clips tried as the first take when a drop is not anchored
 
 
 INTRO_RETRIES = 5
