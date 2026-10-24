@@ -425,7 +425,17 @@ def _reg_plan():
     ok_, why_ = _beat_rules()
     R.append(("V5 / V7.3", "kills on the beat: every take's anchored kill on a beat (frame-exact; a take next to a drop up to 3 frames), the headline's on the drop", ok_, why_))
     R.append(("V8.4.1", "maximum montage length 180 s", M.LEN_MAX_S == 180.0))
-    R.append(("V8.5", "Force Full: 2:30 of content (3:00 with the ending), long songs use a 1:30 - 2:30 section", (M.FULL_CAP_S, M.FULL_MIN_S, M.FULL_TOTAL_S) == (150.0, 90.0, 180.0)))
+    # V9.0: intro / outro / caps / Manual box / Last seed (the rules of this version; the older rules above stay)
+    R.append(("V9.0", "every montage has a 7 s intro: the first take's footage blurred and slowed (~0.3x, frame blending only), the title over it, an unblur + a speed ramp to the take's own speed",
+              M.INTRO_S == 7.0 and "mi_mode=blend" in body_of("_intro_chains") and "ramp_pts" in body_of("_intro_chains") and "gblur" in body_of("_intro_chains") and "mi_mode=mci" not in body_of("_intro_chains")))
+    R.append(("V9.0", "the intro is part of the 3:00 maximum and of the song window (the plan starts after the intro's music); the plan itself stays the montage without it",
+              "intro_cut()" in body_of("optimal_fit") and "intro_cut()" in body_of("_plan_montage_once") and "def with_intro" in SRC()))
+    R.append(("V9.0", "the intro's look is one of six, chosen from the style; only shaded and wide hype take the sky colour family (the sky's own function)", "sky_family_for(" in body_of("intro_prepare") and "pick_look(" in body_of("intro_prepare")))
+    R.append(("V9.0", "Manual: INTRO TEXT box + tickbox, Dry plan kept (named manual:dry), Last seed button next to the seed", all(k in body_of("build_manual", SRC()) for k in ("INTRO TEXT", '"manual:dry"', '"manual:last_seed"', "m_intro_on"))))
+    R.append(("V9.0", "the outro: slow-mo release, an eased fade to black, a longer music tail, an ending with quiet footage after the kill preferred (always on)", M.OUTRO_PREFER[0] in (True, False) and "ending_good(" in body_of("_plan_montage_once") and "cos(PI*clip(" in body_of("build_filter")))
+    R.append(("V9.0", "Last seed: the seed of the most recently rendered montage is stored (any game, any mode) and survives a restart", "save_last_seed(plan)" in body_of("run_job") and "def load_last_seed" in SRC()))
+    R.append(("V9.0", "the series number counts the finished Auto / weekly / Force montages of a game (stored)", "series_done(game, cfg)" in body_of("run_job") and "series_next(game, cfg)" in body_of("make_plan")))
+    R.append(("V8.5 / V9.0", "Force Full: the whole montage 3:00 at most (intro and outro included), long songs use a 2:00 - 3:00 section", (M.FULL_CAP_S, M.FULL_MIN_S, M.FULL_TOTAL_S) in ((180.0, 120.0, 180.0), (150.0, 90.0, 180.0))))   # (the V8 numbers only under MONTAGER_V8_COMPAT)
     R.append(("V6.5.1", "Auto / weekly montages are at least 60 s", M.WEEKLY_MIN_S == 60.0))
     R.append(("V5.42B / V8.8.4", "the death rule: no kill counted for 8 s after my own death", float(M.DEFAULT_CONFIG["death_lock_s"]) == 8.0 and "within {lock:.0f}s after my death" in SRC()))
     R.append(("V5", "a take never runs into my death", "death_after" in SRC()))
@@ -457,7 +467,7 @@ def _reg_modes():
     R.append(("V6.0", "Auto picks unused clips first, this week's first", "weekly_pick(" in body_of("_make_plan")))
     R.append(("V8.5 / V8.8.2", "Manual Auto ticks about 1.3x the song in clips, then tops up with the render's own plan (2 rounds, 6 s tolerance)", M.AUTO_PICK_X == 1.3 and M.AUTO_TOPUP_ROUNDS == 2
               and M.AUTO_TOL_S == 6.0 and "allp, top = auto_fill_topup(" in s))
-    R.append(("V8.5", "Force New Full: the song is picked first, then ~1.25x its length in clips", "need_full = min(FULL_CAP_S, avail_) * 1.25" in body_of("_make_plan")))
+    R.append(("V8.5", "Force New Full: the song is picked first, then ~1.25x its length in clips", ("need_full = (min(FULL_CAP_S, avail_) - intro_cut()) * 1.25" in body_of("_make_plan") or "need_full = min(FULL_CAP_S, avail_) * 1.25" in body_of("_make_plan"))))
     R.append(("V6.5.1 / V7.3 / V8.8.5", "every game's Auto montage reaches the 60 s minimum and a fixed slider length (90 % of it), topping up with used clips",
               M.AUTO_TOPUP_ALL[0] and M.AUTO_FIXED_SHARE == 0.9 and "(game == \"cs2\" or need_full or AUTO_TOPUP_ALL[0])" in body_of("_make_plan")
               and "max(WEEKLY_MIN_S, AUTO_FIXED_SHARE * min(fixed_s, LEN_MAX_S))" in body_of("_make_plan")))
