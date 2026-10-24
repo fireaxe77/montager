@@ -427,7 +427,7 @@ def _reg_plan():
     R.append(("V8.4.1", "maximum montage length 180 s", M.LEN_MAX_S == 180.0))
     # V9.0: intro / outro / caps / Manual box / Last seed (the rules of this version; the older rules above stay)
     R.append(("V9.0", "every montage has a 7 s intro: the first take's footage blurred and slowed (~0.3x, frame blending only), the title over it, an unblur + a speed ramp to the take's own speed",
-              M.INTRO_S == 7.0 and "mi_mode=blend" in body_of("_intro_chains") and "ramp_pts" in body_of("_intro_chains") and "gblur" in body_of("_intro_chains") and "mi_mode=mci" not in body_of("_intro_chains")))
+              M.INTRO_S == 7.0 and "framerate=fps=60:scene=100" in body_of("_intro_chains") and "ramp_pts" in body_of("_intro_chains") and "gblur" in body_of("_intro_chains") and "mi_mode=mci" not in body_of("_intro_chains")))
     R.append(("V9.0", "the intro is part of the 3:00 maximum and of the song window (the plan starts after the intro's music); the plan itself stays the montage without it",
               "intro_cut()" in body_of("optimal_fit") and "intro_cut()" in body_of("_plan_montage_once") and "def with_intro" in SRC()))
     R.append(("V9.0", "the intro's look is one of six, chosen from the style; only shaded and wide hype take the sky colour family (the sky's own function)", "sky_family_for(" in body_of("intro_prepare") and "pick_look(" in body_of("intro_prepare")))

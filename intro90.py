@@ -308,7 +308,7 @@ def text_scale(t):
 
 
 def text_video(out_path, look, title, subline=None, pal=None, ffmpeg="ffmpeg", cancel=None):
-    """the intro text as a video with alpha (qtrle / argb, the picture's width, a band of its height, 60 fps, INTRO_S s): look A = a slow fade with a gentle scale 104 % -> 100 %.
+    """the intro text as a video with alpha (ffv1 / yuva420p bt709, the picture's width, a band of its height, 60 fps, INTRO_S s): look A = a slow fade with a gentle scale 104 % -> 100 %.
     Returns {"file", "y0", "h", "font"} for the overlay: overlay=0:y0."""
     layer, note = build_layer(look, title, subline, pal)
     ua = np.asarray(layer.getchannel("A"))
@@ -319,7 +319,8 @@ def text_video(out_path, look, title, subline=None, pal=None, ffmpeg="ffmpeg", c
     chs = _premult(layer, y0, y1)
     static_px = _straight(_xform(chs, 1.0, W / 2, cyb))
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-video_size", f"{W}x{y1 - y0}", "-framerate", str(FPS), "-i", "pipe:0",
-           "-c:v", "qtrle", "-pix_fmt", "argb", "-t", f"{INTRO_S:.3f}", str(out_path)]
+           "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuva420p", "-c:v", "ffv1", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
+           "-t", f"{INTRO_S:.3f}", str(out_path)]            # a YUV (bt709) video with alpha: the render's colour probe then sees one colour space (an RGB input turned the fast render off)
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     blank = np.zeros((y1 - y0, W, 4), np.uint8).tobytes()
     last_s, last_px = None, None
