@@ -25,3 +25,30 @@ dropcheck.txt
 cs2_border_scan.txt*
 cs2_dating_scan.txt
 musicscan.txt
+
+# personal data and media (public repo, V9.0.1 release housekeeping): never committed
+/config.json
+montage_data*/
+*.csv
+*.mp3
+*.flac
+*.m4a
+*.wav
+*.ogg
+*.opus
+*.mov
+*.mkv
+*.mp4
+!docs/proof_v*/*.mp4
+*.log
+*.lock
+used_*.json
+*_backup*.json
+.claude/
+.vscode/
+.idea/
+*.pyc
+# release build output
+/release/
+/dist/
+*.zip
