@@ -10439,7 +10439,9 @@ def intro_prepare(plan, ev, cfg, rname, song, seed):
         ev1 = ev
         if len(ev.get("parts") or []) > 1 or ev.get("stitched"):          # a stitched first take: the intro comes from the clip it starts with
             ev1 = dict(ev, parts=[ev["parts"][0]], stitched=False, rec=ev["parts"][0]["rec"])
-        if int(sg[4]) if len(sg) > 4 else 0:
+        if float(plan["song"]["start_t"]) < INTRO_S - 0.02:
+            why_no = "the song has no music for the intro before the first take"
+        elif int(sg[4]) if len(sg) > 4 else 0:
             why_no = "the first take starts in its second clip"
         elif sg[2] <= 0:
             why_no = "the first take starts on a held frame"
@@ -10647,6 +10649,8 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
         elif inside:
             sc += 1.5
         sc += 0.5 * (E in sec_b) + 0.3 * (E == last_b) + 0.2 * float(np.mean(an["level"][S:E] if len(an.get("level", [])) >= E else [0]))
+        if ic_ and any(float(bt[S]) - ic_ - 0.3 <= float(bt[int(d_["beat"])]) < float(bt[S]) - 0.2 for d_ in drops if 0 <= int(d_["beat"]) < len(bt)):
+            sc -= 1.5                                      # V9.0: a drop of the song inside the intro's music (just before the first take) would be wasted on the blurred intro: such a section ranks lower
         allc.append((sc + (0.01 * L if full else 0.0), S, E, inside, L))
     L = L_top
     allc = sorted(allc, key=lambda c_: -c_[0])             # V7.6.1: every candidate section, best first; plan_montage tries the best few and keeps the one that places the most
@@ -11162,7 +11166,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
                 continue                                   # V9.0: the first take has the footage for the intro: an event without it is not put in front of it (it stays in the 'didn't fit' list)
             c1, got = takes[0]["c"], None
             reach = 48 + (nat(e) + int(e["span"] / td) if fit else 0)     # V5.42B: long fights need more room in front
-            cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - reach), -1) if E - U[cc] <= target + 1e-6]
+            cc_s = [cc for cc in range(c1 - 2 * MIN_TAKE_BEATS, max(-1, c1 - reach), -1) if E - U[cc] <= target + 1e-6 and cc >= t_lo]      # (V9.0: never before the first tick the song window allows: the intro's music comes before it)
             for xp in (False, True):                       # V5.43: the V5.42 tail window first; extending the end never shortens the run-up
                 for cc in sorted(cc_s, key=lambda cc: (cc % 2, -cc)):
                     got = place(e, U, down, rp, c=cc, end=c1, ext_only=xp)
@@ -11174,10 +11178,10 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             for sh in ((1, 2, 3) if fit and not got and not t0.get("ending") else ()):
                 # V5.42B repair: shift the neighbouring take's window (a slightly longer run-up) so this clip's tail can land
                 g0 = geom(t0["ev"], U, t0["c"] - sh, t0["kb"], t0["end"], t0["ramp"], t0["slow"], anchor=t0.get("anchor", "first"), tailmode=t0.get("tailmode", "plain"))
-                if not g0:
+                if not g0 or t0["c"] - sh < t_lo:
                     continue
                 for xp in (False, True):
-                    for cc in sorted([cc - sh for cc in cc_s if cc - sh >= 0], key=lambda cc: (cc % 2, -cc)):
+                    for cc in sorted([cc - sh for cc in cc_s if cc - sh >= max(0, t_lo)], key=lambda cc: (cc % 2, -cc)):
                         got = place(e, U, down, rp, c=cc, end=c1 - sh, ext_only=xp)
                         if got:
                             break
@@ -11209,6 +11213,8 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             if manual:                                     # V5.42B repair: a longer run-up (the take before ends earlier)
                 fixed = None
                 for sh in range(1, 9):
+                    if i == 0 and t["c"] - sh < t_lo:
+                        break                              # V9.0: the first take never starts before the song window (the intro's music)
                     g = geom(t["ev"], U, t["c"] - sh, t["kb"], t["end"], t["ramp"], t["slow"], anchor=t.get("anchor", "first"), tailmode=t.get("tailmode", "plain"))
                     gp = geom(takes[i - 1]["ev"], U, takes[i - 1]["c"], takes[i - 1]["kb"], t["c"] - sh, takes[i - 1]["ramp"],
                               takes[i - 1]["slow"], anchor=takes[i - 1].get("anchor", "first"), tailmode=takes[i - 1].get("tailmode", "plain")) if i > 0 else True
@@ -14777,14 +14783,15 @@ def _intro_chains(t, ti, chains, inputs, k):
     b = f"i{ti}"
     chains.append(f"[{kc}:v:0]{crop}{scl}setsar=1,fps=60,format=yuv420p,split=2[{b}a][{b}b]")
     nh, nr = int(round(hold * OUT_FPS)), int(round(ramp * OUT_FPS))
-    chains.append(f"[{b}a]trim=0:{d1 + 0.3:.6f},setpts=(PTS-STARTPTS)/{v0:.6f},minterpolate=fps=60:mi_mode=blend,trim=end_frame={nh},setpts=PTS-STARTPTS[{b}c]")      # (+0.3 s of source: the blend at the end of a piece needs the frames after it; the piece is cut to its exact length)
-    chains.append(f"[{b}b]trim={d1:.6f}:{d1 + d2 + 0.3:.6f},setpts={ramp_pts},minterpolate=fps=60:mi_mode=blend,trim=end_frame={nr},setpts=PTS-STARTPTS[{b}d]")
+    chains.append(f"[{b}a]trim=0:{d1 + 0.3:.6f},setpts=(PTS-STARTPTS)/{v0:.6f},framerate=fps=60:scene=100,trim=end_frame={nh},setpts=PTS-STARTPTS[{b}c]")      # (+0.3 s of source: the blend at the end of a piece needs the frames after it; the piece is cut to its exact length)
+    chains.append(f"[{b}b]trim={d1:.6f}:{d1 + d2 + 0.3:.6f},setpts={ramp_pts},framerate=fps=60:scene=100,trim=end_frame={nr},setpts=PTS-STARTPTS[{b}d]")
     chains.append(f"[{b}c][{b}d]concat=n=2:v=1:a=0,fps=60,tpad=stop_mode=clone:stop_duration=0.3,trim=end_frame={n},setpts=PTS-STARTPTS,split=3[{b}s][{b}m0][{b}b0]")
     chains.append(f"[{b}m0]scale=640:360,gblur=sigma=4,scale=1920:1080,eq=brightness=-0.05[{b}m]")
     chains.append(f"[{b}b0]scale=640:360,gblur=sigma=14,scale=1920:1080,eq=brightness=-0.16:saturation=0.85[{b}h]")
-    chains.append(f"[{b}m][{b}h]blend=all_expr='A*(1-clip(2*{w}-1,0,1))+B*clip(2*{w}-1,0,1)'[{b}x]")
-    chains.append(f"[{b}s][{b}x]blend=all_expr='A*(1-min(1,2*{w}))+B*min(1,2*{w})',format=yuv420p[{b}y]")
-    chains.append(f"[{b}y][{kt}:v:0]overlay=0:{int(tx['y0'])}:format=auto:eof_action=pass,format=yuv420p,trim=end_frame={n},setpts=PTS-STARTPTS[t{ti}v]")
+    en = f"enable='gte(t,{hold:.4f})'"                                             # the per-pixel cross-fades only run inside the ramp (the hold is the heavy blur as it is)
+    chains.append(f"[{b}h][{b}m]blend=all_expr='A*clip(2*{w}-1,0,1)+B*(1-clip(2*{w}-1,0,1))':{en}[{b}x]")
+    chains.append(f"[{b}x][{b}s]blend=all_expr='A*min(1,2*{w})+B*(1-min(1,2*{w}))':{en},format=yuv420p[{b}y]")
+    chains.append(f"[{b}y][{kt}:v:0]overlay=0:{int(tx['y0'])}:format=yuv420:eof_action=pass,format=yuv420p,trim=end_frame={n},setpts=PTS-STARTPTS[t{ti}v]")
     chains.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={n / OUT_FPS:.4f},asetpts=PTS-STARTPTS[t{ti}a]")
     return k + 2
 
@@ -15867,7 +15874,7 @@ def intro_assets(p, tdir):
     import intro90
     it = p["intro"]
     Path(tdir).mkdir(parents=True, exist_ok=True)
-    it["_text"] = intro90.text_video(Path(tdir) / "intro_text.mov", it["look"], it["title"], it.get("subline"), it.get("pal"), ffmpeg="ffmpeg", cancel=CANCEL)
+    it["_text"] = intro90.text_video(Path(tdir) / "intro_text.mkv", it["look"], it["title"], it.get("subline"), it.get("pal"), ffmpeg="ffmpeg", cancel=CANCEL)
     out(f"intro text: {it['look']} look, {it['_text'].get('font')}")
 
 

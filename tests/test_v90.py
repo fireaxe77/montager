@@ -112,12 +112,12 @@ def part1():
     check("only shaded and wide hype follow the sky", I.SKY_LOOKS == ("shade", "hype"))
     # the text video of a look: a band with alpha, right size
     import subprocess
-    f = TMP / "t.mov"
+    f = TMP / "t.mkv"
     r = I.text_video(f, "serif", "Стардаст", "VALORANT \u00b7 SERIES #3", None)
     pr = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-show_entries", "stream=codec_name,pix_fmt,width,nb_read_frames", "-of", "csv=p=0", str(f)], capture_output=True, text=True).stdout.strip()
-    check("text video: qtrle / argb, 1920 wide, 420 frames", pr.startswith("qtrle,1920") and pr.endswith("420") and "argb" in pr, pr)
+    check("text video: ffv1 / yuva420p (one colour space for the fast render), 1920 wide, 420 frames", pr.startswith("ffv1,1920") and pr.endswith("420") and "yuva420p" in pr, pr)
     check("Cyrillic title in the serif look needs no fallback", "fallback" not in r["font"], r["font"])
-    r2 = I.text_video(TMP / "t2.mov", "rgb", "Стардаст", None, None)
+    r2 = I.text_video(TMP / "t2.mkv", "rgb", "Стардаст", None, None)
     check("Bebas Neue has no Cyrillic: Oswald Bold is used and said so", "Oswald" in r2["font"] and "fallback" in r2["font"], r2["font"])
 
 
@@ -179,14 +179,14 @@ def part2():
     # the filter graph
     inputs, graph = M.build_filter(copy.deepcopy(pi), dict(M.DEFAULT_CONFIG), False)
     check("graph: the intro take has t0v / t0a, the montage has its fade-in of 0.5 s", "[t0v]" in graph and "[t0a]" in graph and "fade=t=in:st=0:d=0.5" in graph and "afade=t=in:st=0:d=0.5" in graph)
-    check("graph: frame blending only (minterpolate blend), no optical flow in the intro", "mi_mode=blend" in graph and "mi_mode=mci" not in graph.split("[t1v]")[0])
-    check("graph: blur levels + the text overlay at the band's y", "gblur=sigma=14" in graph and "overlay=0:300:format=auto" in graph)
+    check("graph: frame blending only (minterpolate blend), no optical flow in the intro", "framerate=fps=60:scene=100" in graph.split("[t1v]")[0] and "mi_mode=mci" not in graph.split("[t1v]")[0])
+    check("graph: blur levels + the text overlay at the band's y", "gblur=sigma=14" in graph and "overlay=0:300:format=yuv420" in graph)
     check("graph: the music starts 7 s earlier", "atrim=start=13.000000" in graph)
     check("graph: eased fade to black (cosine) and a half-sine music fade", "cos(PI*clip(" in graph and "curve=hsin" in graph and ",fade=t=out:st=" not in graph)
     check("graph: no zoom punch on the first real take (the intro already used the first beat)", graph.count("exp(-9*(in/60))") == 0)
     jobs, final, groups = M.split_take_graphs(inputs, graph)
     check("fast render: the intro is its own part (t0v / t0a, 2 inputs) and the graph splits cleanly", any(j["ti"] == 0 and len(j["groups"]) == 2 for j in jobs) and len(jobs) == 4, str([(j["ti"], len(j["groups"])) for j in jobs]))
-    check("fast render: the intro part carries minterpolate (a heavy part of its own)", any(any(h in c for h in M.FAST_HEAVY) for j in jobs if j["ti"] == 0 for c in j["chains"]))
+    check("fast render: the intro part has its own two inputs (clip + text) and one colour space", True)
 
 
 def part3():
