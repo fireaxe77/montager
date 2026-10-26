@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.0.1"
+APP_VERSION = "V9.0.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -9628,6 +9628,8 @@ INTRO_S = 7.0                           # V9.0: the intro's fixed length (s); th
 INTRO_ON = [True]                       # V9.0 test switch: False = no montage has an intro (every plan / render as before)
 INTRO_CTX = {"on": False, "text": None, "series": None}     # V9.0: set by make_plan for the plan it makes (like FULL_CTX): whether this montage gets an intro, its Manual text, the series number
 INTRO_MANUAL = {"on": True, "text": ""}                     # V9.0: the Manual tab's INTRO TEXT box and tickbox (the GUI writes it; make_plan reads it for a Manual plan)
+MANUAL_PICK = {"sky": "DEFAULT", "font": "DEFAULT"}          # V9.0.2: the Manual tab's Sky colour / Font dropdowns (the GUI writes it; make_plan reads it for a Manual plan only)
+PICK_DEFAULT = "DEFAULT"             # V9.0.2: the first entry of the Manual Sky colour / Font dropdowns = the normal automatic choice
 
 
 def manual_intro_cut():
@@ -10458,7 +10460,7 @@ def intro_prepare(plan, ev, cfg, rname, song, seed):
             title = (INTRO_CTX.get("text") or "").strip() if man_ else ""
             title = title or intro90.clean_title(song.get("title") or Path(plan["song"]["path"]).stem, song.get("artist"))
             sub = None if man_ else f"{GAME_TAG.get(plan['game'], plan['game'].upper())} \u00b7 SERIES #{int(INTRO_CTX.get('series') or 1)}"
-            look = intro90.pick_look(rname, f"{seed}|{Path(plan['song']['path']).stem}")
+            look = INTRO_CTX.get("font_pick") or intro90.pick_look(rname, f"{seed}|{Path(plan['song']['path']).stem}")      # V9.0.2: a Manual Font pick replaces only the look
             fam, fam_why, pal = None, "", None
             if look in intro90.SKY_LOOKS:                  # the sky's own colour family choice (album cover, else the song's vibe): the same function, no second choice
                 ranked = (plan.get("xfx_sky_rank") or {}).get("names") or sky_ranked(rname, song.get("energy"), plan["song"].get("bpm"))[0]
@@ -13249,6 +13251,9 @@ def sky_family_for(plan, ranked, qual=None):
     """V8.8.3: the ONE colour family of a montage's skies, chosen once: the album cover when the MP3 has one (mostly white / black -> that neutral, else the hue of its dominant colour), else the
     song's vibe (the first colour of sky_ranked). A white / black family is kept only when most of the montage's sky candidates keep their contrast with it (sky_neutral_ok), else the vibe's first
     coloured family. Returns (family, why)."""
+    pk_ = plan.get("pick_sky") or INTRO_CTX.get("sky_pick")
+    if pk_ in SKY_FAMILIES:                                # V9.0.2: a Manual Sky colour pick replaces only this choice (DEFAULT = no pick: the automatic choice below, unchanged)
+        return pk_, "picked in Manual"
     song_p = (plan.get("song") or {}).get("path")
     fam, why = None, ""
     try:
@@ -17695,6 +17700,26 @@ def song_fill_target(an, full, target):
     return round(avail - intro_cut(), 2) if avail <= cap else None          # V9.0: the plan itself is the montage without its intro (the song fits with the intro in front)
 
 
+def manual_pick(kind):
+    """V9.0.2: the Manual tab's Sky colour (kind 'sky' -> a SKY_FAMILIES name) or Font (kind 'font' -> an intro90 look) pick, None for DEFAULT or an unknown entry (= the automatic choice)."""
+    v = MANUAL_PICK.get(kind) or PICK_DEFAULT
+    if kind == "sky":
+        return v if v in SKY_FAMILIES else None
+    try:
+        import intro90
+        return next((lk for lk, spec in intro90.LOOKS.items() if intro90.FONT_NAMES.get(spec[0][0]) == v or lk == v), None)
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+def manual_pick_choices(kind):
+    """V9.0.2: the entries of the Manual Sky colour / Font dropdowns: DEFAULT first, then the sky colour families / the intro text fonts the app has."""
+    if kind == "sky":
+        return [PICK_DEFAULT] + list(SKY_FAMILIES)
+    import intro90
+    return [PICK_DEFAULT] + [intro90.FONT_NAMES[spec[0][0]] for spec in intro90.LOOKS.values()]
+
+
 def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False, intro=None, intro_text=None):
     """V8.5 full=True (Force New Full / Manual Auto): the montage fills the whole song (V9.0: 3:00 at most with intro and outro, a long song uses its best 2:00 - 3:00 section).
     V9.0 intro=None: every mode has the intro, a Manual one as the INTRO tickbox says; intro_text = the Manual box (the main line, no subline)."""
@@ -17703,11 +17728,15 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
     man_ = paths is not None
     on_ = (INTRO_MANUAL["on"] if man_ else True) if intro is None else bool(intro)
     INTRO_CTX.update({"on": bool(INTRO_ON[0] and on_), "text": (intro_text if intro_text is not None else (INTRO_MANUAL["text"] if man_ else None)),
-                      "series": None if man_ else series_next(game, cfg), "manual": man_})
+                      "series": None if man_ else series_next(game, cfg), "manual": man_,
+                      "sky_pick": manual_pick("sky") if man_ else None, "font_pick": manual_pick("font") if man_ else None})
     try:
-        return _make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, scan, pin, full)
+        res = _make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, scan, pin, full)
+        if INTRO_CTX.get("sky_pick") and isinstance(res, tuple) and isinstance(res[0], dict):
+            res[0]["pick_sky"] = INTRO_CTX["sky_pick"]       # V9.0.2: the render's sky (xfx_probe_sky) reads the Manual pick from the plan
+        return res
     finally:
-        INTRO_CTX.update({"on": False, "text": None, "series": None})
+        INTRO_CTX.update({"on": False, "text": None, "series": None, "sky_pick": None, "font_pick": None})
         FULL_CTX["on"] = False
         FULL_CTX.pop("live", None)
         FULL_CTX.pop("est_scale", None)
@@ -20298,6 +20327,23 @@ class App:
         self.btn(c3, "Last seed", self.fill_last_seed, name="manual:last_seed").pack(side="left", padx=(4, 0))         # V9.0: the seed of the most recently rendered montage
         for v_ in (self.m_seed, self.m_style):
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
+        c4 = ttk.Frame(s3)                                     # V9.0.2: Sky colour / Font for this Manual montage (DEFAULT = the automatic choice)
+        c4.pack(fill="x", pady=2)
+        self.m_pick = {}
+        for kind, lbl, name in (("sky", "Sky colour", "Sky colour"), ("font", "Font", "Font")):
+            ttk.Label(c4, text=lbl).pack(side="left", padx=(0 if kind == "sky" else 12, 2))
+            ch_ = manual_pick_choices(kind)
+            v_ = tk.StringVar(value=MANUAL_PICK.get(kind) if MANUAL_PICK.get(kind) in ch_ else PICK_DEFAULT)
+            cb_ = ttk.Combobox(c4, textvariable=v_, values=ch_, width=16, state="readonly")
+            cb_.pack(side="left")
+            self.named[name] = cb_
+            self.m_pick[kind] = v_
+
+            def pick_changed(*_, k_=kind, v2_=v_):
+                MANUAL_PICK[k_] = v2_.get() or PICK_DEFAULT
+                if hasattr(self, "m_status"):
+                    self.update_status()
+            v_.trace_add("write", pick_changed)
         self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
         self.m_status_disp = tk.StringVar(value="Tick some clips.")
         self.m_status_lbl = ttk.Label(s3, textvariable=self.m_status_disp, font=("Segoe UI", F(10), "bold"), width=1, anchor="w")
@@ -21121,7 +21167,7 @@ class App:
         sel = self.stree.selection()
         return (self.m_game.get(), tuple(sorted(p for p in paths if p in getattr(self, "byp", {}) and self.byp[p]["kills"])),
                 None if not sel or sel[0] == "auto" else sel[0], "optimal" if self.m_opt.get() else int(self.m_len.get()), self.m_style.get(), self.est_seed(),
-                self.full_flag(None if not sel or sel[0] == "auto" else sel[0]), INTRO_MANUAL["on"], INTRO_MANUAL["text"])
+                self.full_flag(None if not sel or sel[0] == "auto" else sel[0]), INTRO_MANUAL["on"], INTRO_MANUAL["text"], MANUAL_PICK["sky"], MANUAL_PICK["font"])
 
     def pick_count(self):
         """N from the number box next to 'Random pick' (its own box, never the 'Tick newest' one); None = empty / not a number
