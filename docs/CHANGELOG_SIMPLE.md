@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.1.0 - 2026-10-26: Strong-beat labels next to the drops
+- In the song map you can now mark strong beats next to the drops; each one gets a kill exactly on its time, after the drops, without ever taking a drop's kill
+- Drop kills are real kills: CS2 kills over a bright sky or during a hit flash are timed correctly now, and a drop only gets a kill whose row was clearly read
+- The sky colour is solid with its moving pattern clearly visible, white is now an ice white, and the sky only appears in the high-energy parts of the song
+- High-energy songs cut tighter: speed-ups no longer stretch the run-up, so an energetic montage is never slower than a chill one, and every drop still gets its kill
+
 ## V9.0.3 - 2026-10-26: Kills land exactly on the drop you hear
 - Every drop in a song now gets a kill exactly on its stored drop time, in Valorant, CS2 and Rainbow Six Siege
 - The drop effects (flash, punch, sky, low hit) land on that same moment, so kills and effects no longer come about half a second early
