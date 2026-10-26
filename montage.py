@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.0.2"
+APP_VERSION = "V9.0.3"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -11293,11 +11293,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             dl_ = [(float(t_), 2.0, "label") for t_ in lab_] if lab_ else \
                 [(float(d_["t"]), float(d_.get("strength", 1.0)), d_.get("source") or "map") for d_ in (an.get("drops") or [])
                  if d_.get("t") is not None and float(d_.get("conf", 1.0)) >= REPEAT_DROP_MIN_CONF]
-            dl_, rl_ = refine_drop_anchors(song["path"], dl_)       # V7.7.0: the anchor sits on the audible onset of the drop (stored drop unchanged)
-            for l_ in rl_:
-                plan["notes"].append(l_)
-                LOGONLY(l_)
-            anchor_all_drops(plan, dl_, game, plan["notes"], grid=bt)
+            anchor_all_drops(plan, dl_, game, plan["notes"], grid=bt)          # V9.0.3: every game, the kill sits on the STORED drop time (the V7.7.0 onset refinement no longer moves the anchor)
         except Exception as ex_:
             LOGONLY(f"drop anchoring skipped: {ex_}")
     try:                                                   # V7.7.0: a take that broke the tail rule is repaired (tail cut inside the allowed window), never silently skipped
