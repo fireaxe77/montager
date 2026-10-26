@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.0.3 - 2026-10-26: Kills land exactly on the drop you hear
+- Every drop in a song now gets a kill exactly on its stored drop time, in Valorant, CS2 and Rainbow Six Siege
+- The drop effects (flash, punch, sky, low hit) land on that same moment, so kills and effects no longer come about half a second early
+- Every drop still gets a kill; none is skipped
+
 ## V9.0.2 - 2026-10-26: Pick the sky colour and intro font in Manual
 - Manual has two new dropdowns: Sky colour and Font
 - DEFAULT, the first entry, keeps the automatic choice exactly as before
