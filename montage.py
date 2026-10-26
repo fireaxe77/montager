@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.0.3"
+APP_VERSION = "V9.1.0"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4183,13 +4183,21 @@ CS2_UNSURE_LEAD = 1.5                # s: extra footage shown before a kill whos
 
 
 def _dating_file():
+    if CS2_EDGE_DATING[0] and CS2_GATE_SHAPE[0]:
+        return DATA / "cs2_dating_v9.json"                 # V9.1.0: the gate counts only row-shaped outlines (seeded from v8 without its gate rejections, see _dating_memo_load)
     return DATA / ("cs2_dating_v8.json" if CS2_EDGE_DATING[0] else "cs2_dating_v7.json")     # V8.1.1: new memo (old entries were dated without the edge match)
 
 
 def _dating_memo_load():
     if not CS2_DATING_MEMO.get("_loaded_" + str(DATA)):
         try:
-            for k, v in json.loads(_dating_file().read_text(encoding="utf-8")).items():
+            src_ = _dating_file()
+            seed_ = src_.name == "cs2_dating_v9.json" and not src_.exists()
+            d_ = json.loads((DATA / "cs2_dating_v8.json" if seed_ else src_).read_text(encoding="utf-8"))
+            if seed_:                                      # V9.1.0: the v8 results stay, except its gate rejections and its loose proofs (the only results the new gate can change): those rows are dated again
+                rej_ = {k_ for k_, v_ in d_.items() if v_ == CS2_GATE_REJECT} | {k_[:-6] for k_, v_ in d_.items() if k_.endswith("~loose") and v_}
+                d_ = {k_: v_ for k_, v_ in d_.items() if k_ not in rej_ and not (k_.endswith("~loose") and k_[:-6] in rej_)}
+            for k, v in d_.items():
                 CS2_DATING_MEMO[tuple(k.split("#", 1))] = v
         except Exception:
             pass
@@ -4204,6 +4212,20 @@ def _dating_memo_save():
         os.replace(tmp, _dating_file())
     except Exception:
         pass
+
+
+CS2_GATE_SHAPE = [True]              # V9.1.0: the dating gate counts red in the row's slot only when it is shaped like a row outline (both long edges); switch for tests
+CS2_GATE_EDGES = 0.5                 # share of the row's width the outline must cover along its top AND its bottom edge
+
+
+def _outline_cover(mask, y, hrow, xa, xb):
+    """V9.1.0: how much of a row outline the red mask shows at slot y: the smaller of the shares of columns xa..xb that are red along the row's top edge and along its bottom edge
+    (a real outline: both close to 1; a red-tinted scene object or a damage flash behind the feed: red in patches, rarely along both edges)."""
+    top = mask[max(0, y - 2):y + 3, xa:xb]
+    bot = mask[max(0, y + hrow - 3):y + hrow + 2, xa:xb]
+    if not top.size or not bot.size:
+        return 0.0
+    return float(min(top.any(axis=0).mean(), bot.any(axis=0).mean()))
 
 
 def _dating_patch(g, rc):
@@ -4311,9 +4333,16 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
         return CS2_GATE_REJECT
     y_first = y_f if CS2_EDGE_DATING[0] and back else corr(j)[1]      # V7.7.6: the slot the row first appeared in (V8.1.1: as matched before the faint fade-in frames)
     yb0, yb1 = max(0, y_first - 3), min(dh, y_first + hrow + 4)
+
+    def gate_outl(fr, y, y0_, y1_):
+        m_ = border_dm(fr)[0]
+        oc_ = int(m_[y0_:y1_, xa:xb].sum())
+        if CS2_GATE_SHAPE[0] and oc_ and _outline_cover(m_, y, hrow, xa, xb) < CS2_GATE_EDGES:
+            return 0                                           # V9.1.0: red in the slot that is not a row outline (a damage flash tinting the scene behind the feed): no row
+        return oc_
     for q in range(j - ng, j):
         c, _y = corr(q)
-        oc = int(border_dm(frames[q])[0][yb0:yb1, xa:xb].sum())
+        oc = gate_outl(frames[q], y_first, yb0, yb1)
         if info is not None and "trace" in info:
             info["trace"].append((j, q, round(c, 3), oc, ref))
         if c >= 0.6 or oc >= 0.3 * ref:
@@ -4321,7 +4350,8 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
     if info is not None:
         info["y"] = y_first
         yb0s, yb1s = max(0, rc["y0"] - 40), min(dh, rc["y1"] + 40)                 # the V7.5.1.2 gate (rows next to the slot count too): did the row pass it?
-        info["strict"] = not any(corr(q)[0] >= 0.6 or int(border_dm(frames[q])[0][yb0s:yb1s, xa:xb].sum()) >= 0.3 * ref for q in range(j - ng, j))
+        info["strict"] = not any(corr(q)[0] >= 0.6 or (int(border_dm(frames[q])[0][yb0s:yb1s, xa:xb].sum()) if not CS2_GATE_SHAPE[0] else
+                                                      gate_outl(frames[q], y_first, yb0s, yb1s)) >= 0.3 * ref for q in range(j - ng, j))
     return j
 
 
@@ -4397,6 +4427,7 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
             if f == CS2_GATE_REJECT:
                 proposed += 1
                 failed += 1
+                k["t_kept"] = True                             # V9.1.0: the row was on screen before this time but its first appearance is not proven: the time may be late (never a drop kill)
                 if CS2_EDGE_DATING[0] and tr["first"] > int(CS2_EARLY_S * fps) and \
                         _y_at(tr, tr["first"]) + (tr["y1"] - tr["y0"]) >= int((sc.get("size") or [0, 1080])[1]) - CS2_UNSURE_EDGE:
                     k["t_unsure"] = True                       # V8.1.1: first seen at the region's lower edge of a full feed and not datable: the real kill may be earlier
@@ -4405,6 +4436,7 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
                     _DATING_LOGGED.add(kk)
                     LOGONLY(f"CS2 kill time kept (no proven first appearance): {clip} {k['t']:.2f}")
             elif f is not None and CS2_DATING_MEMO.get((str(sc.get("key", "")), str(tr["id"]) + "~loose")) and k["t"] - round(f / fps + off, 3) < CS2_LATE_MIN_S:
+                k["t_kept"] = True                             # V9.1.0: (see above)
                 kk = (clip, round(k["t"], 2), "kept")          # V7.7.6: proven only by the looser slot test and a small move (the fade-in frames): the cached time stays (neither a move nor a failure)
                 if kk not in _DATING_LOGGED:
                     _DATING_LOGGED.add(kk)
@@ -4422,7 +4454,8 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
     if failed * 2 > proposed or [id(k) for k in sorted(b["kills"], key=lambda k: k["t"])] != [id(k) for k in ordered]:      # more than half failed the gate / order changed: the whole clip keeps its cached times
         for k, t in orig:
             k["t"] = t
-            k.pop("t_cached", None)
+            if k.pop("t_cached", None) is not None:
+                k["t_kept"] = True                             # V9.1.0: its row was seen earlier, the move was undone with the rest of the clip: the time may be late
     else:
         for k, t in orig:
             if "t_cached" in k:
@@ -9067,6 +9100,12 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
     un_ = [bool(raw[i]["k"].get("t_unsure")) for i in keep]
     if any(un_):                                            # V8.1.1 (CS2 only): kills whose time may be late (see cs2_kill_times_earlier): no slow-mo / zoom on them, more run-in
         ev["unsure"] = un_
+    kp_ = [bool(raw[i]["k"].get("t_kept")) for i in keep]
+    if any(kp_):                                            # V9.1.0 (CS2 only): kills whose first appearance was not proven (the time may be late): never put on a drop
+        ev["unproven"] = kp_
+    nr_ = [not raw[i]["k"].get("name_read", True) for i in keep]
+    if any(nr_):                                            # V9.1.0 (CS2 border kills): kills whose row did not show my name clearly: never put on a drop
+        ev["unread"] = nr_
     ev["score_pre"] = base_score(ev)
     ev["verified"] = all(raw[i]["k"].get("name_read", True) for i in keep)       # V7.7.5: CS2 border kills carry name_read (my name was read on the row); every other kill counts as verified
     if any(raw[i]["k"].get("util") for i in keep):          # V7.3: a kill admitted by the per-clip utility override (OVERRIDE_ADMITTED)
@@ -9204,6 +9243,8 @@ def ease_in_segments(src_start, v0, E=EASE_FR, group=3):
     return segs, pos
 FADE_IN = 0.3                           # music + video fade-in at the very start
 END_FADE = (2.5, 3.0)                   # final slow-mo release + music + video fade, from the final kill (V9.0: 3-4 s, was 2-3 s: a release of about 1.5 s of real footage, then an eased fade to black)
+RAMP_NO_LONGER = [True]                 # V9.1.0: in a high-energy song (or the aggressive style) a speed-ramped run-up is never longer than the same take's plain run-up (switch for tests)
+RAMP_TIGHT_ENERGY = 0.85                # V9.1.0: song energy (CSV) from which the tight pacing applies
 RECIPES = {                             # all within V4's effect strength; they change pacing, run-ups, zooms, slow-mo, transitions
     "hype":       {"zoom_p": 0.60, "zoom_amp": 0.08, "ramp_p": 0.35, "flash": True, "slow_max": 1, "lead": (1, 2),
                    "trans": {"hard": 0.6, "flash": 0.2, "zoom": 0.2}},
@@ -9705,13 +9746,30 @@ def song_drop_labels(song_path):
         return None
 
 
-def song_drops_write(song_path, times, title="", artist=""):
-    """V7.5.1.1: save (times) or delete (times empty / None) the hand drop labels of ONE song in montage_data\song_drops.json (atomic; other songs stay)."""
+def song_strong_beats(song_path):
+    """V9.1.0: [seconds] the strong beats the user labelled for this song (montage_data\song_drops.json, next to its drop labels, key 'strong_beats'), else None."""
+    if not song_path:
+        return None
+    try:
+        v = (load_json(DATA / "song_drops.json", {}).get(Path(song_path).name) or {}).get("strong_beats")
+        return sorted(float(x) for x in v) if v else None
+    except Exception:
+        return None
+
+
+def song_drops_write(song_path, times, title="", artist="", kind="drops"):
+    """V7.5.1.1: save (times) or delete (times empty / None) the hand drop labels of ONE song in montage_data\song_drops.json (atomic; other songs stay).
+    V9.1.0 kind='strong_beats': the song's strong-beat labels instead (the other list of the song stays)."""
     f = DATA / "song_drops.json"
     cur = load_json(f, {})
     nm = Path(song_path).name
+    ent = dict(cur.get(nm) or {})
     if times:
-        cur[nm] = {"title": title, "artist": artist, "drops": sorted(round(float(t), 2) for t in times)}
+        ent.update({"title": title or ent.get("title", ""), "artist": artist or ent.get("artist", ""), kind: sorted(round(float(t), 2) for t in times)})
+    else:
+        ent.pop(kind, None)
+    if ent.get("drops") or ent.get("strong_beats"):
+        cur[nm] = ent
     else:
         cur.pop(nm, None)
     DATA.mkdir(parents=True, exist_ok=True)
@@ -10129,7 +10187,7 @@ def _relayout_beats(takes, fps, bd):
     return f
 
 
-def reorder_for_drop(plan, t_d, fps, protected):
+def reorder_for_drop(plan, t_d, fps, protected, least=False):
     """V7.6.1 lever b: move ONE take (any take that holds no anchored kill, is no headline / ending / utility take and whose length is a whole number of beat ticks, so every take after it
     keeps its beat phase) to another place in the take list so that one of its kills lands near the drop, then lever a + c put it on the exact time. The takes between its old and new
     place shift by its length; none of them may hold an anchored kill. Returns (new takes, index of the moved take, kill index, levers) or (None, None, None, why)."""
@@ -10159,9 +10217,12 @@ def reorder_for_drop(plan, t_d, fps, protected):
                 continue
             start_f = sum(t["nf"] for t in rest[:q])
             for kj in range(len(X["kills"])):
+                if not drop_kill_clear(X, kj):
+                    continue                                   # V9.1.0: (see anchor_all_drops)
                 e = s0 + start_f / fps + src_to_out(X["segs"], X["kills"][kj]) - t_d
                 if abs(e) <= REORDER_REACH:
-                    cand.append((0 if kj == len(X["kills"]) - 1 else 1, -len(X["kills"]), round(abs(e), 3), abs(q - xi), xi, q, kj))
+                    cand.append((len(X["kills"]), 0, round(abs(e), 3), abs(q - xi), xi, q, kj) if least else       # V9.1.0 least=True (strong beats): the least valuable take first
+                                (0 if kj == len(X["kills"]) - 1 else 1, -len(X["kills"]), round(abs(e), 3), abs(q - xi), xi, q, kj))
     if not cand:
         return None, None, None, f"no movable take has a kill within {REORDER_REACH} s of the drop after being moved"
     base_bad = verify_cutlist(plan, log=False)
@@ -10227,7 +10288,7 @@ def repair_tails(plan, notes, skip_first=False):
             want = int(math.ceil((lo - tail) * fps - 1e-9))
             ds = [d for d in range(want, TAIL_REPAIR_MAX_FR + 1)]
         why = "no repair fits"
-        anch = {x_.get("take") for x_ in (plan.get("drop_sync") or []) if x_.get("take")}
+        anch = {x_.get("take") for x_ in (plan.get("drop_sync") or []) + (plan.get("beat_sync") or []) if x_.get("take")}      # V9.1.0: strong-beat kills keep their time too
         tries = [("next", d) for d in ds[:6]] + ([("self", d) for d in ds[:DRIFT_FR + 1] if abs(d) <= DRIFT_FR + 1] if tail > hi and (i + 1) not in anch else [])
         for how, d in tries:
             new = copy.deepcopy(takes)
@@ -10265,6 +10326,28 @@ def repair_tails(plan, notes, skip_first=False):
     return lines
 
 
+def drop_skip_flags(ev, n):
+    """V9.1.0: per kill of an event: True = not clear enough for a drop (time uncertain, first appearance not proven, my name not read on the row). Stored on the take as 'drop_skip' (only when any)."""
+    out = [False] * n
+    for key in ("unsure", "unproven", "unread"):
+        fl = ev.get(key) or []
+        if len(fl) == n:
+            out = [a or bool(b) for a, b in zip(out, fl)]
+    return out
+
+
+def drop_kill_clear(tk, kj):
+    """V9.1.0: may kill kj of take tk carry a drop? Only a clearly read kill: my name read on its row (CS2 'unread' = not read), its time not uncertain (row first seen at the feed's lower edge) and
+    its first appearance proven (CS2 dating: 'unproven' = the row was on screen earlier than the stored time). Valorant / R6S kills and kills of saved plans without these flags: True."""
+    ev = tk.get("ev") or {}
+    n = len(tk.get("kills") or [])
+    for key in ("unsure", "unproven", "unread", "drop_skip"):
+        fl = (ev.get(key) or tk.get(key)) if ev else tk.get(key)
+        if fl and len(fl) == n and fl[kj]:
+            return False
+    return True
+
+
 def anchor_all_drops(plan, drops, game, notes, grid=None):
     """V7.6.0 (both games): every drop [(time, strength, source)] of the song inside the montage gets a kill impact on its EXACT time (label / map time, never the
     grid beat). Drops are solved together, strongest first (the planner's drop first): candidates are the kills of the selected takes within DROP_SEARCH s,
@@ -10299,6 +10382,8 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
                 continue
             nk = len(tk["kills"])
             for kj in range(nk):
+                if not drop_kill_clear(tk, kj):
+                    continue                                   # V9.1.0: a drop gets a clearly read kill (my name read on the row, its first appearance proven)
                 e = impact_time(plan, ti, kj) - t_d
                 if abs(e) <= DROP_SEARCH:
                     tier = (-1 if is_head and tk.get("role") == "headline" else 0 if nk >= 2 else 1) + (0.0 if kj == nk - 1 else 0.5)
@@ -10350,6 +10435,81 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
         if pth_ is not None:
             x_["take"] = next((i_ + 1 for i_, t_ in enumerate(plan["takes"]) if t_["path"] == pth_), x_["take"])
     plan["drop_sync"] = sorted(sync, key=lambda x: x["drop"])
+    for ln in lines:
+        notes.append(ln)
+        LOGONLY(ln)
+    return lines
+
+
+STRONG_BEAT_ON_DROP_S = 0.25        # V9.1.0: a strong beat this close to a drop is that drop (the drop wins, the strong beat is not placed again)
+
+
+def anchor_strong_beats(plan, beats, notes):
+    """V9.1.0: every strong beat the user labelled for the song (song_strong_beats) gets a kill impact on its EXACT stored time, after the drops (anchor_all_drops): the takes that carry
+    a drop kill, the headline and the ending are never used or moved (protected), so no drop's time or kill changes. Candidates: kills of the other takes within DROP_SEARCH s, the least
+    valuable first (a 1k take, then a 2k take, ...), clearly read kills only (drop_kill_clear); levers a + c (move_kill), then b (another take moved there, least valuable first).
+    A strong beat on a drop is that drop. Writes plan['beat_sync'] (no drop moment effects: assign_extra_fx only dresses drop_sync kills as drops); returns the log lines."""
+    if not beats:
+        return []
+    fps = round(plan["total_frames"] / plan["duration"])
+    s0, D = float(plan["song"]["start_t"]), plan["duration"]
+    drop_ts = [float(x["drop"]) for x in plan.get("drop_sync") or []]
+    used = {plan["takes"][x["take"] - 1]["path"] for x in plan.get("drop_sync") or [] if x.get("take")}
+    used |= {t["path"] for t in plan["takes"] if t.get("role") == "headline" or t.get("ending")}
+    lines, sync = [], []
+    lo_m = (INTRO_LEAD_MIN + 0.02) if INTRO_CTX.get("on") else 0.5
+    for t_b in sorted(float(b) for b in beats):
+        if not (s0 + lo_m < t_b < s0 + D - 1.0):
+            continue
+        if any(abs(t_b - d) <= STRONG_BEAT_ON_DROP_S for d in drop_ts):
+            lines.append(f"strong beat {t_b:.3f}: on the drop at {min(drop_ts, key=lambda d: abs(d - t_b)):.3f} - the drop's kill is there")
+            continue
+        cands = []
+        for ti, tk in enumerate(plan["takes"]):
+            if tk.get("ending") or tk.get("util") or tk.get("role") == "headline" or tk["path"] in used or not tk.get("kills_out"):
+                continue
+            nk = len(tk["kills"])
+            for kj in range(nk):
+                if not drop_kill_clear(tk, kj):
+                    continue
+                e = impact_time(plan, ti, kj) - t_b
+                if abs(e) <= DROP_SEARCH:
+                    cands.append((nk, round(abs(e), 3), ti, kj))
+        why, best = f"no kill of a free take within {DROP_SEARCH} s of the strong beat", None
+        for _n, _e, ti, kj in sorted(cands):
+            new, lev, r = move_kill(plan, ti, kj, t_b, fps, protected=used)
+            if new is None:
+                if why.startswith("no kill"):
+                    why = f"take {ti + 1} kill {kj + 1}/{len(plan['takes'][ti]['kills'])}: {r}"
+                continue
+            plan["takes"] = new
+            best = (ti, kj, lev)
+            break
+        b_why = ""
+        if best is None:
+            new, ti, kj, lev = reorder_for_drop(plan, t_b, fps, used, least=True)
+            if new is not None:
+                plan["takes"] = new
+                best = (ti, kj, lev)
+            else:
+                b_why = lev
+        if best is None:
+            ln = f"strong beat {t_b:.3f} not anchorable: {why} (levers tried: a, c, b [{b_why}]; {len(cands)} candidate kills)"
+            sync.append({"beat": round(t_b, 3), "take": None, "kill": None, "impact": None, "err_ms": None, "lever": None, "why": why + " | lever b: " + b_why})
+        else:
+            ti, kj, lev = best
+            tk = plan["takes"][ti]
+            used.add(tk["path"])
+            imp = impact_time(plan, ti, kj)
+            ln = f"strong beat {t_b:.3f} anchored: take {ti + 1} kill {kj + 1}/{len(tk['kills'])} at {imp:.3f} error {(imp - t_b) * 1000:+.0f} ms via {lev}"
+            sync.append({"beat": round(t_b, 3), "take": ti + 1, "kill": kj + 1, "n": len(tk["kills"]), "impact": round(imp, 4), "err_ms": round((imp - t_b) * 1000, 1),
+                         "lever": lev, "why": "", "_path": tk["path"]})
+        lines.append(ln)
+    for x_ in sync:                                        # lever b may have moved takes: take numbers follow the final order
+        pth_ = x_.pop("_path", None)
+        if pth_ is not None:
+            x_["take"] = next((i_ + 1 for i_, t_ in enumerate(plan["takes"]) if t_["path"] == pth_), x_["take"])
+    plan["beat_sync"] = sorted(sync, key=lambda x: x["beat"])
     for ln in lines:
         notes.append(ln)
         LOGONLY(ln)
@@ -10522,7 +10682,7 @@ def with_intro(plan):
         p["outro"]["fade_start"] = round(p["outro"]["fade_start"] + S, 4)
     for d_ in (p.get("xfx_drop") or []):
         d_["t"] = round(float(d_["t"]) + S, 4)
-    for d_ in (p.get("drop_sync") or []):                  # (the drop / impact times are song times: they stay; the take numbers count the intro)
+    for d_ in (p.get("drop_sync") or []) + (p.get("beat_sync") or []):      # (the drop / impact times are song times: they stay; the take numbers count the intro)
         if d_.get("take"):
             d_["take"] += 1
     p["_intro_applied"] = True
@@ -10998,8 +11158,19 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
     fx = {}
     for e in rest:                                         # speed-ups only in the approach; slow-mo only after the headline
         fx[id(e)] = (rng.uniform(1.4, 1.9) if rng.random() < rp["ramp_p"] else 1.0, False)
+    try:
+        en_ = float(song.get("energy")) if song.get("energy") is not None else 0.0
+    except (TypeError, ValueError):
+        en_ = 0.0
+    tight_pace = bool(RAMP_NO_LONGER[0] and not INTRO_CTX.get("pace_as_before") and (en_ >= RAMP_TIGHT_ENERGY or rname == "aggressive"))     # V9.1.0: high-energy songs cut tight
     def place_fx(e, c=None, kb=None, end=None):
         ramp, sl = fx.get(id(e), (1.0, False))
+        if ramp > 1.0 and tight_pace:                      # V9.1.0: a speed-up compresses the run-up's footage, it never makes the run-up itself longer than the plain take's (energetic styles
+            t1 = place(e, U, down, rp, c=c, kb=kb, end=end, ramp=1.0, slow=sl)          # ramp most often: a longer run-up there made their pacing slower than a chill montage's)
+            tr = place(e, U, down, rp, c=c, kb=kb, end=end, ramp=ramp, slow=sl)
+            if tr and (t1 is None or float(tr["lead_t"]) <= float(t1["lead_t"]) + 1e-6):
+                return tr
+            return t1
         for rr in (ramp, 1.0):
             t = place(e, U, down, rp, c=c, kb=kb, end=end, ramp=rr, slow=sl)
             if t:
@@ -11294,6 +11465,9 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
                 [(float(d_["t"]), float(d_.get("strength", 1.0)), d_.get("source") or "map") for d_ in (an.get("drops") or [])
                  if d_.get("t") is not None and float(d_.get("conf", 1.0)) >= REPEAT_DROP_MIN_CONF]
             anchor_all_drops(plan, dl_, game, plan["notes"], grid=bt)          # V9.0.3: every game, the kill sits on the STORED drop time (the V7.7.0 onset refinement no longer moves the anchor)
+            sb_ = song_strong_beats(song["path"])
+            if sb_:                                        # V9.1.0: the song's strong beats, after the drops (a song without them plans exactly as before)
+                anchor_strong_beats(plan, sb_, plan["notes"])
         except Exception as ex_:
             LOGONLY(f"drop anchoring skipped: {ex_}")
     try:                                                   # V7.7.0: a take that broke the tail rule is repaired (tail cut inside the allowed window), never silently skipped
@@ -11457,8 +11631,10 @@ def _drop_retry(plan, notes, n0, args, kw):
     seen_first = {plan["takes"][0]["path"]}
     variants = [("the first take one beat longer", {"extend_first": 2}), ("the first take two beats longer", {"extend_first": 4}), ("the first take three beats longer", {"extend_first": 6})]
     variants += [(f"another first clip ({i + 1})", None) for i in range(INTRO_FIRST_TRIES)]
+    variants += [("the pacing of V9.0.3 (speed-ups may lengthen run-ups)", {"pace_as_before": True})]     # V9.1.0: the tighter pacing never costs a drop its kill
     for name, ctx in variants:
         INTRO_CTX.pop("extend_first", None)
+        INTRO_CTX.pop("pace_as_before", None)
         INTRO_CTX["avoid"] = avoid0 | (seen_first if ctx is None else set())
         if ctx:
             INTRO_CTX.update(ctx)
@@ -11469,8 +11645,9 @@ def _drop_retry(plan, notes, n0, args, kw):
             continue
         finally:
             INTRO_CTX.pop("extend_first", None)
+            INTRO_CTX.pop("pace_as_before", None)
         seen_first.add(pl2["takes"][0]["path"])
-        if not pl2.get("intro") or kills(pl2) < kills(plan) or abs(pl2["duration"] - plan["duration"]) > 3.0:
+        if not pl2.get("intro") or kills(pl2) < kills(plan) or (abs(pl2["duration"] - plan["duration"]) > 3.0 and not (ctx or {}).get("pace_as_before")):     # V9.1.0: the V9.0.3 pacing may be longer
             continue
         key = (anch(pl2), -len(_unanchored(pl2)))
         if key > best_key:
@@ -12153,7 +12330,8 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           **({"rx": dict(ev["_rx"])} if ev.get("_rx") else {}),
                           **({"seen_lead": list(ev["seen_lead"])} if ev.get("seen_lead") else {}),
                           **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {}), **({"util": True} if ev.get("util") else {}),
-                          **({"unsure": [bool(u_) for u_ in uns], "xpre": round(float(ev["pre"]), 3)} if effects_mode(cfg, game) == "extra" else {})})
+                          **({"unsure": [bool(u_) for u_ in uns], "xpre": round(float(ev["pre"]), 3)} if effects_mode(cfg, game) == "extra" else {}),
+                          **({"drop_skip": ds_} if any(ds_ := drop_skip_flags(ev, len(ko))) else {})})
     notes.extend(notes_music)
     a_mode = audio_state.get("mode") or cfg.get("audio_mode", "auto")
     total_f = out_takes[-1]["f0"] + out_takes[-1]["nf"]
@@ -13227,10 +13405,12 @@ SKY_FAMILIES = {                     # V8.8.3: one colour family per montage: (t
     # V8.8.4: the two ends far apart (a deep top, a light bottom with a small hue step), so the gradient reads clearly under the bands and the mask feather
     "orange": (0xC8360C, 0xFFC24A, 0xFFC861), "red": (0x8C0A18, 0xF2643C, 0xFF6A4A), "rose": (0x781244, 0xF27CA8, 0xFF8FB8), "amber": (0xA4560A, 0xFFD666, 0xFFD27A),
     "blue": (0x0A1A66, 0x4C94F2, 0x7AB4FF), "teal": (0x064650, 0x38C8B6, 0x5CE2D2), "violet": (0x2C1270, 0xA474F2, 0xB890FF), "green": (0x08482A, 0x4CCC7A, 0x70E49A),
-    "white": (0xB4B8C6, 0xFFFFFF, 0xFFFFFF), "black": (0x000000, 0x34343E, 0x4A4A56)}
+    "white": (0x78B4E0, 0xFFFFFF, 0xD8EEFF), "black": (0x000000, 0x5A5A6A, 0x8A8A9A)}      # V9.1.0: white = ice white (pale ice blue -> white), black with room for the pattern
 SKY_NAME_FAMILY = {"ember": "red", "hazy orange": "orange", "amber": "amber", "rose": "rose", "violet": "violet", "deep blue": "blue", "teal": "teal", "emerald": "green",
                    "white": "white", "black": "black"}
-SKY_FAM_EVEN = 0.35                  # V8.8.3: share of the sky's own brightness variation the family colours keep (a clean, even gradient)
+SKY_FAM_EVEN = 0.0                   # V8.8.3: share of the sky's own brightness variation the family colours keep (V9.1.0: 0.35 -> 0: the colour is solid, the old sky never shows through)
+SKY_FAM_OPACITY = 1.0                # V9.1.0: the family colour covers the sky completely inside the mask (only the feathered edge blends); the older looks keep SKY_OPACITY
+SKY_CALM_ROLES = ("calm",)          # V9.1.0: the take role of the song's calm / low-energy parts: no sky there (drop / build / headline / ending takes keep it)
 SKY_FAM_DARK = 0.18                  # the band shade / drop-to-black layer: the top colour at this share of its brightness (nearly black, same hue)
 
 
@@ -13283,6 +13463,11 @@ def sky_family_for(plan, ranked, qual=None):
     return fam, why
 
 
+def sky_role_ok(t):
+    """V9.1.0: may this take get a sky? Only the song's high-energy parts: drop / build takes, the headline and the ending, never a calm / low-energy take (SKY_CALM_ROLES)."""
+    return bool(t.get("ending")) or t.get("role") not in SKY_CALM_ROLES
+
+
 def sky_family_grade(fam, mean_y):
     """V8.8.3: the lutyuv constants of the family look: 'top' / 'bot' (the gradient's two ends, the colour's own brightness, keeping SKY_FAM_EVEN of the sky's own variation around `mean_y`, the
     colour's full chroma: no mixing with the sky's blue, so nothing turns grey or brown), 'dark' (the bands and drops to black: the top colour nearly black) and 'jump' (the beat jumps, inside the family)."""
@@ -13294,7 +13479,8 @@ def sky_family_grade(fam, mean_y):
         yc = 16.0 + (yt - 16.0) * ymul
         return {"y_mul": SKY_FAM_EVEN, "y_add": round(yc - 16.0 - (yr - 16.0) * SKY_FAM_EVEN, 2), "u": max(16.0, min(240.0, 128 + (ut - 128) * csat)),
                 "v": max(16.0, min(240.0, 128 + (vt - 128) * csat)), "haze": 1.0, "y_max": 235}
-    return {"fam": fam, "top": g(top), "bot": g(bot), "dark": g(top, SKY_FAM_DARK, 0.5), "jump": g(jmp)}
+    dark = g(top, SKY_FAM_DARK, 0.5) if _rgb_to_yuv(top)[0] >= 40 else g(jmp)          # V9.1.0: a family whose top is already black shows its pattern in a lighter tone
+    return {"fam": fam, "top": g(top), "bot": g(bot), "dark": dark, "jump": g(jmp)}
 
 
 def sky_neutral_ok(name, info):
@@ -14187,7 +14373,7 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                 m = cv2.GaussianBlur(sm[f - f0], (0, 0), SKY_MASK_FEATHER) * a
                 if cut < k and f - f0 >= cut - SKY_IMPACT_F:   # V8.8.6: fading out over the last frames before the walls start
                     m = m * max(0.0, (cut - (f - f0)) / float(SKY_IMPACT_F + 1))
-                fh.write(np.clip(m * (255.0 * SKY_OPACITY) + 0.5, 0, 255).astype(np.uint8).tobytes())
+                fh.write(np.clip(m * (255.0 * (SKY_FAM_OPACITY if fam_ else SKY_OPACITY)) + 0.5, 0, 255).astype(np.uint8).tobytes())
             else:
                 fh.write(zero)
             if ramp:
@@ -14690,6 +14876,10 @@ def xfx_probe_sky(plan, tmpdir=None):
     mx = int(plan.get("xfx_sky_max", 1))
     space = float(plan.get("xfx_sky_space", sky_spacing_for(plan.get("game"))))
     qual = [c for c in cands if c["cov"] is not None and XFX_SKY_MIN_COV <= c["cov"] <= XFX_SKY_MAX_COV]
+    calm_ = [c for c in qual if not sky_role_ok(plan["takes"][c["ti"]])]
+    for c in calm_:                                        # V9.1.0: the sky belongs to the song's high-energy parts (drop / build, headline, ending)
+        LOGONLY(f"SKY recolour take {c['ti'] + 1}: clear sky, but a {plan['takes'][c['ti']].get('role') or 'calm'} take (low-energy part of the song): no sky")
+    qual = [c for c in qual if c not in calm_]
     kept, used_ = [], []
     fam, fam_why = sky_family_for(plan, ranked, qual)      # V8.8.3: ONE colour family for every sky of the montage (song vibe or cover art), chosen once
     pat, pat_why = sky_pattern_for(plan)                   # V8.8.5: ONE pattern for every sky of the montage (from the song: tempo, energy, vibe, cover), chosen once
@@ -19209,6 +19399,7 @@ class SongMapView:
     def __init__(self, app, path, csv_bpm=None):
         self.app, self.path, self.an, self.zoom = app, path, None, 1
         self.drops, self.hand, self._drag, self._csv_bpm = [], False, None, csv_bpm
+        self.sbeats, self._dl, self._bl = [], [], []                   # V9.1.0: the song's strong beats (blue lines)
         self.win = app.reg(tk.Toplevel(app.root), "window")
         views = app.__dict__.setdefault("song_views", [])             # V7.6.1: trashing a song closes its open map window
         views.append(self)
@@ -19225,6 +19416,10 @@ class SongMapView:
         cb.bind("<<ComboboxSelected>>", lambda e: self.draw())
         ttk.Label(top, text="Zoom").pack(side="right", padx=4)
         ttk.Button(top, text="Reset", command=self.reset_hand).pack(side="right", padx=8)
+        self.addv = tk.StringVar(value="drop")                         # V9.1.0: what a double-click adds
+        cba = ttk.Combobox(top, textvariable=self.addv, values=["drop", "strong beat"], width=11, state="readonly")
+        cba.pack(side="right")
+        ttk.Label(top, text="Double-click adds").pack(side="right", padx=4)
         fr = ttk.Frame(self.win)
         fr.pack(fill="both", expand=True, padx=6, pady=4)
         self.cv = app.reg(tk.Canvas(fr, width=1300, height=int(360 * UI_SCALE[0]), bg="#ececec",
@@ -19244,7 +19439,7 @@ class SongMapView:
         self.cv.bind("<ButtonRelease-1>", self._release)
         self.cv.bind("<Double-Button-1>", self._add)
         self.cv.bind("<Button-3>", self._remove)
-        ttk.Label(leg, text="   |  drag a red line = move the drop (saved as a hand label)  | double-click = add  | right-click a line = remove").pack(side="left")
+        ttk.Label(leg, text="   |  blue line = strong beat   |  drag a line = move it (saved as a hand label)  | double-click = add (drop / strong beat)  | right-click a line = remove").pack(side="left")
 
         def work():
             try:
@@ -19264,72 +19459,81 @@ class SongMapView:
         self.hand = bool(lab)
         self.drops = list(lab) if lab else [float(d["t"]) for d in (self.an or {}).get("drops", []) if d.get("source") != "repeat"]
         self.rdrops = [(float(d["t"]), float(d.get("conf", 0.0))) for d in (self.an or {}).get("repeat_drops", [])]       # V7.6.1: found by a repeated pattern (dashed orange, not editable)
+        self.sbeats = list(song_strong_beats(self.path) or [])
 
     def _t_at(self, ev):
         x = self.cv.canvasx(ev.x)
         return max(0.0, min(self._dur, round((x - 2) / self._W * self._dur, 2)))
 
     def _hit(self, ev, px=7):
+        """(list name, index) of the drop / strong-beat line under the pointer, or None (V9.1.0: both kinds)."""
         x, best = self.cv.canvasx(ev.x), None
-        for i, t in enumerate(self.drops):
-            d = abs(2 + t / self._dur * self._W - x)
-            if d <= px and (best is None or d < best[0]):
-                best = (d, i)
+        for kind in ("drops", "sbeats"):
+            for i, t in enumerate(getattr(self, kind)):
+                d = abs(2 + t / self._dur * self._W - x)
+                if d <= px and (best is None or d < best[0]):
+                    best = (d, (kind, i))
         return None if best is None else best[1]
 
-    def _save_hand(self):
+    def _save_hand(self, kind="drops"):
         try:
-            song_drops_write(self.path, self.drops, (self.an or {}).get("title", "") or "", (self.an or {}).get("artist", "") or "")
-            self.hand = bool(self.drops)
+            if kind == "sbeats":
+                song_drops_write(self.path, self.sbeats, (self.an or {}).get("title", "") or "", (self.an or {}).get("artist", "") or "", kind="strong_beats")
+            else:
+                song_drops_write(self.path, self.drops, (self.an or {}).get("title", "") or "", (self.an or {}).get("artist", "") or "")
+                self.hand = bool(self.drops)
         except Exception as ex:
-            self.info.set(f"could not save the drop labels: {ex}")
+            self.info.set(f"could not save the {'strong beat' if kind == 'sbeats' else 'drop'} labels: {ex}")
             return
         self.show_info()
 
     def _press(self, ev):
-        if self.an and self._dl:
-            i = self._hit(ev)
-            self._drag = i
+        if self.an and (self._dl or self._bl):
+            self._drag = self._hit(ev)
 
     def _motion(self, ev):
         if self._drag is None or not self.an:
             return
+        kind, i = self._drag
         t = self._t_at(ev)
-        self.drops[self._drag] = t
+        getattr(self, kind)[i] = t
         x = 2 + t / self._dur * self._W
-        ln, tx = self._dl[self._drag]
+        ln, tx = (self._dl if kind == "drops" else self._bl)[i]
         self.cv.coords(ln, x, self._top, x, self._bot)
         self.cv.coords(tx, x + 3, self.cv.coords(tx)[1])
-        self.cv.itemconfigure(tx, text=f"DROP {self._fmt(t)}")
+        self.cv.itemconfigure(tx, text=f"{'DROP' if kind == 'drops' else 'STRONG BEAT'} {self._fmt(t)}")
 
     def _release(self, ev):
         if self._drag is not None:
+            kind = self._drag[0]
             self._drag = None
-            self.drops.sort()
-            self._save_hand()
+            getattr(self, kind).sort()
+            self._save_hand(kind)
             self.draw()
 
     def _add(self, ev):
         if not self.an or self._hit(ev) is not None:
             return
-        self.drops = sorted(self.drops + [self._t_at(ev)])
+        kind = "sbeats" if self.addv.get() == "strong beat" else "drops"
+        setattr(self, kind, sorted(getattr(self, kind) + [self._t_at(ev)]))
         self._drag = None
-        self._save_hand()
+        self._save_hand(kind)
         self.draw()
 
     def _remove(self, ev):
         if not self.an:
             return
-        i = self._hit(ev, px=10)
-        if i is not None:
-            del self.drops[i]
-            self._save_hand()
+        h = self._hit(ev, px=10)
+        if h is not None:
+            del getattr(self, h[0])[h[1]]
+            self._save_hand(h[0])
             self.draw()
 
     def reset_hand(self):
-        """Deletes this song's hand labels and goes back to the newest automatic map."""
+        """Deletes this song's hand labels (drops and strong beats) and goes back to the newest automatic map."""
         try:
             song_drops_write(self.path, None)
+            song_drops_write(self.path, None, kind="strong_beats")
         except Exception as ex:
             self.info.set(f"could not reset: {ex}")
             return
@@ -19347,6 +19551,7 @@ class SongMapView:
     def show_info(self):
         an = self.an
         drops = ", ".join(self._fmt(t) for t in self.drops) or "none"
+        drops += "   strong beats: " + (", ".join(self._fmt(t) for t in self.sbeats) or "none")
         self.info.set(f"BPM {an['bpm']} ({an.get('bpm_src')}, librosa {an.get('bpm_librosa')}, agree {an.get('librosa_agree_ms')} ms)   "
                       f"beats {len(an['beats'])}   rhythm {an.get('rhythm')}   loudness {an.get('lufs')} LUFS   drops: {drops}"
                       f"{' (hand-edited)' if self.hand else ''}   sections: {' > '.join(s['label'] for s in an.get('sections', []))}")
@@ -19411,6 +19616,11 @@ class SongMapView:
             ln = cv.create_line(X(t), top, X(t), H - 18, fill="#d00000", width=3, tags=("drop",))
             tx = cv.create_text(X(t) + 3, H - 34, text=f"DROP {self._fmt(t)}", anchor="w", fill="#d00000", font=("Segoe UI", F(9), "bold"), tags=("drop",))
             self._dl.append([ln, tx])
+        self._bl = []                                                 # V9.1.0: [line, text] per strong beat (draggable, blue)
+        for t in self.sbeats:
+            ln = cv.create_line(X(t), top, X(t), H - 18, fill="#1f5fd1", width=3, tags=("sbeat",))
+            tx = cv.create_text(X(t) + 3, H - 66, text=f"STRONG BEAT {self._fmt(t)}", anchor="w", fill="#1f5fd1", font=("Segoe UI", F(9), "bold"), tags=("sbeat",))
+            self._bl.append([ln, tx])
         for t, cf in getattr(self, "rdrops", []):
             cv.create_line(X(t), top, X(t), H - 18, fill="#e08000", width=2, dash=(6, 4))
             cv.create_text(X(t) + 3, H - 50, text=f"REPEAT {self._fmt(t)} ({cf:.2f})", anchor="w", fill="#e08000", font=("Segoe UI", F(9)))
@@ -24352,6 +24562,33 @@ def cmd_dropcheck(args):
     print(f"(read-only; written to {HERE / 'dropcheck.txt'}; nothing else was changed)")
 
 
+def cmd_strongbeatsave(args):
+    """V9.1.0: python montage.py strongbeatsave "<song fragment>" 0:45 1:12 | strongbeatsave --list | strongbeatsave "<fragment>" --clear. Saves the strong beats of ONE song (a kill lands
+    exactly on each, after the drops) next to its drop labels in montage_data\song_drops.json."""
+    cur = load_json(DATA / "song_drops.json", {})
+    if args.list or not args.song:
+        for k, v in sorted(cur.items()):
+            if v.get("strong_beats"):
+                print(f"{k}: strong beats " + ", ".join(_mmss(t) for t in v["strong_beats"]))
+        if not any(v.get("strong_beats") for v in cur.values()):
+            print("no strong beats saved")
+        return
+    cfg = load_config()
+    songs, _, _ = song_pool(cfg, cached_only=True)
+    fr = args.song.lower()
+    hit = [x for x in songs if fr in f"{x.get('artist', '')} {x.get('title', '')} {Path(x['path']).stem}".lower()]
+    if len(hit) != 1:
+        print(("no song matches " if not hit else "several songs match ") + repr(args.song) + (": " + "; ".join(Path(x["path"]).name for x in hit[:10]) if hit else ""))
+        return
+    sg = hit[0]
+    ts_ = [] if args.clear else _dc_parse_drops(",".join(args.times))
+    if not ts_ and not args.clear:
+        print("no strong beat times given (e.g. 0:45 1:12)")
+        return
+    song_drops_write(sg["path"], ts_, sg.get("title", ""), sg.get("artist", ""), kind="strong_beats")
+    print(f"strong beats for {sg.get('artist', '')} - {sg.get('title', '')} ({Path(sg['path']).name}): " + (", ".join(_mmss(t) for t in ts_) or "cleared"))
+
+
 def cmd_dropsave(args):
     """V7.4: python montage.py dropsave "<song fragment>" 0:34 1:32 2:15 | dropsave --list. Saves the labelled drops of ONE song into montage_data\song_drops.json
     (atomic write; the other songs stay). Labels replace the song map's drop list for that song in the planner."""
@@ -24375,7 +24612,7 @@ def cmd_dropsave(args):
         print("no drop times given (e.g. 0:34 1:32 2:15)")
         return
     sg = hit[0]
-    cur[Path(sg["path"]).name] = {"title": sg.get("title", ""), "artist": sg.get("artist", ""), "drops": ts_}
+    cur[Path(sg["path"]).name] = dict(cur.get(Path(sg["path"]).name) or {}, title=sg.get("title", ""), artist=sg.get("artist", ""), drops=ts_)     # V9.1.0: the song's strong beats stay
     DATA.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(f) + ".tmp")
     tmp.write_text(json.dumps(cur, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -24595,6 +24832,12 @@ def main():
     ds.add_argument("times", nargs="*", help="m:ss drop times, e.g. 0:34 1:32 2:15")
     ds.add_argument("--list", action="store_true")
     ds.set_defaults(fn=cmd_dropsave)
+    sb_ = sp.add_parser("strongbeatsave", help="V9.1.0: save the strong beats of a song (a kill lands exactly on each, after the drops); --list shows them, --clear removes them")
+    sb_.add_argument("song", nargs="?", help="a fragment of artist / title / file name")
+    sb_.add_argument("times", nargs="*", help="m:ss strong beat times, e.g. 0:45 1:12")
+    sb_.add_argument("--list", action="store_true")
+    sb_.add_argument("--clear", action="store_true")
+    sb_.set_defaults(fn=cmd_strongbeatsave)
     sp.add_parser("musicscan", help="V7.7.0: run the music-over-gameplay detector over all cached clips (read-only; writes musicscan.txt only)").set_defaults(fn=cmd_musicscan)
     q_ = sp.add_parser("r6srecheck", help="V8.8.1: re-check every saved R6S scan against all utility icons (once per clip), then list kills that still hold a utility icon (the audit; must be empty)")
     q_.add_argument("--audit-only", dest="audit_only", action="store_true", help="only the audit, no re-check")
