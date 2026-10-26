@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.0.2 - 2026-10-26: Pick the sky colour and intro font in Manual
+- Manual has two new dropdowns: Sky colour and Font
+- DEFAULT, the first entry, keeps the automatic choice exactly as before
+- Any other entry sets the sky colour or the intro title font for that montage only; Auto, weekly and Force New Full montages always choose automatically
+
 ## V9.0.1 - 2026-10-24: Every drop gets a kill, also right after the intro
 - A drop in the song that comes right after the intro now gets a kill on it, even when the first clip had no room for it before
 - The first clip after the intro no longer needs its own run-up, because the intro already shows it
