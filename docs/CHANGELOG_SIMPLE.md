@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.1.1 - 2026-10-26: Quick 4k with an unreadable name now counts all four kills
+- A Rainbow Six Siege kill whose victim name is only bars (like "IIIIIIIIIIII") is now found, so a quick 4k is a 4k and its last kill is never cut off by the fade-out
+- The montage check now also makes sure the video never fades to black before the last kill
+- The sky follows the same rules in every game (only in the high-energy parts of the song); Rainbow Six Siege shows none while its sky switch in Settings is off
+
 ## V9.1.0 - 2026-10-26: Strong-beat labels next to the drops
 - In the song map you can now mark strong beats next to the drops; each one gets a kill exactly on its time, after the drops, without ever taking a drop's kill
 - Drop kills are real kills: CS2 kills over a bright sky or during a hit flash are timed correctly now, and a drop only gets a kill whose row was clearly read

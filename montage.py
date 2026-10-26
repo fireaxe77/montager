@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.1.0"
+APP_VERSION = "V9.1.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -2320,6 +2320,8 @@ R6S_SAMETIME_S = 0.3                 # kills this close are one 'same timestamp'
 R6S_PAIR_GAP = 30.0                  # R6S only: clips saved up to this far apart (end of one -> start of the next) can be one fight (CS2 / Valorant keep PAIR_MAX_GAP_S = 12 s)
 R6S_FRAG_S = 1.5                     # R6S only: victim reads this close in time, in the same killfeed slot, where one is a prefix / near-match of the other = ONE row
 R6S_BACK_F = 3                       # at most this many frames a row is dated back through sub-threshold sightings (fade-in)
+R6S_BLANK_VICTIM = [True]            # V9.1.1 switch: a row split at a real weapon icon whose victim name reads as nothing (a name of bars like 'IIIIIIIIIIII') is still a row
+R6S_BLANK_READS = 2                  # ... when it was read blank this often (a one-read blank is a named row read badly)
 R6S_MISSING_MSG = "R6S kill icons missing: put the icon images in montage_data\\r6s\\icons"
 _R6S_ICON_CACHE = {}
 
@@ -2851,10 +2853,15 @@ def r6s_scan_clip(path, rec, det, cfg):
 
 def r6s_rows_from_ocr(entry):
     """OCR frames (the generic killfeed OCR cache format) -> R6S rows ({first, last, hits, reads ...}): rows are split by the weapon icon / gap exactly as
-    for the other games, then tracked by their text (killer + victim) so one row on screen is ONE row however often it is read."""
+    for the other games, then tracked by their text (killer + victim) so one row on screen is ONE row however often it is read.
+    V9.1.1: a row split at the weapon icon with an EMPTY victim side (a victim name OCR cannot read, e.g. 'IIIIIIIIIIII') is a 'blank' row: it only continues a
+    blank track in the same killfeed slot (or one slot higher: pushed up by a newer row), never a named row. A blank track is kept only when it was read blank
+    R6S_BLANK_READS times, no named row appeared in the slot it appeared in within R6S_FRAG_S and no named row sits in its slot in the OCR frame before or after
+    any of its reads (else it was a named row read badly: sliding in, pushed up, faded)."""
     from rapidfuzz import fuzz
-    tracks, prev_f = [], -1
+    tracks, prev_f, order = [], -1, {}
     for f, since, boxes, blobs in entry.get("ocr", []):
+        order[f] = prev_f
         try:
             rs = ocr_rows(boxes, blobs, "r6s")
         except Exception as ex:
@@ -2862,16 +2869,19 @@ def r6s_rows_from_ocr(entry):
             continue
         used = set()
         for r in rs:
-            if r.get("split") is None or not (r["killer"] and r["victim"]):
+            blank = bool(R6S_BLANK_VICTIM[0] and r.get("split") == "icon" and r["killer"] and not r["victim"])
+            if r.get("split") is None or not (r["killer"] and (r["victim"] or blank)):
                 continue
             kt, vt = _alnum(r["ktext"]).lower(), _alnum(r["vtext"]).lower()
             best, bs = None, 0.0
             for t in tracks:
-                if id(t) in used or f - t["last"] > TRACK_KEEP_S * FPS:
+                if id(t) in used or f - t["last"] > TRACK_KEEP_S * FPS or blank != bool(t.get("blank")):
                     continue
                 sk = fuzz.ratio(t["k"], kt) if (t["k"] and kt) else 100.0
                 sv = fuzz.ratio(t["v"], vt) if (t["v"] and vt) else 100.0
                 same_y = abs(t["y"] - r["y"]) <= 0.5 * max(8.0, r["th"])
+                if blank and not (same_y or (t["last"] == prev_f and 0 < t["y"] - r["y"] <= 1.6 * max(8.0, r["th"]))):
+                    continue                                           # a blank row is only told apart by its slot
                 sc = min(sk, sv) + (15 if t["last"] == prev_f and same_y else 0)
                 if sc >= 80 and sc > bs:
                     best, bs = t, sc
@@ -2881,16 +2891,30 @@ def r6s_rows_from_ocr(entry):
                 used.add(id(best))
                 best.update(last=f, y=r["y"], hits=best["hits"] + 1)
                 best["reads"].append([f, left, right])
+                best["fy"].append((f, r["y"]))
                 if r.get("split") == "icon":                           # V8.23.1: the weapon-icon shape of every read (gun = wide), from the stored blobs
                     best["gunv"].append(int(bool(r["gun"])))
             else:
                 first = max(prev_f + 1, min(int(r["appear"]), f)) if prev_f >= 0 else f
-                t = {"first": first, "seen": f, "last": f, "y": r["y"], "hits": 1, "k": kt, "v": vt, "h": int(r["th"]), "reads": [[f, left, right]],
+                t = {"first": first, "seen": f, "last": f, "y": r["y"], "y0": r["y"], "fy": [(f, r["y"])], "hits": 1, "k": kt, "v": vt, "h": int(r["th"]), "reads": [[f, left, right]],
                      "gunv": [int(bool(r["gun"]))] if r.get("split") == "icon" else [],
                      "x": int(min(b[0] for b in r["boxes"])), "w": int(max(b[2] for b in r["boxes"]) - min(b[0] for b in r["boxes"]))}
+                if blank:
+                    t["blank"] = True
                 tracks.append(t)
                 used.add(id(t))
         prev_f = f
+    nxt = {p_: f_ for f_, p_ in order.items()}
+    named = [(f_, y_) for t in tracks if not t.get("blank") for f_, y_ in t["fy"]]
+
+    def _blank_real(b):
+        hh = 0.5 * max(8.0, b["h"])
+        if len(b["reads"]) < R6S_BLANK_READS:
+            return False
+        if any(not t.get("blank") and abs(t["y0"] - b["y0"]) <= hh and abs(t["first"] - b["first"]) <= R6S_FRAG_S * FPS for t in tracks):
+            return False
+        return not any(f_ in (order.get(bf), nxt.get(bf)) and abs(y_ - by) <= hh for bf, by in b["fy"] for f_, y_ in named)
+    tracks = [b for b in tracks if not b.get("blank") or _blank_real(b)]
     return [{"first": int(t["first"]), "seen": int(t["seen"]), "last": int(t["last"]), "hits": int(t["last"] - t["first"] + 1), "x": t["x"], "y": int(t["y"]), "w": t["w"],
              "h": t["h"], "sc": 1.0, "tpl": "ocr", "reads": t["reads"][:8], "gunv": t["gunv"][:40]} for t in tracks]
 
@@ -8858,8 +8882,8 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
                 vk = _alnum(k.get("victim", "").lower())
                 dup = next((u for u in allk if _alnum(u.get("victim", "").lower()) == vk and abs(tt - u["tt"]) <= DUP_WINDOW_S and u["src"] is it
                             or (game == "cs2" and u["src"] is it and 0 < tt - u["tt"] <= CS2_REREAD_S and cs2_same_victim(u.get("victim"), k.get("victim")))
-                            or (u["src"] is not it and abs(tt - u["tt"]) <= LINK_DUP_WINDOW_S and len(vk) >= 2
-                                and fuzz.ratio(_alnum(u.get("victim", "").lower()), vk) >= 80)), None)       # V6.9.7.1: inside a chain: abs time within 3 s
+                            or (u["src"] is not it and abs(tt - u["tt"]) <= LINK_DUP_WINDOW_S and (len(vk) >= 2 or (game == "r6s" and R6S_BLANK_VICTIM[0] and not vk))
+                                and fuzz.ratio(_alnum(u.get("victim", "").lower()), vk) >= 80)), None)       # V6.9.7.1: inside a chain: abs time within 3 s (V9.1.1: two blank R6S victims too)
                 if dup is None:
                     allk.append(dict(k, tt=tt, src=it, off=off))
                 else:
@@ -12460,6 +12484,10 @@ def verify_cutlist(plan, log=True):
         pos = t["f0"] + t["nf"]
     if plan["takes"] and pos != plan["total_frames"]:
         bad.append(f"frames {pos} != planned {plan['total_frames']}")
+    if plan["takes"] and plan["takes"][-1].get("kills_out") and "duration" in plan:       # V9.1.1: the fade to black never starts before the last kill of the ending
+        ko_ = plan["takes"][-1]["f0"] / OUT_FPS + plan["takes"][-1]["kills_out"][-1]
+        if outro_fade(plan)[0] < ko_ - 1.0 / OUT_FPS:
+            bad.append(f"take {len(plan['takes'])}: the video fades to black at {outro_fade(plan)[0]:.2f}s, before its last kill at {ko_:.2f}s")
     return bad
 
 
