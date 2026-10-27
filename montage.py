@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.1.2"
+APP_VERSION = "V9.1.3"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -1313,6 +1313,8 @@ def ocr_rows(boxes, blobs, game=None):
         return ix * iy
     good = [b for b in good if not ((b[5] < 0.75 or len(_alnum(b[4])) <= 2) and
                                     any(ov(b, g) > 0.5 * (b[2] - b[0]) * (b[3] - b[1]) and g[2] >= 1.2 * g[3] for g in blobs))]
+    if game == "cs2" and CS2_ICON_TEXT_ON[0]:                # V9.1.3: one short read spread over two gun icons (Dual Berettas read as 'FP') covers most of a gun icon, not half of itself
+        good = [b for b in good if not (len(_alnum(b[4])) <= 2 and any(ov(b, g) > 0.5 * g[2] * g[3] and g[2] >= 1.5 * g[3] for g in blobs))]
     rows = []
     for b in sorted(good, key=lambda b: (b[1] + b[3]) / 2):
         cy = (b[1] + b[3]) / 2
@@ -3110,6 +3112,15 @@ BORDER_LINE_MIN = 60             # px (1920-wide normalised space): shortest hor
 BORDER_H = (16, 90)              # px: outer height of an outlined row (1920x1080 space; the clip is stretched into it)
 BORDER_PRE_F = 3                 # a track already there in the first frames = on screen when the clip starts (pre-clip)
 BORDER_FAILED = set()            # clips whose sidecar could not be built in this process (not retried every time)
+CS2_OPEN_LEFT_ON = [True]        # V9.1.3: a row that runs past the region's left edge (long names / an assist) is a row with no left side in the crop
+BORDER_OPEN_LEFT_W = 0.8         # V9.1.3: ... and then spans at least this share of the region's width (a real cut row reaches the right edge)
+CS2_LOOSE_PAIR_ON = [True]       # V9.1.3: an outline edge only partly strict-red is completed by the loose mask before pairing
+CS2_PRE_F0_ON = [True]           # V9.1.3: an early row is pre-clip only when the clip's first frame already holds it (sidecar field f0, ext 5)
+BORDER_F0_SIM = 0.8              # V9.1.3: f0 at least this = the row was on screen in frame 0
+CS2_LONE_ROW_ON = [True]         # V9.1.3: the lone-line rescue of border_rects also runs in a frame that holds no other outlined row
+CS2_REACQ_LOOK_ON = [True]       # V9.1.3: the border tracker continues a track after missing frames only on an appearance match
+CS2_SAME_VIC_ON = [True]         # V9.1.3 (ext 5): a 2nd kill row of the same victim while the 1st is still on screen is a copy
+CS2_ICON_TEXT_ON = [True]        # V9.1.3: a 1-2 letter OCR read lying over most of a gun icon is the icon (ocr_rows, CS2 only)
 
 
 def border_dm(fr):
@@ -3148,10 +3159,24 @@ def border_rects(fr):
     lt = thin[len(thin) // 2] if thin else 3                       # typical thickness of one outline line
     rects = []
     used_ln = set()
-    for i, (ya, yb, xa0, xa1) in enumerate(lines):
+    loose_ = {}
+
+    def loose_ext(k):                                              # V9.1.3: the loose-mask line that holds strict line k: (x0, x1) or None
+        if k not in loose_:
+            if "lines" not in loose_:
+                lm_ = border_loose(fr)
+                mh_ = cv2.morphologyEx(cv2.morphologyEx(lm_, cv2.MORPH_CLOSE, np.ones((1, 7), np.uint8)), cv2.MORPH_OPEN, np.ones((1, BORDER_LINE_MIN), np.uint8))
+                n_, _, st_, _ = cv2.connectedComponentsWithStats(mh_, connectivity=8)
+                loose_["lines"] = [(int(st_[q][1]), int(st_[q][1] + st_[q][3] - 1), int(st_[q][0]), int(st_[q][0] + st_[q][2] - 1)) for q in range(1, n_) if st_[q][3] <= 14]
+            ya_, yb_, x0_, x1_ = lines[k]
+            hit = [l_ for l_ in loose_["lines"] if l_[1] >= ya_ - 1 and l_[0] <= yb_ + 1 and l_[2] <= x0_ + 2 and l_[3] >= x1_ - 2]
+            loose_[k] = (min(l_[2] for l_ in hit), max(l_[3] for l_ in hit)) if hit else None
+        return loose_[k]
+    for i, (ya, yb, xa0_s, xa1_s) in enumerate(lines):
         a_thick = yb - ya + 1 > 5                                  # two touching rows (bottom line + top line) blurred into one thick line
         y0 = yb - (lt - 1) if a_thick else ya                      # such a line is the TOP of the row below it ...
         for j, (yc, yd, xb0, xb1) in enumerate(lines[i + 1:], i + 1):
+            xa0, xa1 = xa0_s, xa1_s
             b_thick = yd - yc + 1 > 5
             y1 = yc + (lt - 1) if b_thick else yd                  # ... and the BOTTOM of the row above it
             if y1 - y0 < BORDER_H[0] or yc - yb < 3:
@@ -3159,7 +3184,12 @@ def border_rects(fr):
             if y1 - y0 > BORDER_H[1]:
                 break
             if abs(xa1 - xb1) > 12:
-                continue
+                if not (CS2_LOOSE_PAIR_ON[0] and not a_thick and not b_thick):
+                    continue
+                ea, eb = loose_ext(i), loose_ext(j)                # V9.1.3: one edge only partly strict-red (a thin line on a bright sky): the loose mask holds its full length
+                if ea is None or eb is None or abs(ea[1] - eb[1]) > 12:
+                    continue
+                xa0, xa1, xb0, xb1 = min(xa0, ea[0]), max(xa1, ea[1]), min(xb0, eb[0]), max(xb1, eb[1])
             if a_thick or b_thick:                                 # a merged line is as wide as the wider of its two rows: the clean line decides x0
                 x0 = xb0 if a_thick and not b_thick else xa0 if b_thick and not a_thick else max(xa0, xb0)
                 if a_thick != b_thick and (xa0 if a_thick else xb0) > x0 + 12:
@@ -3172,14 +3202,15 @@ def border_rects(fr):
             side = m[y0:y1 + 1, :]
             fl = float(side[:, max(0, x0 - 3):x0 + 9].any(axis=1).mean())
             fr_ = float(side[:, max(0, x1 - 9):x1 + 3].any(axis=1).mean())
-            if max(fl, fr_) >= 0.5 and min(fl, fr_) >= 0.25:
+            cut_left = CS2_OPEN_LEFT_ON[0] and x0 <= 1 and fr_ >= 0.5 and x1 - x0 + 1 >= BORDER_OPEN_LEFT_W * m.shape[1]      # V9.1.3: a long row runs past the left edge of the killfeed region: it has no left side here
+            if (max(fl, fr_) >= 0.5 and min(fl, fr_) >= 0.25) or cut_left:
                 band = np.concatenate([dd[y0:y0 + lt, x0:x1 + 1].ravel(), dd[max(y0, y1 - lt + 1):y1 + 1, x0:x1 + 1].ravel()])
                 band = band[band >= 40]
                 rects.append({"x0": x0, "y0": y0, "x1": x1, "y1": y1, "str": float(band.mean()) if band.size else 0.0})
                 used_ln |= {i, j}
             break                                                  # the nearest matching line below closes this row
     strict_ = list(rects)
-    if len(used_ln) < len(lines) and strict_:                      # V8.7: a strict line without a partner (the other edge smeared by compression): the loose mask may still hold it
+    if len(used_ln) < len(lines) and (strict_ or CS2_LONE_ROW_ON[0]):      # V9.1.3: also in a frame with no other row (the only row on screen, CS2 2026-10-17 17-15-59: Tom); V8.7: a strict line without a partner (the other edge smeared by compression): the loose mask may still hold it
         lm = border_loose(fr)
         mh2 = cv2.morphologyEx(cv2.morphologyEx(lm, cv2.MORPH_CLOSE, np.ones((1, 7), np.uint8)), cv2.MORPH_OPEN, np.ones((1, BORDER_LINE_MIN), np.uint8))
         n2, _, st2, _ = cv2.connectedComponentsWithStats(mh2, connectivity=8)
@@ -3202,7 +3233,7 @@ def border_rects(fr):
                 continue
             hh, up_, lo_ = min(cand, key=lambda c: c[0])
             x0, x1 = min(up_[2], lo_[2]), max(up_[3], lo_[3])
-            if not any(abs(r_["x1"] - x1) <= 6 and abs((r_["y1"] - r_["y0"] + 1) - hh) <= 6 for r_ in strict_):
+            if strict_ and not any(abs(r_["x1"] - x1) <= 6 and abs((r_["y1"] - r_["y0"] + 1) - hh) <= 6 for r_ in strict_):
                 continue                                           # only in a frame that already holds a clearly outlined row of the same height and right edge (the killfeed is on screen; no red bar elsewhere)
             side = lm[up_[0]:lo_[1] + 1, :]
             fl = float(side[:, max(0, x0 - 3):x0 + 9].any(axis=1).mean())
@@ -3319,6 +3350,22 @@ def border_quality(fr, rc):
     return int(bright_mask(inner).sum()) if inner.size else 0
 
 
+def border_seen_f0(f0, rc, desc):
+    """V9.1.3: how much the clip's FIRST frame holds this row (0-1): the best appearance match of the row (its first tracked look) anywhere in the same
+    x range of frame 0 (rows only move up / down between frames, never sideways). A row that faded in during the first frames is not there (low); a row that
+    was on screen when the clip started is (0.85-1.0, same scale as the tracker's row identity). None when there is nothing to compare."""
+    import numpy as np
+    if f0 is None or rc is None or desc is None:
+        return None
+    h = rc["y1"] - rc["y0"]
+    best = 0.0
+    for y in range(0, f0.shape[0] - h, 2):
+        d = border_desc(f0, dict(rc, y0=y, y1=y + h))
+        if d is not None:
+            best = max(best, float(np.dot(desc, d)))
+    return round(best, 3)
+
+
 class BorderTracker:
     """Tracks outlined rows over the frames of one clip. A row is identified by its outline width, its appearance (text independent)
     and its position; when the list shifts (a new row pushes the others down) the shift is measured from the rows that agree on it. A
@@ -3329,10 +3376,13 @@ class BorderTracker:
         self.gap = int(round(BORDER_GAP_S * fps))
         self.pairs_dy = []
         self.blob_n = 0
+        self.f0 = None                                             # V9.1.3: the clip's first frame (was an early row already on screen?)
 
     def feed(self, f, fr):
         import numpy as np
         self.n = f + 1
+        if f == 0:
+            self.f0 = fr.copy()
         rects = border_rects(fr)
         live = [t for t in self.tracks if f - t["last"] <= self.gap]
         descs = [border_desc(fr, rc) if live else None for rc in rects]
@@ -3355,6 +3405,10 @@ class BorderTracker:
         sc = []
         for c, dy, t, i in pairs:
             pos_ok = abs(dy - shift) <= max(6.0, 0.35 * (t["y1"] - t["y0"]))
+            if CS2_REACQ_LOOK_ON[0] and f - t["last"] > 1 and c < 0.8:
+                continue
+            if CS2_REACQ_LOOK_ON[0] and abs(dy - shift) > 1.2 * (t["y1"] - t["y0"]):
+                continue                                           # V9.1.3: rows slide, they never jump past a whole row between two frames (two look-alike rows swapped in a damage flash: 2025.05.08 - 20.19.13)                                           # V9.1.3: after a gap only the same LOOK continues a track (a damage flash outlined another row, then a new row appeared there: 2024.04.30 - 15.24.18)
             if c >= 0.8 or (pos_ok and c >= 0.35):
                 sc.append((c + (0.5 if pos_ok else 0.0) - 0.002 * abs(dy - shift), id(t), i, t))
         sc.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
@@ -3370,7 +3424,8 @@ class BorderTracker:
             d = descs[i] if live else border_desc(fr, rc)
             if t is None:
                 t = {"id": len(self.tracks), "first": f, "last": f, "hits": 0, "y0": rc["y0"], "y1": rc["y1"], "x0": rc["x0"], "x1": rc["x1"],
-                     "w": rc["x1"] - rc["x0"], "desc": d, "slots": [[f, rc["y0"]]], "crops": {}, "s0": rc.get("str", 0.0), "smax": rc.get("str", 0.0)}
+                     "w": rc["x1"] - rc["x0"], "desc": d, "slots": [[f, rc["y0"]]], "crops": {}, "s0": rc.get("str", 0.0), "smax": rc.get("str", 0.0),
+                     "desc0": d, "rc0": dict(rc)}
                 self.tracks.append(t)
             else:
                 if abs(rc["y0"] - t["y0"]) >= 2:
@@ -3394,6 +3449,8 @@ class BorderTracker:
         self.blob_n = len(blobs) + len(self.tracks) - len(raw)
         for t in res:
             t["op0"] = round(min(1.0, t["s0"] / t["smax"]), 3) if t.get("smax") else None      # outline strength at the first frame / its best (fade-in)
+            if CS2_PRE_F0_ON[0] and 0 < t["first"] <= int(BORDER_PRE_S * self.fps) + 1:
+                t["f0"] = border_seen_f0(self.f0, t.get("rc0"), t.get("desc0"))
             ranked = sorted(t["crops"].items(), key=lambda kv: -kv[1][0])
             late = [kv for kv in ranked if kv[1][1] >= t["first"] + 2] or ranked      # skip the slide-in frames when there are later ones
             pick = []
@@ -3477,6 +3534,7 @@ def border_build(rec, det, cfg, write=True, keep_images=False):
         best = t["picked"][0] if t["picked"] else None
         out_tracks.append({"id": t["id"], "first": t["first"], "last": t["last"], "hits": t["hits"], "x0": t["x0"], "x1": t["x1"],
                            "y0": t["y0"], "y1": t["y1"], "slots": t["slots"], "votes": votes, "op0": t.get("op0"),
+                           **({"f0": t["f0"]} if t.get("f0") is not None else {}),
                            "best_f": best[1] if best else None, "best_rect": best[3] if best else None})
         if keep_images and best:
             images[t["id"]] = best[2]
@@ -3662,8 +3720,11 @@ def _slot_at(t, f):
     return cur[2] if len(cur) > 2 else int(round(cur[1] / 40.0))
 
 
-BORDER_EXT = 4                   # V9.1.2: sidecar extension level written by border_build (3 = V8.7 row grid, 4 = + rows that slid up into a row's slot)
-BORDER_FIX = 2                   # V9.1.2: border_shape_filter fix level of a newly built sidecar (False / True = before V8.7 / V8.7)
+BORDER_EXT = 5                   # V9.1.3: 5 = + rows cut by the region's left edge, loose-completed edges, frame-0 presence (f0) of early rows; V9.1.2: sidecar extension level written by border_build (3 = V8.7 row grid, 4 = + rows that slid up into a row's slot)
+BORDER_FIX = 3                   # V9.1.3: 3 = the row grid is measured on SETTLED slots only (a slot held BORDER_SLOT_HOLD frames; the in-between heights of a slide are no row levels); V9.1.2: border_shape_filter fix level of a newly built sidecar (False / True = before V8.7 / V8.7)
+BORDER_SLOT_HOLD = 4             # V9.1.3: frames a row must stay at one height for that height to count as a row level of the grid
+BORDER_MIN_W = 120               # V9.1.3: px (killfeed region): the narrowest outlined row (two short names + an icon) is wider than this
+BORDER_PITCH_MIN = 0.9           # V9.1.3: the row pitch is at least this share of the row height (two levels closer than a row are a slide, not two slots)
 BORDER_SLID_HITS = 8             # V9.1.2: frames a row that slid up into a row's slot needs (a real row lives seconds)
 BORDER_SLID_YTOL = 3             # V9.1.2: px: its last height and the accepted row's height agree within this
 
@@ -3671,7 +3732,7 @@ BORDER_SLID_YTOL = 3             # V9.1.2: px: its last height and the accepted 
 def border_fix_kw(sc):
     """V9.1.2: the border_shape_filter keyword of a stored sidecar (each sidecar is read with the rule it was built with)."""
     e = sc.get("ext", 1)
-    return {"fix": BORDER_FIX} if e >= 4 else {"fix": True} if e >= 3 else {}
+    return {"fix": BORDER_FIX} if e >= 5 else {"fix": 2} if e >= 4 else {"fix": True} if e >= 3 else {}
 
 
 def _slid_into_row(t, rows):
@@ -3691,24 +3752,34 @@ def border_shape_filter(tracks, n, fix=False):
     from the long-lived tracks). Anything else - a bomb-site marker, a map icon, an explosion, a red wall - is a non-row blob."""
     def shape(t):
         h, w = t["y1"] - t["y0"], t["x1"] - t["x0"]
-        return BORDER_H[0] <= h <= BORDER_H[1] and w >= BORDER_ASPECT * h and (t["hits"] >= 3 or (t["last"] >= n - 2 and t["hits"] >= 1))
+        return BORDER_H[0] <= h <= BORDER_H[1] and w >= BORDER_ASPECT * h and (t["hits"] >= 3 or (t["last"] >= n - 2 and t["hits"] >= 1))             and (fix < 3 or w >= BORDER_MIN_W)                    # V9.1.3: a killfeed row holds two names and a weapon icon
     cand = [t for t in tracks if shape(t)]
     refs = [t for t in cand if t["hits"] >= BORDER_REF_HITS]
     x1ref = pitch = anchor = None
+
+    def held(t, k):                                                # frames the track stayed at slot k
+        return (t["slots"][k + 1][0] if k + 1 < len(t["slots"]) else t["last"] + 1) - t["slots"][k][0]
     if refs:
         x1ref = max(refs, key=lambda a: sum(b["hits"] for b in refs if abs(b["x1"] - a["x1"]) <= 12))["x1"]
         refs = [t for t in refs if abs(t["x1"] - x1ref) <= 14]
         lv = []
-        for y in sorted(s[1] for t in refs for s in t["slots"]):
+        for y in sorted(s[1] for t in refs for k, s in enumerate(t["slots"]) if fix < 3 or held(t, k) >= BORDER_SLOT_HOLD):     # (True = level 1)
             if not lv or y - lv[-1] > 3:
                 lv.append(y)
         h = sorted(t["y1"] - t["y0"] for t in refs)[len(refs) // 2] if refs else 30
         d = [b - a for a, b in zip(lv, lv[1:]) if b - a >= 0.6 * h]
+        if fix >= 3:                                               # V9.1.3: rows never overlap, so the pitch is at least a row's height: the distance from every level to the
+            d = [min(b for b in lv if b - a >= BORDER_PITCH_MIN * h) - a for a in lv if any(b - a >= BORDER_PITCH_MIN * h for b in lv)]   # next one a row higher (a slide that paused mid-way is no level);
+            d = [x / max(1, int(x // (BORDER_PITCH_MIN * h))) for x in d]       # a level distance of two rows (a row between that is not mine has no outline) is two slots
         if d:
             pitch, anchor = min(d), lv[0]
 
     def on_grid(t, pitch_):
-        return all(abs(((y - anchor + pitch_ / 2.0) % pitch_) - pitch_ / 2.0) <= 0.3 * pitch_ for y in (t["slots"][0][1], t["slots"][-1][1]))
+        near = lambda y: abs(((y - anchor + pitch_ / 2.0) % pitch_) - pitch_ / 2.0) <= 0.3 * pitch_
+        if fix >= 3:                                               # V9.1.3: a row that slid in while the feed was moving sits on the grid where it SETTLED (a slot held
+            held_ = [s[1] for k, s in enumerate(t["slots"]) if held(t, k) >= BORDER_SLOT_HOLD] or [t["slots"][-1][1]]     # BORDER_SLOT_HOLD frames), not at its first height
+            return any(near(y) for y in held_)
+        return all(near(y) for y in (t["slots"][0][1], t["slots"][-1][1]))
     if pitch and fix:                                              # V8.7: one early slot of a fragment (two touching rows seen as one thick line) made the smallest level distance 26 instead of the true row pitch 31 and every row from the 3rd on was thrown out as a blob
         okx = [t for t in cand if (x1ref is None or abs(t["x1"] - x1ref) <= 14) and t["hits"] >= 8]
         if any(not on_grid(t, pitch) for t in okx):
@@ -3723,7 +3794,7 @@ def border_shape_filter(tracks, n, fix=False):
         ok = x1ref is None or abs(t["x1"] - x1ref) <= 14
         if ok and pitch:
             ok = on_grid(t, pitch)
-            if not ok and fix == BORDER_FIX:
+            if not ok and fix >= 2:
                 off.append(t)                                      # right edge fine, only off the grid: may be a row that slid up (decided below)
         (rows if ok else blobs).append(t)
     if off:                                                        # V9.1.2: only ever ADDS rows; the grid itself and every row it accepts stay as before
@@ -3752,11 +3823,18 @@ def _clear_other(text):
     return t if max(sims) < 40 else ""
 
 
-def cs2_classify_track(track, cfg=None):
+def _cs2_readable_other(first):
+    """V9.1.3: a killer-side first name that is a real read: 3+ Latin letters / digits or 4+ other characters (two garbled CJK characters are no name)."""
+    a = _alnum(first)
+    return len(re.sub(r"[^A-Za-z0-9]", "", a)) >= 3 or len(a) >= 4
+
+
+def cs2_classify_track(track, cfg=None, ext=1):
     """Vote over the clearest frames of one OUTLINED row (V6.8.2: the outline marks rows where the player is the killer or the assister, never
     the victim, so a border track is a kill or an assist, never a death). Returns {verdict, name_read, why, ktext, vtext, gun, hs, ks, vs, votes,
     sus (suspicious side reads)}. verdict: kill | assist | utility | other (a stable, readable OTHER name first) | none (text could not be split)."""
     tally, votes, sus, rows_, others = {}, [], [], cs2_track_rows(track), []
+    cut = CS2_OPEN_LEFT_ON[0] and track.get("x0", 99) <= 1         # V9.1.3: the row runs past the region's left edge: the killer's name is off-screen, the visible first name is not the killer
     for v, r in rows_:
         if r is None:
             votes.append(("empty", 0, "OCR found nothing", "", ""))
@@ -3765,8 +3843,11 @@ def cs2_classify_track(track, cfg=None):
         if CS2_ROWID_ON[0] and ver == "death" and cs2_victim_is_me(r.get("vtext")) and not cs2_me_jumbled((r.get("ktext") or "").split("+")[0]):
             sus.append(why)                                        # V8.1: my name on the victim side (and not on the killer side) = my death, never a kill
             ver, w, why = "death", 1, f"death: my name on the victim side ('{r.get('vtext', '')}'), not a kill"
+        elif cut and ver == "kill?":
+            why = f"kill (the killer's name is cut off by the killfeed region's left edge, border confirmed; '{r.get('ktext') or '-'}' -> '{r.get('vtext') or '-'}')"
         elif CS2_ROWID_ON[0] and ver == "kill?" and _alnum((r.get("ktext") or "").split("+")[0] if CS2_ROWID_V811[0] else (r.get("ktext") or "")) \
-                and not cs2_me_jumbled((r.get("ktext") or "").split("+")[0]):          # V8.1.1: '+ sashadidntwakeup' = the killer before the '+' is unread, not another player
+                and not cs2_me_jumbled((r.get("ktext") or "").split("+")[0]) \
+                and (ext < 5 or _cs2_readable_other((r.get("ktext") or "").split("+")[0])):          # V8.1.1: '+ sashadidntwakeup' = the killer before the '+' is unread, not another player
             ver, w, why = "other", 1, f"not mine: the killer side '{r.get('ktext') or '-'}' does not look like my name"      # V8.1
         elif ver == "death":                                       # my name on the victim side of an outlined row: a misread
             sus.append(why)
@@ -3775,7 +3856,7 @@ def cs2_classify_track(track, cfg=None):
             else:
                 ver, w, why = "kill?", 1, f"suspicious side read ({why}): an outlined row is never a death, kept as a kill"
         votes.append((ver, w, why, r.get("ktext", ""), r.get("vtext", "")))
-        if ver == "kill?" and r.get("gun"):
+        if ver == "kill?" and r.get("gun") and not cut:
             o = _clear_other(r.get("ktext", ""))
             if o:
                 others.append(o)
@@ -3908,7 +3989,7 @@ CS2_ROWID_V811 = [True]          # V8.1.1 switch (tests)
 CS2_ROW_WTOL = 40               # px: outline widths of one row (its left end is found less reliably than its right end)
 
 
-def _cs2_row_relation(a, b, ca, cb, rows):
+def _cs2_row_relation(a, b, ca, cb, rows, ext=1):
     """V8.1: 'same' | 'distinct' | None (no evidence either way) for two tracks (a first seen first). Distinct: another player's row
     against a row that names me, victims that read clearly different, two places at one time, b lower than a was (rows never move
     down) or longer apart than one row lives. Same: born in one place at one frame, in one place at one time (two rows never share a
@@ -3924,7 +4005,9 @@ def _cs2_row_relation(a, b, ca, cb, rows):
     fps = BORDER_FPS
     if max(a["first"], b["first"]) <= min(a["last"], b["last"]):
         f = max(a["first"], b["first"])
-        if abs(_y_at(a, f) - _y_at(b, f)) <= CS2_ROW_YTOL and (wd <= CS2_ROW_WTOL or vm is True):
+        lo_, hi_ = f, min(a["last"], b["last"])
+        place = (abs(_y_at(a, f) - _y_at(b, f)) <= CS2_ROW_YTOL) if ext < 5 else             sum(abs(_y_at(a, g) - _y_at(b, g)) <= CS2_ROW_YTOL for g in (lo_, (lo_ + hi_) // 2, hi_)) >= 2     # V9.1.3 (ext 5): one place for most of the overlap, not only at
+        if place and (wd <= CS2_ROW_WTOL or vm is True):                                                         # its first frame (a new row matched one frame at an old row's height, 2024.02.12 - 21.22.43)
             return "same"                                         # two rows never stand in one place at the same time (a copy that later hops to the next row still started as this one)
         s = a if a["hits"] <= b["hits"] else b
         if s["hits"] <= CS2_ROW_SPUR_HITS and vm is True and not _cs2_row_is_new(s, rows):
@@ -3946,11 +4029,11 @@ def _cs2_row_relation(a, b, ca, cb, rows):
     return None
 
 
-def border_merge(tracks, cfg):
+def border_merge(tracks, cfg, ext=1):
     """Fragments of one row (the tracker lost it and found it again) become ONE track. Returns [(merged track, classification, [member ids])]."""
-    cls = {t["id"]: cs2_classify_track(t, cfg) for t in tracks}
+    cls = {t["id"]: cs2_classify_track(t, cfg, ext) for t in tracks}
     if CS2_ROWID_ON[0]:
-        rel_fn = lambda a, b, ca, cb: _cs2_row_relation(a, b, ca, cb, tracks)
+        rel_fn = lambda a, b, ca, cb: _cs2_row_relation(a, b, ca, cb, tracks, ext)
     else:
         rel_fn = _border_relation
     groups = []
@@ -3974,7 +4057,7 @@ def border_merge(tracks, cfg):
         m = dict(g[0])
         m.update(first=g[0]["first"], last=max(t["last"] for t in g), hits=sum(t["hits"] for t in g), x0=g[-1]["x0"], x1=g[-1]["x1"],
                  slots=sorted((s for t in g for s in t["slots"]), key=lambda s: s[0]), votes=sorted((v for t in g for v in t.get("votes", [])), key=lambda v: v["f"]))
-        res.append((m, cs2_classify_track(m, cfg), [t["id"] for t in g]))
+        res.append((m, cs2_classify_track(m, cfg, ext), [t["id"] for t in g]))
     return res
 
 
@@ -4039,7 +4122,7 @@ def border_analysis(sc, cfg, deaths=None):
     early = []                       # V7.7.6: (time, victim, track id) of rows on screen in the first CS2_EARLY_S s that are not kills of this list (pre-clip rows, unshaped tracks)
     blobs_n = len(blob_t) + int(sc.get("blobs", 0))
     tok = hashlib.md5((sc.get("key") or "").encode()).hexdigest()[:4]       # an unreadable victim gets a name unique to this clip and row
-    for t, c, ids in sorted(border_merge(rows_t, cfg), key=lambda x: x[0]["first"]):
+    for t, c, ids in sorted(border_merge(rows_t, cfg, sc.get("ext", 1)), key=lambda x: x[0]["first"]):
         tt = round(t["first"] / fps + off, 3)
         last = round(t["last"] / fps + off, 3)
         if c["verdict"] == "none":
@@ -4063,8 +4146,11 @@ def border_analysis(sc, cfg, deaths=None):
         mine.append({"t": tt, "row": row, "verdict": "kill" if v == "kill" else "reject", "why": c["why"], "hits": t["hits"]})
         det_rows.append({"track": t, "cls": c, "t": tt, "merged": ids})
         op0 = t.get("op0")
-        pre = t["first"] <= BORDER_PRE_F or (t["first"] <= int(BORDER_PRE_S * fps) and
-                                              ((op0 is not None and op0 >= 0.85) or (op0 is None and _slot_at(t, t["first"]) > 0)))
+        if CS2_PRE_F0_ON[0] and t.get("f0") is not None:        # V9.1.3 (sidecars from ext 5): pre-clip = the clip's first frame already holds this row (a row that faded in during the
+            pre = t["f0"] >= BORDER_F0_SIM                       # first frames is a kill inside the clip, CS2 2023.09.01 - 12.13.31: Flx at 0.07 s)
+        else:
+            pre = t["first"] <= BORDER_PRE_F or (t["first"] <= int(BORDER_PRE_S * fps) and
+                                                  ((op0 is not None and op0 >= 0.85) or (op0 is None and _slot_at(t, t["first"]) > 0)))
         if pre:
             rej.append({"t": tt, "reason": f"pre-clip: row already on screen when the clip starts ({row})", "ks": max(c["ks"], c["vs"]) / 100})
             if c["vtext"]:
@@ -4121,6 +4207,16 @@ def border_analysis(sc, cfg, deaths=None):
         kills = keep_k
     if CS2_SAMETIME_ON[0]:
         kills = cs2_sametime_guard(kills, rej)
+    if sc.get("ext", 1) >= 5 and CS2_SAME_VIC_ON[0]:        # V9.1.3: a victim cannot die twice while his first kill row is still on screen: the later row is a copy
+        keep_k = []                                          # (a shaking feed split one row into two tracks: 2025.02.07 - 06.13.51, B7ackL)
+        for k in kills:
+            o = next((p for p in keep_k if p["t"] < k["t"] <= p.get("t_last", p["t"]) + 0.3 and not k["victim"].startswith("(unread")
+                      and cs2_same_victim(p["victim"], k["victim"])), None)
+            if o is not None:
+                rej.append({"t": k["t"], "reason": f"CS2 duplicate row: same victim as the kill row at {o['t']:.1f} s, which is still on screen ({k['row']})", "ks": k["ks"]})
+                continue
+            keep_k.append(k)
+        kills = keep_k
     victims = [ocr_norm(k["victim"]) for k in kills if k["name_read"] and ocr_norm(k["victim"])]
     rep = any(cs2_same_victim(a, b) for i, a in enumerate(victims) for b in victims[i + 1:])
     return {"kills": kills, "deaths": sorted(deaths or []), "revives": [], "rej": sorted(rej, key=lambda r: r["t"]), "vis": vis,
@@ -4415,6 +4511,12 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
     return j
 
 
+def _dating_tid(sc, tr):
+    """V9.1.3: the memo name of a track. From sidecar ext 5 on it carries the sidecar's build time and the track's first frame: a rebuilt sidecar numbers its
+    tracks anew, and track 3 of the new sidecar took the date of track 3 of the old one (CS2 2026-10-17 17-15-59: a row at 20.5 s dated 18.2 s)."""
+    return str(tr["id"]) + (f"@{sc.get('built', '')}/{tr['first']}" if sc.get("ext", 1) >= 5 else "")
+
+
 def cs2_row_first_frame(rec, det, cfg, sc, tr):
     """V7.5.1 (CS2 only): the first sidecar frame (BORDER_FPS grid) at which the SAME row is already on screen, walking back from tr['first']. Same row = the row's grayscale
     name patch (taken at the settled frame) found again within +-40 px in y (a newer row slides it down) with normalised correlation >= 0.9. The faint fade-in stretch
@@ -4426,7 +4528,7 @@ def cs2_row_first_frame(rec, det, cfg, sc, tr):
     import numpy as np
     fps = float(sc.get("fps", BORDER_FPS))
     f1 = int(tr["first"])
-    key = (str(sc.get("key", "")), str(tr["id"]))
+    key = (str(sc.get("key", "")), _dating_tid(sc, tr))
     _dating_memo_load()
     if key in CS2_DATING_MEMO:
         return CS2_DATING_MEMO[key]
@@ -4495,7 +4597,7 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
                 if kk not in _DATING_LOGGED:
                     _DATING_LOGGED.add(kk)
                     LOGONLY(f"CS2 kill time kept (no proven first appearance): {clip} {k['t']:.2f}")
-            elif f is not None and CS2_DATING_MEMO.get((str(sc.get("key", "")), str(tr["id"]) + "~loose")) and k["t"] - round(f / fps + off, 3) < CS2_LATE_MIN_S:
+            elif f is not None and CS2_DATING_MEMO.get((str(sc.get("key", "")), _dating_tid(sc, tr) + "~loose")) and k["t"] - round(f / fps + off, 3) < CS2_LATE_MIN_S:
                 k["t_kept"] = True                             # V9.1.0: (see above)
                 kk = (clip, round(k["t"], 2), "kept")          # V7.7.6: proven only by the looser slot test and a small move (the fade-in frames): the cached time stays (neither a move nor a failure)
                 if kk not in _DATING_LOGGED:
@@ -4929,6 +5031,58 @@ def gun_onsets(rec, cache=None, cfg=None):
     return ons
 
 
+CS2_LOCK_ROW_ON = [True]         # V9.1.3: a CS2 outlined kill row that reads my name proves I was alive: the death lock never removes it (9 of 10 such rows checked on the frames were real kills)
+SEEN_GUARD_ON = [True]           # V9.1.3 switch: CS2 / R6S takes carry the clip's kill rows of mine (counted or not) for the CUT LIST CHECK
+SEEN_NOT_KILL = ("death", "victim side", "suspicious", "assist", "not mine", "other player", "utility", "gadget", "shifted up", "same victim",
+                 "same row", "same-timestamp", "no readable name", "revive")       # rejections that say the row is NOT a kill of mine (or a copy of a counted one)
+SEEN_MIN_S = 0.25                # V9.1.3: an uncounted row must be on screen at least this long inside a take to fail the check
+SEEN_MATCH_S = 0.6               # V9.1.3: a take kill this close to a row's first frame is that row's kill
+
+
+def clip_seen_rows(a, kills, rej=()):
+    """V9.1.3 (CS2 / R6S): every kill row of mine of one clip, as the plan-time guard needs it: [{t, t_last, victim, rule}] in clip time; rule None = a counted kill
+    (`kills` = the clip's final kill list), else the rule that dropped it. Rows the analysis itself calls NOT a kill of mine (deaths, assists, utility, another
+    player's row, a copy of a counted row) are left out: only real-looking kill rows that are not counted can fail the check."""
+    rej = list(a.get("rej", [])) + list(rej)
+    out_ = []
+
+    def counted(t, victim):
+        return next((k for k in kills if abs(k["t"] - t) <= 0.01 or (k.get("t_cached") is not None and abs(k["t_cached"] - t) <= 0.01)), None)
+
+    def why_at(t):
+        return next((j["reason"] for j in sorted(rej, key=lambda j: abs(j["t"] - t)) if abs(j["t"] - t) <= 0.05 and not j.get("soft")), None)
+    if a.get("border"):
+        fps = BORDER_FPS
+        for d in a.get("rows", []):
+            if d["cls"]["verdict"] != "kill":
+                continue
+            t0 = float(d["t"])
+            tl = round(t0 + (d["track"]["last"] - d["track"]["first"]) / fps, 3)
+            k = next((k for k in kills if k.get("track") == d["track"]["id"]), None)
+            if k is not None:
+                out_.append({"t": round(min(k["t"], t0), 3), "t_last": tl, "victim": k.get("victim", ""), "rule": None})
+                continue
+            why = why_at(t0) or "not in the kill list"
+            if not any(w in why.lower() for w in SEEN_NOT_KILL):
+                out_.append({"t": round(t0, 3), "t_last": tl, "victim": d["cls"]["vtext"], "rule": why})
+        for k in kills:                                         # kills the border list took from the name scan
+            if k.get("track") is None:
+                out_.append({"t": round(k["t"], 3), "t_last": round(float(k.get("t_last", k["t"] + 1.0)), 3), "victim": k.get("victim", ""), "rule": None})
+    else:
+        for m in a.get("mine", []):
+            if m.get("verdict") != "kill":
+                continue
+            k = counted(m["t"], "")
+            if k is not None:
+                out_.append({"t": round(k["t"], 3), "t_last": round(float(k.get("t_last", k["t"] + 1.0)), 3), "victim": k.get("victim", ""), "rule": None})
+                continue
+            why = why_at(m["t"]) or "not in the kill list"
+            if not any(w in why.lower() for w in SEEN_NOT_KILL):
+                out_.append({"t": round(m["t"], 3), "t_last": round(m["t"] + 1.0, 3), "victim": (m.get("row") or "").rsplit("[", 1)[-1].rstrip("]"), "rule": why})
+    out_.sort(key=lambda r: r["t"])
+    return out_
+
+
 def verified_kills(pool_items, cfg):
     """Gunshot audio is a SOFT signal now: a score bonus and a note, never a rejection and (V8.8.4) never the kill time (the kill row is).
     The only hard rule here is the death lock. Returns stats; every rejection is logged with its reason."""
@@ -4968,7 +5122,8 @@ def verified_kills(pool_items, cfg):
                 k = dict(k, shot=True, lag=round(k["t"] - shot, 3), shot_t=round(shot, 3))
             if k.get("weak_hl"):
                 it["rej"].append({"t": k["t"], "reason": "no highlight colour (kept - highlight is only a bonus)", "ks": k["ks"], "soft": True})
-            if not k.get("util") and any(d < k["t"] <= d + lock and not any(d < rv <= k["t"] for rv in it.get("revives", []))
+            if not k.get("util") and not (CS2_LOCK_ROW_ON[0] and k.get("border") and k.get("name_read")) \
+                    and any(d < k["t"] <= d + lock and not any(d < rv <= k["t"] for rv in it.get("revives", []))
                                          for d in it.get("deaths", [])):                     # a (Clove) revive ends the lock; V6.9.7.1: not for rows the utility override admitted
                 st["death_lock"] += 1
                 it["rej"].append({"t": k["t"], "reason": f"within {lock:.0f}s after my death", "ks": k["ks"]})
@@ -6243,7 +6398,8 @@ def game_pool(cfg, game, paths=None):
         for j in a["rej"]:
             allrej.append((Path(r["path"]).name, j))
         if a["kills"]:
-            pool.append({"rec": r, "kills": a["kills"], "deaths": a["deaths"], "revives": a["revives"], "vis": a["vis"], "rej": []})
+            pool.append({"rec": r, "kills": a["kills"], "deaths": a["deaths"], "revives": a["revives"], "vis": a["vis"], "rej": [],
+                         **({"_a": a} if game in ("cs2", "r6s") and SEEN_GUARD_ON[0] else {})})
     stats["with_kills"] = len(pool)
     if ovs:
         seen_ = {_pkey(r["path"]) for r, _ in cands}
@@ -6258,6 +6414,13 @@ def game_pool(cfg, game, paths=None):
         out(f"CS2 name '{MY_NAME_CS2}': {sum(cjk.values())} rows recovered that 'fireaxe' alone missed"
             + (" (" + ", ".join(f"{v} {k}" for k, v in sorted(cjk.items())) + ")" if cjk else ""))
     stats["audio"] = verified_kills(pool, cfg) if pool else {"raw": 0, "no_shot": 0, "death_lock": 0, "kept": 0}
+    for it in pool:                                        # V9.1.3 (CS2 / R6S): the clip's kill rows of mine for the plan-time guard (after the death lock)
+        a_ = it.pop("_a", None)
+        if a_ is not None:
+            try:
+                it["seen_rows"] = clip_seen_rows(a_, it["kills"], it["rej"])
+            except Exception as ex_:                       # noqa: BLE001
+                LOGONLY(f"kill rows for the cut list check skipped: {Path(it['rec']['path']).name}: {type(ex_).__name__}: {ex_}")
     for it in pool:
         nm = Path(it["rec"]["path"]).name
         allrej += [(nm, j) for j in it["rej"]]
@@ -9152,6 +9315,11 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
                      "rec": s_["it"]["rec"]} for s_ in spans],
           "stitched": len(spans) > 1, "stitch_note": stitch_note.strip(), "lags": [0.0] * len(times),
           "vis": spans[0]["it"].get("vis", []) if len(spans) == 1 else main.get("vis", [])}
+    if SEEN_GUARD_ON[0] and rec.get("game") in ("cs2", "r6s"):     # V9.1.3: the kill rows of mine of every clip of the event, on the event's timeline
+        seen_ = [dict(r_, t=round(r_["t"] + s_["shift"], 4), t_last=round(r_["t_last"] + s_["shift"], 4), clip=Path(s_["path"]).name)
+                 for s_ in spans for r_ in s_["it"].get("seen_rows", [])]
+        if seen_:
+            ev["seen"] = seen_
     sl_ = [float(raw[i]["k"].get("seen_lead", 0.0)) for i in keep]
     if any(x > 0.5 for x in sl_):                           # V7.7.6 (CS2 only): a row of this victim was already on screen this long before the kill time
         ev["seen_lead"] = [round(x, 3) for x in sl_]
@@ -12389,6 +12557,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                           **({"tail": {"mode": "fit", "v0": round(float(tk["v0"]), 3), "ease": EASE_FR, "ex": int(tk["ex"])}} if tk.get("tailmode") == "fit" else {}),
                           **({"rx": dict(ev["_rx"])} if ev.get("_rx") else {}),
                           **({"seen_lead": list(ev["seen_lead"])} if ev.get("seen_lead") else {}),
+                          **({"seen": [dict(r_) for r_ in ev["seen"]]} if ev.get("seen") else {}),
                           **({"jumps": len(tk["cuts"])} if tk.get("cuts") else {}), **({"util": True} if ev.get("util") else {}),
                           **({"unsure": [bool(u_) for u_ in uns], "xpre": round(float(ev["pre"]), 3)} if effects_mode(cfg, game) == "extra" else {}),
                           **({"drop_skip": ds_} if any(ds_ := drop_skip_flags(ev, len(ko))) else {})})
@@ -12469,6 +12638,42 @@ def kill_window_audit(t):
     return msgs
 
 
+def seen_rows_audit(t):
+    """V9.1.3 plan-time guard on one take (CS2 / R6S takes carry t['seen'] = the kill rows of mine of their clips, counted or not, on the take's timeline):
+    (1) a kill row of mine that is on screen for SEEN_MIN_S or more of the footage the take plays but is not one of the take's kills, (2) a kill of the take
+    whose row was already on screen before the take starts (the take shows the row, then 'cuts to' a kill that happened earlier). Returns [message]."""
+    msgs = []
+    segs = [sg for sg in t.get("segs", []) if sg[2] > 0 and sg[3] > 0]
+    if not segs or not t.get("seen"):
+        return msgs
+    kills = list(zip(t.get("kills", []), (t.get("victims") or []) + [""] * len(t.get("kills", []))))
+    srcs = t.get("srcs") or []
+
+    def own(sg, r):                                        # a clip's rows are only on screen in the footage played FROM that clip (a stitched partner's rows never count in the other clip)
+        if not srcs or not r.get("clip"):
+            return True
+        i = sg[4] if len(sg) > 4 else 0
+        return i >= len(srcs) or not srcs[i].get("path") or Path(srcs[i]["path"]).name == r["clip"]
+    def same_vic(a, b):
+        return bool(a and b and (cs2_same_victim(a, b) or ocr_ratio(a, b) >= 80))
+    for r in t["seen"]:
+        if "pre-clip" in (r.get("rule") or "") and any(o.get("clip") != r.get("clip") and o["t"] < r["t"] and same_vic(o.get("victim"), r.get("victim"))
+                                                       for o in t["seen"]):
+            continue                                       # a stitched clip's pre-clip row is the earlier clip's row still on screen: that row is judged there
+        vis = sum(max(0.0, min(sg[1], r["t_last"]) - max(sg[0], r["t"])) for sg in segs if own(sg, r))
+        if vis < SEEN_MIN_S:
+            continue
+        mine = [k for k, v in kills if abs(k - r["t"]) <= SEEN_MATCH_S or (r["t"] - SEEN_MATCH_S <= k <= r["t_last"] and v and r.get("victim")
+                                                                       and (cs2_same_victim(v, r["victim"]) or ocr_ratio(v, r["victim"]) >= 80))]
+        if not mine:
+            msgs.append(f"uncounted kill row of mine on screen for {vis:.2f} s: {r.get('clip', '')} row at {r['t']:.2f}s ([{r.get('victim') or '?'}]) is not a kill of this take ("
+                        + (f"dropped by: {r['rule']}" if r.get("rule") else "a kill of the clip that belongs to another take / was not placed") + ")")
+        elif r["t"] < segs[0][0] - 0.2 and min(mine) >= segs[0][0]:
+            msgs.append(f"the kill row of the kill at {min(mine):.2f}s ([{r.get('victim') or '?'}]) is on screen from {r['t']:.2f}s, before the take starts ({segs[0][0]:.2f}s): "
+                        "the take shows the row, then a kill that already happened")
+    return msgs
+
+
 def verify_cutlist(plan, log=True):
     """Final check before rendering: contiguous frames, segments add up, every take >= 2 beats and holds its kills (in order,
     inside its source windows), 1.0x from 1.0 s before the first kill through the last, tails 0.2-0.5 s (ending excepted),
@@ -12491,6 +12696,10 @@ def verify_cutlist(plan, log=True):
             bad.append(f"take {i}: {m_}")
             if log:                                        # not for the trial moves of the drop levers (_take_rules): those are meant to fail and are simply not applied
                 out(f"KILL WINDOW CHECK FAILED: take {i} {Path(t['path']).name}: {m_}")
+        for m_ in seen_rows_audit(t):                      # V9.1.3: no kill row of mine on screen that the take does not count
+            bad.append(f"take {i}: {m_}")
+            if log:
+                out(f"CUT LIST CHECK FAILED: take {i} {Path(t['path']).name}: {m_}")
         for sg in t["segs"]:
             a, b, sp = sg[:3]
             if sp != 1.0 and a < kl - 1.0 / OUT_FPS and b > k0 - 1.0 + 1.0 / OUT_FPS:
