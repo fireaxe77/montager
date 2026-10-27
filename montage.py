@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.1.1"
+APP_VERSION = "V9.1.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -3390,7 +3390,7 @@ class BorderTracker:
     def finish(self):
         """Tracks seen at least BORDER_MIN_HITS frames (or still on screen at the very end), each with its clearest crops."""
         raw = [t for t in self.tracks if not (t["hits"] < 2 and t["last"] < self.n - 2)]
-        res, blobs = border_shape_filter(raw, self.n, fix=True)
+        res, blobs = border_shape_filter(raw, self.n, fix=BORDER_FIX)
         self.blob_n = len(blobs) + len(self.tracks) - len(raw)
         for t in res:
             t["op0"] = round(min(1.0, t["s0"] / t["smax"]), 3) if t.get("smax") else None      # outline strength at the first frame / its best (fade-in)
@@ -3482,7 +3482,7 @@ def border_build(rec, det, cfg, write=True, keep_images=False):
             images[t["id"]] = best[2]
     t2 = time.time()
     p, key = border_path(rec, det)
-    sc = {"v": BORDER_V, "ext": 3, "blobs": tr.blob_n, "key": key, "stamp": det.d["stamp"], "fps": BORDER_FPS, "frames": tr.n, "size": [det.dw, det.dh],
+    sc = {"v": BORDER_V, "ext": BORDER_EXT, "blobs": tr.blob_n, "key": key, "stamp": det.d["stamp"], "fps": BORDER_FPS, "frames": tr.n, "size": [det.dw, det.dh],
           "v_off": rec.get("v_off", 0.0), "built": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "tracks": out_tracks,
           "secs": round(t2 - t0, 2), "decode_secs": round(t1 - t0, 2), "ocr_secs": round(t2 - t1, 2),
           "ms_per_frame": round(1000 * (t1 - t0) / max(1, tr.n), 2)}
@@ -3662,6 +3662,28 @@ def _slot_at(t, f):
     return cur[2] if len(cur) > 2 else int(round(cur[1] / 40.0))
 
 
+BORDER_EXT = 4                   # V9.1.2: sidecar extension level written by border_build (3 = V8.7 row grid, 4 = + rows that slid up into a row's slot)
+BORDER_FIX = 2                   # V9.1.2: border_shape_filter fix level of a newly built sidecar (False / True = before V8.7 / V8.7)
+BORDER_SLID_HITS = 8             # V9.1.2: frames a row that slid up into a row's slot needs (a real row lives seconds)
+BORDER_SLID_YTOL = 3             # V9.1.2: px: its last height and the accepted row's height agree within this
+
+
+def border_fix_kw(sc):
+    """V9.1.2: the border_shape_filter keyword of a stored sidecar (each sidecar is read with the rule it was built with)."""
+    e = sc.get("ext", 1)
+    return {"fix": BORDER_FIX} if e >= 4 else {"fix": True} if e >= 3 else {}
+
+
+def _slid_into_row(t, rows):
+    """V9.1.2: True when track t moved UP by most of a row height (rows only ever move up, when a row above them expires) and ended at a height where an
+    accepted row stood: a kill row pushed up one slot. The in-between heights of the slide can give the row grid a false pitch
+    (CS2 2026-10-27 00-26-09: 94 -> 92 -> 88 -> 81 -> 64 made a 19 px pitch) and such a row was thrown out as a blob."""
+    sl = t["slots"]
+    if len(sl) < 2 or t["hits"] < BORDER_SLID_HITS or sl[0][1] - sl[-1][1] < 0.6 * (t["y1"] - t["y0"]):
+        return False
+    return any(r is not t and abs(s[1] - sl[-1][1]) <= BORDER_SLID_YTOL for r in rows for s in r["slots"])
+
+
 def border_shape_filter(tracks, n, fix=False):
     """V6.8.2 ROW SHAPE VALIDATION -> (rows, blobs). An outlined track is a killfeed row only when it is a closed thin rectangle at least
     BORDER_ASPECT x wider than high with a valid row height, lasts at least 3 frames (or is still there at the very end of the clip), ends at the
@@ -3696,11 +3718,25 @@ def border_shape_filter(tracks, n, fix=False):
                     pitch = alt
                     break
     rows, blobs = [], [t for t in tracks if not shape(t)]
+    off = []
     for t in cand:
         ok = x1ref is None or abs(t["x1"] - x1ref) <= 14
         if ok and pitch:
             ok = on_grid(t, pitch)
+            if not ok and fix == BORDER_FIX:
+                off.append(t)                                      # right edge fine, only off the grid: may be a row that slid up (decided below)
         (rows if ok else blobs).append(t)
+    if off:                                                        # V9.1.2: only ever ADDS rows; the grid itself and every row it accepts stay as before
+        back = []
+        while True:                                                # a rescued row counts as accepted for the next one (three rows pushed up together)
+            add = [t for t in off if not any(t is b for b in back) and _slid_into_row(t, rows + back)]
+            if not add:
+                break
+            back += add
+        if back:
+            keep_ = {id(t) for t in rows + back}
+            rows = [t for t in cand if id(t) in keep_]
+            blobs = [t for t in blobs if id(t) not in keep_]
     return rows, blobs
 
 
@@ -3996,7 +4032,7 @@ def border_analysis(sc, cfg, deaths=None):
     outlined: `deaths` comes from the normal name rule (analyse_entry) and keeps its 8 s lock."""
     off, fps, n = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS)), int(sc.get("frames", 0))
     legacy = sc.get("ext", 1) < 2
-    rows_t, blob_t = border_shape_filter(sc.get("tracks", []), n, **({"fix": True} if sc.get("ext", 1) >= 3 else {}))      # V8.7: sidecars built from ext 3 on use the corrected row grid (older ones are read exactly as before)
+    rows_t, blob_t = border_shape_filter(sc.get("tracks", []), n, **border_fix_kw(sc))      # V8.7: sidecars built from ext 3 on use the corrected row grid (V9.1.2: ext 4 = settled slots only; older ones are read exactly as before)
     kills, rej, vis, mine, det_rows, sus, others, merges = [], [], [], [], [], [], [], []
     unread = []                      # V8.21: outlined, row-shaped tracks whose text never split into killer / weapon / victim: (time, frames) - no verdict, but a row WAS there
     pre_victims = []
@@ -4118,7 +4154,7 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
     if not CS2_NAMEKEEP_ON[0] or len(b["kills"]) >= len(a["kills"]):
         return []
     off, fps, n = sc.get("v_off", 0.0), float(sc.get("fps", BORDER_FPS)), int(sc.get("frames", 0))
-    _, blobs = border_shape_filter(sc.get("tracks", []), n, **({"fix": True} if sc.get("ext", 1) >= 3 else {}))
+    _, blobs = border_shape_filter(sc.get("tracks", []), n, **border_fix_kw(sc))
     shaped = []
     for t in blobs:
         r = t.get("best_rect") or {}
