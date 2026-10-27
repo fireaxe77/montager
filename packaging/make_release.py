@@ -2,7 +2,7 @@
 
 For the version on main (APP_VERSION in montage.py = the title bar):
   1. exports origin/main with `git archive` into build/src (a clean copy: never your working folder or montage_data)
-  2. checks that the app files there are identical to the git tag of that version (v9.1.2 for V9.1.2)
+  2. checks that the app files there are identical to the git tag of that version (v9.1.3 for V9.1.3)
   3. builds Montager.exe + Montager-CLI.exe (PyInstaller, packaging/montager.spec) with FFmpeg and the OCR engine inside
   4. checks the app files inside the build: data files byte for byte, Python modules by their compiled code
   5. builds Montager-Portable.zip, Montager-Setup.exe (Inno Setup) and Montager-Python.zip (the plain Python version)

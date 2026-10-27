@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.1.3 - 2026-10-27: No more missing kills in CS2
+- Kill rows that were skipped before are now found: very long rows, a row that is the only one on screen, Dual Berettas kills and kills in the first moment of a clip
+- 69 CS2 clips gained kills that were missing, so a clip saved as a 4k now plays as a 4k; kills that had been counted twice are counted once
+- A take never shows one of your kills without counting it, and never starts after a kill that is already in the killfeed
+- Valorant and Rainbow Six Siege are unchanged
+
 ## V9.1.2 - 2026-10-27: CS2 2k no longer loses its second kill
 - In CS2, a kill whose row moves up in the killfeed while the row above it disappears is now found, so a 2k saved in two clips is placed as a 2k
 - The same fight saved twice still counts each kill only once
