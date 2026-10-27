@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.1.2 - 2026-10-27: CS2 2k no longer loses its second kill
+- In CS2, a kill whose row moves up in the killfeed while the row above it disappears is now found, so a 2k saved in two clips is placed as a 2k
+- The same fight saved twice still counts each kill only once
+- Nine older CS2 clips gained kills that were missed before; no clip lost a kill
+- Valorant and Rainbow Six Siege are unchanged
+
 ## V9.1.1 - 2026-10-26: Quick 4k with an unreadable name now counts all four kills
 - A Rainbow Six Siege kill whose victim name is only bars (like "IIIIIIIIIIII") is now found, so a quick 4k is a 4k and its last kill is never cut off by the fade-out
 - The montage check now also makes sure the video never fades to black before the last kill
