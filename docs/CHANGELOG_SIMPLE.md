@@ -2,6 +2,13 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.3.0 - 2026-10-28: New skies in every colour
+- Skies now come in every colour from the Sky colour list, chosen fresh for each montage, and new flowing patterns replace the stripes and rings
+- A sky now stays until the end of its take instead of cutting off or flickering, there are half as many, and its movement follows how intense the song is at that moment
+- White and black skies are a clean ice white and a deep black, and the intro's 3D lettering takes the same colour as the montage's skies
+- A kill that was dated too early in some CS2 clips is now shown properly, and the Step 3 controls are back where they were, tidier
+- Your PC stays usable while a montage renders, and the final video is made faster
+
 ## V9.2.1 - 2026-10-28: Faster renders and a tidy Step 3
 - Renders finish about a minute sooner: the sky check of slow-motion endings and the intro are made faster, with exactly the same picture and sound
 - The app starts faster and no longer freezes for seconds when it opens or when you switch tabs

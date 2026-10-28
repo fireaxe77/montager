@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.2.1"
+APP_VERSION = "V9.3.0"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4301,6 +4301,8 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
 CS2_LATE_ROW_ON = [True]             # V8.8 switch (tests / A-B): late rows re-timed, legacy-sidecar name kills kept
 CS2_LATE_ROW_S = 8.0                 # V8.8: a border row whose victim the name scan read this much (at most) EARLIER was picked up late (a row slid up / an old sidecar's merged rows)
 CS2_LATE_ROW_MIN_S = 1.0
+CS2_LATE_KIND_ON = [True]            # V9.3.0 switch: no re-time from a name-scan row read as a utility / notice row onto a gun kill row (2026.01.20 - 13.13.35.15: the gear-icon 'fireaxe' notice
+                                     # fading out at 3.1 s, read as one row with the Ramzes kill row that appears at 6.87 s, moved that kill 3.7 s early: its take ended before the kill)
 
 
 def cs2_late_rows_retime(a, b, clip=""):
@@ -4315,6 +4317,7 @@ def cs2_late_rows_retime(a, b, clip=""):
     for bk in sorted(b.get("kills", []), key=lambda k: k["t"]):
         cand = [nk for nk in a.get("kills", []) if id(nk) not in used and CS2_LATE_ROW_MIN_S <= bk["t"] - nk["t"] <= CS2_LATE_ROW_S
                 and nk.get("ks", 0.0) >= CS2_NAMEKEEP_KS and len(_alnum(nk.get("victim") or "")) >= 3 and cs2_same_victim(nk.get("victim"), bk.get("victim"))
+                and not (CS2_LATE_KIND_ON[0] and nk.get("weapon") == "util" and bk.get("weapon") != "util")      # V9.3.0: a notice row (gear icon) merged into the kill row's slot is not that row
                 and not any(abs(o["t"] - nk["t"]) < CS2_LATE_ROW_MIN_S for o in b["kills"] if o is not bk)]
         if not cand:
             continue
@@ -8943,6 +8946,16 @@ def cmd_songmatch(args):
     print(txt)
 
 
+def cmd_firstkill(args):
+    """V9.3.0: python montage.py firstkill <plan.json> [...]: the first-kill check of every take of saved plans (with the kill times the analysis gives now)."""
+    for f in args.plans:
+        p = load_json(Path(f), {})
+        bad = first_kill_audit(p)
+        out(f"{Path(f).name}: {len(p.get('takes') or [])} takes, {len(bad)} with the first kill not fully shown")
+        for b_ in bad:
+            out("   " + b_)
+
+
 def cmd_ledger(args):
     """V6.9.7: python montage.py ledger. Read-only: reprints the last run's kill ledger from montage_data\\ledger_last.json (written by the run) or, failing
     that, from the log; writes ledger.txt next to montage.py; changes no cache, flag or config file."""
@@ -12818,6 +12831,70 @@ def seen_rows_doomed(ev):
     return msgs[0] if msgs else None
 
 
+FIRST_KILL_LEAD_S = 0.3             # V9.3.0 first-kill check: footage shown before the first kill (LEAD_MIN) ...
+FIRST_KILL_TAIL_S = 0.4             # ... and after its row appears (ROW_TAIL), both inside one continuous stretch of the take
+_FK_MEMO = {}
+
+
+def _fk_clip_kills(path, cfg):
+    """V9.3.0: [(time, victim)] of a clip's kills as the analysis gives them NOW (the same analysis the planner uses), or None."""
+    if path in _FK_MEMO:
+        return _FK_MEMO[path]
+    res = None
+    try:
+        g = tag_game(path, cfg)[0]
+        rec = next((r for r in scan_clips(cfg) if _pkey(r["path"]) == _pkey(path)), None)
+        det = load_dets(g).get(g) if g else None
+        if rec and det:
+            rec = dict(rec, game=g)
+            e = load_kills_cache().get(kills_key(rec, g, det))
+            if e and not e.get("error"):
+                res = [(float(k["t"]), str(k.get("victim") or "")) for k in analyse_clip_entry(rec, e, cfg, g).get("kills", [])]
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"first-kill check: {Path(path).name} not read ({type(ex).__name__}: {ex})")
+    _FK_MEMO[path] = res
+    return res
+
+
+def first_kill_audit(plan, cfg=None, fresh=True):
+    """V9.3.0: every take's FIRST kill must be seen: its moment and its row inside the footage the take shows, with FIRST_KILL_LEAD_S of continuous footage before the kill and
+    FIRST_KILL_TAIL_S after the row appears, before any cut away (a jump-cut, a dissolve, the take's end). fresh=True: the kill's moment is the one the clip's analysis gives NOW
+    (a planned time that the analysis no longer agrees with is the error this catches: a row dated seconds early puts the take before the kill). Returns [message]."""
+    cfg = cfg or load_config()
+    msgs = []
+    for ti, t in enumerate(plan.get("takes") or []):
+        if t.get("intro") or not t.get("kills"):
+            continue
+        k0, r0 = float(t["kills"][0]), float((t.get("rows") or t["kills"])[0])
+        vic = ((t.get("victims") or [""]) + [""])[0]
+        srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0}]
+        real = None
+        if fresh:
+            for s_ in srcs:
+                ks = _fk_clip_kills(s_["path"], cfg) or []
+                cand = [kt + float(s_.get("shift") or 0.0) for kt, v in ks if vic and v and (cs2_same_victim(v, vic) or ocr_ratio(v, vic) >= 80)]
+                if cand:
+                    real = min(cand, key=lambda x: abs(x - k0))
+                    break
+        k_ = k0 if real is None else real
+        r_ = max(r0 + (k_ - k0), k_)
+        segs = [sg for sg in t.get("segs", []) if sg[3] > 0]
+        runs, cur = [], None                               # continuous played stretches (source time)
+        for sg in segs:
+            a, b = float(sg[0]), float(sg[1])
+            if cur and abs(a - cur[1]) < 0.02:
+                cur[1] = b
+            else:
+                cur = [a, b]
+                runs.append(cur)
+        inside = next((r for r in runs if r[0] + FIRST_KILL_LEAD_S - 1e-3 <= k_ and r_ + FIRST_KILL_TAIL_S - 1e-3 <= r[1]), None)
+        if inside is None:
+            shown = ", ".join(f"{a:.2f}-{b:.2f}" for a, b in runs)
+            msgs.append(f"take {ti + 1} {Path(t['path']).name}: first kill ([{vic}]) at {k_:.2f} s" + (f" (the plan has {k0:.2f} s)" if abs(k_ - k0) > 0.05 else "")
+                        + f", its row from {r_:.2f} s, but the take shows {shown} s: the kill needs {FIRST_KILL_LEAD_S} s before it and its row {FIRST_KILL_TAIL_S} s after it, before any cut")
+    return msgs
+
+
 def verify_cutlist(plan, log=True):
     """Final check before rendering: contiguous frames, segments add up, every take >= 2 beats and holds its kills (in order,
     inside its source windows), 1.0x from 1.0 s before the first kill through the last, tails 0.2-0.5 s (ending excepted),
@@ -13822,7 +13899,7 @@ SKY_PER_S = 30.0                     # and a montage gets at most one per this m
 SKY_MAX_N = 6
 
 
-SKY_PER_S_88, SKY_MAX_N_88, SKY_SPACING_88 = 15.0, 12, 6.0      # V8.8 (CS2 / R6S): about twice as many skies (one per 15 s, at most 12), at least 6 s apart
+SKY_PER_S_88, SKY_MAX_N_88, SKY_SPACING_88 = 30.0, 6, 12.0     # V9.3.0: half as many skies: one per 30 s, at most 6, at least 12 s apart (V8.8: one per 15 s, at most 12, 6 s apart)
 
 
 def sky_max_for(duration, game=None):
@@ -13902,7 +13979,7 @@ def sky_family_for(plan, ranked, qual=None):
     if pk_ in SKY_FAMILIES:                                # V9.0.2: a Manual Sky colour pick replaces only this choice (DEFAULT = no pick: the automatic choice below, unchanged)
         return pk_, "picked in Manual"
     if SKY_VARIETY_ON[0]:
-        return sky_variety_pick(plan, ranked)
+        return sky_variety_pick(plan, ranked, qual)
     song_p = (plan.get("song") or {}).get("path")
     fam, why = None, ""
     try:
@@ -13936,20 +14013,30 @@ def sky_family_for(plan, ranked, qual=None):
     return fam, why
 
 
-SKY_VARIETY_ON = [True]              # V9.2.0 switch: the automatic family is a seeded pick per montage among SKY_VARIETY (the cover / vibe rule above made ~90 % of montages orange)
-SKY_VARIETY = ("blue", "teal", "orange")         # deep blue, teal, hazy orange
-SKY_VARIETY_BIAS = 0.5               # the family the song's feel ranks first among these three gets this much more weight (each has 1.0): a lean, never a certainty (at most 40 %)
+SKY_VARIETY_ON = [True]              # V9.2.0 switch: the automatic family is a seeded pick per montage (V9.3.0: among EVERY family of the Sky colour dropdown)
+SKY_VARIETY = tuple(SKY_FAMILIES)    # V9.3.0: all of them (V9.2.0: deep blue / teal / hazy orange only, the song's lean +50 %: 3 of 5 montages came out orange)
+SKY_VARIETY_BIAS = 0.3               # V9.3.0: the family the song's feel ranks first gets this much more weight (each has 1.0): a small lean only
 
 
-def sky_variety_pick(plan, ranked):
-    """V9.2.0: the montage's sky family when nothing is picked in Manual: deep blue, teal or hazy orange, drawn from the montage's own seed (another montage of the same song can get another
-    colour); the song's feel (sky_ranked order) leans the draw toward its first family of the three. Returns (family, why)."""
+def sky_variety_pick(plan, ranked, qual=None):
+    """V9.3.0: the montage's sky family when nothing is picked in Manual: one of every family the dropdown offers, drawn from the montage's own seed; the song's feel (sky_ranked order) leans
+    the draw a little toward its first family. A white / black draw that would wash out / turn muddy in most of the montage's sky shots (sky_neutral_ok) is drawn again among the coloured ones
+    (same seed). Returns (family, why)."""
     fams_ = [SKY_NAME_FAMILY.get(n_) for n_ in (ranked or [])]
     lean = next((f_ for f_ in fams_ if f_ in SKY_VARIETY), None)
-    w = [1.0 + (SKY_VARIETY_BIAS if f_ == lean else 0.0) for f_ in SKY_VARIETY]
     rng = random.Random(int(plan.get("seed") or 1) * 7919 + 17)
-    fam = rng.choices(SKY_VARIETY, weights=w)[0]
-    return fam, f"seeded pick of deep blue / teal / hazy orange" + (f" (the song's feel leans {lean})" if lean else "")
+    pool = list(SKY_VARIETY)
+    w = [1.0 + (SKY_VARIETY_BIAS if f_ == lean else 0.0) for f_ in pool]
+    fam = rng.choices(pool, weights=w)[0]
+    why = "seeded pick of every sky colour" + (f" (the song's feel leans {lean})" if lean else "")
+    if fam in ("white", "black") and qual:
+        bad = sum(1 for c in qual if not sky_neutral_ok(fam, c.get("info"))[0])
+        if bad * 2 > len(qual):
+            pool2 = [f_ for f_ in pool if f_ not in ("white", "black")]
+            fam2 = rng.choices(pool2, weights=[1.0 + (SKY_VARIETY_BIAS if f_ == lean else 0.0) for f_ in pool2])[0]
+            why += f"; {fam} would wash out / turn muddy in {bad} of {len(qual)} sky shots -> {fam2}"
+            fam = fam2
+    return fam, why
 
 
 def sky_role_ok(t):
@@ -13968,8 +14055,15 @@ def sky_family_grade(fam, mean_y):
         yc = 16.0 + (yt - 16.0) * ymul
         return {"y_mul": SKY_FAM_EVEN, "y_add": round(yc - 16.0 - (yr - 16.0) * SKY_FAM_EVEN, 2), "u": max(16.0, min(240.0, 128 + (ut - 128) * csat)),
                 "v": max(16.0, min(240.0, 128 + (vt - 128) * csat)), "haze": 1.0, "y_max": 235}
+    if fam in SKY_FLAT:                                    # V9.3.0: white / black are one flat colour (no gradient) with a clearly visible pattern colour
+        base_, pat_, jmp_ = SKY_FLAT[fam]
+        return {"fam": fam, "top": g(base_), "bot": g(base_), "dark": g(pat_), "jump": g(jmp_)}
     dark = g(top, SKY_FAM_DARK, 0.5) if _rgb_to_yuv(top)[0] >= 40 else g(jmp)          # V9.1.0: a family whose top is already black shows its pattern in a lighter tone
     return {"fam": fam, "top": g(top), "bot": g(bot), "dark": dark, "jump": g(jmp)}
+
+
+SKY_FLAT = {"white": (0xEEF6FF, 0x8FB4D6, 0xDCEEFF),   # V9.3.0: ice white, an ice-blue pattern, the beat jumps a lighter ice
+            "black": (0x050508, 0x4A4A5E, 0x26262F)}   # deep black, a grey pattern you can see, the beat jumps a dark grey
 
 
 def sky_neutral_ok(name, info):
@@ -14318,6 +14412,26 @@ def sky_anim_params(energy, bpm, recipe=None, drop=False, game=None):
     return {"hard": hd, "drift": round(25.0 + 110.0 * hd + 0.1 * (b - 60.0), 2), "period": round(8 * 60.0 / b, 2), "surge": round(0.7 + 0.3 * hd, 2), "push": round(0.03 + 0.03 * hd, 4),
             "depth": round(0.12 + 0.55 * hd, 2), "strobe_hz": round(on(0.35) * 14.0, 2), "strobe_depth": round(0.30 + 0.65 * on(0.35), 2), "jump": round(on(0.45), 2), "bd": round(on(0.40), 2),
             "swing": round(0.05 + 0.95 * on(0.15), 2), "swing_period": round(max(0.6, 2 * 60.0 / b * (2.0 - hd)), 2)}
+
+
+SKY_LOCAL_ON = [True]                # V9.3.0 switch: sky intensity / speed from the song's local energy at the take
+SKY_LOCAL_BPM = (70.0, 170.0)        # the 'tempo' the animation runs at for local energy 0 .. 1 (speed of drift, pulses, swings)
+
+
+def sky_local_feel(plan, t):
+    """V9.3.0: (energy 0..1, animation tempo) of the song where take `t` plays: the song map's per-beat energy over the take's own stretch of the song (its rank among all the song's beats,
+    so a quiet verse of a loud song is quiet), the tempo of the animation from that energy (SKY_LOCAL_BPM). Without a song map: the song's overall energy and BPM, as before."""
+    song = plan.get("song") or {}
+    if SKY_LOCAL_ON[0]:
+        try:
+            an = get_songmap(song["path"], song.get("csv_bpm"))
+            s0 = float(song.get("start_t") or 0.0) + float(t.get("out_start") or 0.0)
+            rk = song_end_rank(an, s0, s0 + max(0.5, float(t.get("dur") or 1.0)))
+            if rk is not None:
+                return round(rk, 3), round(SKY_LOCAL_BPM[0] + (SKY_LOCAL_BPM[1] - SKY_LOCAL_BPM[0]) * rk, 1)
+        except Exception as ex:                            # noqa: BLE001
+            LOGONLY(f"sky: local song energy not read ({type(ex).__name__}: {ex}); the song's overall feel is used")
+    return song.get("energy", plan.get("xfx_energy")), song.get("bpm")
 
 
 def sky_alt_colour(ranked, rgb):
@@ -14713,7 +14827,8 @@ def sky_shot_breaks(imgs, fr_src=None, thr=None):
 
 SKY_SHOT_DIFF = 28.0                 # V8.8.5: mean grey change (0-255, on a 96 x 54 thumbnail) between two frames above which they are two shots (a cut / an instant flick)
 SKY_WARM_FRAME = [True]              # V8.8.6 switch (tests): a frame whose smooth region is warm is a wall in the mask too (as in the kill-frame probe)
-SKY_CUT_ON = [True]                  # V8.8.6 switch (tests): the sky ends where the camera leaves it instead of the take losing its sky
+SKY_CUT_ON = [True]                  # V8.8.6 switch (tests): the sky ends where the camera leaves it instead of the take losing its sky (V9.3.0: with SKY_HOLD_LAST_ON it holds instead of ending)
+SKY_HOLD_LAST_ON = [True]            # V9.3.0 switch: every sky runs from its kill frame to the last frame of its take; a frame whose mask fails holds the last good mask (it cut off / popped in and out)
 SKY_CUT_MIN_F = 18                   # V8.8.6: ... when at least this many frames (0.3 s) of clean sky come first
 SKY_GUARD_GROW = 1                   # V8.8.5: mask pixels the painted region may reach past the frame's own sky (the soft edge); never more
 
@@ -14801,11 +14916,14 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                 break
         pre_bad = sum(1 for q in status[:cut] if q == "bad")
         if cut < k and cut >= SKY_CUT_MIN_F and pre_bad <= SKY_MAX_BAD * cut:
-            for i in range(cut, k):
-                segm[i] = np.zeros((h, w), np.uint8)
-                status[i] = "cut"
-            n_bad = pre_bad
-            x["sky_cut"] = round(cut / float(OUT_FPS), 3)
+            n_bad = pre_bad                                # the take keeps its sky (as V8.8.6) ...
+            if SKY_HOLD_LAST_ON[0]:
+                cut = k                                    # V9.3.0: ... to the last frame of the take: the frames after the walls start hold the last good mask (below)
+            else:
+                for i in range(cut, k):
+                    segm[i] = np.zeros((h, w), np.uint8)
+                    status[i] = "cut"
+                x["sky_cut"] = round(cut / float(OUT_FPS), 3)
         else:
             cut = k
     held_i = set()
@@ -14827,6 +14945,21 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                     segm[i] = (segm[j].astype(bool) & own_).astype(np.uint8)
                     held_i.add(i)
                     held += 1
+    if SKY_HOLD_LAST_ON[0]:                                # V9.3.0: from the kill frame to the take's last frame: a frame whose own mask failed (a wall, a dropout, nothing found) holds the last good mask
+        last_ = None
+        for i in range(k):
+            if status[i] == "ok" and segm[i].any() and good[i]:
+                last_ = segm[i]
+            elif last_ is not None and i not in held_i:
+                segm[i] = last_.copy()
+                held_i.add(i)
+                held += 1
+        first_ = next((i for i in range(k) if status[i] == "ok" and segm[i].any()), None)
+        for i in range(first_ or 0):                       # frames before the first good one (the kill frame itself unreadable) take the first good mask
+            if first_ is not None and not segm[i].any():
+                segm[i] = segm[first_].copy()
+                held_i.add(i)
+                held += 1
     imgs = None
     segm = list(pool_.map(sky_mask_even, segm))           # V8.8.2: one even region per frame: small gaps closed, enclosed holes (cloud specks, cut-out texture) filled, so the tint has no patches inside the sky
     pool_.shutdown()
@@ -14841,7 +14974,7 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
         nb_ = [segm[j] for j in range(max(0, i - 4), min(k, i + 5)) if shot[j] == shot[i]]
         a_ = np.mean(nb_, axis=0)
         s_ = np.clip((a_ - 0.35) / 0.30, 0.0, 1.0).astype(np.float32)
-        own_ = cv2.dilate(segm[i], gk) if segm[i].any() else segm[i]          # V8.8.5: never past the frame's OWN sky (+ the soft edge): no mask where this picture has no sky
+        own_ = cv2.dilate(segm[i], gk) if segm[i].any() else segm[i]          # V8.8.5: never past the frame's OWN sky (+ the soft edge): no mask where this picture has no sky (a held frame: the held mask)
         sm.append(s_ * own_.astype(np.float32))
     bottoms = []
     for m_ in sm:
@@ -14857,7 +14990,7 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
     an_ = x.get("anim")
     fam_ = bool(x.get("fam")) and ramp and an_ is not None              # V8.8.3: the family look: regular beat-locked bands (no cloud blobs) + the colour gradient in a 4th plane
     clouds = sky_cloud_field(w, h, nf, OUT_FPS, an_["drift"], an_["period"], x.get("seed", 1), soft=SKY_CLOUD_SOFT) if (ramp and an_ and not fam_) else None
-    pats = sky_pattern_frames(x.get("pattern") or "bands", h, w, hor, nf, f0, x.get("beats") or [], an_, x.get("seed", 1)) if fam_ else None      # V8.8.5: the montage's pattern, moving on every frame
+    pats = sky_pattern_frames(x.get("pattern") or "amoebas", h, w, hor, nf, f0, x.get("beats") or [], an_, x.get("seed", 1)) if fam_ else None      # V8.8.5: the montage's pattern, moving on every frame
     ramps = sky_frame_ramps(sm, h, w, hor) if fam_ else None        # V8.8.4: the gradient follows each frame's own sky region (its top row -> its lowest row), smoothed over time
     mid_b = np.full((h * w,), 128, np.uint8).tobytes()
     gdark = x.get("grad_dark", 0.35)                       # the gradient: how much darker the top of the sky is than its horizon (0.55 'dark' = red to black, 0.25 'sunset')
@@ -14969,14 +15102,16 @@ def sky_band_rows(h, hor, nf, f0, beats, an):
     return out_
 
 
-SKY_PATTERNS = ("bands", "amoebas", "rings", "rays", "aurora")
+SKY_PATTERNS = ("amoebas", "ink", "marble", "cells")
+# V9.3.0: only organic, fluid patterns with fine detail over the whole sky (no big shapes laid over it): amoebas (the V8.7 cloud spots), ink (ink drifting in water: fine noise carried by a
+# slow swirl), marble (fine marbling veins flowing), cells (thin cell walls drifting). The line patterns (bands, rings, rays, aurora) are gone
 # V8.8.5: the sky's pattern, ONE per montage (sky_pattern_for): bands = horizontal stripes that flow down and ripple sideways; amoebas = the V8.7 soft cloud spots drifting in two layers
 # and breathing; rings = soft circles rippling out from a point above the sky; rays = a fan of soft beams from above the sky, turning; aurora = vertical curtains that sway and flow sideways
 SKY_FLOW = {"speed0": 0.35, "speed1": 0.80, "wave": 0.22, "wave_len": 0.65, "wave_hz": 0.35}
 # V8.8.5: every pattern moves on EVERY frame: speed0 .. speed1 pattern cycles a second (more for a harder song), plus the beat steps of SKY_BANDS; bands also ripple sideways (wave: share of a band,
 # over wave_len of the picture width, travelling at wave_hz)
-SKY_PATTERN_FEEL = {"bands": (0.75, 128.0, ()), "amoebas": (0.35, 85.0, ("black",)), "rings": (0.92, 155.0, ("white",)),
-                    "rays": (0.65, 105.0, ("orange", "red", "amber", "rose")), "aurora": (0.50, 95.0, ("blue", "teal", "violet", "green"))}
+SKY_PATTERN_FEEL = {"amoebas": (0.35, 85.0, ("black",)), "ink": (0.80, 140.0, ("orange", "red", "amber", "rose")), "marble": (0.55, 100.0, ("white", "violet")),
+                    "cells": (0.65, 120.0, ("blue", "teal", "green"))}
 # V8.8.5: (energy, BPM, cover families) each pattern suits best; sky_pattern_for scores every pattern against the song and picks the best one
 SKY_PATTERN_JITTER = 0.45            # the song's own fixed share of the score (a hash of artist + title): similar songs still get different patterns, the same song always the same
 
@@ -15082,7 +15217,8 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
     def soft(c):
         v = np.clip((c - e0) / (e1 - e0), 0.0, 1.0)
         return (v * v * (3 - 2 * v) * depth).astype(np.float32)
-    if pattern == "amoebas":                               # the V8.7 cloud field (two layers of soft fractal noise against each other, breathing), drifting by sub-pixel steps
+    if pattern in ("amoebas", "ink", "marble", "cells"):   # the V8.7 cloud field (two layers of soft fractal noise against each other, breathing), drifting by sub-pixel steps;
+        # V9.3.0: ink / marble / cells are other textures moved by exactly this animation (the same drift, the same two layers, the same breathing and beat nudge)
         try:
             bpm = 240.0 / float(an.get("period") or 2.0)
         except (TypeError, ValueError, ZeroDivisionError):
@@ -15091,12 +15227,33 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
         period = 8 * 60.0 / max(60.0, min(200.0, bpm))
         ww = w * 3
 
-        def layer():
+        def noise(scales):
             base = np.zeros((h, ww), np.float32)
-            for sz, amp in ((16, 1.0), (32, 0.55), (64, 0.3)):
+            for sz, amp in scales:
                 n = rng.rand(max(2, h // sz + 1), max(2, ww // sz + 1)).astype(np.float32)
                 base += amp * cv2.resize(n, (ww, h), interpolation=cv2.INTER_CUBIC)
             return (base - base.min()) / max(1e-6, float(base.max() - base.min()))
+
+        def layer():
+            if pattern == "ink":                           # ink: the same kind of field, finer (drops of ink in water)
+                return noise(SKY_INK_SCALES)
+            if pattern == "marble":                        # marble: fine curling veins (the ridges of a fractal field)
+                v = (1.0 - np.abs(2.0 * noise(SKY_MARBLE_SCALES) - 1.0)) ** 4
+                return ((v - v.min()) / max(1e-6, float(v.max() - v.min()))).astype(np.float32)
+            if pattern == "cells":                         # cells: thin walls between drifting cells
+                n_c = max(6, int(ww / SKY_CELL_PX))
+                pts = np.stack([rng.uniform(0, ww, n_c * 2), rng.uniform(-0.1 * h, 1.1 * h, n_c * 2)], 1).astype(np.float32)
+                wp = noise(((96, 1.0), (192, 0.6))) - 0.5
+                xx_, yy_ = np.meshgrid(np.arange(ww, dtype=np.float32), np.arange(h, dtype=np.float32))
+                ax, ay = xx_ + 12.0 * wp, yy_ + 12.0 * wp
+                d1 = np.full((h, ww), 1e9, np.float32)
+                d2 = np.full((h, ww), 1e9, np.float32)
+                for px, py in pts:
+                    d = np.hypot(ax - px, ay - py)
+                    d2 = np.where(d < d1, d1, np.minimum(d2, d))
+                    d1 = np.minimum(d1, d)
+                return (1.0 - np.clip((d2 - d1) / SKY_CELL_WALL, 0.0, 1.0)).astype(np.float32)
+            return noise(SKY_AMOEBA_SCALES)
         la, lb = layer(), layer()
         cmul = 1.0 - 0.55 * max(0.0, hd - 0.4) / 0.6
         amp = SKY_CLOUD_MAX * cmul
@@ -15112,7 +15269,8 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
                 continue
             t = f / float(OUT_FPS)
             ph = _sky_phase(t, t0, 0.0, bts) * 24.0            # a beat nudges the clouds 12 mask pixels on (eased)
-            win = 0.62 * shifted(la, t * drift + ph) + 0.38 * shifted(lb, (ww - w) - t * drift * 0.55 - 0.5 * ph)
+            a_, b_ = shifted(la, t * drift + ph), shifted(lb, (ww - w) - t * drift * 0.55 - 0.5 * ph)
+            win = np.maximum(a_, 0.85 * b_) if pattern in ("marble", "cells") else 0.62 * a_ + 0.38 * b_      # V9.3.0: line textures: both layers' veins / walls show
             th = 0.50 + 0.17 * np.sin(2 * np.pi * t / max(1.0, period))
             yield (np.clip((win - th) * 6.0 + 0.5, 0.0, 1.0) * amp).astype(np.float32)
         return
@@ -15150,6 +15308,12 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
             wv = SKY_FLOW["wave"] * per * np.sin(2 * np.pi * (xx / (w * SKY_FLOW["wave_len"]) - SKY_FLOW["wave_hz"] * t) + sw0)
             c = 0.5 + 0.5 * np.cos(2 * np.pi * ((yy + wv) / per - ph))
         yield soft(c)
+
+
+SKY_AMOEBA_SCALES = ((16, 1.0), (32, 0.55), (64, 0.3))       # the V8.7 cloud field: fine fluid detail over the whole sky
+SKY_INK_SCALES = ((8, 1.0), (16, 0.55), (32, 0.3))           # V9.3.0 ink: the same field, finer
+SKY_MARBLE_SCALES = ((24, 1.0), (48, 0.6), (96, 0.3))       # V9.3.0 marble: the field whose ridges are the veins
+SKY_CELL_PX, SKY_CELL_WALL = 70.0, 7.0     # V9.3.0 cells: one cell per this many pixels of width (two rows), wall softness (px)
 
 
 def sky_mask_even(m):
@@ -15391,6 +15555,7 @@ def xfx_probe_sky(plan, tmpdir=None):
     fam, fam_why = sky_family_for(plan, ranked, qual)      # V8.8.3: ONE colour family for every sky of the montage (song vibe or cover art), chosen once
     pat, pat_why = sky_pattern_for(plan)                   # V8.8.5: ONE pattern for every sky of the montage (from the song: tempo, energy, vibe, cover), chosen once
     plan["xfx_sky_pattern"] = pat
+    plan["xfx_sky_fam"] = fam                              # V9.3.0: the intro's sky-coloured looks use this very family
     order = sorted(qual, key=lambda c: (-int(c["x"].get("prio", 0)), -c["cov"]))
     if any(c["x"].get("drop_i") is not None for c in qual):           # V8.8 (CS2 / R6S): first the best sky kill of EVERY drop (headline, then the strongest beat), then the rest by role
         firsts, seen_d = [], set()
@@ -15419,8 +15584,8 @@ def xfx_probe_sky(plan, tmpdir=None):
             raise RuntimeError("no temp folder for the mask")
         Path(tmpdir).mkdir(parents=True, exist_ok=True)
         mp = Path(tmpdir) / f"sky_take{ti + 1}.gray"
-        an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"), plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"),
-                              game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8: locked to the beat
+        e_loc, b_loc = sky_local_feel(plan, plan["takes"][ti])         # V9.3.0: the song's energy right at this take (the song map), not the song's overall energy / BPM
+        an_ = sky_anim_params(e_loc, b_loc, plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"), game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8: locked to the beat
         x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "beats": sky_take_beats(plan, plan["takes"][ti], x), "fam": fam, "pattern": pat})
         st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True, plan=plan)                  # (again: with the animation planes; V8.8.3: bands + the gradient plane)
         if mk_ and st["bad"] > SKY_MAX_BAD * max(1, st["window"]):
@@ -15942,13 +16107,17 @@ def drop_audio_filters(drops):
     return "1", "*".join(lifts), hits                          # V8.6.2: no music dip, no duck: the music level is never touched by the drop moment ("1" = unchanged)
 
 
+NVENC_PRESET = "p4"                  # V9.3.0: p7 -> p4: the final encode twice as fast (RTX 3080: 84 -> 166 fps at 1080p60); same CQ 16, measured on a CS2 montage stretch SSIM 0.9960 vs 0.9972,
+                                     # PSNR 50.8 vs 52.2 dB, the same file size: no visible difference
+
+
 def enc_args(maxq, preview, nvenc):
     if preview:
         v = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "26", "-b:v", "0"] if nvenc else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "24"]
     elif maxq:
         v = ["-c:v", "libx264", "-crf", "15", "-preset", "slow"]
     elif nvenc:
-        v = ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", "16", "-b:v", "0", "-maxrate", "120M",
+        v = ["-c:v", "h264_nvenc", "-preset", NVENC_PRESET, "-tune", "hq", "-rc", "vbr", "-cq", "16", "-b:v", "0", "-maxrate", "120M",
              "-bufsize", "240M", "-spatial-aq", "1", "-aq-strength", "8", "-rc-lookahead", "32", "-profile:v", "high"]
     else:
         v = ["-c:v", "libx264", "-crf", "17", "-preset", "medium"]
@@ -16779,6 +16948,11 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         try:
             with jstage("intro (waited for)"):
                 intro_box["th"].join()
+            it_ = p.get("intro") or {}
+            if intro_box.get("err") is None and it_.get("pal") and p.get("xfx_sky_fam") in SKY_FAMILIES and it_.get("family") != p["xfx_sky_fam"]:
+                import intro90                             # V9.3.0: the skies ended in another family than the plan's guess (a white / black redraw): the intro text again in theirs
+                it_["family"], it_["pal"] = p["xfx_sky_fam"], intro90.fam_palette(p["xfx_sky_fam"], SKY_FAMILIES, it_["look"])
+                intro_assets(p, itmp)
             JOB_STAGES["intro"] = JOB_STAGES.get("intro", 0.0) + float(intro_box.get("s", 0.0))
             if intro_box.get("err") is not None:
                 raise intro_box["err"]
@@ -16848,11 +17022,10 @@ def failing_take_text(plan, graph, out_t):
 
 
 
-STEP3_PAD = ((6, 16), (1, 1))        # V9.2.1 Manual Step 3 grid: (label -> its control, between pairs) and (above, below) every row, px
-STEP3_DROP_W = 13                    # the Sky colour / Font / Style dropdowns: one width (characters)
-STEP3_ENTRY_W = 18                   # the intro text box
-STEP3_SLIDER_W = 110                 # the length slider (px; it grows with the column)
-STEP3_BTN_W = 8                      # Last seed and Preview: one size (characters)
+STEP3_GAP = 4                        # V9.3.0 Manual Step 3: the one gap (px) between every label, control and button
+STEP3_ENTRY_W = 16                   # the intro text box (characters)
+STEP3_SEED_W = 6                     # the seed box (a 6-digit seed)
+STEP3_SLIDER_W = 46                  # the length slider (px)
 LIGHT_TASKS = ("clips",)             # V9.2.0: tasks that only read the caches and refill a list: they run beside a job instead of waiting for it
 
 FAST_RENDER = [True]                 # V8.8.8 switch: every take's own chains run in parallel ffmpeg processes into lossless files, then one light final pass (the same filters, the same frames)
@@ -17298,12 +17471,13 @@ _PRIO_SET = {}
 
 
 def _set_prio(pr, high):
-    """V8.8.8: Windows process priority of a part: above normal (needed soon / the encoder) or below normal (the rest); elsewhere nothing."""
+    """V8.8.8: Windows process priority of a part: (V9.3.0) below normal for every part and the encoder (V8.8.8: above normal for the ones needed soon and the encoder, which took
+    the PC from the user: no video, no game while rendering); elsewhere nothing."""
     if os.name != "nt" or _PRIO_SET.get(pr.pid) == high or pr.poll() is not None:
         return
     try:
         import ctypes
-        ctypes.windll.kernel32.SetPriorityClass(int(pr._handle), 0x8000 if high else 0x4000)
+        ctypes.windll.kernel32.SetPriorityClass(int(pr._handle), 0x4000)             # V9.3.0: every part below normal (idle starved them behind any busy program)
         _PRIO_SET[pr.pid] = high
     except Exception:                                      # noqa: BLE001
         pass
@@ -19042,6 +19216,46 @@ def weekly_plan_key(game, full):
     return (game, bool(full), cfg_sig(), tuple(st_))
 
 
+JOB_FREE_CORES = 2                   # V9.3.0: physical CPU cores a job leaves free (its process and every ffmpeg it starts run on the others, at below-normal priority)
+_JOB_PRIO_SAVED = []
+
+
+def job_quiet(on):
+    """V9.3.0: while a job runs the PC stays usable: the app's process runs at below-normal priority on all but JOB_FREE_CORES physical cores (Windows hands both on to every
+    ffmpeg / worker the job starts); on=False restores what it was. Nothing on other systems or without psutil."""
+    try:
+        import psutil
+        me = psutil.Process()
+        if on:
+            _JOB_PRIO_SAVED[:] = [me.nice(), me.cpu_affinity()]
+            n_log, n_phys = psutil.cpu_count() or 1, psutil.cpu_count(logical=False) or 1
+            keep = max(1, n_log - JOB_FREE_CORES * max(1, n_log // n_phys))
+            me.cpu_affinity(list(range(keep)))
+            if os.name == "nt":
+                me.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+            LOGONLY(f"job: below-normal priority on {keep} of {n_log} logical CPUs ({JOB_FREE_CORES} physical cores left free)")
+        elif _JOB_PRIO_SAVED:
+            me.nice(_JOB_PRIO_SAVED[0])
+            me.cpu_affinity(_JOB_PRIO_SAVED[1])
+            _JOB_PRIO_SAVED.clear()
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"job priority not set: {type(ex).__name__}: {ex}")
+
+
+def quiet_job(fn):
+    """V9.3.0: `fn` with the PC kept usable (job_quiet) for its whole length."""
+    import functools
+
+    @functools.wraps(fn)
+    def w(*a, **k):
+        job_quiet(True)
+        try:
+            return fn(*a, **k)
+        finally:
+            job_quiet(False)
+    return w
+
+
 def run_job(game, mode="render", force=False, paths=None, song_path=None, target=None, style=None,
             seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True, pin=None, full=False, intro=None, intro_text=None):
     """mode: dry | preview | render. weekly=True is Auto. Always prints a plan or a plain-language reason.
@@ -19086,6 +19300,13 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             out(f"Manual (this plan): {now_sum}")
             if pin and pin.get("summary") and pin["summary"] != now_sum:
                 out(f"NOTE: the summary shown at {pin.get('at', '?')} differs from this plan (inputs changed since: {pin['summary'][:160]} -> {now_sum[:160]})")
+        try:                                               # V9.3.0: every take's first kill (moment + row) inside the footage it shows, with lead and tail
+            fk_ = first_kill_audit(plan, cfg)
+            out("FIRST KILL CHECK: " + ("OK - every take shows its first kill with lead and tail" if not fk_ else f"{len(fk_)} take(s) do not show the first kill fully"))
+            for b_ in fk_:
+                out("   " + b_)
+        except Exception as ex:                            # noqa: BLE001
+            LOGONLY(f"first-kill check skipped: {type(ex).__name__}: {ex}")
         T_JOB = {"plan": time.time() - T0_JOB}
         out(f"PICK  song: {plan['pick']['title']}  style: {plan['pick']['style']}  (picked by {plan['pick']['by']})")
         out(f"EFFECTS {plan.get('effects', 'default')}")      # V8.4
@@ -19156,6 +19377,9 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
     except Exception as ex:
         out(f"CANNOT {mode.upper()} ({game}): unexpected error: {ex}\n{traceback.format_exc()}")
     return None
+
+
+run_job = quiet_job(run_job)         # V9.3.0: every job (Auto, Manual, dry plan, preview, render) at below-normal priority with 2 cores free
 
 
 # ------------------------------------------------------------------ commands
@@ -20085,6 +20309,9 @@ def apply_theme(root, scale=None, accent="lime", base="grey", mode="standard"):
             st.configure("TNotebook.Tab", padding=(16, 5), font=("Segoe UI", F(10), "bold"))
             st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
             st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+            st.configure("Small.TButton", padding=(4, 2))       # V9.3.0: low-use buttons sized to their text
+            st.configure("Tight.TCheckbutton", padding=(0, 0))
+            st.configure("Tight.TRadiobutton", padding=(0, 0))
             st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
             st.configure("Dim.TLabel", foreground=pal["dim"])
         root.configure(bg=pal["bg"])
@@ -20152,6 +20379,9 @@ def _apply_theme_clam(root, scale=None, pal=None, flat=False):
     st.configure("Vertical.TScrollbar", background=pal["btn"], troughcolor=pal["head"], arrowcolor=pal["fg"], bordercolor=pal["border"])
     st.configure("Horizontal.TScale", background=pal["acc"], troughcolor=pal["head"], bordercolor=pal["border"])
     st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+    st.configure("Small.TButton", padding=(4, 2))               # V9.3.0: low-use buttons sized to their text
+    st.configure("Tight.TCheckbutton", padding=(0, 0))          # V9.3.0: Step 3's tick / option boxes without extra padding (the row fits a 920 px window)
+    st.configure("Tight.TRadiobutton", padding=(0, 0))
     st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6), background=pal["acc"], foreground=pal["acc_fg"],
                  lightcolor=pal["acc"], darkcolor=pal["acc"], bordercolor=pal["acc"])
     st.map("Big.Accent.TButton", background=[("disabled", pal["head"]), ("active", pal["sel"]), ("pressed", pal["sel"])],
@@ -21297,40 +21527,36 @@ class App:
     # ------------------------------------------------------------ Manual tab
     def build_manual(self):
         f = self.tabs["Manual"]
-        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=(8, 1, 8, 2))
+        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=(4, 2, 4, 2))
         s3.pack(side="bottom", fill="x", padx=2, pady=(6, 2))          # packed FIRST so it can never be pushed off-screen
-        # V9.2.1: ONE grid: three rows of label + control pairs in the same columns (labels left-aligned, the same style, every control one height); Render top right
-        g3 = ttk.Frame(s3)
-        g3.pack(fill="x")
-        PX, PY = STEP3_PAD
+        G = STEP3_GAP                                          # V9.3.0: the V9.2.0 positions (two rows), narrow boxes, ONE gap between every label, control and button
+        import tkinter.font as tkfont
+        fnt_ = tkfont.nametofont("TkDefaultFont")
+        longest_ = max(manual_pick_choices("sky") + manual_pick_choices("font") + list(STYLE_CHOICES), key=lambda x: fnt_.measure(x))
+        drop_w = -(-fnt_.measure(longest_) // max(1, fnt_.measure("0")))          # the three dropdowns: one width, just their longest value (measured, in '0' widths)
 
-        def lab(text, r, c):
-            ttk.Label(g3, text=text).grid(row=r, column=c, sticky="w", padx=(0 if c == 0 else PX[1], PX[0]), pady=PY)
-
-        def put(w, r, c, span=1):
-            w.grid(row=r, column=c, columnspan=span, sticky="ew", pady=PY)
+        def gap(w, first=False):
+            w.pack(side="left", padx=(0 if first else G, 0))
             return w
-
-        def strip(r, c, span=1):
-            fr = ttk.Frame(g3)
-            put(fr, r, c, span)
-            return fr
-        lab("Intro text", 0, 0)                                # V9.0: the intro's text (the main line, nothing else) and its tickbox
-        it_ = strip(0, 1)
+        bb = ttk.Frame(s3)                                     # row 1: Intro text, Intro, Sky colour, Font ... Render at the right edge
+        bb.pack(fill="x", pady=(2, 4))
+        rb_ = self.btn(bb, "Render", lambda: self.manual("render"), big=True, primary=True, name="manual:render")
+        rb_.pack(side="right", fill="x", expand=True, padx=(4 * G, 0))       # the big primary button: the rest of the row up to the panel's right edge (V9.2.0)
+        gap(ttk.Label(bb, text="Intro text"), first=True)     # V9.0: the intro's text (the main line, nothing else) and its tickbox
         self.m_intro_text = tk.StringVar(value=INTRO_MANUAL["text"])
-        self.e_intro = ttk.Entry(it_, textvariable=self.m_intro_text, width=STEP3_ENTRY_W)
-        self.e_intro.pack(side="left", fill="x", expand=True)
+        self.e_intro = gap(ttk.Entry(bb, textvariable=self.m_intro_text, width=STEP3_ENTRY_W))
         self.named["Intro text"] = self.e_intro
         self.m_intro_on = tk.BooleanVar(value=INTRO_MANUAL["on"])
-        cbi = ttk.Checkbutton(it_, text="Intro", variable=self.m_intro_on, command=lambda: intro_changed())
-        cbi.pack(side="left", padx=(PX[0], 0))
+        lbi = gap(ttk.Label(bb, text="Intro"))                # the label left of its tickbox (a click on it ticks too)
+        cbi = gap(ttk.Checkbutton(bb, text="", variable=self.m_intro_on, command=lambda: intro_changed(), style="Tight.TCheckbutton"))
+        lbi.bind("<Button-1>", lambda e: (self.m_intro_on.set(not self.m_intro_on.get()), intro_changed()))
         self.named["Intro tickbox"] = cbi
         self.m_pick = {}                                       # V9.2.0: Sky colour / Font (V9.0.2)
-        for kind, lbl, name, row, col in (("sky", "Sky colour", "Sky colour", 0, 2), ("font", "Font", "Font", 1, 4)):
-            lab(lbl, row, col)
+        for kind, lbl, name in (("sky", "Sky colour", "Sky colour"), ("font", "Font", "Font")):
+            gap(ttk.Label(bb, text=lbl))
             ch_ = manual_pick_choices(kind)
             v_ = tk.StringVar(value=MANUAL_PICK.get(kind) if MANUAL_PICK.get(kind) in ch_ else PICK_DEFAULT)
-            cb_ = put(ttk.Combobox(g3, textvariable=v_, values=ch_, width=STEP3_DROP_W, state="readonly"), row, col + 1)
+            cb_ = gap(ttk.Combobox(bb, textvariable=v_, values=ch_, width=drop_w, state="readonly"))
             self.named[name] = cb_
             self.m_pick[kind] = v_
 
@@ -21347,49 +21573,38 @@ class App:
                 self.update_status()
         self.m_intro_text.trace_add("write", intro_changed)
         self.m_intro_on.trace_add("write", intro_changed)
-        lab("Length", 1, 0)
-        ln_ = strip(1, 1)
+        c3 = ttk.Frame(s3)                                     # row 2: Length, Optimal, slider + value, Style, Quality, Seed, Last seed, Preview
+        c3.pack(fill="x", pady=2)
+        gap(ttk.Label(c3, text="Length"), first=True)
         L = self.cfg.get("length_s", "optimal")
         self.m_opt = tk.BooleanVar(value=not isinstance(L, (int, float)))
-        cb = ttk.Checkbutton(ln_, text="Optimal", variable=self.m_opt, command=self.update_status)
-        cb.pack(side="left")
+        cb = gap(ttk.Checkbutton(c3, text="Optimal", variable=self.m_opt, command=self.update_status, style="Tight.TCheckbutton"))
         self.named["Optimal length"] = cb
         self.m_len = tk.IntVar(value=int(L) if isinstance(L, (int, float)) else LEN_MIN_S)
-        self.m_len_sc = ttk.Scale(ln_, from_=LEN_MIN_S, to=LEN_MAX_S, variable=self.m_len, length=STEP3_SLIDER_W,
-                                  command=lambda v: (self.m_len.set(int(float(v))), self.update_status()))
-        self.m_len_sc.pack(side="left", fill="x", expand=True, padx=(PX[0], PX[0]))
-        ttk.Label(ln_, textvariable=self.m_len, width=4, anchor="e").pack(side="left")
-        lab("Style", 1, 2)
+        self.m_len_sc = gap(ttk.Scale(c3, from_=LEN_MIN_S, to=LEN_MAX_S, variable=self.m_len, length=STEP3_SLIDER_W,
+                                      command=lambda v: (self.m_len.set(int(float(v))), self.update_status())))
+        gap(ttk.Label(c3, textvariable=self.m_len, width=3, anchor="e"))
+        gap(ttk.Label(c3, text="Style"))
         st = self.cfg.get("style", "auto")
         self.m_style = tk.StringVar(value=st if st in STYLE_CHOICES else "auto")
-        cbx = put(ttk.Combobox(g3, textvariable=self.m_style, values=STYLE_CHOICES, width=STEP3_DROP_W, state="readonly"), 1, 3)
+        cbx = gap(ttk.Combobox(c3, textvariable=self.m_style, values=STYLE_CHOICES, width=drop_w, state="readonly"))
         self.named["Style"] = cbx
-        lab("Quality", 2, 0)
-        q_ = strip(2, 1)
+        gap(ttk.Label(c3, text="Quality"))
         self.m_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
-        ttk.Radiobutton(q_, text="Fast (NVENC)", variable=self.m_q, value="nvenc").pack(side="left")
-        ttk.Radiobutton(q_, text="Max (x264 CRF15)", variable=self.m_q, value="max").pack(side="left", padx=(PX[0], 0))
-        lab("Seed", 2, 2)
+        gap(ttk.Radiobutton(c3, text="Fast (NVENC)", variable=self.m_q, value="nvenc", style="Tight.TRadiobutton"))
+        gap(ttk.Radiobutton(c3, text="Max (x264)", variable=self.m_q, value="max", style="Tight.TRadiobutton"))      # V9.3.0: shorter label (still x264 CRF 15): the row fits a 920 px window
+        gap(ttk.Label(c3, text="Seed"))
         self.m_seed = tk.StringVar()
-        put(ttk.Entry(g3, textvariable=self.m_seed, width=8), 2, 3)          # the seed box: the dropdowns' column and width
-        sb_ = ttk.Frame(g3)
-        sb_.grid(row=2, column=4, columnspan=2, sticky="ew", padx=(PX[1], 0), pady=PY)      # Last seed + Preview: under Render, the same left / right edges
-        for i_, (text_, cmd_, nm_) in enumerate((("Last seed", self.fill_last_seed, "manual:last_seed"), ("Preview", lambda: self.manual("preview"), "manual:preview"))):
-            self.btn(sb_, text_, cmd_, name=nm_, width=STEP3_BTN_W).grid(row=0, column=i_, sticky="ew", padx=((0, PX[0] // 2), (PX[0] // 2, 0))[i_])     # V9.0 Last seed, V9.2.0 the small 720p / 20 s Preview: the same size
-            sb_.columnconfigure(i_, weight=1, uniform="step3btn")
-        rb_ = self.btn(g3, "Render", lambda: self.manual("render"), name="manual:render", style="Accent.TButton")      # the primary action: accent colour, the panel's top right corner
-        rb_.grid(row=0, column=4, columnspan=2, sticky="nsew", padx=(PX[1], 0), pady=PY)
-        g3.columnconfigure(1, weight=2)
-        for c_ in (3, 5):
-            g3.columnconfigure(c_, weight=1, uniform="step3drop")      # the dropdown columns: one width
-        for r_ in range(3):
-            g3.rowconfigure(r_, uniform="step3row")
+        gap(ttk.Entry(c3, textvariable=self.m_seed, width=STEP3_SEED_W))
+        bw_ = -(-max(fnt_.measure("Last seed"), fnt_.measure("Preview")) // max(1, fnt_.measure("0")))     # Last seed and Preview: one size, their text plus a little padding
+        for text_, cmd_, nm_ in (("Last seed", self.fill_last_seed, "manual:last_seed"), ("Preview", lambda: self.manual("preview"), "manual:preview")):
+            gap(self.btn(c3, text_, cmd_, name=nm_, width=bw_, style="Small.TButton"))     # V9.0 Last seed, V9.2.0 the small 720p / 20 s Preview right next to it
         for v_ in (self.m_seed, self.m_style):
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
         self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
         self.m_status_disp = tk.StringVar(value="Tick some clips.")
         self.m_status_lbl = ttk.Label(s3, textvariable=self.m_status_disp, font=("Segoe UI", F(10), "bold"), width=1, anchor="w")
-        self.m_status_lbl.pack(anchor="w", fill="x", pady=(PY[0] + 1, 0))         # the panel's left edge, as the rows above
+        self.m_status_lbl.pack(anchor="w", fill="x", pady=2)
         self.m_status.trace_add("write", self.fit_status)
         self.m_status_lbl.bind("<Configure>", self.fit_status)
         self.mpane = mid = self.make_pane(f, "vertical")           # V5.55: drag divider between the clip list and the song list
@@ -25697,6 +25912,9 @@ def main():
     scp.set_defaults(fn=cmd_songcheck)
     sp.add_parser("cfgdump", help="print the config file path + contents").set_defaults(fn=cmd_cfgdump)
     sp.add_parser("timeanchor", help="V6.9.7: what the file-name time means (clip START or END) per naming scheme; read-only, writes timeanchor.txt").set_defaults(fn=cmd_timeanchor)
+    pfk = sp.add_parser("firstkill", help="V9.3.0: first-kill check (kill + row shown with lead and tail) of every take of saved plan.json files")
+    pfk.add_argument("plans", nargs="+")
+    pfk.set_defaults(fn=cmd_firstkill)
     pu = sp.add_parser("utilclip", help="V6.9.7: per-clip 'allow utility kills' override (Valorant): utilclip <name fragment | --list> [on|off]; writes only clip_overrides.json")
     pu.add_argument("target", nargs="?", default="", help="part of the clip file name, or --list")
     pu.add_argument("state", nargs="?", default="", help="on | off")
