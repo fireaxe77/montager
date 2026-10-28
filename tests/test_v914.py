@@ -95,7 +95,7 @@ def partk():
     base = os.environ.get("V914_BASELINE")
     if base:
         b = {x["id"]: x["pass"] for x in json.loads(Path(base).read_text(encoding="utf-8"))["kills"]}
-        worse = [x["id"] for x in out if b.get(x["id"]) and not x["pass"]]
+        worse = [x["id"] for x in out if b.get(x["id"]) and not x["pass"]]       # ids missing from the baseline were not judged then
         check(f"no kill that passed at baseline fails now ({len(worse)} worse)", not worse, worse)
     check(f"answer key: {passed} of {judged} pass", passed == judged)
 
