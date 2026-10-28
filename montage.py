@@ -14055,8 +14055,15 @@ def sky_family_grade(fam, mean_y):
         yc = 16.0 + (yt - 16.0) * ymul
         return {"y_mul": SKY_FAM_EVEN, "y_add": round(yc - 16.0 - (yr - 16.0) * SKY_FAM_EVEN, 2), "u": max(16.0, min(240.0, 128 + (ut - 128) * csat)),
                 "v": max(16.0, min(240.0, 128 + (vt - 128) * csat)), "haze": 1.0, "y_max": 235}
+    if fam in SKY_FLAT:                                    # V9.3.0: white / black are one flat colour (no gradient) with a clearly visible pattern colour
+        base_, pat_, jmp_ = SKY_FLAT[fam]
+        return {"fam": fam, "top": g(base_), "bot": g(base_), "dark": g(pat_), "jump": g(jmp_)}
     dark = g(top, SKY_FAM_DARK, 0.5) if _rgb_to_yuv(top)[0] >= 40 else g(jmp)          # V9.1.0: a family whose top is already black shows its pattern in a lighter tone
     return {"fam": fam, "top": g(top), "bot": g(bot), "dark": dark, "jump": g(jmp)}
+
+
+SKY_FLAT = {"white": (0xEEF6FF, 0x8FB4D6, 0xDCEEFF),   # V9.3.0: ice white, an ice-blue pattern, the beat jumps a lighter ice
+            "black": (0x050508, 0x4A4A5E, 0x26262F)}   # deep black, a grey pattern you can see, the beat jumps a dark grey
 
 
 def sky_neutral_ok(name, info):
@@ -15210,7 +15217,8 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
     def soft(c):
         v = np.clip((c - e0) / (e1 - e0), 0.0, 1.0)
         return (v * v * (3 - 2 * v) * depth).astype(np.float32)
-    if pattern == "amoebas":                               # the V8.7 cloud field (two layers of soft fractal noise against each other, breathing), drifting by sub-pixel steps
+    if pattern in ("amoebas", "ink", "marble", "cells"):   # the V8.7 cloud field (two layers of soft fractal noise against each other, breathing), drifting by sub-pixel steps;
+        # V9.3.0: ink / marble / cells are other textures moved by exactly this animation (the same drift, the same two layers, the same breathing and beat nudge)
         try:
             bpm = 240.0 / float(an.get("period") or 2.0)
         except (TypeError, ValueError, ZeroDivisionError):
@@ -15219,12 +15227,33 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
         period = 8 * 60.0 / max(60.0, min(200.0, bpm))
         ww = w * 3
 
-        def layer():
+        def noise(scales):
             base = np.zeros((h, ww), np.float32)
-            for sz, amp in SKY_AMOEBA_SCALES:
+            for sz, amp in scales:
                 n = rng.rand(max(2, h // sz + 1), max(2, ww // sz + 1)).astype(np.float32)
                 base += amp * cv2.resize(n, (ww, h), interpolation=cv2.INTER_CUBIC)
             return (base - base.min()) / max(1e-6, float(base.max() - base.min()))
+
+        def layer():
+            if pattern == "ink":                           # ink: the same kind of field, finer (drops of ink in water)
+                return noise(SKY_INK_SCALES)
+            if pattern == "marble":                        # marble: fine curling veins (the ridges of a fractal field)
+                v = (1.0 - np.abs(2.0 * noise(SKY_MARBLE_SCALES) - 1.0)) ** 4
+                return ((v - v.min()) / max(1e-6, float(v.max() - v.min()))).astype(np.float32)
+            if pattern == "cells":                         # cells: thin walls between drifting cells
+                n_c = max(6, int(ww / SKY_CELL_PX))
+                pts = np.stack([rng.uniform(0, ww, n_c * 2), rng.uniform(-0.1 * h, 1.1 * h, n_c * 2)], 1).astype(np.float32)
+                wp = noise(((96, 1.0), (192, 0.6))) - 0.5
+                xx_, yy_ = np.meshgrid(np.arange(ww, dtype=np.float32), np.arange(h, dtype=np.float32))
+                ax, ay = xx_ + 12.0 * wp, yy_ + 12.0 * wp
+                d1 = np.full((h, ww), 1e9, np.float32)
+                d2 = np.full((h, ww), 1e9, np.float32)
+                for px, py in pts:
+                    d = np.hypot(ax - px, ay - py)
+                    d2 = np.where(d < d1, d1, np.minimum(d2, d))
+                    d1 = np.minimum(d1, d)
+                return (1.0 - np.clip((d2 - d1) / SKY_CELL_WALL, 0.0, 1.0)).astype(np.float32)
+            return noise(SKY_AMOEBA_SCALES)
         la, lb = layer(), layer()
         cmul = 1.0 - 0.55 * max(0.0, hd - 0.4) / 0.6
         amp = SKY_CLOUD_MAX * cmul
@@ -15240,12 +15269,10 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
                 continue
             t = f / float(OUT_FPS)
             ph = _sky_phase(t, t0, 0.0, bts) * 24.0            # a beat nudges the clouds 12 mask pixels on (eased)
-            win = 0.62 * shifted(la, t * drift + ph) + 0.38 * shifted(lb, (ww - w) - t * drift * 0.55 - 0.5 * ph)
+            a_, b_ = shifted(la, t * drift + ph), shifted(lb, (ww - w) - t * drift * 0.55 - 0.5 * ph)
+            win = np.maximum(a_, 0.85 * b_) if pattern in ("marble", "cells") else 0.62 * a_ + 0.38 * b_      # V9.3.0: line textures: both layers' veins / walls show
             th = 0.50 + 0.17 * np.sin(2 * np.pi * t / max(1.0, period))
             yield (np.clip((win - th) * 6.0 + 0.5, 0.0, 1.0) * amp).astype(np.float32)
-        return
-    if pattern in ("ink", "marble", "cells"):
-        yield from sky_organic_frames(pattern, h, w, hor, nf, f0, bts, hd, depth, soft, rng, sw0, spd, t0)
         return
     if pattern == "rings":
         per = max(16.0, hor / (2.5 + 2.0 * hd))
@@ -15284,58 +15311,9 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
 
 
 SKY_AMOEBA_SCALES = ((16, 1.0), (32, 0.55), (64, 0.3))       # the V8.7 cloud field: fine fluid detail over the whole sky
-
-
-def sky_organic_frames(pattern, h, w, hor, nf, f0, bts, hd, depth, soft, rng, sw0, spd, t0):
-    """V9.3.0: the fluid sky patterns: fine detail over the whole sky that moves like a liquid on every frame (speed from the song's local energy `hd`) and steps on the beats
-    (_sky_phase): ink = fine noise carried and stretched by a slow swirl; marble = fine veins of a warped flow; cells = thin walls of 8-12 drifting cells. Yields float32 h x w shade arrays (0 before the kill frame f0)."""
-    import cv2
-    import numpy as np
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    hz = max(24.0, float(hor))
-
-    def noise(sizes, seed_):
-        r_ = np.random.RandomState(seed_)
-        acc = np.zeros((h, w), np.float32)
-        for sz, amp in sizes:
-            acc += amp * cv2.resize(r_.rand(max(2, h // sz + 1), max(2, w // sz + 1)).astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
-        return (acc - acc.min()) / max(1e-6, float(acc.max() - acc.min()))
-    fine = noise(((16, 1.0), (32, 0.55), (64, 0.3)), int(rng.randint(1, 1 << 30)))
-    wx, wy = noise(((96, 1.0), (192, 0.6)), int(rng.randint(1, 1 << 30))) - 0.5, noise(((96, 1.0), (192, 0.6)), int(rng.randint(1, 1 << 30))) - 0.5
-    n_ = int(rng.randint(8, 13))
-    seeds = []
-    for _try in range(400):                                # cell centres apart from each other (two close centres make a dark wedge)
-        if len(seeds) >= n_:
-            break
-        q = (float(rng.uniform(0, 1)) * w, float(rng.uniform(0, 1.2)) * hz)
-        if all(np.hypot(q[0] - a[0], q[1] - a[1]) >= 0.16 * w for a in seeds):
-            seeds.append(q)
-    n_ = len(seeds)
-    cx0, cy0, ph0 = np.array([a for a, _b in seeds]), np.array([b for _a, b in seeds]), rng.uniform(0, 2 * np.pi, n_)
-    for f in range(nf):
-        if f < f0:
-            yield np.zeros((h, w), np.float32)
-            continue
-        t = f / float(OUT_FPS)
-        ph = _sky_phase(t, t0, spd * 0.5, bts)
-        if pattern == "ink":                               # the fine field carried by a slow swirl that turns and stretches it
-            ang = 0.9 * ph
-            mx = (xx + 60.0 * (np.cos(ang) * wx - np.sin(ang) * wy) * (1.0 + 0.3 * np.sin(0.4 * ph)) + 28.0 * ph).astype(np.float32)
-            my = (yy + 60.0 * (np.sin(ang) * wx + np.cos(ang) * wy)).astype(np.float32)
-            v = cv2.remap(fine, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-            c = np.clip((v - (0.50 + 0.08 * np.sin(0.7 * ph))) * 6.0 + 0.5, 0.0, 1.0)
-        elif pattern == "marble":                          # fine veins of a warped flow
-            u = xx / (0.16 * w) + yy / (0.55 * hz) + 3.0 * (np.cos(0.5 * ph) * wx + np.sin(0.5 * ph) * wy) + 0.5 * ph
-            c = (0.5 + 0.5 * np.cos(2 * np.pi * u)) ** 3
-        elif pattern == "cells":                           # thin walls between 8-12 drifting cells
-            pts = [(cx0[i] + 0.06 * w * np.sin(0.5 * ph + ph0[i]), cy0[i] + 0.06 * hz * np.cos(0.4 * ph + 2 * ph0[i])) for i in range(n_)]
-            ax = xx + 0.05 * w * wx * 2
-            ay = yy + 0.05 * hz * wy * 2
-            ds = np.sort(np.stack([np.hypot(ax - px, ay - py) for px, py in pts]), axis=0)
-            c = 1.0 - np.clip((ds[1] - ds[0]) / (0.06 * max(hz, 0.4 * w)), 0.0, 1.0)
-        else:
-            c = np.zeros((h, w), np.float32)
-        yield soft(c.astype(np.float32))
+SKY_INK_SCALES = ((8, 1.0), (16, 0.55), (32, 0.3))           # V9.3.0 ink: the same field, finer
+SKY_MARBLE_SCALES = ((24, 1.0), (48, 0.6), (96, 0.3))       # V9.3.0 marble: the field whose ridges are the veins
+SKY_CELL_PX, SKY_CELL_WALL = 70.0, 7.0     # V9.3.0 cells: one cell per this many pixels of width (two rows), wall softness (px)
 
 
 def sky_mask_even(m):
