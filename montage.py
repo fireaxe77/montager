@@ -13899,7 +13899,7 @@ SKY_PER_S = 30.0                     # and a montage gets at most one per this m
 SKY_MAX_N = 6
 
 
-SKY_PER_S_88, SKY_MAX_N_88, SKY_SPACING_88 = 15.0, 12, 6.0      # V8.8 (CS2 / R6S): about twice as many skies (one per 15 s, at most 12), at least 6 s apart
+SKY_PER_S_88, SKY_MAX_N_88, SKY_SPACING_88 = 30.0, 6, 12.0     # V9.3.0: half as many skies: one per 30 s, at most 6, at least 12 s apart (V8.8: one per 15 s, at most 12, 6 s apart)
 
 
 def sky_max_for(duration, game=None):
@@ -14407,6 +14407,26 @@ def sky_anim_params(energy, bpm, recipe=None, drop=False, game=None):
             "swing": round(0.05 + 0.95 * on(0.15), 2), "swing_period": round(max(0.6, 2 * 60.0 / b * (2.0 - hd)), 2)}
 
 
+SKY_LOCAL_ON = [True]                # V9.3.0 switch: sky intensity / speed from the song's local energy at the take
+SKY_LOCAL_BPM = (70.0, 170.0)        # the 'tempo' the animation runs at for local energy 0 .. 1 (speed of drift, pulses, swings)
+
+
+def sky_local_feel(plan, t):
+    """V9.3.0: (energy 0..1, animation tempo) of the song where take `t` plays: the song map's per-beat energy over the take's own stretch of the song (its rank among all the song's beats,
+    so a quiet verse of a loud song is quiet), the tempo of the animation from that energy (SKY_LOCAL_BPM). Without a song map: the song's overall energy and BPM, as before."""
+    song = plan.get("song") or {}
+    if SKY_LOCAL_ON[0]:
+        try:
+            an = get_songmap(song["path"], song.get("csv_bpm"))
+            s0 = float(song.get("start_t") or 0.0) + float(t.get("out_start") or 0.0)
+            rk = song_end_rank(an, s0, s0 + max(0.5, float(t.get("dur") or 1.0)))
+            if rk is not None:
+                return round(rk, 3), round(SKY_LOCAL_BPM[0] + (SKY_LOCAL_BPM[1] - SKY_LOCAL_BPM[0]) * rk, 1)
+        except Exception as ex:                            # noqa: BLE001
+            LOGONLY(f"sky: local song energy not read ({type(ex).__name__}: {ex}); the song's overall feel is used")
+    return song.get("energy", plan.get("xfx_energy")), song.get("bpm")
+
+
 def sky_alt_colour(ranked, rgb):
     """V8.7: the colour the sky jumps to on the beats of a hard song: the first colour of the song's family at least 80 degrees away from the main colour (else the complement of the main colour)."""
     neutral_main = rgb in (SKY_PALETTE["white"], SKY_PALETTE["black"])
@@ -14800,7 +14820,8 @@ def sky_shot_breaks(imgs, fr_src=None, thr=None):
 
 SKY_SHOT_DIFF = 28.0                 # V8.8.5: mean grey change (0-255, on a 96 x 54 thumbnail) between two frames above which they are two shots (a cut / an instant flick)
 SKY_WARM_FRAME = [True]              # V8.8.6 switch (tests): a frame whose smooth region is warm is a wall in the mask too (as in the kill-frame probe)
-SKY_CUT_ON = [True]                  # V8.8.6 switch (tests): the sky ends where the camera leaves it instead of the take losing its sky
+SKY_CUT_ON = [True]                  # V8.8.6 switch (tests): the sky ends where the camera leaves it instead of the take losing its sky (V9.3.0: with SKY_HOLD_LAST_ON it holds instead of ending)
+SKY_HOLD_LAST_ON = [True]            # V9.3.0 switch: every sky runs from its kill frame to the last frame of its take; a frame whose mask fails holds the last good mask (it cut off / popped in and out)
 SKY_CUT_MIN_F = 18                   # V8.8.6: ... when at least this many frames (0.3 s) of clean sky come first
 SKY_GUARD_GROW = 1                   # V8.8.5: mask pixels the painted region may reach past the frame's own sky (the soft edge); never more
 
@@ -14888,11 +14909,14 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                 break
         pre_bad = sum(1 for q in status[:cut] if q == "bad")
         if cut < k and cut >= SKY_CUT_MIN_F and pre_bad <= SKY_MAX_BAD * cut:
-            for i in range(cut, k):
-                segm[i] = np.zeros((h, w), np.uint8)
-                status[i] = "cut"
-            n_bad = pre_bad
-            x["sky_cut"] = round(cut / float(OUT_FPS), 3)
+            n_bad = pre_bad                                # the take keeps its sky (as V8.8.6) ...
+            if SKY_HOLD_LAST_ON[0]:
+                cut = k                                    # V9.3.0: ... to the last frame of the take: the frames after the walls start hold the last good mask (below)
+            else:
+                for i in range(cut, k):
+                    segm[i] = np.zeros((h, w), np.uint8)
+                    status[i] = "cut"
+                x["sky_cut"] = round(cut / float(OUT_FPS), 3)
         else:
             cut = k
     held_i = set()
@@ -14914,6 +14938,21 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                     segm[i] = (segm[j].astype(bool) & own_).astype(np.uint8)
                     held_i.add(i)
                     held += 1
+    if SKY_HOLD_LAST_ON[0]:                                # V9.3.0: from the kill frame to the take's last frame: a frame whose own mask failed (a wall, a dropout, nothing found) holds the last good mask
+        last_ = None
+        for i in range(k):
+            if status[i] == "ok" and segm[i].any() and good[i]:
+                last_ = segm[i]
+            elif last_ is not None and i not in held_i:
+                segm[i] = last_.copy()
+                held_i.add(i)
+                held += 1
+        first_ = next((i for i in range(k) if status[i] == "ok" and segm[i].any()), None)
+        for i in range(first_ or 0):                       # frames before the first good one (the kill frame itself unreadable) take the first good mask
+            if first_ is not None and not segm[i].any():
+                segm[i] = segm[first_].copy()
+                held_i.add(i)
+                held += 1
     imgs = None
     segm = list(pool_.map(sky_mask_even, segm))           # V8.8.2: one even region per frame: small gaps closed, enclosed holes (cloud specks, cut-out texture) filled, so the tint has no patches inside the sky
     pool_.shutdown()
@@ -14928,7 +14967,7 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
         nb_ = [segm[j] for j in range(max(0, i - 4), min(k, i + 5)) if shot[j] == shot[i]]
         a_ = np.mean(nb_, axis=0)
         s_ = np.clip((a_ - 0.35) / 0.30, 0.0, 1.0).astype(np.float32)
-        own_ = cv2.dilate(segm[i], gk) if segm[i].any() else segm[i]          # V8.8.5: never past the frame's OWN sky (+ the soft edge): no mask where this picture has no sky
+        own_ = cv2.dilate(segm[i], gk) if segm[i].any() else segm[i]          # V8.8.5: never past the frame's OWN sky (+ the soft edge): no mask where this picture has no sky (a held frame: the held mask)
         sm.append(s_ * own_.astype(np.float32))
     bottoms = []
     for m_ in sm:
@@ -14944,7 +14983,7 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
     an_ = x.get("anim")
     fam_ = bool(x.get("fam")) and ramp and an_ is not None              # V8.8.3: the family look: regular beat-locked bands (no cloud blobs) + the colour gradient in a 4th plane
     clouds = sky_cloud_field(w, h, nf, OUT_FPS, an_["drift"], an_["period"], x.get("seed", 1), soft=SKY_CLOUD_SOFT) if (ramp and an_ and not fam_) else None
-    pats = sky_pattern_frames(x.get("pattern") or "bands", h, w, hor, nf, f0, x.get("beats") or [], an_, x.get("seed", 1)) if fam_ else None      # V8.8.5: the montage's pattern, moving on every frame
+    pats = sky_pattern_frames(x.get("pattern") or "amoebas", h, w, hor, nf, f0, x.get("beats") or [], an_, x.get("seed", 1)) if fam_ else None      # V8.8.5: the montage's pattern, moving on every frame
     ramps = sky_frame_ramps(sm, h, w, hor) if fam_ else None        # V8.8.4: the gradient follows each frame's own sky region (its top row -> its lowest row), smoothed over time
     mid_b = np.full((h * w,), 128, np.uint8).tobytes()
     gdark = x.get("grad_dark", 0.35)                       # the gradient: how much darker the top of the sky is than its horizon (0.55 'dark' = red to black, 0.25 'sunset')
@@ -15056,14 +15095,16 @@ def sky_band_rows(h, hor, nf, f0, beats, an):
     return out_
 
 
-SKY_PATTERNS = ("bands", "amoebas", "rings", "rays", "aurora")
+SKY_PATTERNS = ("amoebas", "ink", "marble", "cells")
+# V9.3.0: only organic, fluid patterns with fine detail over the whole sky (no big shapes laid over it): amoebas (the V8.7 cloud spots), ink (ink drifting in water: fine noise carried by a
+# slow swirl), marble (fine marbling veins flowing), cells (thin cell walls drifting). The line patterns (bands, rings, rays, aurora) are gone
 # V8.8.5: the sky's pattern, ONE per montage (sky_pattern_for): bands = horizontal stripes that flow down and ripple sideways; amoebas = the V8.7 soft cloud spots drifting in two layers
 # and breathing; rings = soft circles rippling out from a point above the sky; rays = a fan of soft beams from above the sky, turning; aurora = vertical curtains that sway and flow sideways
 SKY_FLOW = {"speed0": 0.35, "speed1": 0.80, "wave": 0.22, "wave_len": 0.65, "wave_hz": 0.35}
 # V8.8.5: every pattern moves on EVERY frame: speed0 .. speed1 pattern cycles a second (more for a harder song), plus the beat steps of SKY_BANDS; bands also ripple sideways (wave: share of a band,
 # over wave_len of the picture width, travelling at wave_hz)
-SKY_PATTERN_FEEL = {"bands": (0.75, 128.0, ()), "amoebas": (0.35, 85.0, ("black",)), "rings": (0.92, 155.0, ("white",)),
-                    "rays": (0.65, 105.0, ("orange", "red", "amber", "rose")), "aurora": (0.50, 95.0, ("blue", "teal", "violet", "green"))}
+SKY_PATTERN_FEEL = {"amoebas": (0.35, 85.0, ("black",)), "ink": (0.80, 140.0, ("orange", "red", "amber", "rose")), "marble": (0.55, 100.0, ("white", "violet")),
+                    "cells": (0.65, 120.0, ("blue", "teal", "green"))}
 # V8.8.5: (energy, BPM, cover families) each pattern suits best; sky_pattern_for scores every pattern against the song and picks the best one
 SKY_PATTERN_JITTER = 0.45            # the song's own fixed share of the score (a hash of artist + title): similar songs still get different patterns, the same song always the same
 
@@ -15180,7 +15221,7 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
 
         def layer():
             base = np.zeros((h, ww), np.float32)
-            for sz, amp in ((16, 1.0), (32, 0.55), (64, 0.3)):
+            for sz, amp in SKY_AMOEBA_SCALES:
                 n = rng.rand(max(2, h // sz + 1), max(2, ww // sz + 1)).astype(np.float32)
                 base += amp * cv2.resize(n, (ww, h), interpolation=cv2.INTER_CUBIC)
             return (base - base.min()) / max(1e-6, float(base.max() - base.min()))
@@ -15202,6 +15243,9 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
             win = 0.62 * shifted(la, t * drift + ph) + 0.38 * shifted(lb, (ww - w) - t * drift * 0.55 - 0.5 * ph)
             th = 0.50 + 0.17 * np.sin(2 * np.pi * t / max(1.0, period))
             yield (np.clip((win - th) * 6.0 + 0.5, 0.0, 1.0) * amp).astype(np.float32)
+        return
+    if pattern in ("ink", "marble", "cells"):
+        yield from sky_organic_frames(pattern, h, w, hor, nf, f0, bts, hd, depth, soft, rng, sw0, spd, t0)
         return
     if pattern == "rings":
         per = max(16.0, hor / (2.5 + 2.0 * hd))
@@ -15237,6 +15281,61 @@ def sky_pattern_frames(pattern, h, w, hor, nf, f0, beats, an, seed=1):
             wv = SKY_FLOW["wave"] * per * np.sin(2 * np.pi * (xx / (w * SKY_FLOW["wave_len"]) - SKY_FLOW["wave_hz"] * t) + sw0)
             c = 0.5 + 0.5 * np.cos(2 * np.pi * ((yy + wv) / per - ph))
         yield soft(c)
+
+
+SKY_AMOEBA_SCALES = ((16, 1.0), (32, 0.55), (64, 0.3))       # the V8.7 cloud field: fine fluid detail over the whole sky
+
+
+def sky_organic_frames(pattern, h, w, hor, nf, f0, bts, hd, depth, soft, rng, sw0, spd, t0):
+    """V9.3.0: the fluid sky patterns: fine detail over the whole sky that moves like a liquid on every frame (speed from the song's local energy `hd`) and steps on the beats
+    (_sky_phase): ink = fine noise carried and stretched by a slow swirl; marble = fine veins of a warped flow; cells = thin walls of 8-12 drifting cells. Yields float32 h x w shade arrays (0 before the kill frame f0)."""
+    import cv2
+    import numpy as np
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    hz = max(24.0, float(hor))
+
+    def noise(sizes, seed_):
+        r_ = np.random.RandomState(seed_)
+        acc = np.zeros((h, w), np.float32)
+        for sz, amp in sizes:
+            acc += amp * cv2.resize(r_.rand(max(2, h // sz + 1), max(2, w // sz + 1)).astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
+        return (acc - acc.min()) / max(1e-6, float(acc.max() - acc.min()))
+    fine = noise(((16, 1.0), (32, 0.55), (64, 0.3)), int(rng.randint(1, 1 << 30)))
+    wx, wy = noise(((96, 1.0), (192, 0.6)), int(rng.randint(1, 1 << 30))) - 0.5, noise(((96, 1.0), (192, 0.6)), int(rng.randint(1, 1 << 30))) - 0.5
+    n_ = int(rng.randint(8, 13))
+    seeds = []
+    for _try in range(400):                                # cell centres apart from each other (two close centres make a dark wedge)
+        if len(seeds) >= n_:
+            break
+        q = (float(rng.uniform(0, 1)) * w, float(rng.uniform(0, 1.2)) * hz)
+        if all(np.hypot(q[0] - a[0], q[1] - a[1]) >= 0.16 * w for a in seeds):
+            seeds.append(q)
+    n_ = len(seeds)
+    cx0, cy0, ph0 = np.array([a for a, _b in seeds]), np.array([b for _a, b in seeds]), rng.uniform(0, 2 * np.pi, n_)
+    for f in range(nf):
+        if f < f0:
+            yield np.zeros((h, w), np.float32)
+            continue
+        t = f / float(OUT_FPS)
+        ph = _sky_phase(t, t0, spd * 0.5, bts)
+        if pattern == "ink":                               # the fine field carried by a slow swirl that turns and stretches it
+            ang = 0.9 * ph
+            mx = (xx + 60.0 * (np.cos(ang) * wx - np.sin(ang) * wy) * (1.0 + 0.3 * np.sin(0.4 * ph)) + 28.0 * ph).astype(np.float32)
+            my = (yy + 60.0 * (np.sin(ang) * wx + np.cos(ang) * wy)).astype(np.float32)
+            v = cv2.remap(fine, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+            c = np.clip((v - (0.50 + 0.08 * np.sin(0.7 * ph))) * 6.0 + 0.5, 0.0, 1.0)
+        elif pattern == "marble":                          # fine veins of a warped flow
+            u = xx / (0.16 * w) + yy / (0.55 * hz) + 3.0 * (np.cos(0.5 * ph) * wx + np.sin(0.5 * ph) * wy) + 0.5 * ph
+            c = (0.5 + 0.5 * np.cos(2 * np.pi * u)) ** 3
+        elif pattern == "cells":                           # thin walls between 8-12 drifting cells
+            pts = [(cx0[i] + 0.06 * w * np.sin(0.5 * ph + ph0[i]), cy0[i] + 0.06 * hz * np.cos(0.4 * ph + 2 * ph0[i])) for i in range(n_)]
+            ax = xx + 0.05 * w * wx * 2
+            ay = yy + 0.05 * hz * wy * 2
+            ds = np.sort(np.stack([np.hypot(ax - px, ay - py) for px, py in pts]), axis=0)
+            c = 1.0 - np.clip((ds[1] - ds[0]) / (0.06 * max(hz, 0.4 * w)), 0.0, 1.0)
+        else:
+            c = np.zeros((h, w), np.float32)
+        yield soft(c.astype(np.float32))
 
 
 def sky_mask_even(m):
@@ -15478,6 +15577,7 @@ def xfx_probe_sky(plan, tmpdir=None):
     fam, fam_why = sky_family_for(plan, ranked, qual)      # V8.8.3: ONE colour family for every sky of the montage (song vibe or cover art), chosen once
     pat, pat_why = sky_pattern_for(plan)                   # V8.8.5: ONE pattern for every sky of the montage (from the song: tempo, energy, vibe, cover), chosen once
     plan["xfx_sky_pattern"] = pat
+    plan["xfx_sky_fam"] = fam                              # V9.3.0: the intro's sky-coloured looks use this very family
     order = sorted(qual, key=lambda c: (-int(c["x"].get("prio", 0)), -c["cov"]))
     if any(c["x"].get("drop_i") is not None for c in qual):           # V8.8 (CS2 / R6S): first the best sky kill of EVERY drop (headline, then the strongest beat), then the rest by role
         firsts, seen_d = [], set()
@@ -15506,8 +15606,8 @@ def xfx_probe_sky(plan, tmpdir=None):
             raise RuntimeError("no temp folder for the mask")
         Path(tmpdir).mkdir(parents=True, exist_ok=True)
         mp = Path(tmpdir) / f"sky_take{ti + 1}.gray"
-        an_ = sky_anim_params((plan.get("song") or {}).get("energy", plan.get("xfx_energy")), (plan.get("song") or {}).get("bpm"), plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"),
-                              game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8: locked to the beat
+        e_loc, b_loc = sky_local_feel(plan, plan["takes"][ti])         # V9.3.0: the song's energy right at this take (the song map), not the song's overall energy / BPM
+        an_ = sky_anim_params(e_loc, b_loc, plan.get("recipe"), x.get("why") in ("headline kill", "drop kill"), game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8: locked to the beat
         x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "beats": sky_take_beats(plan, plan["takes"][ti], x), "fam": fam, "pattern": pat})
         st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True, plan=plan)                  # (again: with the animation planes; V8.8.3: bands + the gradient plane)
         if mk_ and st["bad"] > SKY_MAX_BAD * max(1, st["window"]):
@@ -16866,6 +16966,11 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         try:
             with jstage("intro (waited for)"):
                 intro_box["th"].join()
+            it_ = p.get("intro") or {}
+            if intro_box.get("err") is None and it_.get("pal") and p.get("xfx_sky_fam") in SKY_FAMILIES and it_.get("family") != p["xfx_sky_fam"]:
+                import intro90                             # V9.3.0: the skies ended in another family than the plan's guess (a white / black redraw): the intro text again in theirs
+                it_["family"], it_["pal"] = p["xfx_sky_fam"], intro90.fam_palette(p["xfx_sky_fam"], SKY_FAMILIES, it_["look"])
+                intro_assets(p, itmp)
             JOB_STAGES["intro"] = JOB_STAGES.get("intro", 0.0) + float(intro_box.get("s", 0.0))
             if intro_box.get("err") is not None:
                 raise intro_box["err"]

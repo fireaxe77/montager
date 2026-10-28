@@ -36,7 +36,7 @@ LOOKS = {
     "serif": (("PlayfairDisplay-VF.ttf", 500), ("PlayfairDisplay-VF.ttf", 500), 92, 0.10, 0.36, True),
     "hype": (("Unbounded-VF.ttf", 800), ("Unbounded-VF.ttf", 600), 70, 0.02, 0.30, True),
 }
-SKY_LOOKS = ("shade", "hype")      # the two looks whose colours follow the montage's sky colour family
+SKY_LOOKS = ("shade", "hype", "ext")      # the looks whose colours follow the montage's sky colour family (V9.3.0: ext's extruded edge too; its letters stay white)
 LOOK_GROUPS = {"hype": ("rgb", "ext", "hype"), "aggressive": ("rgb", "ext", "hype"), "chill": ("glow", "serif"), "cinematic": ("glow", "serif"), "smooth": ("shade", "serif")}
 DEFAULT_PAL = {"shade": dict(top=(255, 255, 255), bot=(255, 196, 70), edge=(14, 14, 22), shadow=(0, 0, 0), alpha=0.7),
                "hype": dict(top=(255, 255, 255), bot=(255, 255, 255), edge=(255, 56, 140), shadow=(0, 0, 0), alpha=0.45, accent=(255, 56, 140), ink=(18, 10, 28))}
@@ -114,6 +114,13 @@ def fam_palette(fam, families, look):
         p = dict(top=_mix(bot, (255, 255, 255), 0.35), bot=bot, edge=top, shadow=_mix(top, (0, 0, 0), 0.7), alpha=0.75, accent=mid,
                  ink=(18, 10, 28) if sum(mid) > 330 else (255, 255, 255))
     return p
+
+
+def ext_edge(pal):
+    """V9.3.0: (back, front) colours of the ext look's extruded edge from a family palette: the deep end of the family at the back, its middle tone (lifted toward the bright end) at the
+    front, so the edge reads as that colour under the white letters (white family: a cool grey edge; black family: near black to dark grey)."""
+    deep, mid, bright = pal["edge"], pal["accent"], pal["bot"]
+    return _mix(deep, (0, 0, 0), 0.35), _mix(mid, bright, 0.35)
 
 
 def _font(cache, name, size, weight=None):
@@ -208,9 +215,10 @@ def _line(cache, look, text, fname, wt, size, sp_em, cy, small, pal):
         depth = int(round((4 if small else 16) * k))
         ex, ey = 0.669, 0.743
         out = _over(out, _tint(_shift(m, depth * ex * 1.3 + 6 * k, depth * ey * 1.3 + 10 * k).filter(ImageFilter.GaussianBlur(9 * k)), (0, 0, 0), 0.55))
+        back, front = ((26, 40, 80), (96, 140, 230)) if not pal else ext_edge(pal)        # V9.3.0: the extrusion in the sky's colour family (no pal: the blue as before)
         for i in range(depth, 0, -1):
             t = i / depth
-            out = _over(out, _tint(_shift(m, ex * i, ey * i), (int(26 + 70 * (1 - t)), int(40 + 100 * (1 - t)), int(80 + 150 * (1 - t)))))
+            out = _over(out, _tint(_shift(m, ex * i, ey * i), tuple(int(back[c] + (front[c] - back[c]) * (1 - t)) for c in range(3))))
         out = _over(out, _vgrad(m, (255, 255, 255), (205, 215, 235)))
     elif look == "glow":
         kk = (0.6 if small else 1.0) * k
