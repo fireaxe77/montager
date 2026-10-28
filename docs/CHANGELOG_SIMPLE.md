@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.2.0 - 2026-10-28: Much faster planning
+- Planning a montage now takes seconds instead of minutes, and Render uses the plan Auto or Preview already made instead of planning again
+- Choosing a song or ticking clips no longer starts any work in the background, and clips and songs can be moved or deleted while a montage is being made
+- The Manual tab is tidier: Sky colour and Font sit next to Render, Preview is a small button next to Last seed, and Dry plan is only on the Auto tab
+- Skies now change colour between deep blue, teal and hazy orange, montages end at a calm moment of the song instead of on its loudest part, and CS2 takes show the first kill with a proper lead-in
+
 ## V9.1.4 - 2026-10-28: Kills double-checked on the frames
 - Every CS2 kill that changed in the last update was checked by eye, and kill times now land on the moment the kill appears in the killfeed
 - Kills during a red damage flash are no longer dated late

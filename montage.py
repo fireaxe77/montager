@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.1.4"
+APP_VERSION = "V9.2.0"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -243,10 +243,14 @@ def load_json_ro(p, default):
         return default
 
 
+SAVE_JSON_BIG = 200                     # V9.2.0: a dict / list with more entries than this is saved compact (a cache, not a file people read)
+
+
 def save_json(p, obj):
     DATA.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(p) + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=1, ensure_ascii=False), encoding="utf-8")
+    tmp = Path(f"{p}.{os.getpid()}.{threading.get_ident()}.tmp")         # V9.2.0: own temp name per thread (the clip list may save a cache beside a running job)
+    big = isinstance(obj, (dict, list)) and len(obj) > SAVE_JSON_BIG       # V9.2.0: the big caches (song maps, kills, loudness) are written compact by the C encoder: indent=1 runs the pure Python one (28 s for the 135 MB song map cache)
+    tmp.write_text(json.dumps(obj, indent=None if big else 1, ensure_ascii=False, separators=(",", ":") if big else None), encoding="utf-8")
     os.replace(tmp, p)
 
 
@@ -8043,9 +8047,35 @@ def _frames_at(path, t, n=7, fps=60):
     return fr[:m * 192 * 108].reshape(m, 108, 192).astype(np.float32), pts[:m]
 
 
+STITCH_CHECK_CACHE = DATA / "stitch_check.json"       # V9.2.0: the frame check of a stitched cut, per clip pair + cut time (also an unreadable cut: never read again)
+_STITCH_MEMO = {}
+
+
 def verify_stitch(spans, cut):
     """Checks the cut between two stitched clips: the frame of clip A at the cut must equal clip B's frame at the same game moment
-    (no repeated or skipped frames). Returns (ok, corrected shift of B, report)."""
+    (no repeated or skipped frames). Returns (ok, corrected shift of B, report).
+    V9.2.0: the answer depends only on the two files and the times, so it is kept (memory + STITCH_CHECK_CACHE): every plan of every job asked again (44 ffmpeg reads per plan)."""
+    a, b = spans
+    try:
+        key = "|".join([file_key(a["path"]), file_key(b["path"]), f"{cut - a['shift']:.4f}", f"{cut - b['shift']:.4f}", f"{b['shift']:.4f}"])
+    except OSError:
+        return _verify_stitch(spans, cut)
+    if not _STITCH_MEMO:
+        _STITCH_MEMO.update(load_json(STITCH_CHECK_CACHE, {}))
+    hit = _STITCH_MEMO.get(key)
+    if hit is not None:
+        return bool(hit[0]), float(hit[1]), str(hit[2])
+    with jstage("frame checks"):
+        res = _verify_stitch(spans, cut)
+    _STITCH_MEMO[key] = [bool(res[0]), float(res[1]), str(res[2])]
+    try:
+        save_json(STITCH_CHECK_CACHE, _STITCH_MEMO)
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"stitch check cache not saved: {ex}")
+    return res
+
+
+def _verify_stitch(spans, cut):
     import numpy as np
     a, b = spans
     fa, ta = _frames_at(a["path"], cut - a["shift"])
@@ -9638,6 +9668,17 @@ def dead_air_cuts(ev, U, kb, t0=None, lead_override=None):
     allow = ev.get("_allow")
     if allow is None or len(times) < 2 or max(b - a for a, b in zip(times, times[1:])) <= GAP_ALLOW[0]:
         return [], span
+    memo = ev.setdefault("_dac", {})                       # V9.2.0: the planner asks the same question hundreds of times per event (same answer: memoised on the event copy)
+    mk = (id(U), id(allow), float(U[kb]) if t0 is None else float(t0), lead_override, tuple(times), tuple(ev.get("rows") or ()), tuple(ev.get("unsure") or ()))
+    if mk in memo:
+        c_, o_ = memo[mk]
+        return list(c_), o_
+    res = _dead_air_cuts(ev, U, kb, t0, lead_override, times, span, allow)
+    memo[mk] = (list(res[0]), res[1])
+    return res
+
+
+def _dead_air_cuts(ev, U, kb, t0, lead_override, times, span, allow):
     import bisect
     cuts, o = [], 0.0                                      # o = output time of kill i, from the first kill
     T0, nt = float(U[kb]) if t0 is None else float(t0), len(U)
@@ -9649,7 +9690,8 @@ def dead_air_cuts(ev, U, kb, t0=None, lead_override=None):
             continue
         rd = max(0.0, rows[i] - a) if i < len(rows) else 0.0             # V5.42B: never cut before this kill's row is seen
         j0 = bisect.bisect_left(U, T0 + o + max(0.4, rd + ROW_TAIL) - 1e-6)
-        ok = [j for j in range(j0, nt) if U[j] - (T0 + o) <= g - 1.0 - 0.25 and U[j] - (T0 + o) <= 2.5]
+        j1 = min(nt, bisect.bisect_right(U, T0 + o + min(g - 1.0 - 0.25, 2.5) + 1e-6) + 1)      # V9.2.0: U is sorted: only the ticks up to the limit (it walked to the song's end: half the plan time)
+        ok = [j for j in range(j0, j1) if U[j] - (T0 + o) <= g - 1.0 - 0.25 and U[j] - (T0 + o) <= 2.5]
         cj = next((j for j in ok if j % 2 == 0), ok[0] if ok else None)
         if cj is None:
             o += g
@@ -9711,10 +9753,18 @@ def last_anchor_solve(ev, U, kb):
     return res
 
 
+CS2_KILL_LEAD_ON = [True]                # V9.2.0 switch (CS2): the run-up before the first kill is measured from the kill itself, not from its kill row
+CS2_ROW_DELAY_S = 0.15                   # V9.2.0: a CS2 kill row appears about this long after the hit (frame check of the ILFTB takes: shots ~0.35 s and the hit ~0.1-0.15 s before the row)
+CS2_KILL_LEAD_S = 0.45                   # V9.2.0: footage shown before the hit itself, so the fight that leads to the first kill is seen (LEAD_MIN counted to the row = 0.15 s before the hit)
+
+
 def _lead_min(ev):
-    base = float((ev.get("_rx") or {}).get("lead_min", LEAD_MIN))
+    rx_ = (ev.get("_rx") or {}).get("lead_min")
+    base = float(LEAD_MIN if rx_ is None else rx_)
     if (ev.get("unsure") or [False])[0]:                   # V8.1.1 (CS2 only): the first kill's time may be late: show more footage before it
         return min(base + CS2_UNSURE_LEAD, max(base, float(ev.get("pre", base))))
+    if CS2_KILL_LEAD_ON[0] and rx_ is None and (ev.get("rec") or {}).get("game") == "cs2":
+        return min(max(base, CS2_ROW_DELAY_S + CS2_KILL_LEAD_S), max(base, float(ev.get("pre", base))))     # V9.2.0: never more than the clip has (a short clip keeps the old minimum)
     return base
 
 
@@ -11079,6 +11129,10 @@ def optimal_fit(clips, an, style, song_path=None, rank=0):
         elif inside:
             sc += 1.5
         sc += 0.5 * (E in sec_b) + 0.3 * (E == last_b) + 0.2 * float(np.mean(an["level"][S:E] if len(an.get("level", [])) >= E else [0]))
+        if ENDING_CALM_ON[0] and E != last_b:              # V9.2.0: a montage that stops before the song does stops at a calm moment, never on a peak
+            rk_ = song_end_rank(an, float(bt[E]) - ENDING_WIN_S, float(bt[E]))
+            if rk_ is not None:
+                sc -= ENDING_CALM_W * rk_ + (ENDING_PEAK_PENALTY if rk_ >= ENDING_PEAK_RANK else 0.0)
         if ic_ and any(float(bt[S]) - ic_ - 0.3 <= float(bt[int(d_["beat"])]) < float(bt[S]) - 0.2 for d_ in drops if 0 <= int(d_["beat"]) < len(bt)):
             sc -= 1.5                                      # V9.0: a drop of the song inside the intro's music (just before the first take) would be wasted on the blurred intro: such a section ranks lower
         allc.append((sc + (0.01 * L if full else 0.0), S, E, inside, L))
@@ -11348,6 +11402,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
                          f"{len(plain)} plain single kills left out (enough better material)")
         usable = [e for e in usable if any(e is c_ for c_ in fit["clips"])]
         notes.append(fit["why"])
+    ub_kills = sum(int(e["n"]) for e in usable)            # V9.2.0: the most kills any take structure of this section can place (plan_montage_tries stops early on it)
     head_cands = [e for e in usable if e["path"] not in heads] or usable
     k_top = sum(1 for e in head_cands if e["score"] == head_cands[0]["score"])
     if HEADLINE_RULES_V73 and head_cands[0]["n"] == 1 and k_top > 1 and all(e["n"] == 1 for e in head_cands[:k_top]):
@@ -11744,6 +11799,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
         LOGONLY(f"tail repair skipped: {type(ex_).__name__}: {ex_}")
     if OUTRO_TRIM_ON[0]:                                   # V7.6.0: the video ends 0.5 s after the fade to black starts, ~0.5 s after the final kill
         trim_outro(plan, plan["notes"])
+        calm_outro_music(plan, an, plan["notes"])
     assign_soft_cuts(plan, plan["notes"])                  # V7.6.1: soft dissolves where footage allows it, hard cuts elsewhere
     if effects_mode(cfg, game) == "extra":                 # V8.4: EXTRA EFFECTS: only adds look data to the takes (its own random stream); kills, cuts, timing and the default effects' draws stay as they are
         try:
@@ -11794,6 +11850,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             plan["notes"].append(f"relaxed rule: {Path(t_['path']).name} - " + ", ".join(
                 {"half": "first kill on a half-beat tick", "lead_min": f"run-up shortened to {t_['kills_out'][0]:.2f} s (only that much footage before the kill)"}[k_]
                 for k_ in t_["rx"] if k_ in ("half", "lead_min")))
+    plan["_ub_kills"] = ub_kills
     plan["fit"] = {"cands_n": (fit or {}).get("cands_n", 1), "usable": n_usable, "used": len(plan["takes"]), "unplaced": unplaced, "skipped": [[nm(e), why_no_take(e)] for e in skipped],
                    "left_out": [] if fitm else [nm(e) for e in cut_len + left],
                    "song_short": [nm(e) for e in (cut_len + left + left_song if fitm else left_song)],
@@ -11806,6 +11863,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
 
 
 SECTION_TRIES = 4                       # V7.6.1: candidate song sections evaluated per plan (Optimal length)
+SECTION_EARLY_STOP = [True]             # V9.2.0 switch: no other section is planned when the first one already places every offered kill with every drop anchored
 
 
 def _extend_first(takes, n, U, song_end):
@@ -11870,6 +11928,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         INTRO_CTX.pop("avoid", None)
         INTRO_CTX.pop("extend_first", None)
     plan.pop("_intro_retry", None)
+    plan.pop("_ub_kills", None)
     return plan
 
 
@@ -11946,7 +12005,11 @@ def plan_montage_tries(cfg, game, events, song, an, seed, style, target_s, hist_
     best = (plan, first_notes, 0)
     key = lambda pl: (sum(len(t["kills"]) for t in pl["takes"]), sum(1 for x in (pl.get("drop_sync") or []) if x.get("take")), 1 if pl.get("intro") else 0)
     tried = [(0, key(plan), plan["song"]["start_t"], plan["duration"])]
-    if cands_n > 1 and (plan.get("fit") or {}).get("optimal"):
+    fits_ = (SECTION_EARLY_STOP[0] and key(plan)[0] >= int(plan.get("_ub_kills") or 10 ** 9) and not _unanchored(plan)
+             and (plan.get("intro") or not INTRO_CTX.get("on")))
+    if fits_:                                              # V9.2.0: every kill the length rule offered is placed, every drop in it anchored, the intro made: another section can only tie
+        plan["notes"].append(f"song sections: #1 already fits (all {key(plan)[0]} kills placed, every drop anchored) - the other {min(SECTION_TRIES, cands_n) - 1} not planned")
+    if cands_n > 1 and (plan.get("fit") or {}).get("optimal") and not fits_:
         for rk in range(1, min(SECTION_TRIES, cands_n)):
             nl = list(n0)
             try:
@@ -12714,6 +12777,47 @@ def seen_rows_audit(t):
     return msgs
 
 
+SEEN_PRECHECK_ON = [True]          # V9.2.0 switch: events whose kill-row check fails on the footage EVERY take of them must show are left out before planning
+
+
+def seen_rows_doomed(ev):
+    """V9.2.0: the CUT LIST CHECK's uncounted-row rule (seen_rows_audit) on the footage that every possible take of the event plays: the shortest run-up of the first kill
+    (INTRO_LEAD_MIN), ~0.7 s before every later kill (a jump-cut over dead air resumes at least that early), 0.4 s after every kill but the last (a jump-cut starts no
+    sooner) and the last kill itself. A row that already fails there fails in every take, also with the take window extended, so the event cannot be placed: the planner
+    used to plan, fail, extend the take, plan, fail, drop it and plan again (2 of 3 plan rounds of a job). Returns the rule text, or None."""
+    if not ev.get("seen") or not SEEN_PRECHECK_ON[0]:
+        return None
+    ts_ = list(ev["times"])
+    iv = [(ts_[0] - INTRO_LEAD_MIN, ts_[0])]
+    iv += [(a + 0.0, a + ROW_TAIL) for a in ts_[:-1]] + [(b - 0.7, b) for b in ts_[1:]]
+    iv.sort()
+    merged = []
+    for a, b in iv:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    parts = ev.get("parts") or []
+
+    def src_of(a, b):
+        m = (a + b) / 2
+        for i, p_ in enumerate(parts):
+            if p_.get("start") is not None and p_.get("end") is not None and p_["start"] - 1e-6 <= m <= p_["end"] + 1e-6:
+                return i
+        return 0
+    if len(parts) > 1:                                     # a stitched event: a piece is played from the clip that covers it
+        cut_at = []
+        for a, b in merged:
+            pts_ = sorted({a, b} | {float(x) for p_ in parts for x in (p_.get("start"), p_.get("end")) if x is not None and a < float(x) < b})
+            cut_at += list(zip(pts_, pts_[1:]))
+        merged = [list(x) for x in cut_at]
+    segs = [[a, b, 1.0, max(1, int(round((b - a) * OUT_FPS))), src_of(a, b)] for a, b in merged if b - a > 1e-6]
+    fake = {"segs": segs, "seen": ev["seen"], "kills": ts_, "victims": list(ev.get("victims") or []),
+            "srcs": [{"path": p_.get("path")} for p_ in parts] if len(parts) > 1 else []}
+    msgs = [m_ for m_ in seen_rows_audit(fake) if m_.startswith("uncounted kill row")]
+    return msgs[0] if msgs else None
+
+
 def verify_cutlist(plan, log=True):
     """Final check before rendering: contiguous frames, segments add up, every take >= 2 beats and holds its kills (in order,
     inside its source windows), 1.0x from 1.0 s before the first kill through the last, tails 0.2-0.5 s (ending excepted),
@@ -12899,6 +13003,55 @@ INTRO_PUNCH = (0.06, 0.25)  # first take: zoom amount on the first beat, settlin
 OUTRO_AFTER = 0.0           # V7.6.0: the fade to black starts this long after the last kill impact (never before the last kill row is readable); V9.0: 1.5 s of slow-mo release first (was 0.5 s)
 OUTRO_ROW_READ = 0.4        # the last kill row is readable this long after it appears
 OUTRO_MUSIC_MIN = 2.5       # the music fade (last kill -> final frame) is at least this long (V9.0: a long music tail, was 0.6 s)
+
+
+ENDING_CALM_ON = [True]      # V9.2.0 switch: a montage that stops before the song ends stops at a calm moment (section choice), else gets a longer music fade
+ENDING_CALM_W = 1.5          # section score lost per unit of the end's loudness rank (0 = the calmest part of the song .. 1 = the loudest)
+ENDING_PEAK_RANK = 0.7       # an end this loud (rank among the song's beats) is a peak: such a section loses ENDING_PEAK_PENALTY more, a plan that still ends there gets the long fade
+ENDING_PEAK_PENALTY = 1.0
+ENDING_WIN_S = 3.0           # the end's loudness = the song's energy over the last this many seconds (where the music fades)
+OUTRO_MUSIC_LONG = 5.0       # V9.2.0: the music fade when the montage still ends on a loud part of the song (instead of OUTRO_MUSIC_MIN .. END_FADE)
+
+
+def song_end_rank(an_or_none, t0, t1):
+    """V9.2.0: how loud the song is between song times t0 .. t1, as a rank among all its beats (0 = calmest, 1 = loudest), from the song map's per-beat energy; None without one."""
+    import bisect
+    an = an_or_none or {}
+    bt, en = list(an.get("beats") or []), list(an.get("energy") or [])
+    n = min(len(bt), len(en))
+    if n < 8:
+        return None
+    bt = [float(x) for x in bt[:n]]
+    i0 = bisect.bisect_left(bt, t0)
+    i1 = max(i0 + 1, bisect.bisect_right(bt, t1))
+    win = [float(x) for x in en[i0:min(i1, n)]]
+    if not win:
+        return None
+    m = sum(win) / len(win)
+    srt = sorted(float(x) for x in en[:n])
+    return bisect.bisect_left(srt, m) / max(1, len(srt) - 1)
+
+
+def calm_outro_music(plan, an, notes=None):
+    """V9.2.0: the montage ends before the song does and the song is loud right there (a peak): the music fades over OUTRO_MUSIC_LONG s instead (it would sound like a cut)."""
+    if not ENDING_CALM_ON[0] or not plan.get("outro"):
+        return False
+    D = float(plan["duration"])
+    st = float(plan["song"].get("start_t", 0.0))
+    if st + D >= song_live_range(an)[1] - 1.0:
+        return False                                       # the song itself ends here
+    fo = float(plan["song"]["fade_out_start"])
+    rk = song_end_rank(an, st + D - ENDING_WIN_S, st + D)
+    if rk is None or rk < ENDING_PEAK_RANK or D - fo >= OUTRO_MUSIC_LONG - 0.01:
+        return False
+    plan["song"]["fade_out_start"] = round(max(0.0, D - OUTRO_MUSIC_LONG), 4)
+    plan["outro"]["music_long"] = True
+    ln = (f"outro: the montage ends on a loud part of the song (loudness rank {rk:.2f}), so the music fades over {D - plan['song']['fade_out_start']:.1f} s "
+          f"(from {plan['song']['fade_out_start']:.2f} s) instead of {D - fo:.1f} s")
+    if notes is not None:
+        notes.append(ln)
+    LOGONLY(ln)
+    return True
 
 
 def trim_outro(plan, notes=None):
@@ -13153,6 +13306,11 @@ def _drop_index(plan, gp):
 
 
 def assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None, sky_on=True):
+    with jstage("effects"):
+        return _assign_extra_fx(plan, game, seed, notes, energy, flicks, sky_on)
+
+
+def _assign_extra_fx(plan, game, seed, notes=None, energy=None, flicks=None, sky_on=True):
     """V8.4.2 EXTRA EFFECTS: builds the EFFECT PLAN of this montage and writes t['xfx'] (effect dicts on the take's own timeline). Nothing here changes segments, kill times, cut timing or
     the default zoom pulses (its own random stream). The plan: (1) the song's feel (style, energy, BPM) fixes the colour and the profile (FEEL_PROFILES: which kill effects weigh how much,
     how many kills are dressed, which cut effects, how many sky recolours); (2) a seed and the song pick this montage's SIGNATURE (2-3 of glow / flash / split / punch, so two montages
@@ -13743,6 +13901,8 @@ def sky_family_for(plan, ranked, qual=None):
     pk_ = plan.get("pick_sky") or INTRO_CTX.get("sky_pick")
     if pk_ in SKY_FAMILIES:                                # V9.0.2: a Manual Sky colour pick replaces only this choice (DEFAULT = no pick: the automatic choice below, unchanged)
         return pk_, "picked in Manual"
+    if SKY_VARIETY_ON[0]:
+        return sky_variety_pick(plan, ranked)
     song_p = (plan.get("song") or {}).get("path")
     fam, why = None, ""
     try:
@@ -13774,6 +13934,22 @@ def sky_family_for(plan, ranked, qual=None):
             why = f"{why}; {fam} would wash out / turn muddy in {bad} of {len(qual)} sky shots -> {alt}"
             fam = alt
     return fam, why
+
+
+SKY_VARIETY_ON = [True]              # V9.2.0 switch: the automatic family is a seeded pick per montage among SKY_VARIETY (the cover / vibe rule above made ~90 % of montages orange)
+SKY_VARIETY = ("blue", "teal", "orange")         # deep blue, teal, hazy orange
+SKY_VARIETY_BIAS = 0.5               # the family the song's feel ranks first among these three gets this much more weight (each has 1.0): a lean, never a certainty (at most 40 %)
+
+
+def sky_variety_pick(plan, ranked):
+    """V9.2.0: the montage's sky family when nothing is picked in Manual: deep blue, teal or hazy orange, drawn from the montage's own seed (another montage of the same song can get another
+    colour); the song's feel (sky_ranked order) leans the draw toward its first family of the three. Returns (family, why)."""
+    fams_ = [SKY_NAME_FAMILY.get(n_) for n_ in (ranked or [])]
+    lean = next((f_ for f_ in fams_ if f_ in SKY_VARIETY), None)
+    w = [1.0 + (SKY_VARIETY_BIAS if f_ == lean else 0.0) for f_ in SKY_VARIETY]
+    rng = random.Random(int(plan.get("seed") or 1) * 7919 + 17)
+    fam = rng.choices(SKY_VARIETY, weights=w)[0]
+    return fam, f"seeded pick of deep blue / teal / hazy orange" + (f" (the song's feel leans {lean})" if lean else "")
 
 
 def sky_role_ok(t):
@@ -15173,8 +15349,16 @@ def xfx_probe_sky(plan, tmpdir=None):
             else:
                 src = next((s_ for s_ in reversed(srcs) if 0 <= float(t["kills"][-1]) - s_["shift"] <= (s_.get("dur") or 1e9)), srcs[0])
                 tsrc = float(t["kills"][-1]) - src["shift"]
-            img = sky_grab_frames(src["path"], tsrc, tsrc + 0.04, src["rect"], src["wh"], fps=60)[0]
-            mk_, info = sky_eyedrop(img)                                 # V8.6.1: the sky by its own colour (eyedropper), the share of the whole picture
+            ck_ = sky_cache_key(src["path"], tsrc, src.get("rect"), src.get("wh"))
+            hit_ = SKY_CACHE_MEMO.get("probe", {}).get(ck_) if ck_ else None
+            if hit_ is not None:                                         # V9.2.0: the same clip frame was looked at before (this or an earlier job)
+                info = dict(hit_)
+            else:
+                img = sky_grab_frames(src["path"], tsrc, tsrc + 0.04, src["rect"], src["wh"], fps=60)[0]
+                mk_, info = sky_eyedrop(img)                             # V8.6.1: the sky by its own colour (eyedropper), the share of the whole picture
+                if ck_:
+                    sky_cache_put("probe", ck_, {k_: (float(v_) if isinstance(v_, (int, float)) and not isinstance(v_, bool) else v_)
+                                                 for k_, v_ in info.items() if isinstance(v_, (bool, int, float, str)) or v_ is None})
             cov = float(info["cov"]) if info["ok"] else 0.0
             x["model"] = None
         except Exception as ex:                       # noqa: BLE001
@@ -15183,6 +15367,7 @@ def xfx_probe_sky(plan, tmpdir=None):
         x["ok"] = False
         return {"ti": ti, "x": x, "cov": cov, "why": why, "info": info}
     from concurrent.futures import ThreadPoolExecutor
+    sky_cache_load()
     with ThreadPoolExecutor(max_workers=min(8, SKY_THREADS)) as pool_:        # V8.8.2: the candidate frames are read and looked at several at a time (same results, in the same order)
         cands = list(pool_.map(probe_one, jobs_))
     ranked = (plan.get("xfx_sky_rank") or {}).get("names") or list(SKY_PALETTE)
@@ -15206,9 +15391,21 @@ def xfx_probe_sky(plan, tmpdir=None):
                 seen_d.add(d_)
                 firsts.append(c)
         order = firsts + [c for c in order if c not in firsts]
+    def mask_key(c):
+        t_ = plan["takes"][c["ti"]]
+        try:
+            fk_ = "|".join(file_key(s_["path"]) for s_ in (t_.get("srcs") or [{"path": t_["path"]}]))
+        except OSError:
+            return None
+        return hashlib.md5(json.dumps([fk_, t_.get("segs"), t_.get("rect"), t_.get("wh"), t_.get("nf"), c["x"].get("p"), zone], default=str).encode()).hexdigest()
+
     def mask_one(c, x):
         """one candidate's mask (x is the candidate's dict or a copy of it): (mask path, animation, mask stats)."""
         ti = c["ti"]
+        mk_ = mask_key(c)
+        bad_ = SKY_CACHE_MEMO.get("bad", {}).get(mk_) if mk_ else None
+        if bad_:                                           # V9.2.0: this take's footage gave a wall-not-sky mask before: not built again
+            raise RuntimeError(bad_ + " (known from an earlier render)")
         if tmpdir is None:
             raise RuntimeError("no temp folder for the mask")
         Path(tmpdir).mkdir(parents=True, exist_ok=True)
@@ -15217,6 +15414,8 @@ def xfx_probe_sky(plan, tmpdir=None):
                               game=plan.get("game"))      # V8.7: the sky follows the song's hardness; V8.8: locked to the beat
         x.update({"anim": an_, "push": an_["push"], "seed": int(plan.get("seed", 1)) * 131 + ti, "beats": sky_take_beats(plan, plan["takes"][ti], x), "fam": fam, "pattern": pat})
         st = sky_take_mask(plan["takes"][ti], x, zone, mp, ramp=True, plan=plan)                  # (again: with the animation planes; V8.8.3: bands + the gradient plane)
+        if mk_ and st["bad"] > SKY_MAX_BAD * max(1, st["window"]):
+            sky_cache_put("bad", mk_, f"the sky mask was a wall in {st['bad']} of {st['window']} frames of the take - no sky for this take")
         return mp, an_, st
 
     def mask_copy(c):
@@ -15284,6 +15483,34 @@ def xfx_probe_sky(plan, tmpdir=None):
         out(f"SKY recolour take {c['ti'] + 1}: {msg}")
     out(f"SKY recolour: {len(kept)} chosen of {len(cands)} candidate kills ({len(qual)} with a clear sky; at most {mx} for {plan.get('duration', 0):.0f} s, at least {space:.0f} s apart, best role first)" if cands
         else "SKY recolour: no candidate kill")
+
+
+SKY_CACHE = DATA / "sky_probe_cache.json"         # V9.2.0: per clip frame: the sky probe (coverage, kind); per take footage: a mask that came out a wall (never built again)
+SKY_CACHE_MEMO = {}
+_SKY_CACHE_LOCK = threading.Lock()
+
+
+def sky_cache_key(path, t, rect=None, wh=None):
+    try:
+        return f"{file_key(path)}|{float(t):.3f}|{list(rect or [])}|{list(wh or [])}|{SKY_W}x{SKY_H}"
+    except OSError:
+        return None
+
+
+def sky_cache_load():
+    with _SKY_CACHE_LOCK:
+        if not SKY_CACHE_MEMO:
+            d_ = load_json(SKY_CACHE, {})
+            SKY_CACHE_MEMO.update({"probe": dict(d_.get("probe") or {}), "bad": dict(d_.get("bad") or {})})
+
+
+def sky_cache_put(kind, key, val):
+    with _SKY_CACHE_LOCK:
+        SKY_CACHE_MEMO.setdefault(kind, {})[key] = val
+        try:
+            save_json(SKY_CACHE, SKY_CACHE_MEMO)
+        except Exception as ex:                            # noqa: BLE001
+            LOGONLY(f"sky cache not saved: {ex}")
 
 
 SKY_MASK_PAR = [True]                # V8.8.8 switch: the sky masks of a render made several at a time (same masks, same choice)
@@ -16514,7 +16741,8 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
                 t_["xfx"] = [x_ for x_ in t_["xfx"] if x_.get("k") != "sky"]
     if p.get("effects") == "extra" and sky_ok:
         try:
-            xfx_probe_sky(p, itmp)                             # V8.4.1: the sky recolour only where the real frame has sky (V8.4.4: its masks are made here, in the render's temp folder)
+            with jstage("sky analysis"):
+                xfx_probe_sky(p, itmp)                             # V8.4.1: the sky recolour only where the real frame has sky (V8.4.4: its masks are made here, in the render's temp folder)
         except Exception as ex_:                               # noqa: BLE001
             out(f"sky check skipped: {type(ex_).__name__}: {ex_}")
     bad = verify_cutlist(p)
@@ -16526,7 +16754,8 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         raise RuntimeError("cut list problem, not rendering: " + "; ".join(bad))
     if p.get("intro"):                                     # V9.0: the intro's text (a video with alpha) first, then the plan as the render sees it (the intro take in front)
         try:
-            intro_assets(p, itmp)
+            with jstage("intro"):
+                intro_assets(p, itmp)
         except Exception as ex_:                           # noqa: BLE001
             if CANCEL.is_set():
                 shutil.rmtree(itmp, ignore_errors=True)
@@ -16548,7 +16777,8 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         out(f"interpolation skipped: {type(ex).__name__}: {ex}")
         pr_ = p
     try:
-        return _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, fx, D)
+        with jstage("render"):
+            return _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, fx, D)
     finally:
         if isinstance(plan.get("intro"), dict):
             plan["intro"].pop("_text", None)               # the temporary text video is gone with the temp folder: never saved in the plan
@@ -16584,6 +16814,8 @@ def failing_take_text(plan, graph, out_t):
         return f"(could not name the failing take: {type(ex).__name__}: {ex})"
 
 
+
+LIGHT_TASKS = ("clips",)             # V9.2.0: tasks that only read the caches and refill a list: they run beside a job instead of waiting for it
 
 FAST_RENDER = [True]                 # V8.8.8 switch: every take's own chains run in parallel ffmpeg processes into lossless files, then one light final pass (the same filters, the same frames)
 RENDER_JOBS = max(2, min(8, (os.cpu_count() or 4) // 4))      # parts rendered at the same time (measured on 16 threads: 4 = 207 s, 5 = 212 s, 6 = 223 s, 8 = 226 s for a 146 s CS2 montage)
@@ -18242,6 +18474,7 @@ def make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, se
         FULL_CTX.pop("fill_over", None)
         FULL_CTX.pop("sky_pick", None)
         FULL_CTX.pop("last_est", None)
+        FULL_CTX.pop("_fill_round", None)
 
 
 def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, seed=None, lock=None, placement=None, scan=True, pin=None, full=False):
@@ -18251,7 +18484,8 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
     cfg = autodetect_dirs(cfg)
     if not load_dets(game).get(game):
         raise RuntimeError("OCR detector unavailable: Troubleshoot > Selfcheck (pip install rapidocr-onnxruntime)")
-    tagged = [r for r in scan_clips(cfg) if r.get("game") == game]
+    with jstage("scan"):
+        tagged = [r for r in scan_clips(cfg) if r.get("game") == game]
     if not tagged:
         raise RuntimeError(f"No {game} clips found in {[d for d, _ in clip_dirs(cfg, game)]} "
                            f"(or clips are over {cfg['max_mb']} MB / {cfg['max_dur_s']} s). Check Settings > clip folders.")
@@ -18260,14 +18494,17 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
         paths = auto_scan_set(cfg, game)
         out(f"auto: {len(paths)} uncached clips to scan this run (last {cfg['auto_recent_days']} days + up to {cfg['auto_old_per_run']} older)")
     if paths and scan:
-        run_scan(cfg, [game], paths)
+        with jstage("scan"):
+            run_scan(cfg, [game], paths)
     pair = None
     pool_paths = set(paths) if manual else None
     if (game == "cs2" or MANUAL_PAIR_ALL[0]) and manual and paths:      # V6.9: neighbour clips of the ticked clips join the candidate pool (V8.8.6: every game, not only CS2)
-        pair = pairing_run(cfg, tagged, paths, quiet=not scan, game=game)
+        with jstage("pairing"):
+            pair = pairing_run(cfg, tagged, paths, quiet=not scan, game=game)
         if pair and pair["partners"]:
             pool_paths |= {p_["path"] for p_, _, _ in pair["partners"]}
-    pool, st = game_pool(cfg, game, pool_paths)
+    with jstage("scan"):
+        pool, st = game_pool(cfg, game, pool_paths)
     au = st["audio"]
     out(f"{game}: {st['tagged']} clips in included folders, {st['scanned']} scanned, {st['with_kills']} with detected kills; "
         f"{au['raw']} kills found, {au['no_shot']} without a heard gunshot (kept, audio is only a bonus), {au['death_lock']} dropped after my death, {au['kept']} usable")
@@ -18278,13 +18515,16 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
     seed = int(seed) if seed else random.randrange(1, 10 ** 6)
     if pair and pair["partners"]:                          # V6.9: the ticked clips are planned exactly as before; a partner only joins one of
         sel_ = {_pkey(p_) for p_ in paths}                 # their events when the planner's own merge + stitch accepts it (never its own take)
-        events, notes = build_events([it for it in pool if _pkey(it["rec"]["path"]) in sel_], game, cfg, random.Random(seed))
+        with jstage("selection"):
+            events, notes = build_events([it for it in pool if _pkey(it["rec"]["path"]) in sel_], game, cfg, random.Random(seed))
         try:
-            events = pairing_replace_events(pair, pool, events, game, cfg, seed)
+            with jstage("pairing"):
+                events = pairing_replace_events(pair, pool, events, game, cfg, seed)
         except Exception as ex:
             out(f"pairing skipped: {type(ex).__name__}: {ex}")
     else:
-        events, notes = build_events(pool, game, cfg, random.Random(seed))
+        with jstage("selection"):
+            events, notes = build_events(pool, game, cfg, random.Random(seed))
     if not events:
         raise RuntimeError("no usable kill events (utility kills are excluded)")
     all_events = list(events)
@@ -18302,7 +18542,8 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
     if effects_mode(cfg, game) == "extra" and sky_enabled(cfg, game):
         FULL_CTX["sky_pick"] = cfg                         # V8.8.6: the pick prefers clear-sky multikills within their group (_sky_first)
     if not manual:                                         # V6.0: weekly / Auto picks only unused clips, this week's first
-        events, wk_notes = weekly_pick(events, cfg, cfg.get("length_s", "optimal") if target is None else target,
+        with jstage("selection"):
+            events, wk_notes = weekly_pick(events, cfg, cfg.get("length_s", "optimal") if target is None else target,
                                        cfg.get("style", "auto") if style is None else style, game=game, need_s=need_full)
         notes += wk_notes
         for n_ in wk_notes:
@@ -18312,10 +18553,12 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
     def companions(evs, pair_):
         if not manual and game in ("cs2", "valorant", "r6s"):     # V6.9 (CS2) / V6.9.8 (both) / V8.0.2 (R6S): companion clips of the picked clips (same slot, same count)
             sel_ = set().union(*[pair_event_clips(e) for e in evs]) if evs else set()
-            pair_ = pairing_run(cfg, tagged, sel_, quiet=not scan, game=game, allow_used=True)
+            with jstage("pairing"):
+                pair_ = pairing_run(cfg, tagged, sel_, quiet=not scan, game=game, allow_used=True)
             if pair_ and pair_["partners"]:
                 try:
-                    evs = pairing_replace_events(pair_, pool, evs, game, cfg, seed)
+                    with jstage("pairing"):
+                        evs = pairing_replace_events(pair_, pool, evs, game, cfg, seed)
                 except Exception as ex:
                     out(f"pairing skipped: {type(ex).__name__}: {ex}")
         return evs, pair_
@@ -18325,7 +18568,8 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
     if pre_song:
         song, an, sinfo, runners = pre_song
     else:
-        song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path or pin_song)
+        with jstage("song map"):
+            song, an, sinfo, runners = pick_song(cfg, game, songs, forced=song_path or pin_song)
         if not manual and not song_path and not pin_song:
             song, an, sinfo, runners = weekly_song_fit(song, an, sinfo, runners)
     placement = placement or cfg.get("placement", "v5")
@@ -18337,10 +18581,18 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
         style = cfg.get("style", "auto")
     def plan_loop(events):
         pool_ev, fixes, extended, rule_skips = list(events), [], set(), {}
+        for e_ in list(pool_ev):                               # V9.2.0: an event no take can carry past the kill-row check is left out before the first plan (same final plan, 2 plan rounds less)
+            why_ = seen_rows_doomed(e_)
+            if why_:
+                rule_skips.setdefault(e_["path"], why_)
+                fixes.append(f"cut list repair: dropped {Path(e_['path']).name} ({why_}) before planning: the kill-row check fails on the footage every take of it shows")
+                LOGONLY(fixes[-1])
+        pool_ev = [e_ for e_ in pool_ev if e_["path"] not in rule_skips]
         for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
             n2 = list(notes)
-            plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
-                                placement=placement, manual=manual)
+            with jstage("planning" if _try == 0 and not FULL_CTX.get("_fill_round") else "repair loop"):
+                plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
+                                    placement=placement, manual=manual)
             bad = [b_ for b_ in verify_cutlist(plan) if re.match(r"take \d+:", b_) and ("kill row" in b_ or _TAKE_SKIP_OK(b_))]   # V6.9.9: any per-take problem drops / re-plans only that take
             idx = {int(m.group(1)) for b_ in bad for m in [re.match(r"take (\d+):", b_)] if m}
             why_b = {plan["takes"][i - 1]["path"]: b_.split(":", 1)[1].strip() for b_ in bad for m in [re.match(r"take (\d+):", b_)]
@@ -18403,6 +18655,7 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
             out(notes[-1])
             events = list(picked) if manual else companions(list(picked), pair)[0]
             try:
+                FULL_CTX["_fill_round"] = True
                 plan, pool_ev, fixes = plan_loop(events)
             except RuntimeError as ex:
                 notes.append(f"song fill: re-plan failed ({ex})")
@@ -18584,6 +18837,23 @@ def video_ready(path):
             LOGONLY(f"video-ready callback failed: {ex}")
 
 
+LAST_JOB_PLAN = {}                   # V9.2.0: the plan the last job made or reused (a copy before the render touched it): the Manual tab keeps it for a Render / Preview of the same inputs
+WEEKLY_PLANS = {}                    # V9.2.0: game -> the last weekly (Auto tab) plan + the state it was made from (weekly_plan_key)
+
+
+def weekly_plan_key(game, full):
+    """V9.2.0: what a weekly plan depends on besides chance: the game, full mode, the settings, the used history and the scan caches (their files' times). Equal key = the same clips and history:
+    a Dry plan / Preview made a moment ago is rendered as it is instead of being planned again (a render marks clips used, so the next one plans fresh)."""
+    st_ = []
+    for p_ in ("used_clips.json", "used_flags.json", "used_titles.json", "used_songs.json", "clips_cache3.json", "kills_cache3.json", "kills_v5", "clip_rows_v1.json"):
+        try:
+            s_ = os.stat(DATA / p_)
+            st_.append((p_, s_.st_mtime_ns, s_.st_size))
+        except OSError:
+            st_.append((p_, None))
+    return (game, bool(full), cfg_sig(), tuple(st_))
+
+
 def run_job(game, mode="render", force=False, paths=None, song_path=None, target=None, style=None,
             seed=None, maxq=None, weekly=False, lock=None, encoder=None, outfile=None, placement=None, effects=True, pin=None, full=False, intro=None, intro_text=None):
     """mode: dry | preview | render. weekly=True is Auto. Always prints a plan or a plain-language reason.
@@ -18600,8 +18870,9 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
                 return None
         out(f"== {game} / {mode} ==")
         T0_JOB = time.time()
+        JOB_STAGES.clear()
         if pin and pin.get("plan") is not None and pin.get("ok") and paths is not None:
-            plan, text = pin["plan"], pin["text"]          # V7.6.1: the summary was made from this very plan (same clips, song, style, length, seed, settings, everything scanned): it is rendered as it is
+            plan, text = copy.deepcopy(pin["plan"]), pin["text"]          # V7.6.1: the summary was made from this very plan (same clips, song, style, length, seed, settings, everything scanned): it is rendered as it is
             LAST_PLAN[game] = plan
             out(f"plan: the one the summary showed at {pin.get('at', '?')} - rendered as shown, not planned again")
             try:
@@ -18611,8 +18882,16 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
                     ledger_save(pin["ledger"], plan)
             except Exception as ex:                        # noqa: BLE001
                 LOGONLY(f"kill ledger skipped: {type(ex).__name__}: {ex}")
+        elif weekly and paths is None and (wk_ := WEEKLY_PLANS.get(game)) and wk_["key"] == weekly_plan_key(game, full):
+            plan, text = copy.deepcopy(wk_["plan"]), wk_["text"]       # V9.2.0: the weekly plan made a moment ago (Dry plan / Preview) for exactly this state: rendered as it is, not planned again
+            LAST_PLAN[game] = plan
+            out(f"plan: the one made at {wk_['at']} ({wk_['mode']}) - nothing changed since, not planned again")
         else:
             plan, text = make_plan(cfg, game, paths, song_path, target, style, seed, lock, placement, pin=pin, full=full, intro=intro, intro_text=intro_text)
+            if weekly and paths is None:
+                WEEKLY_PLANS[game] = {"key": weekly_plan_key(game, full), "plan": copy.deepcopy(plan), "text": text, "at": time.strftime("%H:%M:%S"), "mode": mode}
+        LAST_JOB_PLAN.clear()
+        LAST_JOB_PLAN.update({"game": game, "plan": copy.deepcopy(plan), "text": text, "ledger": LAST_LEDGER[0], "at": time.strftime("%H:%M:%S")})
         out(text)
         if paths is not None:                              # V7.6.1: the summary of THIS plan, printed from the plan that is rendered, and compared with the one shown before
             now_sum = plan_summary_text(plan, len(paths))
@@ -18629,11 +18908,13 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             (plans / (base + ".dry.txt")).write_text(text, encoding="utf-8")
             save_json(plans / (base + ".dry.json"), plan)
             out(f"(dry plan only - nothing rendered; seed {plan['seed']}; saved to {plans})")
+            out(job_stages_line())
             return plan
         odir = Path(cfg["output_root"]) / GAME_DIR[game]
         if mode == "preview":
             pv = render_plan(plan, odir / f"preview_{GAME_DIR[game]}.mp4", cfg, maxq, True, encoder)
             quality_check(slice_plan(plan), pv, cfg, preview=True)
+            out(job_stages_line())
             return pv
         odir.mkdir(parents=True, exist_ok=True)
         outfile = Path(outfile) if outfile else odir / (montage_name(odir, plan, now) + ".mp4")
@@ -18662,6 +18943,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             out(f"rendered {outfile}")
             T_JOB["checks"] = time.time() - t_c0
             out("TIMING: " + " | ".join(f"{k} {v:.1f} s" for k, v in T_JOB.items()))
+            out(job_stages_line())
             return outfile
         out("video ready - running the quality / sync / transition checks")
         try:
@@ -18675,6 +18957,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
                 out(f"sync report skipped: {ex}")
         T_JOB["checks"] = time.time() - t_c0
         out("TIMING: " + " | ".join(f"{k} {v:.1f} s" for k, v in T_JOB.items()))
+        out(job_stages_line())
         try:                                               # the checks add their numbers to the plan (ssim ...): saved again
             save_json(logs / (outfile.stem + ".plan.json"), plan)
         except Exception as ex:
@@ -19411,6 +19694,7 @@ def auto_fill_topup(cfg, game, picked, song_path, an, style, seed, info, note=No
     target = min(FULL_CAP_S, lv1 - max(lv0, float(an["beats"][0])) - 0.1) - manual_intro_cut()
     rest = list(info.get("rest") or [])
     allp, added, rounds, dur = list(picked), 0, 0, 0.0
+    plan, _t = None, ""
     for rounds in range(AUTO_TOPUP_ROUNDS + 1):
         QUIET.on = True
         try:
@@ -19419,6 +19703,7 @@ def auto_fill_topup(cfg, game, picked, song_path, an, style, seed, info, note=No
         except Exception as ex:                            # noqa: BLE001
             if note:
                 note(f"Auto: the check plan failed ({type(ex).__name__}: {ex}); the first pick is kept")
+            plan = None
             break
         finally:
             QUIET.on = False
@@ -19439,7 +19724,10 @@ def auto_fill_topup(cfg, game, picked, song_path, an, style, seed, info, note=No
         added += len(new_)
         if note:
             note(f"Auto: the montage would end {short:.0f} s before the song ends ({dur:.0f} of {target:.0f} s): {len(new_)} more clip(s) ticked")
-    return allp, {"length": dur, "target": target, "added": added, "rounds": rounds}
+    last_ = None
+    if plan is not None:                                   # V9.2.0: the loop only ends right after a plan of the final pick (or on a failed plan): that plan is kept for the Render
+        last_ = {"plan": copy.deepcopy(plan), "text": _t, "ledger": LAST_LEDGER[0], "at": time.strftime("%H:%M:%S"), "game": game}
+    return allp, {"length": dur, "target": target, "added": added, "rounds": rounds, "job": last_}
 
 
 # V5.57: accent colour (main, dark = selection / pressed, darkest, OpenCV hue 0-179) x base (grey | black)
@@ -20488,7 +20776,10 @@ class App:
         return sn
 
     def run_task(self, name, fn, *a):
-        if self.busy or getattr(self, "est_running", False):    # never next to the status-line estimate (shared caches)
+        if name in LIGHT_TASKS and self.busy and not self.scan_active:      # V9.2.0: the clip list (game switch, Reload list) never waits for a running plan / render
+            self.run_light(name, fn, *a)
+            return
+        if self.busy:
             self.pending.append((name, fn, a))
             out(f"Queued: {name}")
             return
@@ -20509,6 +20800,29 @@ class App:
             finally:
                 job_exit()
                 self.q.put(("done", None))
+        threading.Thread(target=target, daemon=True).start()
+
+    def run_light(self, name, fn, *a):
+        """V9.2.0: a list refresh next to a running job: its own thread, buttons stay as they are; a second request while one runs runs once more after it (latest data)."""
+        lt = self.__dict__.setdefault("_light", {})
+        if lt.get(name):
+            lt[name] = "again"
+            return
+        lt[name] = "run"
+        self.snap_vars()
+
+        def target():
+            try:
+                fn(*a)
+            except Exception as ex:
+                out(f"ERROR in {name}: {ex}\n{traceback.format_exc()}")
+            finally:
+                def fin():
+                    again = lt.get(name) == "again"
+                    lt[name] = None
+                    if again:
+                        self.run_task(name, fn, *a)
+                self.q.put(("call", fin))
         threading.Thread(target=target, daemon=True).start()
 
     def flush_log(self):
@@ -20567,6 +20881,7 @@ class App:
                         self.flash_button(*bb_)
                     self.flush_fills()
                     self.refresh_auto()
+                    self.run_idle_ops()                    # V9.2.0: moves / Recycle Bin asked for while the job ran
                     if self.pending:
                         n, fn, a = self.pending.pop(0)
                         self.run_task(n, fn, *a)
@@ -20658,11 +20973,13 @@ class App:
     def open_vfolder(self):
         self.open_path(self.last_video.parent if self.last_video else Path(load_config()["output_root"]))
 
-    def job_video(self, game, **kw):
+    def job_video(self, game, keep_sig=None, **kw):
         def go():
-            if kw.get("mode", "render") == "render":
-                out("Render: plan first (same as Dry plan, printed below), then render")
+            LAST_JOB_PLAN.clear()
             res = run_job(game, **kw)
+            if keep_sig is not None and LAST_JOB_PLAN.get("game") == game:      # V9.2.0: a Manual Preview's plan is kept for the Render of the same inputs
+                job_ = dict(LAST_JOB_PLAN)
+                self.q.put(("call", lambda: self.keep_plan(keep_sig, job_)))
             if isinstance(res, Path) and kw.get("mode", "render") == "render":      # V5.55: a rendered montage marks its clips used
                 try:
                     pj = load_json(res.parent / "logs" / (res.stem + ".plan.json"), {})
@@ -20805,10 +21122,22 @@ class App:
         cbi = ttk.Checkbutton(bb, text="Intro", variable=self.m_intro_on, command=lambda: intro_changed())
         cbi.pack(side="left", padx=(2, 8))
         self.named["Intro tickbox"] = cbi
-        for text, mode in (("Preview (720p, 20 s)", "preview"), ("Render", "render")):
-            self.btn(bb, text, lambda m=mode: self.manual(m), big=True, primary=(mode == "render"),
-                     name=f"manual:{mode}").pack(side="left", expand=True, fill="x", padx=6)
-        self.btn(bb, "Dry plan", lambda: self.manual("dry"), name="manual:dry").pack(side="right", padx=6)      # a small secondary action (it was a big button)
+        self.m_pick = {}                                       # V9.2.0: Sky colour / Font (V9.0.2) sit where the big Preview and the Dry plan button were
+        for kind, lbl, name in (("sky", "Sky colour", "Sky colour"), ("font", "Font", "Font")):
+            ttk.Label(bb, text=lbl).pack(side="left", padx=(6, 2))
+            ch_ = manual_pick_choices(kind)
+            v_ = tk.StringVar(value=MANUAL_PICK.get(kind) if MANUAL_PICK.get(kind) in ch_ else PICK_DEFAULT)
+            cb_ = ttk.Combobox(bb, textvariable=v_, values=ch_, width=14, state="readonly")
+            cb_.pack(side="left", padx=(0, 4))
+            self.named[name] = cb_
+            self.m_pick[kind] = v_
+
+            def pick_changed(*_, k_=kind, v2_=v_):
+                MANUAL_PICK[k_] = v2_.get() or PICK_DEFAULT
+                if hasattr(self, "m_status"):
+                    self.update_status()
+            v_.trace_add("write", pick_changed)
+        self.btn(bb, "Render", lambda: self.manual("render"), big=True, primary=True, name="manual:render").pack(side="left", expand=True, fill="x", padx=6)
 
         def intro_changed(*_):
             INTRO_MANUAL["on"] = bool(self.m_intro_on.get())
@@ -20819,6 +21148,8 @@ class App:
         self.m_intro_on.trace_add("write", intro_changed)
         c3 = ttk.Frame(s3)
         c3.pack(fill="x", pady=2)
+        sd_ = ttk.Frame(c3)                                    # V9.2.0: Seed / Last seed / Preview packed first (right side): a narrow window cuts the Quality choice, never these buttons
+        sd_.pack(side="right")
         ttk.Label(c3, text="Length").pack(side="left")
         L = self.cfg.get("length_s", "optimal")
         self.m_opt = tk.BooleanVar(value=not isinstance(L, (int, float)))
@@ -20840,29 +21171,13 @@ class App:
         self.m_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
         ttk.Radiobutton(c3, text="Fast (NVENC)", variable=self.m_q, value="nvenc").pack(side="left")
         ttk.Radiobutton(c3, text="Max (x264 CRF15)", variable=self.m_q, value="max").pack(side="left", padx=4)
-        ttk.Label(c3, text="Seed").pack(side="left", padx=(12, 2))
+        ttk.Label(sd_, text="Seed").pack(side="left", padx=(12, 2))
         self.m_seed = tk.StringVar()
-        ttk.Entry(c3, textvariable=self.m_seed, width=8).pack(side="left")
-        self.btn(c3, "Last seed", self.fill_last_seed, name="manual:last_seed").pack(side="left", padx=(4, 0))         # V9.0: the seed of the most recently rendered montage
+        ttk.Entry(sd_, textvariable=self.m_seed, width=8).pack(side="left")
+        self.btn(sd_, "Last seed", self.fill_last_seed, name="manual:last_seed").pack(side="left", padx=(4, 0))         # V9.0: the seed of the most recently rendered montage
+        self.btn(sd_, "Preview", lambda: self.manual("preview"), name="manual:preview").pack(side="left", padx=(6, 0))     # V9.2.0: the 720p / 20 s preview, a small button
         for v_ in (self.m_seed, self.m_style):
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
-        c4 = ttk.Frame(s3)                                     # V9.0.2: Sky colour / Font for this Manual montage (DEFAULT = the automatic choice)
-        c4.pack(fill="x", pady=2)
-        self.m_pick = {}
-        for kind, lbl, name in (("sky", "Sky colour", "Sky colour"), ("font", "Font", "Font")):
-            ttk.Label(c4, text=lbl).pack(side="left", padx=(0 if kind == "sky" else 12, 2))
-            ch_ = manual_pick_choices(kind)
-            v_ = tk.StringVar(value=MANUAL_PICK.get(kind) if MANUAL_PICK.get(kind) in ch_ else PICK_DEFAULT)
-            cb_ = ttk.Combobox(c4, textvariable=v_, values=ch_, width=16, state="readonly")
-            cb_.pack(side="left")
-            self.named[name] = cb_
-            self.m_pick[kind] = v_
-
-            def pick_changed(*_, k_=kind, v2_=v_):
-                MANUAL_PICK[k_] = v2_.get() or PICK_DEFAULT
-                if hasattr(self, "m_status"):
-                    self.update_status()
-            v_.trace_add("write", pick_changed)
         self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
         self.m_status_disp = tk.StringVar(value="Tick some clips.")
         self.m_status_lbl = ttk.Label(s3, textvariable=self.m_status_disp, font=("Segoe UI", F(10), "bold"), width=1, anchor="w")
@@ -21091,15 +21406,17 @@ class App:
         if not c:
             return
         name = c.get("name") or Path(iid).name
-        if self.busy or getattr(self, "est_running", False) or getattr(self, "scan_active", False):
-            self.status_flash("Busy (scan or render running) - try again when it is done")
-            out(f"not moved (a scan or render is running): {name}")
-            return
         cfg = load_config()
         game = c.get("game") or (tag_game(iid, cfg) or (None,))[0] or self.m_game.get()
         dest_dir = os.path.join(moved_root(cfg), MOVED_GAME_DIR.get(game or "", "Other"))
         if not messagebox.askyesno("Move clip", f"Move {name} out of your montages, into\n{dest_dir}?\n\nThe file is kept there and never used again (move it back to use it)."):
             return
+        if self.when_idle(iid, lambda: self.move_clip_now(iid, name, game, cfg), f"moved out of the montages when the running job ends: {name}"):
+            return
+        self.move_clip_now(iid, name, game, cfg)
+
+    def move_clip_now(self, iid, name, game, cfg):
+        self._gone = getattr(self, "_gone", set()) - {iid}
         try:
             dest = move_clip_file(iid, game, cfg)
         except Exception as ex:
@@ -21122,12 +21439,14 @@ class App:
         if not c:
             return
         name = c.get("name") or Path(iid).name
-        if self.busy or getattr(self, "est_running", False) or getattr(self, "scan_active", False):
-            self.status_flash("Busy (scan or render running) - try again when it is done")
-            out(f"not moved to the Recycle Bin (a scan or render is running): {name}")
-            return
         if not messagebox.askyesno("Recycle Bin", f"Move {name} to the Recycle Bin?"):
             return
+        if self.when_idle(iid, lambda: self.trash_clip_now(iid, name), f"moved to the Recycle Bin when the running job ends: {name}"):
+            return
+        self.trash_clip_now(iid, name)
+
+    def trash_clip_now(self, iid, name):
+        self._gone = getattr(self, "_gone", set()) - {iid}
         try:
             fk = file_key(iid)                             # the cache key needs the file's size / time: taken before it moves
         except OSError:
@@ -21169,12 +21488,42 @@ class App:
         both lists, auto pick, scoring and the planner at once (the folder is re-read), its cached song maps are removed and its hand-labelled drops are kept. The playlist CSV
         entry shows as 'no MP3' like any unmatched track. Refused while a scan or render runs."""
         name = Path(path).name
-        if self.busy or getattr(self, "est_running", False) or getattr(self, "scan_active", False):
-            self.status_flash("Busy (scan or render running) - try again when it is done")
-            out(f"not moved to the Recycle Bin (a scan or render is running): {name}")
-            return
         if not messagebox.askyesno("Recycle Bin", f"Move {name} to the Recycle Bin?"):
             return
+        if self.when_idle(path, lambda: self.trash_song_now(path, name), f"song moved to the Recycle Bin when the running job ends: {name}", song=True):
+            return
+        self.trash_song_now(path, name)
+
+    def when_idle(self, path, fn, msg, song=False):
+        """V9.2.0: a move / Recycle Bin while a job (scan, plan, render) runs is never refused: its row leaves the list now and the file operation runs the moment the job ends
+        (the job may be reading that file). Returns True when it was put off."""
+        if not (self.busy or getattr(self, "scan_active", False)):
+            return False
+        self._idle_ops = getattr(self, "_idle_ops", [])
+        self._idle_ops.append(fn)
+        if song:
+            for tr_ in (getattr(self, "stree", None), getattr(self, "mtree", None)):
+                try:
+                    if tr_ is not None and tr_.exists(path):
+                        tr_.detach(path)
+                except tk.TclError:
+                    pass
+        else:
+            self._gone = getattr(self, "_gone", set()) | {path}
+            self.ticked.discard(path)
+            getattr(self, "_fill_sig", {}).pop(self.ctree, None)
+            self.apply_filter()
+            self.update_status()
+        out(msg)
+        self.status_flash(msg, 4000)
+        return True
+
+    def run_idle_ops(self):
+        ops, self._idle_ops = getattr(self, "_idle_ops", []), []
+        for fn in ops:
+            self.safe(fn)()
+
+    def trash_song_now(self, path, name):
         for v in list(getattr(self, "song_views", [])):             # a song map window of it is open: close it first (it holds the analysis, not the file)
             if getattr(v, "path", None) == path:
                 try:
@@ -21429,7 +21778,10 @@ class App:
         lim = max(lim, lo2 or 0)
         hi = hi2 or hi
         rows = []
+        gone_ = getattr(self, "_gone", set())
         for c in self.clips:
+            if c["path"] in gone_:                                  # V9.2.0: moved / binned while a job ran: the file goes when the job ends, the row is gone already
+                continue
             if (fo != "All folders" and c["folder"] != fo) or c["mtime"] < lim or c["mtime"] > hi:
                 continue
             uf = self.m_used.get()
@@ -21588,8 +21940,8 @@ class App:
             out("   " + p_)
 
     def update_status(self):
-        """Status line. The length comes from the REAL planner (make_plan on the already-scanned ticked clips, same song, style
-        and seed as the render), run quietly in the background after a short pause, so the estimate is the plan."""
+        """Status line: ticked clips, kills, song - counted from the list, nothing else. V9.2.0: selecting a song, ticking clips or changing an option never plans
+        (the background estimate is gone); the plan is made only by Auto, Preview or Render, and a Render of the same inputs reuses the plan Auto / Preview made."""
         tk_ = [self.byp[p] for p in self.ticked if p in getattr(self, "byp", {})]
         self.m_cshown.set(f"{len(tk_)} ticked, {len(self.ctree.get_children())} shown")      # V6.8: ticks count hidden rows too
         kills = sum(c["kills"] or 0 for c in tk_)
@@ -21603,18 +21955,26 @@ class App:
                 song = f"{s['title']} ({self.song_bpm(s) or '?'} BPM)"
         txt = f"{len(tk_)} clips ticked, {kills} kills found"
         if uns:
-            txt += f" ({uns} not scanned yet - they get scanned first; the estimate leaves them out)"
+            txt += f" ({uns} not scanned yet - they get scanned first)"
         self.m_head = txt
-        short = f"{len(tk_)} clips ticked \u00b7 {kills} kills" + (f" \u00b7 {uns} not scanned" if uns else "")
+        short = f"{len(tk_)} clips ticked · {kills} kills" + (f" · {uns} not scanned" if uns else "")
         self.m_short = short
-        self.m_status.set(short + (" \u00b7 estimating ..." if kills else "") + f" \u00b7 song: {song}")
-        if not kills:
-            self.log_summary(txt + f", song: {song}")
-        if getattr(self, "_est_after", None):
-            self.root.after_cancel(self._est_after)
-            self._est_after = None
-        if kills:
-            self._est_after = self.root.after(700, self.start_estimate)
+        pin = getattr(self, "est_pin", None)
+        planned = ""
+        if pin and pin.get("plan") is not None and pin.get("sig") == self.pin_sig(list(self.ticked)):
+            pl_ = pin["plan"]
+            planned = f" · planned: montage {pl_['duration'] + (INTRO_S if pl_.get('intro') else 0.0):.0f} s, {pl_['recipe']}"
+        self.m_status.set(short + f" · song: {song}" + planned)
+
+    def keep_plan(self, sig, job=None):
+        """V9.2.0: the plan the last Auto / Preview job made for the inputs `sig` (pin_sig, taken when the job started) is kept: a Render of the same inputs renders it as it is."""
+        lp = dict(job or LAST_JOB_PLAN)
+        if not lp.get("plan") or sig is None:
+            return
+        self.est_pin = {"sig": sig, "song": lp["plan"]["song"]["path"], "at": lp.get("at", time.strftime("%H:%M:%S")), "plan": lp["plan"], "text": lp["text"],
+                        "summary": None, "cfg": cfg_sig(), "ledger": lp.get("ledger")}
+        if hasattr(self, "m_status"):
+            self.update_status()
 
     def fill_last_seed(self):
         """V9.0: puts the seed of the most recently rendered montage (any game, any mode; stored, so it survives a restart) in the Seed box; nothing to do when no montage was rendered yet."""
@@ -21630,52 +21990,6 @@ class App:
         if not getattr(self, "_est_seed", None):
             self._est_seed = random.randrange(1, 10 ** 6)
         return self._est_seed
-
-    def start_estimate(self):
-        self._est_after = None
-        if self.busy or getattr(self, "est_running", False):  # never next to a running job: retry shortly
-            self._est_after = self.root.after(1500, self.start_estimate)
-            return
-        paths = [p for p in self.ticked if p in getattr(self, "byp", {}) and self.byp[p]["kills"]]
-        if not paths:
-            return
-        sel = self.stree.selection()
-        args = dict(paths=paths, song_path=None if not sel or sel[0] == "auto" else sel[0],
-                    target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=self.m_style.get(), seed=self.est_seed(),
-                    full=self.full_flag(None if not sel or sel[0] == "auto" else sel[0]))
-        game, head, short = self.m_game.get(), self.m_head, getattr(self, "m_short", "")
-        sig_ = self.pin_sig(paths)
-        self.est_gen = getattr(self, "est_gen", 0) + 1
-        gen = self.est_gen
-        self.est_running = True
-
-        def go():
-            QUIET.on = True
-            pin_ = None
-            try:
-                plan, _ = make_plan(load_config(), game, scan=False, **args)
-                msg = self.estimate_text(plan, len(paths))
-                pin_ = {"sig": sig_, "song": plan["song"]["path"], "at": time.strftime("%H:%M:%S"), "summary": msg, "plan": plan, "text": _,
-                        "cfg": cfg_sig(), "ledger": LAST_LEDGER[0]}
-                sg_ = plan["song"]
-                msg_short = f"montage {plan['duration'] + (INTRO_S if plan.get('intro') else 0.0):.0f} s \u00b7 song: {sg_['title'] or Path(sg_['path']).stem} \u00b7 {plan['recipe']}"
-            except Exception as ex:
-                msg = f"cannot plan yet: {ex}"
-                msg_short = "cannot plan yet (see log)"
-            finally:
-                QUIET.on = False
-
-            def show():
-                self.est_running = False
-                if gen == self.est_gen:
-                    self.est_pin = pin_                      # V7.6.1: the pick of this summary; the render of the same inputs reuses it
-                    self.m_status.set(f"{short} \u00b7 {msg_short}")
-                    self.log_summary(head, msg)
-                if self.pending and not self.busy:
-                    n, fn, a = self.pending.pop(0)
-                    self.run_task(n, fn, *a)
-            self.q.put(("call", show))
-        threading.Thread(target=go, daemon=True).start()
 
     @staticmethod
     def estimate_text(plan, n_clips):
@@ -21802,6 +22116,8 @@ class App:
                 self.auto_full = {"ticked": set(allp), "song": song["path"]}
                 for iid in self.ctree.get_children():
                     self.ctree.item(iid, text=self.row_text(iid))
+                if top.get("job") and self.m_opt.get() and seed == self.est_seed():     # V9.2.0: the Render of this pick renders the plan Auto just made
+                    self.keep_plan(self.pin_sig(list(allp)), top["job"])
                 self.update_status()
                 self.status_flash(msg, 4000)
             out(msg)
@@ -21819,18 +22135,19 @@ class App:
         pin = getattr(self, "est_pin", None)
         if pin and pin.get("sig") == self.pin_sig(paths):          # V7.6.1: ONE song + style pick per job - the render keeps the pick the summary showed
             pin = dict(pin, ok=(pin.get("cfg") == cfg_sig() and all(self.byp[p]["kills"] is not None for p in paths if p in self.byp)))
-            out(f"pick kept: song {Path(pin['song']).stem}, the one the summary showed at {pin['at']} (not picked again)" if not song else
-                f"pick: the song you chose ({Path(song).stem})")
+            out(f"plan kept: the one made at {pin['at']} for exactly these clips, song, length, style and seed (not planned again)")
         else:
             if pin:
-                out("pick redone: the ticked clips, song, style, length or seed changed after the last summary - this job picks fresh")
+                out("plan redone: the ticked clips, song, style, length or seed changed after the last Auto / Preview - this job plans fresh")
             pin = None
-        self._est_seed = None
+        sig_now = self.pin_sig(paths)
+        if mode == "render":
+            self._est_seed = None                                  # V9.2.0: a new seed after a render only (a Preview keeps it, so the Render after it reuses the previewed plan)
         style = self.m_style.get()
         self.run_task("manual " + mode, self.job_video(
             self.m_game.get(), mode=mode, force=True, paths=paths, song_path=song,
             target="optimal" if self.m_opt.get() else int(self.m_len.get()), style=style, seed=seed, maxq=(self.m_q.get() == "max"), pin=pin, full=self.full_flag(song),
-            intro=bool(self.m_intro_on.get()), intro_text=self.m_intro_text.get().strip()))
+            intro=bool(self.m_intro_on.get()), intro_text=self.m_intro_text.get().strip(), keep_sig=None if mode == "render" else sig_now))
 
     # ------------------------------------------------------------ Songs tab
     def build_songs(self):
@@ -23530,8 +23847,8 @@ def planner_selftest(verbose=True):
             last = takes[-1]
             if not last["ending"] or not last["slow"] or last["n"] < 2:
                 fails.append(f"seed {seed}: the last take is not a strong slow-mo ending")
-            elif abs(plan["song"]["fade_out_start"] - (last["out_start"] + last["kills_out"][-1])) > 0.02 or \
-                    not ((OUTRO_MUSIC_MIN - 0.05 if plan.get("outro") else END_FADE[0] - 0.05) <= plan["duration"] - plan["song"]["fade_out_start"] <= END_FADE[1] + 0.05):
+            elif not (plan.get("outro") or {}).get("music_long") and (abs(plan["song"]["fade_out_start"] - (last["out_start"] + last["kills_out"][-1])) > 0.02 or \
+                    not ((OUTRO_MUSIC_MIN - 0.05 if plan.get("outro") else END_FADE[0] - 0.05) <= plan["duration"] - plan["song"]["fade_out_start"] <= END_FADE[1] + 0.05)):
                 fails.append(f"seed {seed}: the fades do not run from the final kill to the end")
             if last["slow_at"] is None or not (-1.5 / OUT_FPS <= last["kills_out"][-1] - last["slow_at"] <= (EASE_FR + 1.5) / OUT_FPS):
                 fails.append(f"seed {seed}: the ending slow-mo does not start on the final kill")
@@ -23594,7 +23911,7 @@ for _g in GAMES:
     REQUIRED_BUTTONS[f"auto:{_g}:Dry plan"] = ("Auto", f"task:{_g} Dry plan")
     REQUIRED_BUTTONS[f"auto:{_g}:Preview 720p / 20 s"] = ("Auto", f"task:{_g} Preview 720p / 20 s")
 REQUIRED_BUTTONS.update({
-    "manual:dry": ("Manual", "task:manual dry"), "manual:preview": ("Manual", "task:manual preview"),
+    "manual:preview": ("Manual", "task:manual preview"),
     "manual:render": ("Manual", "task:manual render"),
     "Tick all shown": ("Manual", "ticked"), "Untick all": ("Manual", "unticked"), "Tick clips with kills": ("Manual", "ticked"),
     "Tick newest": ("Manual", "ticked"), "Reload list": ("Manual", "task:clips"),
@@ -23774,7 +24091,7 @@ def smoketest_gui(sizes=((1220, 920), (1920, 1040), (920, 640))):
             app.m_len.set(ln)
             app.m_style.set(sty)
             app.update_status()
-            app.named["manual:dry"].invoke()
+            app.named["manual:preview"].invoke()
             root.update()
         want = [("optimal", "auto"), (45, "chill")]
         if [(k.get("target"), k.get("style")) for k in got] != want:
@@ -24166,6 +24483,34 @@ class _Stage:
 
 def pstage(name):
     return _Stage(name)
+
+
+JOB_STAGES = {}                      # V9.2.0: seconds per stage of the running job (scan, selection, pairing, planning, ...): one 'STAGES' line in montage.log per job
+JOB_STAGE_ORDER = ("scan", "song map", "selection", "pairing", "planning", "repair loop", "frame checks", "effects", "sky analysis", "intro", "render")
+
+
+class _JobStage:
+    """V9.2.0 `with jstage("planning"):` adds the block's time to JOB_STAGES (only on the job's own thread; a stage inside another counts in both)."""
+    __slots__ = ("n", "t")
+
+    def __init__(self, n):
+        self.n = n
+
+    def __enter__(self):
+        self.t = time.perf_counter()
+        return self
+
+    def __exit__(self, *a):
+        JOB_STAGES[self.n] = JOB_STAGES.get(self.n, 0.0) + time.perf_counter() - self.t
+
+
+def jstage(name):
+    return _JobStage(name)
+
+
+def job_stages_line():
+    ks = [k for k in JOB_STAGE_ORDER if k in JOB_STAGES] + [k for k in JOB_STAGES if k not in JOB_STAGE_ORDER]
+    return "STAGES: " + " | ".join(f"{k} {JOB_STAGES[k]:.1f} s" for k in ks) if ks else "STAGES: none timed"
 
 
 def pmark(name):
