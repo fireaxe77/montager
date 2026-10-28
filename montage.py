@@ -243,10 +243,14 @@ def load_json_ro(p, default):
         return default
 
 
+SAVE_JSON_BIG = 200                     # V9.2.0: a dict / list with more entries than this is saved compact (a cache, not a file people read)
+
+
 def save_json(p, obj):
     DATA.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(p) + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=1, ensure_ascii=False), encoding="utf-8")
+    big = isinstance(obj, (dict, list)) and len(obj) > SAVE_JSON_BIG       # V9.2.0: the big caches (song maps, kills, loudness) are written compact by the C encoder: indent=1 runs the pure Python one (28 s for the 135 MB song map cache)
+    tmp.write_text(json.dumps(obj, indent=None if big else 1, ensure_ascii=False, separators=(",", ":") if big else None), encoding="utf-8")
     os.replace(tmp, p)
 
 
@@ -8043,9 +8047,34 @@ def _frames_at(path, t, n=7, fps=60):
     return fr[:m * 192 * 108].reshape(m, 108, 192).astype(np.float32), pts[:m]
 
 
+STITCH_CHECK_CACHE = DATA / "stitch_check.json"       # V9.2.0: the frame check of a stitched cut, per clip pair + cut time (also an unreadable cut: never read again)
+_STITCH_MEMO = {}
+
+
 def verify_stitch(spans, cut):
     """Checks the cut between two stitched clips: the frame of clip A at the cut must equal clip B's frame at the same game moment
-    (no repeated or skipped frames). Returns (ok, corrected shift of B, report)."""
+    (no repeated or skipped frames). Returns (ok, corrected shift of B, report).
+    V9.2.0: the answer depends only on the two files and the times, so it is kept (memory + STITCH_CHECK_CACHE): every plan of every job asked again (44 ffmpeg reads per plan)."""
+    a, b = spans
+    try:
+        key = "|".join([file_key(a["path"]), file_key(b["path"]), f"{cut - a['shift']:.4f}", f"{cut - b['shift']:.4f}", f"{b['shift']:.4f}"])
+    except OSError:
+        return _verify_stitch(spans, cut)
+    if not _STITCH_MEMO:
+        _STITCH_MEMO.update(load_json(STITCH_CHECK_CACHE, {}))
+    hit = _STITCH_MEMO.get(key)
+    if hit is not None:
+        return bool(hit[0]), float(hit[1]), str(hit[2])
+    res = _verify_stitch(spans, cut)
+    _STITCH_MEMO[key] = [bool(res[0]), float(res[1]), str(res[2])]
+    try:
+        save_json(STITCH_CHECK_CACHE, _STITCH_MEMO)
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"stitch check cache not saved: {ex}")
+    return res
+
+
+def _verify_stitch(spans, cut):
     import numpy as np
     a, b = spans
     fa, ta = _frames_at(a["path"], cut - a["shift"])
@@ -9638,6 +9667,17 @@ def dead_air_cuts(ev, U, kb, t0=None, lead_override=None):
     allow = ev.get("_allow")
     if allow is None or len(times) < 2 or max(b - a for a, b in zip(times, times[1:])) <= GAP_ALLOW[0]:
         return [], span
+    memo = ev.setdefault("_dac", {})                       # V9.2.0: the planner asks the same question hundreds of times per event (same answer: memoised on the event copy)
+    mk = (id(U), id(allow), float(U[kb]) if t0 is None else float(t0), lead_override, tuple(times), tuple(ev.get("rows") or ()), tuple(ev.get("unsure") or ()))
+    if mk in memo:
+        c_, o_ = memo[mk]
+        return list(c_), o_
+    res = _dead_air_cuts(ev, U, kb, t0, lead_override, times, span, allow)
+    memo[mk] = (list(res[0]), res[1])
+    return res
+
+
+def _dead_air_cuts(ev, U, kb, t0, lead_override, times, span, allow):
     import bisect
     cuts, o = [], 0.0                                      # o = output time of kill i, from the first kill
     T0, nt = float(U[kb]) if t0 is None else float(t0), len(U)
@@ -9649,7 +9689,8 @@ def dead_air_cuts(ev, U, kb, t0=None, lead_override=None):
             continue
         rd = max(0.0, rows[i] - a) if i < len(rows) else 0.0             # V5.42B: never cut before this kill's row is seen
         j0 = bisect.bisect_left(U, T0 + o + max(0.4, rd + ROW_TAIL) - 1e-6)
-        ok = [j for j in range(j0, nt) if U[j] - (T0 + o) <= g - 1.0 - 0.25 and U[j] - (T0 + o) <= 2.5]
+        j1 = min(nt, bisect.bisect_right(U, T0 + o + min(g - 1.0 - 0.25, 2.5) + 1e-6) + 1)      # V9.2.0: U is sorted: only the ticks up to the limit (it walked to the song's end: half the plan time)
+        ok = [j for j in range(j0, j1) if U[j] - (T0 + o) <= g - 1.0 - 0.25 and U[j] - (T0 + o) <= 2.5]
         cj = next((j for j in ok if j % 2 == 0), ok[0] if ok else None)
         if cj is None:
             o += g
@@ -11348,6 +11389,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
                          f"{len(plain)} plain single kills left out (enough better material)")
         usable = [e for e in usable if any(e is c_ for c_ in fit["clips"])]
         notes.append(fit["why"])
+    ub_kills = sum(int(e["n"]) for e in usable)            # V9.2.0: the most kills any take structure of this section can place (plan_montage_tries stops early on it)
     head_cands = [e for e in usable if e["path"] not in heads] or usable
     k_top = sum(1 for e in head_cands if e["score"] == head_cands[0]["score"])
     if HEADLINE_RULES_V73 and head_cands[0]["n"] == 1 and k_top > 1 and all(e["n"] == 1 for e in head_cands[:k_top]):
@@ -11794,6 +11836,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
             plan["notes"].append(f"relaxed rule: {Path(t_['path']).name} - " + ", ".join(
                 {"half": "first kill on a half-beat tick", "lead_min": f"run-up shortened to {t_['kills_out'][0]:.2f} s (only that much footage before the kill)"}[k_]
                 for k_ in t_["rx"] if k_ in ("half", "lead_min")))
+    plan["_ub_kills"] = ub_kills
     plan["fit"] = {"cands_n": (fit or {}).get("cands_n", 1), "usable": n_usable, "used": len(plan["takes"]), "unplaced": unplaced, "skipped": [[nm(e), why_no_take(e)] for e in skipped],
                    "left_out": [] if fitm else [nm(e) for e in cut_len + left],
                    "song_short": [nm(e) for e in (cut_len + left + left_song if fitm else left_song)],
@@ -11806,6 +11849,7 @@ def _plan_montage_once(cfg, game, events, song, an, seed, style, target_s, hist_
 
 
 SECTION_TRIES = 4                       # V7.6.1: candidate song sections evaluated per plan (Optimal length)
+SECTION_EARLY_STOP = [True]             # V9.2.0 switch: no other section is planned when the first one already places every offered kill with every drop anchored
 
 
 def _extend_first(takes, n, U, song_end):
@@ -11870,6 +11914,7 @@ def plan_montage(cfg, game, events, song, an, seed, style, target_s, hist_c, not
         INTRO_CTX.pop("avoid", None)
         INTRO_CTX.pop("extend_first", None)
     plan.pop("_intro_retry", None)
+    plan.pop("_ub_kills", None)
     return plan
 
 
@@ -11946,7 +11991,11 @@ def plan_montage_tries(cfg, game, events, song, an, seed, style, target_s, hist_
     best = (plan, first_notes, 0)
     key = lambda pl: (sum(len(t["kills"]) for t in pl["takes"]), sum(1 for x in (pl.get("drop_sync") or []) if x.get("take")), 1 if pl.get("intro") else 0)
     tried = [(0, key(plan), plan["song"]["start_t"], plan["duration"])]
-    if cands_n > 1 and (plan.get("fit") or {}).get("optimal"):
+    fits_ = (SECTION_EARLY_STOP[0] and key(plan)[0] >= int(plan.get("_ub_kills") or 10 ** 9) and not _unanchored(plan)
+             and (plan.get("intro") or not INTRO_CTX.get("on")))
+    if fits_:                                              # V9.2.0: every kill the length rule offered is placed, every drop in it anchored, the intro made: another section can only tie
+        plan["notes"].append(f"song sections: #1 already fits (all {key(plan)[0]} kills placed, every drop anchored) - the other {min(SECTION_TRIES, cands_n) - 1} not planned")
+    if cands_n > 1 and (plan.get("fit") or {}).get("optimal") and not fits_:
         for rk in range(1, min(SECTION_TRIES, cands_n)):
             nl = list(n0)
             try:
@@ -12712,6 +12761,47 @@ def seen_rows_audit(t):
             msgs.append(f"the kill row of the kill at {min(mine):.2f}s ([{r.get('victim') or '?'}]) is on screen from {r['t']:.2f}s, before the take starts ({segs[0][0]:.2f}s): "
                         "the take shows the row, then a kill that already happened")
     return msgs
+
+
+SEEN_PRECHECK_ON = [True]          # V9.2.0 switch: events whose kill-row check fails on the footage EVERY take of them must show are left out before planning
+
+
+def seen_rows_doomed(ev):
+    """V9.2.0: the CUT LIST CHECK's uncounted-row rule (seen_rows_audit) on the footage that every possible take of the event plays: the shortest run-up of the first kill
+    (INTRO_LEAD_MIN), ~0.7 s before every later kill (a jump-cut over dead air resumes at least that early), 0.4 s after every kill but the last (a jump-cut starts no
+    sooner) and the last kill itself. A row that already fails there fails in every take, also with the take window extended, so the event cannot be placed: the planner
+    used to plan, fail, extend the take, plan, fail, drop it and plan again (2 of 3 plan rounds of a job). Returns the rule text, or None."""
+    if not ev.get("seen") or not SEEN_PRECHECK_ON[0]:
+        return None
+    ts_ = list(ev["times"])
+    iv = [(ts_[0] - INTRO_LEAD_MIN, ts_[0])]
+    iv += [(a + 0.0, a + ROW_TAIL) for a in ts_[:-1]] + [(b - 0.7, b) for b in ts_[1:]]
+    iv.sort()
+    merged = []
+    for a, b in iv:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    parts = ev.get("parts") or []
+
+    def src_of(a, b):
+        m = (a + b) / 2
+        for i, p_ in enumerate(parts):
+            if p_.get("start") is not None and p_.get("end") is not None and p_["start"] - 1e-6 <= m <= p_["end"] + 1e-6:
+                return i
+        return 0
+    if len(parts) > 1:                                     # a stitched event: a piece is played from the clip that covers it
+        cut_at = []
+        for a, b in merged:
+            pts_ = sorted({a, b} | {float(x) for p_ in parts for x in (p_.get("start"), p_.get("end")) if x is not None and a < float(x) < b})
+            cut_at += list(zip(pts_, pts_[1:]))
+        merged = [list(x) for x in cut_at]
+    segs = [[a, b, 1.0, max(1, int(round((b - a) * OUT_FPS))), src_of(a, b)] for a, b in merged if b - a > 1e-6]
+    fake = {"segs": segs, "seen": ev["seen"], "kills": ts_, "victims": list(ev.get("victims") or []),
+            "srcs": [{"path": p_.get("path")} for p_ in parts] if len(parts) > 1 else []}
+    msgs = [m_ for m_ in seen_rows_audit(fake) if m_.startswith("uncounted kill row")]
+    return msgs[0] if msgs else None
 
 
 def verify_cutlist(plan, log=True):
@@ -18337,6 +18427,13 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
         style = cfg.get("style", "auto")
     def plan_loop(events):
         pool_ev, fixes, extended, rule_skips = list(events), [], set(), {}
+        for e_ in list(pool_ev):                               # V9.2.0: an event no take can carry past the kill-row check is left out before the first plan (same final plan, 2 plan rounds less)
+            why_ = seen_rows_doomed(e_)
+            if why_:
+                rule_skips.setdefault(e_["path"], why_)
+                fixes.append(f"cut list repair: dropped {Path(e_['path']).name} ({why_}) before planning: the kill-row check fails on the footage every take of it shows")
+                LOGONLY(fixes[-1])
+        pool_ev = [e_ for e_ in pool_ev if e_["path"] not in rule_skips]
         for _try in range(6):                                  # never abort: drop the failing takes' events, re-plan the gap
             n2 = list(notes)
             plan = plan_montage(cfg, game, pool_ev, song, an, seed, style, target, hist_list(USED_CLIPS, game), n2, lock=lock,
