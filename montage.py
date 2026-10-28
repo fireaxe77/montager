@@ -14669,6 +14669,15 @@ def sky_take_frames(plan, t, f0, f1, size=(SKY_W, SKY_H)):
     import numpy as np
     _inp, keep = sky_take_graph(plan, t, f0, f1, size)
     w, h = size
+    if HEAVY_REUSE_ON[0] and HEAVY_DIR[0] is not None:     # V9.2.1: the slow-motion pieces come from their lossless files (made here once; the render reuses them)
+        groups_ = _split_inputs(_inp)
+        for L in heavy_labels(keep):
+            hf_ = heavy_file(_part(keep, groups_, [L], set(), {}), L)
+            if hf_ is not None:
+                n_ = len(groups_)
+                groups_.append(["-i", str(hf_)])
+                keep = [f"[{n_}:v:0]null[{L}]" if _chain_io(c)[1] == [L] else c for c in keep]
+        _inp = [a for g in groups_ for a in g]
     vin = sorted({int(i_) for p_ in keep for i_ in re.findall(r"\[(\d+):v:0\]", p_)})
     gp = Path(tempfile.mkstemp(prefix="skyframes_", suffix=".txt")[1])
     try:
@@ -16734,11 +16743,24 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = slice_plan(plan) if preview else plan
     itmp = render_tmpdir(outfile)
+    HEAVY_DIR[0] = Path(itmp) / "heavy"                    # V9.2.1: this render's slow-motion pieces (sky check + render share them)
+    REUSED_HEAVY.clear()
     sky_ok = sky_enabled(cfg, p.get("game"))               # V8.7: sky recolour off for this game (Settings): no probe, no mask, no recolour in the render (also for a plan made before it was switched off)
     if not sky_ok:
         for t_ in p.get("takes") or []:
             if t_.get("xfx"):
                 t_["xfx"] = [x_ for x_ in t_["xfx"] if x_.get("k") != "sky"]
+    intro_box = {}
+    if p.get("intro"):                                     # V9.2.1: the intro's text video is made beside the sky check (they share nothing; same file, made sooner)
+        def _intro_job():
+            t_ = time.perf_counter()
+            try:
+                intro_assets(p, itmp)
+            except Exception as ex_:                       # noqa: BLE001
+                intro_box["err"] = ex_
+            intro_box["s"] = time.perf_counter() - t_
+        intro_box["th"] = threading.Thread(target=_intro_job, daemon=True)
+        intro_box["th"].start()
     if p.get("effects") == "extra" and sky_ok:
         try:
             with jstage("sky analysis"):
@@ -16754,8 +16776,11 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         raise RuntimeError("cut list problem, not rendering: " + "; ".join(bad))
     if p.get("intro"):                                     # V9.0: the intro's text (a video with alpha) first, then the plan as the render sees it (the intro take in front)
         try:
-            with jstage("intro"):
-                intro_assets(p, itmp)
+            with jstage("intro (waited for)"):
+                intro_box["th"].join()
+            JOB_STAGES["intro"] = JOB_STAGES.get("intro", 0.0) + float(intro_box.get("s", 0.0))
+            if intro_box.get("err") is not None:
+                raise intro_box["err"]
         except Exception as ex_:                           # noqa: BLE001
             if CANCEL.is_set():
                 shutil.rmtree(itmp, ignore_errors=True)
@@ -16769,7 +16794,8 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     elog = LOG_DIR / "last_render_stderr.txt"
     fx = set(FX_ALL) | (set(XFX_FX) if p.get("effects") == "extra" else set()) if effects else {"slow"}
     try:                                                   # V6.9.3: low-fps clips are interpolated first (only the ranges the plan uses)
-        pr_ = interp_prepare(p, cfg, itmp, fx)
+        with jstage("render: interpolation"):
+            pr_ = interp_prepare(p, cfg, itmp, fx)
     except Exception as ex:
         if CANCEL.is_set():
             shutil.rmtree(itmp, ignore_errors=True)
@@ -16782,6 +16808,9 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     finally:
         if isinstance(plan.get("intro"), dict):
             plan["intro"].pop("_text", None)               # the temporary text video is gone with the temp folder: never saved in the plan
+        if REUSED_HEAVY:
+            LOGONLY(f"fast render: {len(REUSED_HEAVY)} slow-motion piece(s) read back from the sky check (made once): {', '.join(REUSED_HEAVY)}")
+        HEAVY_DIR[0] = None
         shutil.rmtree(itmp, ignore_errors=True)
 
 
@@ -16983,6 +17012,51 @@ def split_take_graphs(inputs, graph, pin=None, audio_final=False):
 FAST_VCODEC = ["-c:v", "utvideo", "-pred", "median"]     # V8.8.8: lossless intermediate picture codec (decodes ~5x faster than FFV1; yuv420p kept bit for bit)
 FAST_THREADS = [2, 2]                                    # V8.8.8: filter / encoder threads of each part (many parts run at once: more threads only fight for the cores)
 FAST_HEAVY = ("minterpolate",)                           # V8.8.8: a take's chain with one of these (slow motion: motion interpolation, one thread) runs as its own job
+REUSED_HEAVY = []                    # V9.2.1: the slow-motion parts the last render read back instead of making them again (log, tests)
+HEAVY_REUSE_ON = [True]              # V9.2.1 switch: a slow-motion piece is made ONCE per render: the sky check of a take makes it (lossless, like a render part) and the render reuses that file
+HEAVY_DIR = [None]                   # the render's folder for those files (set by render_plan for one render)
+_HEAVY_LOCK = threading.Lock()
+_HEAVY_KEY_LOCKS = {}
+
+
+def heavy_key(part, L):
+    """V9.2.1: the identity of a heavy (slow-motion) piece: its input arguments + its filter text (inputs renumbered from 0, its own output label left out)."""
+    return hashlib.md5(json.dumps([part["groups"], [re.sub(r"\[" + re.escape(L) + r"\]$", "[OUT]", c) for c in part["chains"]]]).encode()).hexdigest()
+
+
+def heavy_file(part, L):
+    """V9.2.1: the lossless file of a heavy piece in HEAVY_DIR, made now when it is not there yet (exactly the render part's command without the colour pin); None when off."""
+    if not HEAVY_REUSE_ON[0] or HEAVY_DIR[0] is None:
+        return None
+    d = Path(HEAVY_DIR[0])
+    d.mkdir(parents=True, exist_ok=True)
+    k = heavy_key(part, L)
+    dest = d / f"{k}.nut"
+    with _HEAVY_LOCK:
+        lk = _HEAVY_KEY_LOCKS.setdefault(k, threading.Lock())
+    with lk:
+        if dest.exists():
+            return dest
+        gp = d / f"{k}.filter.txt"
+        gp.write_text(";\n".join(part["chains"]), encoding="utf-8")
+        tmp = d / f"{k}.part.nut"
+        cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats"] + [a for g in part["groups"] for a in g] + ["-filter_threads", str(FAST_THREADS[0]), "-filter_complex_script", str(gp),
+               "-map", f"[{L}]"] + FAST_VCODEC + ["-threads", str(FAST_THREADS[1]), "-enc_time_base:v", "1:1000000", "-fps_mode", "passthrough", "-f", "nut", str(tmp)])
+        r = run(cmd, timeout=1800)
+        if r.returncode != 0 or not tmp.exists():
+            raise RuntimeError("slow-motion piece not made: " + (r.stderr or b"").decode("utf-8", "ignore")[-300:])
+        os.replace(tmp, dest)
+        return dest
+
+
+def heavy_labels(chains):
+    """V9.2.1: the outputs of the chains that are a heavy piece the render runs as its own part (FAST_HEAVY, one output, read straight from the inputs)."""
+    res = []
+    for c in chains:
+        ins_, outs_ = _chain_io(c)
+        if any(h_ in c for h_ in FAST_HEAVY) and len(outs_) == 1 and ins_ and all(re.match(r"^\d+:", x) for x in ins_):
+            res.append(outs_[0])
+    return res
 
 
 def _concat_list(paths, p):
@@ -17203,6 +17277,10 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
             if opt_:
                 ph["chains"] = [re.sub(r"\[" + re.escape(L) + r"\]$", "[" + L + "_pin]", c) for c in ph["chains"]] + [f"[{L}_pin]format={opt_}[{L}]"]
             nm = f"slow{ti}_{k}"
+            hk_ = Path(HEAVY_DIR[0]) / f"{heavy_key(_part(j['chains'], j['groups'], [L], set(), {**kinds, L: 'v'}), L)}.nut" if HEAVY_REUSE_ON[0] and HEAVY_DIR[0] else None
+            if hk_ is not None and hk_.exists():                # V9.2.1: the sky check made this piece already: read back (lossless), only the colour pin applied
+                ph = {"chains": [f"[0:v:0]{('format=' + opt_) if opt_ else 'null'}[{L}]"], "groups": [["-i", str(hk_)]], "reads": []}
+                REUSED_HEAVY.append(nm)
             add(nm, ph, [(L, "v")], [], tpos[ti] - 0.3 * _est_frames(ph["chains"]) / 2.0)
             hk[L] = "v"
             made_by[L] = nm
@@ -17410,6 +17488,12 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
             except OSError:
                 pass
     slow = sorted(took.items(), key=lambda kv: -kv[1])[:3]
+    t_parts = max(t_done.values() or [t0]) - t0                # V9.2.1: the render's own stages in the job's STAGES line
+    JOB_STAGES["render: slow-motion parts"] = JOB_STAGES.get("render: slow-motion parts", 0.0) + sum(v for k, v in took.items() if k.startswith("slow"))
+    JOB_STAGES["render: takes"] = JOB_STAGES.get("render: takes", 0.0) + sum(v for k, v in took.items() if k.startswith("take"))
+    JOB_STAGES["render: dissolves"] = JOB_STAGES.get("render: dissolves", 0.0) + sum(v for k, v in took.items() if k.startswith("dissolve"))
+    JOB_STAGES["render: all parts made"] = JOB_STAGES.get("render: all parts made", 0.0) + t_parts
+    JOB_STAGES["render: final encode after the parts"] = JOB_STAGES.get("render: final encode after the parts", 0.0) + max(0.0, time.time() - t0 - t_parts)
     LOGONLY(f"fast render: {len([n for n in tasks if n.startswith('take')])} takes, {len([n for n in tasks if n.startswith('slow')])} slow-motion parts, "
             f"{len([n for n in tasks if n.startswith('dissolve')])} dissolves, {RENDER_JOBS} at a time (longest: " + ", ".join(f"{k} {v:.1f} s" for k, v in slow)
             + f"); all parts made after {max(t_done.values() or [0]) - t0:.1f} s, encoder done after {time.time() - t0:.1f} s (started at {t1 - t0:.1f} s), rc {rc}")
@@ -24513,7 +24597,8 @@ def pstage(name):
 
 
 JOB_STAGES = {}                      # V9.2.0: seconds per stage of the running job (scan, selection, pairing, planning, ...): one 'STAGES' line in montage.log per job
-JOB_STAGE_ORDER = ("scan", "song map", "selection", "pairing", "planning", "repair loop", "frame checks", "effects", "sky analysis", "intro", "render")
+JOB_STAGE_ORDER = ("scan", "song map", "selection", "pairing", "planning", "repair loop", "frame checks", "effects", "sky analysis", "intro", "intro (waited for)", "render: interpolation", "render",
+                   "render: slow-motion parts", "render: takes", "render: dissolves", "render: all parts made", "render: final encode after the parts")      # V9.2.1: the parts are CPU time of parallel jobs
 
 
 class _JobStage:
