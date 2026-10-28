@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.2.0"
+APP_VERSION = "V9.2.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -14669,7 +14669,7 @@ def sky_take_frames(plan, t, f0, f1, size=(SKY_W, SKY_H)):
     import numpy as np
     _inp, keep = sky_take_graph(plan, t, f0, f1, size)
     w, h = size
-    if HEAVY_REUSE_ON[0] and HEAVY_DIR[0] is not None:     # V9.2.1: the slow-motion pieces come from their lossless files (made here once; the render reuses them)
+    if HEAVY_REUSE_ON[0] and HEAVY_DIR[0] is not None:     # V9.2.1: the slow-motion pieces come from their lossless files (made once, as a lean job; the same frames, bit for bit)
         groups_ = _split_inputs(_inp)
         for L in heavy_labels(keep):
             hf_ = heavy_file(_part(keep, groups_, [L], set(), {}), L)
@@ -16743,13 +16743,14 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = slice_plan(plan) if preview else plan
     itmp = render_tmpdir(outfile)
-    HEAVY_DIR[0] = Path(itmp) / "heavy"                    # V9.2.1: this render's slow-motion pieces (sky check + render share them)
-    REUSED_HEAVY.clear()
+    HEAVY_DIR[0] = Path(itmp) / "heavy"                    # V9.2.1: the sky check's slow-motion pieces (made once per take)
     sky_ok = sky_enabled(cfg, p.get("game"))               # V8.7: sky recolour off for this game (Settings): no probe, no mask, no recolour in the render (also for a plan made before it was switched off)
     if not sky_ok:
         for t_ in p.get("takes") or []:
             if t_.get("xfx"):
                 t_["xfx"] = [x_ for x_ in t_["xfx"] if x_.get("k") != "sky"]
+    if not preview:                                        # V9.2.1: the render's slow-motion parts start now, beside the sky check and the intro text
+        heavy_prestart(p, cfg, (set(FX_ALL) | (set(XFX_FX) if p.get("effects") == "extra" else set()) if effects else {"slow"}), Path(itmp) / "pre", p.get("game"))
     intro_box = {}
     if p.get("intro"):                                     # V9.2.1: the intro's text video is made beside the sky check (they share nothing; same file, made sooner)
         def _intro_job():
@@ -16808,9 +16809,12 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     finally:
         if isinstance(plan.get("intro"), dict):
             plan["intro"].pop("_text", None)               # the temporary text video is gone with the temp folder: never saved in the plan
-        if REUSED_HEAVY:
-            LOGONLY(f"fast render: {len(REUSED_HEAVY)} slow-motion piece(s) read back from the sky check (made once): {', '.join(REUSED_HEAVY)}")
         HEAVY_DIR[0] = None
+        if HEAVY_PRE:
+            LOGONLY(f"render: {len(PRE_USED)} of {len(HEAVY_PRE)} early slow-motion part(s) used ({', '.join(PRE_USED) or 'none'})")
+            for b_ in HEAVY_PRE.values():
+                b_["th"].join(timeout=600)
+            HEAVY_PRE.clear()
         shutil.rmtree(itmp, ignore_errors=True)
 
 
@@ -17012,20 +17016,106 @@ def split_take_graphs(inputs, graph, pin=None, audio_final=False):
 FAST_VCODEC = ["-c:v", "utvideo", "-pred", "median"]     # V8.8.8: lossless intermediate picture codec (decodes ~5x faster than FFV1; yuv420p kept bit for bit)
 FAST_THREADS = [2, 2]                                    # V8.8.8: filter / encoder threads of each part (many parts run at once: more threads only fight for the cores)
 FAST_HEAVY = ("minterpolate",)                           # V8.8.8: a take's chain with one of these (slow motion: motion interpolation, one thread) runs as its own job
-REUSED_HEAVY = []                    # V9.2.1: the slow-motion parts the last render read back instead of making them again (log, tests)
-HEAVY_REUSE_ON = [True]              # V9.2.1 switch: a slow-motion piece is made ONCE per render: the sky check of a take makes it (lossless, like a render part) and the render reuses that file
+HEAVY_REUSE_ON = [True]              # V9.2.1 switch: the sky check makes a take's slow-motion piece as its own lean job (lossless, like a render part; 196 s -> 79 s for the ILFTB ending) and reads it back.
+                                     # The render makes its own: its pieces carry the colour pin, which changes the pixels before the motion interpolation (not shareable)
 HEAVY_DIR = [None]                   # the render's folder for those files (set by render_plan for one render)
 _HEAVY_LOCK = threading.Lock()
 _HEAVY_KEY_LOCKS = {}
 
 
+HEAVY_PRE_ON = [False]               # V9.2.1 switch, off: measured slower (the early parts take the CPU from the sky check and the final pass is the limit); output identical either way
+HEAVY_PRE = {}                       # key -> {"th", "path", "ok"} for the running render
+PRE_USED = []                        # the render parts that were taken from HEAVY_PRE (log, tests)
+
+
+def part_cmd(part, read_files, gp, outs):
+    """V9.2.1 (V8.8.8 render_parts): the ffmpeg command of one render part: its inputs, its file reads, its filter script, every output as a lossless NUT with microsecond timestamps."""
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats"] + [a for g in part["groups"] for a in g] + sum([["-i", str(f_)] for f_ in read_files], [])
+    cmd += ["-filter_threads", str(FAST_THREADS[0]), "-filter_complex_script", str(gp)]
+    for l_, f_ in outs:
+        cmd += ["-map", f"[{l_}]"] + FAST_VCODEC + ["-threads", str(FAST_THREADS[1]), "-enc_time_base:v", "1:1000000", "-fps_mode", "passthrough", "-f", "nut", str(f_)]
+    return cmd
+
+
+def heavy_parts(inputs, graph, pin):
+    """V9.2.1: the render's slow-motion parts exactly as render_parts makes them: [(label, part)] with the colour pin applied (the same detection, chains and pin)."""
+    jobs, _final, _fg = split_take_graphs(inputs, graph, pin, audio_final=True)
+    opt_ = ":".join(o_ for o_ in ((f"pix_fmts={pin[2]}" if len(pin) > 2 and pin[2] else ""), (f"color_spaces={pin[0]}:color_ranges={pin[1]}" if pin[0] else "")) if o_)
+    kinds = {l_: k_ for j in jobs for l_, k_ in j["outs"]}
+    res = []
+    for j in jobs:
+        v_outs = [(l_, k_) for l_, k_ in j["outs"] if k_ == "v"]
+        pv = _part(j["chains"], j["groups"], [l_ for l_, _k in v_outs], set(), kinds)
+        for c in [j["chains"][i] for i in sorted(pv["cl"])]:
+            ins_, outs_ = _chain_io(c)
+            if any(h_ in c for h_ in FAST_HEAVY) and len(outs_) == 1 and ins_ and all(re.match(r"^\d+:", x) for x in ins_) and outs_[0] not in kinds:
+                L = outs_[0]
+                ph = _part(j["chains"], j["groups"], [L], set(), {**kinds, L: "v"})
+                if opt_:
+                    ph["chains"] = [re.sub(r"\[" + re.escape(L) + r"\]$", "[" + L + "_pin]", c_) for c_ in ph["chains"]] + [f"[{L}_pin]format={opt_}[{L}]"]
+                res.append((L, ph))
+    return res
+
+
+def heavy_prestart(p, cfg, fx, tdir, game):
+    """V9.2.1: starts the render's slow-motion parts (the longest render work; the same commands render_parts runs) beside the sky check and the intro, at most 2 at a time, into
+    `tdir`. The graph is the plan's before the sky check (the sky never touches a slow-motion piece; a piece whose filters still differ in the real graph has another key and is made again)."""
+    HEAVY_PRE.clear()
+    PRE_USED.clear()
+    if not HEAVY_PRE_ON[0] or not FAST_RENDER[0]:
+        return
+    try:
+        inputs, graph = build_filter(with_intro(dict(p, intro=None)), cfg, False, fx)      # the intro's text video is not made yet; the intro holds no slow-motion piece of a take
+        m_ = re.search(r"format=(\w+)\[vout\]\s*(?:;|$)", graph)
+        if not m_:
+            return
+        pins_ = load_json(DATA / "render_pins.json", {})
+        g_pin = pins_.get(str(game)) if isinstance(pins_, dict) else None
+        pin = (g_pin[0], g_pin[1], m_.group(1)) if isinstance(g_pin, list) and len(g_pin) == 2 else ("bt709", "tv", m_.group(1))
+        todo = heavy_parts(inputs, graph, pin)
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"slow-motion parts not started early: {type(ex).__name__}: {ex}")
+        return
+    tdir = Path(tdir)
+    tdir.mkdir(parents=True, exist_ok=True)
+    sem = threading.Semaphore(2)
+    for n_, (L, ph) in enumerate(sorted(todo, key=lambda x: -_est_frames(x[1]["chains"]))):
+        k = heavy_key(ph, L)
+        if k in HEAVY_PRE:
+            continue
+        box = {"path": tdir / f"pre{n_}.nut", "ok": False}
+
+        def job(L=L, ph=ph, box=box, n_=n_):
+            with sem:
+                if CANCEL.is_set():
+                    return
+                gp = tdir / f"pre{n_}.filter.txt"
+                gp.write_text(";\n".join(ph["chains"]), encoding="utf-8")
+                try:
+                    pr = subprocess.Popen(part_cmd(ph, [], gp, [(L, box["path"])]), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    PROCS.append(pr)
+                    _o, err = pr.communicate()
+                    if pr in PROCS:
+                        PROCS.remove(pr)
+                    box["ok"] = pr.returncode == 0
+                    if not box["ok"]:
+                        LOGONLY("slow-motion part made early failed (the render makes it): " + (err or b"").decode("utf-8", "ignore")[-200:])
+                except Exception as ex_:                   # noqa: BLE001
+                    LOGONLY(f"slow-motion part made early failed (the render makes it): {ex_}")
+        box["th"] = threading.Thread(target=job, daemon=True)
+        HEAVY_PRE[k] = box
+        box["th"].start()
+    LOGONLY(f"render: {len(HEAVY_PRE)} slow-motion part(s) started beside the sky check")
+
+
 def heavy_key(part, L):
     """V9.2.1: the identity of a heavy (slow-motion) piece: its input arguments + its filter text (inputs renumbered from 0, its own output label left out)."""
-    return hashlib.md5(json.dumps([part["groups"], [re.sub(r"\[" + re.escape(L) + r"\]$", "[OUT]", c) for c in part["chains"]]]).encode()).hexdigest()
+    lab_ = re.compile(r"\[" + re.escape(L) + r"(_pin)?\]")             # its output label and the pin's in-between label (both are numbered differently in another graph)
+    return hashlib.md5(json.dumps([part["groups"], [lab_.sub(lambda m: "[OUT" + (m.group(1) or "") + "]", c) for c in part["chains"]]]).encode()).hexdigest()
 
 
 def heavy_file(part, L):
-    """V9.2.1: the lossless file of a heavy piece in HEAVY_DIR, made now when it is not there yet (exactly the render part's command without the colour pin); None when off."""
+    """V9.2.1: the lossless file of a heavy piece in HEAVY_DIR, made now when it is not there yet (the render part's command, without the render's colour pin); None when off."""
     if not HEAVY_REUSE_ON[0] or HEAVY_DIR[0] is None:
         return None
     d = Path(HEAVY_DIR[0])
@@ -17251,14 +17341,11 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
         pos_ += (seg_frames(L, allc0) or 300) / 60.0
     tpos = {j["ti"]: min([seg_pos[l_] for l_, _k in j["outs"] if l_ in seg_pos] or [pos_]) for j in jobs}
 
-    def add(name, part, outs, deps, prio):
+    def add(name, part, outs, deps, prio, pre=None):
         gp_ = tdir / f"{name}.filter.txt"
         gp_.write_text(";\n".join(part["chains"]), encoding="utf-8")
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats"] + [a for g in part["groups"] for a in g] + sum([["-i", str(fpath(l_))] for l_ in part["reads"]], [])
-        cmd += ["-filter_threads", str(FAST_THREADS[0]), "-filter_complex_script", str(gp_)]
-        for l_, _k in outs:
-            cmd += ["-map", f"[{l_}]"] + FAST_VCODEC + ["-threads", str(FAST_THREADS[1]), "-enc_time_base:v", "1:1000000", "-fps_mode", "passthrough", "-f", "nut", str(fpath(l_))]
-        tasks[name] = {"cmd": cmd, "deps": set(deps), "prio": prio}
+        cmd = part_cmd(part, [fpath(l_) for l_ in part["reads"]], gp_, [(l_, fpath(l_)) for l_, _k in outs])
+        tasks[name] = {"cmd": cmd, "deps": set(deps), "prio": prio, **({"pre": pre} if pre else {})}
         (tdir / f"{name}.cmd.json").write_text(json.dumps(cmd, ensure_ascii=False), encoding="utf-8")       # (kept with the part: a failed part can be rerun by hand)
 
     made_by = {}
@@ -17277,11 +17364,8 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
             if opt_:
                 ph["chains"] = [re.sub(r"\[" + re.escape(L) + r"\]$", "[" + L + "_pin]", c) for c in ph["chains"]] + [f"[{L}_pin]format={opt_}[{L}]"]
             nm = f"slow{ti}_{k}"
-            hk_ = Path(HEAVY_DIR[0]) / f"{heavy_key(_part(j['chains'], j['groups'], [L], set(), {**kinds, L: 'v'}), L)}.nut" if HEAVY_REUSE_ON[0] and HEAVY_DIR[0] else None
-            if hk_ is not None and hk_.exists():                # V9.2.1: the sky check made this piece already: read back (lossless), only the colour pin applied
-                ph = {"chains": [f"[0:v:0]{('format=' + opt_) if opt_ else 'null'}[{L}]"], "groups": [["-i", str(hk_)]], "reads": []}
-                REUSED_HEAVY.append(nm)
-            add(nm, ph, [(L, "v")], [], tpos[ti] - 0.3 * _est_frames(ph["chains"]) / 2.0)
+            pre_ = HEAVY_PRE.get(heavy_key(ph, L)) if HEAVY_PRE_ON[0] else None     # V9.2.1: made beside the sky check with this very command (same key = same filters, inputs, pin)
+            add(nm, ph, [(L, "v")], [], tpos[ti] - 0.3 * _est_frames(ph["chains"]) / 2.0, pre=pre_)
             hk[L] = "v"
             made_by[L] = nm
         pv = _part(j["chains"], j["groups"], [l_ for l_, _k in v_outs], set(hk), {**kinds, **hk})
@@ -17316,6 +17400,19 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
                         return
                     cv.wait(0.5)
             ts = time.time()
+            pre_ = tasks[nm].get("pre")
+            if pre_ is not None:                               # V9.2.1: a slow-motion part made beside the sky check: wait for it, then it IS this part's file
+                pre_["th"].join()
+                if pre_.get("ok") and Path(pre_["path"]).exists():
+                    os.replace(pre_["path"], Path(tasks[nm]["cmd"][-1]))
+                    PRE_USED.append(nm)
+                    with cv:
+                        running.discard(nm)
+                        done.add(nm)
+                        took[nm] = time.time() - ts
+                        t_done[nm] = time.time()
+                        cv.notify_all()
+                    continue
             try:
                 pr = subprocess.Popen(tasks[nm]["cmd"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 PROCS.append(pr)
@@ -22875,12 +22972,26 @@ class App:
             self.run_task("rescan", lambda: rescan_stale_names(load_config()))
 
     def rp_refresh(self):
-        """V6.8: the Settings region picker: every saved region of the selected game (same data as regioncheck)."""
+        """V6.8: the Settings region picker: every saved region of the selected game (same data as regioncheck).
+        V9.2.1: the rows are counted on a worker thread (it reads every cache entry: ~4 s that froze the window at start-up and on every refresh), then shown."""
         g = self.rp_game.get()
+        self._rp_gen = getattr(self, "_rp_gen", 0) + 1
+        gen = self._rp_gen
+
+        def work():
+            try:
+                rows = region_options(g)
+            except Exception as ex:                        # noqa: BLE001
+                LOGONLY(f"region list not read: {type(ex).__name__}: {ex}")
+                return
+            self.q.put(("call", lambda: gen == self._rp_gen and self.rp_fill(rows)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def rp_fill(self, rows_):
         keep = self.rp_tree.selection()
         self.rp_tree.delete(*self.rp_tree.get_children())
         self.rp_rows = {}
-        for i, row in enumerate(region_options(g)):
+        for i, row in enumerate(rows_):
             iid = f"r{i}"
             self.rp_rows[iid] = row
             self.rp_tree.insert("", "end", iid=iid, text=row["label"],
