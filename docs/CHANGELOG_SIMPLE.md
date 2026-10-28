@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.2.1 - 2026-10-28: Faster renders and a tidy Step 3
+- Renders finish about a minute sooner: the sky check of slow-motion endings and the intro are made faster, with exactly the same picture and sound
+- The app starts faster and no longer freezes for seconds when it opens or when you switch tabs
+- The Step 3 panel is laid out cleanly: every control lines up in the same columns, with the same size and spacing, at any window size
+- The series number in the intro no longer counts a montage that never finished rendering
+
 ## V9.2.0 - 2026-10-28: Much faster planning
 - Planning a montage now takes seconds instead of minutes, and Render uses the plan Auto or Preview already made instead of planning again
 - Choosing a song or ticking clips no longer starts any work in the background, and clips and songs can be moved or deleted while a montage is being made

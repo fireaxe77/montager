@@ -448,14 +448,17 @@ def _reg_plan():
     R.append(("V9.0", "the intro is part of the 3:00 maximum and of the song window (the plan starts after the intro's music); the plan itself stays the montage without it",
               "intro_cut()" in body_of("optimal_fit") and "intro_cut()" in body_of("_plan_montage_once") and "def with_intro" in SRC()))
     R.append(("V9.0", "the intro's look is one of six, chosen from the style; only shaded and wide hype take the sky colour family (the sky's own function)", "sky_family_for(" in body_of("intro_prepare") and "pick_look(" in body_of("intro_prepare")))
-    R.append(("V9.0 / V9.2.0", "Manual: INTRO TEXT box + tickbox, Last seed button next to the seed (V9.2.0: Dry plan only in the Auto tab, a small Preview next to Last seed)",
-              all(k in body_of("build_manual", SRC()) for k in ("INTRO TEXT", '"manual:preview"', '"manual:last_seed"', "m_intro_on")) and '"manual:dry"' not in body_of("build_manual", SRC())))
+    R.append(("V9.0 / V9.2.0 / V9.2.1", "Manual: Intro text box + tickbox, Last seed button next to the seed (V9.2.0: Dry plan only in the Auto tab, a small Preview next to Last seed; V9.2.1: label in sentence case)",
+              all(k in body_of("build_manual", SRC()) for k in ('lab("Intro text"', '"manual:preview"', '"manual:last_seed"', "m_intro_on")) and '"manual:dry"' not in body_of("build_manual", SRC())))
     R.append(("V9.2.0", "nothing plans on its own: selecting a song / ticking clips only counts (no background estimate); Render reuses the plan Auto / Preview made for the same inputs",
               "start_estimate" not in SRC() and "keep_plan(" in body_of("auto_fill_ticks") and "keep_sig" in body_of("job_video")))
     R.append(("V9.2.0", "planning speed: bounded + memoised dead-air cuts, kill-row pre-check before planning, section early stop, cached stitch frame checks and sky probes",
               M.SEEN_PRECHECK_ON[0] and M.SECTION_EARLY_STOP[0] and "_dac" in body_of("dead_air_cuts") and "STITCH_CHECK_CACHE" in body_of("verify_stitch") and "sky_cache_put(" in body_of("xfx_probe_sky")))
     R.append(("V9.2.0", "the sky family varies per montage (deep blue / teal / hazy orange, seeded; a Manual pick wins)", M.SKY_VARIETY_ON[0] and set(M.SKY_VARIETY) == {"blue", "teal", "orange"}))
     R.append(("V9.2.0", "a montage that stops before the song ends stops at a calm moment, else the music fades longer", M.ENDING_CALM_ON[0] and "calm_outro_music(" in body_of("_plan_montage_once")))
+    R.append(("V9.2.1", "Manual Step 3 is one grid: three rows of label + control pairs in shared columns, Render top right as the accent button, Last seed / Preview one size",
+              all(k in body_of("build_manual", SRC()) for k in ("g3 = ttk.Frame(s3)", 'uniform="step3drop"', 'uniform="step3btn"', 'style="Accent.TButton"'))))
+    R.append(("V9.2.1", "no start-up freeze: the killfeed region list is counted on a worker thread", "threading.Thread(target=work" in body_of("rp_refresh", SRC())))
     R.append(("V9.2.0", "CS2: the run-up before the first kill is counted from the hit, not the kill row", M.CS2_KILL_LEAD_ON[0] and M.CS2_ROW_DELAY_S + M.CS2_KILL_LEAD_S >= 0.55))
     R.append(("V9.0", "the outro: slow-mo release, an eased fade to black, a longer music tail, an ending with quiet footage after the kill preferred (always on)", M.OUTRO_PREFER[0] in (True, False) and "ending_good(" in body_of("_plan_montage_once") and "cos(PI*clip(" in body_of("build_filter")))
     R.append(("V9.0", "Last seed: the seed of the most recently rendered montage is stored (any game, any mode) and survives a restart", "save_last_seed(plan)" in body_of("run_job") and "def load_last_seed" in SRC()))
