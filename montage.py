@@ -17040,11 +17040,10 @@ def failing_take_text(plan, graph, out_t):
 
 
 
-STEP3_PAD = ((6, 16), (1, 1))        # V9.2.1 Manual Step 3 grid: (label -> its control, between pairs) and (above, below) every row, px
-STEP3_DROP_W = 13                    # the Sky colour / Font / Style dropdowns: one width (characters)
-STEP3_ENTRY_W = 18                   # the intro text box
-STEP3_SLIDER_W = 110                 # the length slider (px; it grows with the column)
-STEP3_BTN_W = 8                      # Last seed and Preview: one size (characters)
+STEP3_GAP = 4                        # V9.3.0 Manual Step 3: the one gap (px) between every label, control and button
+STEP3_ENTRY_W = 16                   # the intro text box (characters)
+STEP3_SEED_W = 6                     # the seed box (a 6-digit seed)
+STEP3_SLIDER_W = 46                  # the length slider (px)
 LIGHT_TASKS = ("clips",)             # V9.2.0: tasks that only read the caches and refill a list: they run beside a job instead of waiting for it
 
 FAST_RENDER = [True]                 # V8.8.8 switch: every take's own chains run in parallel ffmpeg processes into lossless files, then one light final pass (the same filters, the same frames)
@@ -20284,6 +20283,9 @@ def apply_theme(root, scale=None, accent="lime", base="grey", mode="standard"):
             st.configure("TNotebook.Tab", padding=(16, 5), font=("Segoe UI", F(10), "bold"))
             st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
             st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+            st.configure("Small.TButton", padding=(4, 2))       # V9.3.0: low-use buttons sized to their text
+            st.configure("Tight.TCheckbutton", padding=(0, 0))
+            st.configure("Tight.TRadiobutton", padding=(0, 0))
             st.configure("Section.TLabel", font=("Segoe UI", F(11), "bold"), foreground=pal["acc"])
             st.configure("Dim.TLabel", foreground=pal["dim"])
         root.configure(bg=pal["bg"])
@@ -20351,6 +20353,9 @@ def _apply_theme_clam(root, scale=None, pal=None, flat=False):
     st.configure("Vertical.TScrollbar", background=pal["btn"], troughcolor=pal["head"], arrowcolor=pal["fg"], bordercolor=pal["border"])
     st.configure("Horizontal.TScale", background=pal["acc"], troughcolor=pal["head"], bordercolor=pal["border"])
     st.configure("Big.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6))
+    st.configure("Small.TButton", padding=(4, 2))               # V9.3.0: low-use buttons sized to their text
+    st.configure("Tight.TCheckbutton", padding=(0, 0))          # V9.3.0: Step 3's tick / option boxes without extra padding (the row fits a 920 px window)
+    st.configure("Tight.TRadiobutton", padding=(0, 0))
     st.configure("Big.Accent.TButton", font=("Segoe UI", F(11), "bold"), padding=(14, 6), background=pal["acc"], foreground=pal["acc_fg"],
                  lightcolor=pal["acc"], darkcolor=pal["acc"], bordercolor=pal["acc"])
     st.map("Big.Accent.TButton", background=[("disabled", pal["head"]), ("active", pal["sel"]), ("pressed", pal["sel"])],
@@ -21496,40 +21501,36 @@ class App:
     # ------------------------------------------------------------ Manual tab
     def build_manual(self):
         f = self.tabs["Manual"]
-        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=(8, 1, 8, 2))
+        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=(4, 2, 4, 2))
         s3.pack(side="bottom", fill="x", padx=2, pady=(6, 2))          # packed FIRST so it can never be pushed off-screen
-        # V9.2.1: ONE grid: three rows of label + control pairs in the same columns (labels left-aligned, the same style, every control one height); Render top right
-        g3 = ttk.Frame(s3)
-        g3.pack(fill="x")
-        PX, PY = STEP3_PAD
+        G = STEP3_GAP                                          # V9.3.0: the V9.2.0 positions (two rows), narrow boxes, ONE gap between every label, control and button
+        import tkinter.font as tkfont
+        fnt_ = tkfont.nametofont("TkDefaultFont")
+        longest_ = max(manual_pick_choices("sky") + manual_pick_choices("font") + list(STYLE_CHOICES), key=lambda x: fnt_.measure(x))
+        drop_w = -(-fnt_.measure(longest_) // max(1, fnt_.measure("0")))          # the three dropdowns: one width, just their longest value (measured, in '0' widths)
 
-        def lab(text, r, c):
-            ttk.Label(g3, text=text).grid(row=r, column=c, sticky="w", padx=(0 if c == 0 else PX[1], PX[0]), pady=PY)
-
-        def put(w, r, c, span=1):
-            w.grid(row=r, column=c, columnspan=span, sticky="ew", pady=PY)
+        def gap(w, first=False):
+            w.pack(side="left", padx=(0 if first else G, 0))
             return w
-
-        def strip(r, c, span=1):
-            fr = ttk.Frame(g3)
-            put(fr, r, c, span)
-            return fr
-        lab("Intro text", 0, 0)                                # V9.0: the intro's text (the main line, nothing else) and its tickbox
-        it_ = strip(0, 1)
+        bb = ttk.Frame(s3)                                     # row 1: Intro text, Intro, Sky colour, Font ... Render at the right edge
+        bb.pack(fill="x", pady=(2, 4))
+        rb_ = self.btn(bb, "Render", lambda: self.manual("render"), big=True, primary=True, name="manual:render")
+        rb_.pack(side="right", fill="x", expand=True, padx=(4 * G, 0))       # the big primary button: the rest of the row up to the panel's right edge (V9.2.0)
+        gap(ttk.Label(bb, text="Intro text"), first=True)     # V9.0: the intro's text (the main line, nothing else) and its tickbox
         self.m_intro_text = tk.StringVar(value=INTRO_MANUAL["text"])
-        self.e_intro = ttk.Entry(it_, textvariable=self.m_intro_text, width=STEP3_ENTRY_W)
-        self.e_intro.pack(side="left", fill="x", expand=True)
+        self.e_intro = gap(ttk.Entry(bb, textvariable=self.m_intro_text, width=STEP3_ENTRY_W))
         self.named["Intro text"] = self.e_intro
         self.m_intro_on = tk.BooleanVar(value=INTRO_MANUAL["on"])
-        cbi = ttk.Checkbutton(it_, text="Intro", variable=self.m_intro_on, command=lambda: intro_changed())
-        cbi.pack(side="left", padx=(PX[0], 0))
+        lbi = gap(ttk.Label(bb, text="Intro"))                # the label left of its tickbox (a click on it ticks too)
+        cbi = gap(ttk.Checkbutton(bb, text="", variable=self.m_intro_on, command=lambda: intro_changed(), style="Tight.TCheckbutton"))
+        lbi.bind("<Button-1>", lambda e: (self.m_intro_on.set(not self.m_intro_on.get()), intro_changed()))
         self.named["Intro tickbox"] = cbi
         self.m_pick = {}                                       # V9.2.0: Sky colour / Font (V9.0.2)
-        for kind, lbl, name, row, col in (("sky", "Sky colour", "Sky colour", 0, 2), ("font", "Font", "Font", 1, 4)):
-            lab(lbl, row, col)
+        for kind, lbl, name in (("sky", "Sky colour", "Sky colour"), ("font", "Font", "Font")):
+            gap(ttk.Label(bb, text=lbl))
             ch_ = manual_pick_choices(kind)
             v_ = tk.StringVar(value=MANUAL_PICK.get(kind) if MANUAL_PICK.get(kind) in ch_ else PICK_DEFAULT)
-            cb_ = put(ttk.Combobox(g3, textvariable=v_, values=ch_, width=STEP3_DROP_W, state="readonly"), row, col + 1)
+            cb_ = gap(ttk.Combobox(bb, textvariable=v_, values=ch_, width=drop_w, state="readonly"))
             self.named[name] = cb_
             self.m_pick[kind] = v_
 
@@ -21546,49 +21547,38 @@ class App:
                 self.update_status()
         self.m_intro_text.trace_add("write", intro_changed)
         self.m_intro_on.trace_add("write", intro_changed)
-        lab("Length", 1, 0)
-        ln_ = strip(1, 1)
+        c3 = ttk.Frame(s3)                                     # row 2: Length, Optimal, slider + value, Style, Quality, Seed, Last seed, Preview
+        c3.pack(fill="x", pady=2)
+        gap(ttk.Label(c3, text="Length"), first=True)
         L = self.cfg.get("length_s", "optimal")
         self.m_opt = tk.BooleanVar(value=not isinstance(L, (int, float)))
-        cb = ttk.Checkbutton(ln_, text="Optimal", variable=self.m_opt, command=self.update_status)
-        cb.pack(side="left")
+        cb = gap(ttk.Checkbutton(c3, text="Optimal", variable=self.m_opt, command=self.update_status, style="Tight.TCheckbutton"))
         self.named["Optimal length"] = cb
         self.m_len = tk.IntVar(value=int(L) if isinstance(L, (int, float)) else LEN_MIN_S)
-        self.m_len_sc = ttk.Scale(ln_, from_=LEN_MIN_S, to=LEN_MAX_S, variable=self.m_len, length=STEP3_SLIDER_W,
-                                  command=lambda v: (self.m_len.set(int(float(v))), self.update_status()))
-        self.m_len_sc.pack(side="left", fill="x", expand=True, padx=(PX[0], PX[0]))
-        ttk.Label(ln_, textvariable=self.m_len, width=4, anchor="e").pack(side="left")
-        lab("Style", 1, 2)
+        self.m_len_sc = gap(ttk.Scale(c3, from_=LEN_MIN_S, to=LEN_MAX_S, variable=self.m_len, length=STEP3_SLIDER_W,
+                                      command=lambda v: (self.m_len.set(int(float(v))), self.update_status())))
+        gap(ttk.Label(c3, textvariable=self.m_len, width=3, anchor="e"))
+        gap(ttk.Label(c3, text="Style"))
         st = self.cfg.get("style", "auto")
         self.m_style = tk.StringVar(value=st if st in STYLE_CHOICES else "auto")
-        cbx = put(ttk.Combobox(g3, textvariable=self.m_style, values=STYLE_CHOICES, width=STEP3_DROP_W, state="readonly"), 1, 3)
+        cbx = gap(ttk.Combobox(c3, textvariable=self.m_style, values=STYLE_CHOICES, width=drop_w, state="readonly"))
         self.named["Style"] = cbx
-        lab("Quality", 2, 0)
-        q_ = strip(2, 1)
+        gap(ttk.Label(c3, text="Quality"))
         self.m_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
-        ttk.Radiobutton(q_, text="Fast (NVENC)", variable=self.m_q, value="nvenc").pack(side="left")
-        ttk.Radiobutton(q_, text="Max (x264 CRF15)", variable=self.m_q, value="max").pack(side="left", padx=(PX[0], 0))
-        lab("Seed", 2, 2)
+        gap(ttk.Radiobutton(c3, text="Fast (NVENC)", variable=self.m_q, value="nvenc", style="Tight.TRadiobutton"))
+        gap(ttk.Radiobutton(c3, text="Max (x264)", variable=self.m_q, value="max", style="Tight.TRadiobutton"))      # V9.3.0: shorter label (still x264 CRF 15): the row fits a 920 px window
+        gap(ttk.Label(c3, text="Seed"))
         self.m_seed = tk.StringVar()
-        put(ttk.Entry(g3, textvariable=self.m_seed, width=8), 2, 3)          # the seed box: the dropdowns' column and width
-        sb_ = ttk.Frame(g3)
-        sb_.grid(row=2, column=4, columnspan=2, sticky="ew", padx=(PX[1], 0), pady=PY)      # Last seed + Preview: under Render, the same left / right edges
-        for i_, (text_, cmd_, nm_) in enumerate((("Last seed", self.fill_last_seed, "manual:last_seed"), ("Preview", lambda: self.manual("preview"), "manual:preview"))):
-            self.btn(sb_, text_, cmd_, name=nm_, width=STEP3_BTN_W).grid(row=0, column=i_, sticky="ew", padx=((0, PX[0] // 2), (PX[0] // 2, 0))[i_])     # V9.0 Last seed, V9.2.0 the small 720p / 20 s Preview: the same size
-            sb_.columnconfigure(i_, weight=1, uniform="step3btn")
-        rb_ = self.btn(g3, "Render", lambda: self.manual("render"), name="manual:render", style="Accent.TButton")      # the primary action: accent colour, the panel's top right corner
-        rb_.grid(row=0, column=4, columnspan=2, sticky="nsew", padx=(PX[1], 0), pady=PY)
-        g3.columnconfigure(1, weight=2)
-        for c_ in (3, 5):
-            g3.columnconfigure(c_, weight=1, uniform="step3drop")      # the dropdown columns: one width
-        for r_ in range(3):
-            g3.rowconfigure(r_, uniform="step3row")
+        gap(ttk.Entry(c3, textvariable=self.m_seed, width=STEP3_SEED_W))
+        bw_ = -(-max(fnt_.measure("Last seed"), fnt_.measure("Preview")) // max(1, fnt_.measure("0")))     # Last seed and Preview: one size, their text plus a little padding
+        for text_, cmd_, nm_ in (("Last seed", self.fill_last_seed, "manual:last_seed"), ("Preview", lambda: self.manual("preview"), "manual:preview")):
+            gap(self.btn(c3, text_, cmd_, name=nm_, width=bw_, style="Small.TButton"))     # V9.0 Last seed, V9.2.0 the small 720p / 20 s Preview right next to it
         for v_ in (self.m_seed, self.m_style):
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
         self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
         self.m_status_disp = tk.StringVar(value="Tick some clips.")
         self.m_status_lbl = ttk.Label(s3, textvariable=self.m_status_disp, font=("Segoe UI", F(10), "bold"), width=1, anchor="w")
-        self.m_status_lbl.pack(anchor="w", fill="x", pady=(PY[0] + 1, 0))         # the panel's left edge, as the rows above
+        self.m_status_lbl.pack(anchor="w", fill="x", pady=2)
         self.m_status.trace_add("write", self.fit_status)
         self.m_status_lbl.bind("<Configure>", self.fit_status)
         self.mpane = mid = self.make_pane(f, "vertical")           # V5.55: drag divider between the clip list and the song list
