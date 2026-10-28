@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.1.3"
+APP_VERSION = "V9.1.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -4338,7 +4338,6 @@ CS2_DATING_OWN = 0.9
 CS2_DATING_SLOT_ON = [True]          # V9.1.4: a faint fade-in frame counts only when the name patch matches in the row's own slot (the row above matched: Oneelke, mytos, 小林 ... 0.13-0.25 s early)
 CS2_DATING_SLOT_PX = 8
 CS2_DATING_MIN_MOVE_5 = 0.06        # V9.1.4 (ext 5, own-slot proof): two frames earlier is a real correction (小林 12.97 -> 12.87, row from 12.83)
-CS2_EDGE_FILL = 0.4                 # V9.1.4: an outline fading in before its text: at least this share of the bottom edge is red
 CS2_DATING_FLASH_ON = [True]         # V9.1.4: in the first-appearance gate a red flash (the row's inside red too) is no outline (2023.10.29 - 16.03.59 Chevrolet dated 0.33 s late)
 CS2_FLASH_MIN_C = 0.45              # V9.1.4: under a flash the red slot proves nothing: a fade-in frame needs this much name-patch match
 CS2_FLASH_FILL = 0.3                 # share of the row's inside in the strict red mask that means a flash, not an outline
@@ -4471,12 +4470,6 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
             dms[j] = border_dm(frames[j])[0]
         return int(dms[j][max(0, y - 3):y + hrow + 4, xa:xb].sum())
 
-    def bottom_edge(j, y):                                     # V9.1.4: share of the row's width with red on its BOTTOM edge (the top edge may be the row above's bottom edge)
-        if j not in dms:
-            dms[j] = border_dm(frames[j])[0]
-        b = dms[j][max(0, y + hrow - 3):min(dh, y + hrow + 3), xa:xb]
-        return float(b.any(axis=0).mean()) if b.size else 0.0
-
     def corr_at(j, y):                                         # V9.1.4: the name-patch match inside the row's own slot only (y +- CS2_DATING_SLOT_PX)
         r0, r1 = max(0, y + 4 - CS2_DATING_SLOT_PX), min(dh, y + 4 + th + CS2_DATING_SLOT_PX)
         c0, c1 = max(0, rc["x0"]), min(dw, rc["x0"] + 6 + tw + 6)
@@ -4519,8 +4512,7 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
         y_f = corr(j)[1]
         back = 0
         while j - 1 >= 0 and back < int(0.2 * fps) and (corr_at(j - 1, y_f) if CS2_DATING_SLOT_ON[0] else corr(j - 1)[0]) >= (CS2_FLASH_MIN_C if flash(j - 1, y_f) else 0.3) and \
-                (bottom_edge(j - 1, y_f) >= CS2_EDGE_FILL if CS2_DATING_SLOT_ON[0] else
-                 int(border_dm(frames[j - 1])[0][max(0, y_f - 3):min(dh, y_f + hrow + 4), xa:xb].sum()) >= 0.3 * ref) \
+                int(border_dm(frames[j - 1])[0][max(0, y_f - 3):min(dh, y_f + hrow + 4), xa:xb].sum()) >= 0.3 * ref \
                 and not other_row_at(j - 1, y_f):                   # V9.1.4: the band is the row's own box (3 px above it stood the row above's bottom edge: Oneelke dated 0.2 s early)
             j -= 1
             back += 1
@@ -4539,7 +4531,9 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
             return 0                                           # V9.1.0: red in the slot that is not a row outline (a damage flash tinting the scene behind the feed): no row
         return oc_
     for q in range(j - ng, j):
-        c = corr_at(q, y_first) if CS2_DATING_SLOT_ON[0] else corr(q)[0]     # V9.1.4: only a match in OUR slot proves the row was already there (a look-alike row elsewhere matched 0.60: 计伯常)
+        c, y_m = corr(q)
+        if CS2_DATING_SLOT_ON[0] and abs(y_m - y_first) > CS2_DATING_SLOT_PX:
+            c = corr_at(q, y_first)                            # V9.1.4: the best match stands in ANOTHER row's slot (a look-alike row: 计伯常): only our own slot counts
         oc = gate_outl(frames[q], y_first, yb0, yb1)
         if info is not None and "trace" in info:
             info["trace"].append((j, q, round(c, 3), oc, ref))

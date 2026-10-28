@@ -5,6 +5,11 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V9.1.4 (branch work-v914, NOT merged) - 2026-10-28
+- Frozen answer key `tests/answer_key_v914.json` (138 kills V9.1.3 changed, judged on the frames; 2 deathmatch ignored) + `tests/test_v914.py` part k. Baseline after reverting the outline-edge rule: 130 / 136; end: 135 / 136, no kill worse than baseline. Still wrong: #70 我不会打枪 (2024.01.25 - 22.00.50) 9.37 s, row from ~9.53 s.
+- Kept: red-flash dating (`CS2_DATING_FLASH_ON`, `CS2_FLASH_*`), own-patch walk (`CS2_DATING_OWN_ON`), fade frames in the row's own slot (`CS2_DATING_SLOT_ON`, `corr_at`), gate: a best match in another row's slot counts only in our slot, loose proof dropped for the own-slot gate, `CS2_DATING_MIN_MOVE_5`, strict-line left-cut boxes (`CS2_CUT_STRICT_ON`), '$' = 's' in stale / presence checks (`CS2_DOLLAR_ON`), full-feed kills unsure (`CS2_FULL_FEED_ON`); memo tag d914b. Reverted: bottom-edge outline rule (8 kills 0.1-0.4 s late), own-slot text extension (4 kills early), V9.1.3 gate (计伯常 late).
+- Not released: outside the key the dating changes move 37 kills in 69 of the other 1033 CS2 clips (mostly 0.1 s earlier, some 0.13-0.26 s later), unchecked on frames: `tests/v914_unchecked_moves.json`. Row data in montage_data unchanged.
+
 ## V9.1.3 (branch work-v913, merged to main, APP_VERSION = V9.1.3) - 2026-10-27
 - Case A (TOY montage, take 11, "CS2 2026-10-17 17-15-59.mov"): a 4k stored as a 1k. Rows: Han 15.1 s (Dual Berettas icon read as the text 'FP' -> `utility`), Hood 17.9 s (stored), I KICK MIDGETS 20.5 s (row longer than the killfeed region: no left edge -> never a rect), Tom 28.5 s (the only row on screen, bottom edge only partly strict-red -> never a rect). Now 4 kills.
 - Case B (take 28, "Counter-strike 2 2023.09.01 - 12.13.31.07.DVR.mp4", 15.5 s of a 7-kill round): rows smpampip (pre-clip, on screen at frame 0), Flx (fades in at 0.07 s), KaKou 13.3 s. Flx was missing from the old sidecar and kept from the name scan at 1.67 s (1.6 s late), so the take started at 0.58 s after the real kill; a fresh V9.1.2 scan would drop it as pre-clip (first seen at full opacity within 0.6 s). Now Flx 0.2 s + KaKou 13.3 s.
