@@ -64,6 +64,23 @@ def body_of(name, src=None):
     return src[i:j if j > 0 else len(src)]
 
 
+def _series_ok():
+    """V9.2.1: the series number counted for real: an empty folder = #1, each finished montage (also a _2 of the same day, an older week name) +1, a .part file not; the same after a restart."""
+    import subprocess
+    d = Path(tempfile.mkdtemp(prefix="v885series_"))
+    cfg = {"output_root": str(d)}
+    g = d / M.GAME_DIR["cs2"]
+    g.mkdir()
+    got = [M.series_next("cs2", cfg)]
+    for nm in ("ILFTB_CS2_V9.2.1_2026-10-28.mp4", "ILFTB_CS2_V9.2.1_2026-10-28_2.mp4", "CS2_2026-W41_12826.mp4", "CS2_2026-W41_827727.part.mp4", "X_CS2_V9.2.1_2026-10-29.part.mp4"):
+        (g / nm).write_bytes(b"0")
+        got.append(M.series_next("cs2", cfg))
+    code = f"import sys; sys.path.insert(0, {str(ROOT)!r}); import montage as M; print(M.series_next('cs2', {{'output_root': {str(d)!r}}}))"
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    after = int((r.stdout.strip().splitlines() or ["0"])[-1])
+    return got == [1, 2, 3, 4, 4, 4] and after == 4
+
+
 def part0():
     print("0) version, changelogs")
     check("APP_VERSION is V8.8.5", M.APP_VERSION == "V8.8.5")
@@ -431,18 +448,22 @@ def _reg_plan():
     R.append(("V9.0", "the intro is part of the 3:00 maximum and of the song window (the plan starts after the intro's music); the plan itself stays the montage without it",
               "intro_cut()" in body_of("optimal_fit") and "intro_cut()" in body_of("_plan_montage_once") and "def with_intro" in SRC()))
     R.append(("V9.0", "the intro's look is one of six, chosen from the style; only shaded and wide hype take the sky colour family (the sky's own function)", "sky_family_for(" in body_of("intro_prepare") and "pick_look(" in body_of("intro_prepare")))
-    R.append(("V9.0 / V9.2.0", "Manual: INTRO TEXT box + tickbox, Last seed button next to the seed (V9.2.0: Dry plan only in the Auto tab, a small Preview next to Last seed)",
-              all(k in body_of("build_manual", SRC()) for k in ("INTRO TEXT", '"manual:preview"', '"manual:last_seed"', "m_intro_on")) and '"manual:dry"' not in body_of("build_manual", SRC())))
+    R.append(("V9.0 / V9.2.0 / V9.2.1", "Manual: Intro text box + tickbox, Last seed button next to the seed (V9.2.0: Dry plan only in the Auto tab, a small Preview next to Last seed; V9.2.1: label in sentence case)",
+              all(k in body_of("build_manual", SRC()) for k in ('lab("Intro text"', '"manual:preview"', '"manual:last_seed"', "m_intro_on")) and '"manual:dry"' not in body_of("build_manual", SRC())))
     R.append(("V9.2.0", "nothing plans on its own: selecting a song / ticking clips only counts (no background estimate); Render reuses the plan Auto / Preview made for the same inputs",
               "start_estimate" not in SRC() and "keep_plan(" in body_of("auto_fill_ticks") and "keep_sig" in body_of("job_video")))
     R.append(("V9.2.0", "planning speed: bounded + memoised dead-air cuts, kill-row pre-check before planning, section early stop, cached stitch frame checks and sky probes",
               M.SEEN_PRECHECK_ON[0] and M.SECTION_EARLY_STOP[0] and "_dac" in body_of("dead_air_cuts") and "STITCH_CHECK_CACHE" in body_of("verify_stitch") and "sky_cache_put(" in body_of("xfx_probe_sky")))
     R.append(("V9.2.0", "the sky family varies per montage (deep blue / teal / hazy orange, seeded; a Manual pick wins)", M.SKY_VARIETY_ON[0] and set(M.SKY_VARIETY) == {"blue", "teal", "orange"}))
     R.append(("V9.2.0", "a montage that stops before the song ends stops at a calm moment, else the music fades longer", M.ENDING_CALM_ON[0] and "calm_outro_music(" in body_of("_plan_montage_once")))
+    R.append(("V9.2.1", "Manual Step 3 is one grid: three rows of label + control pairs in shared columns, Render top right as the accent button, Last seed / Preview one size",
+              all(k in body_of("build_manual", SRC()) for k in ("g3 = ttk.Frame(s3)", 'uniform="step3drop"', 'uniform="step3btn"', 'style="Accent.TButton"'))))
+    R.append(("V9.2.1", "no start-up freeze: the killfeed region list is counted on a worker thread", "threading.Thread(target=work" in body_of("rp_refresh", SRC())))
     R.append(("V9.2.0", "CS2: the run-up before the first kill is counted from the hit, not the kill row", M.CS2_KILL_LEAD_ON[0] and M.CS2_ROW_DELAY_S + M.CS2_KILL_LEAD_S >= 0.55))
     R.append(("V9.0", "the outro: slow-mo release, an eased fade to black, a longer music tail, an ending with quiet footage after the kill preferred (always on)", M.OUTRO_PREFER[0] in (True, False) and "ending_good(" in body_of("_plan_montage_once") and "cos(PI*clip(" in body_of("build_filter")))
     R.append(("V9.0", "Last seed: the seed of the most recently rendered montage is stored (any game, any mode) and survives a restart", "save_last_seed(plan)" in body_of("run_job") and "def load_last_seed" in SRC()))
-    R.append(("V9.0", "the series number counts the finished Auto / weekly / Force montages of a game (stored)", "series_done(game, cfg)" in body_of("run_job") and "series_next(game, cfg)" in body_of("make_plan")))
+    R.append(("V9.0 / V9.2.1", "the series number = the finished montages of the game in its output folder + 1 (no stored counter: it survives a restart; a half-made .part file does not count)",
+              _series_ok() and "series_next(game, cfg)" in body_of("make_plan")))
     R.append(("V8.5 / V9.0", "Force Full: the whole montage 3:00 at most (intro and outro included), long songs use a 2:00 - 3:00 section", (M.FULL_CAP_S, M.FULL_MIN_S, M.FULL_TOTAL_S) in ((180.0, 120.0, 180.0), (150.0, 90.0, 180.0))))   # (the V8 numbers only under MONTAGER_V8_COMPAT)
     R.append(("V6.5.1", "Auto / weekly montages are at least 60 s", M.WEEKLY_MIN_S == 60.0))
     R.append(("V5.42B / V8.8.4", "the death rule: no kill counted for 8 s after my own death", float(M.DEFAULT_CONFIG["death_lock_s"]) == 8.0 and "within {lock:.0f}s after my death" in SRC()))
