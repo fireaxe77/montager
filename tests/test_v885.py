@@ -64,6 +64,23 @@ def body_of(name, src=None):
     return src[i:j if j > 0 else len(src)]
 
 
+def _series_ok():
+    """V9.2.1: the series number counted for real: an empty folder = #1, each finished montage (also a _2 of the same day, an older week name) +1, a .part file not; the same after a restart."""
+    import subprocess
+    d = Path(tempfile.mkdtemp(prefix="v885series_"))
+    cfg = {"output_root": str(d)}
+    g = d / M.GAME_DIR["cs2"]
+    g.mkdir()
+    got = [M.series_next("cs2", cfg)]
+    for nm in ("ILFTB_CS2_V9.2.1_2026-10-28.mp4", "ILFTB_CS2_V9.2.1_2026-10-28_2.mp4", "CS2_2026-W41_12826.mp4", "CS2_2026-W41_827727.part.mp4", "X_CS2_V9.2.1_2026-10-29.part.mp4"):
+        (g / nm).write_bytes(b"0")
+        got.append(M.series_next("cs2", cfg))
+    code = f"import sys; sys.path.insert(0, {str(ROOT)!r}); import montage as M; print(M.series_next('cs2', {{'output_root': {str(d)!r}}}))"
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+    after = int((r.stdout.strip().splitlines() or ["0"])[-1])
+    return got == [1, 2, 3, 4, 4, 4] and after == 4
+
+
 def part0():
     print("0) version, changelogs")
     check("APP_VERSION is V8.8.5", M.APP_VERSION == "V8.8.5")
@@ -442,7 +459,8 @@ def _reg_plan():
     R.append(("V9.2.0", "CS2: the run-up before the first kill is counted from the hit, not the kill row", M.CS2_KILL_LEAD_ON[0] and M.CS2_ROW_DELAY_S + M.CS2_KILL_LEAD_S >= 0.55))
     R.append(("V9.0", "the outro: slow-mo release, an eased fade to black, a longer music tail, an ending with quiet footage after the kill preferred (always on)", M.OUTRO_PREFER[0] in (True, False) and "ending_good(" in body_of("_plan_montage_once") and "cos(PI*clip(" in body_of("build_filter")))
     R.append(("V9.0", "Last seed: the seed of the most recently rendered montage is stored (any game, any mode) and survives a restart", "save_last_seed(plan)" in body_of("run_job") and "def load_last_seed" in SRC()))
-    R.append(("V9.0", "the series number counts the finished Auto / weekly / Force montages of a game (stored)", "series_done(game, cfg)" in body_of("run_job") and "series_next(game, cfg)" in body_of("make_plan")))
+    R.append(("V9.0 / V9.2.1", "the series number = the finished montages of the game in its output folder + 1 (no stored counter: it survives a restart; a half-made .part file does not count)",
+              _series_ok() and "series_next(game, cfg)" in body_of("make_plan")))
     R.append(("V8.5 / V9.0", "Force Full: the whole montage 3:00 at most (intro and outro included), long songs use a 2:00 - 3:00 section", (M.FULL_CAP_S, M.FULL_MIN_S, M.FULL_TOTAL_S) in ((180.0, 120.0, 180.0), (150.0, 90.0, 180.0))))   # (the V8 numbers only under MONTAGER_V8_COMPAT)
     R.append(("V6.5.1", "Auto / weekly montages are at least 60 s", M.WEEKLY_MIN_S == 60.0))
     R.append(("V5.42B / V8.8.4", "the death rule: no kill counted for 8 s after my own death", float(M.DEFAULT_CONFIG["death_lock_s"]) == 8.0 and "within {lock:.0f}s after my death" in SRC()))
