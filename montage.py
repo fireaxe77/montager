@@ -16815,7 +16815,7 @@ def failing_take_text(plan, graph, out_t):
 
 
 
-STEP3_PAD = ((6, 16), (3, 3))        # V9.2.1 Manual Step 3 grid: (label -> its control, between pairs) and (above, below) every row, px
+STEP3_PAD = ((6, 16), (1, 1))        # V9.2.1 Manual Step 3 grid: (label -> its control, between pairs) and (above, below) every row, px
 STEP3_DROP_W = 13                    # the Sky colour / Font / Style dropdowns: one width (characters)
 STEP3_ENTRY_W = 18                   # the intro text box
 STEP3_SLIDER_W = 110                 # the length slider (px; it grows with the column)
@@ -21116,7 +21116,7 @@ class App:
     # ------------------------------------------------------------ Manual tab
     def build_manual(self):
         f = self.tabs["Manual"]
-        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=(8, 4, 8, 6))
+        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=(8, 1, 8, 2))
         s3.pack(side="bottom", fill="x", padx=2, pady=(6, 2))          # packed FIRST so it can never be pushed off-screen
         # V9.2.1: ONE grid: three rows of label + control pairs in the same columns (labels left-aligned, the same style, every control one height); Render top right
         g3 = ttk.Frame(s3)
@@ -21208,7 +21208,7 @@ class App:
         self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
         self.m_status_disp = tk.StringVar(value="Tick some clips.")
         self.m_status_lbl = ttk.Label(s3, textvariable=self.m_status_disp, font=("Segoe UI", F(10), "bold"), width=1, anchor="w")
-        self.m_status_lbl.pack(anchor="w", fill="x", pady=(PY[0] + 2, 0))         # the panel's left edge, as the rows above
+        self.m_status_lbl.pack(anchor="w", fill="x", pady=(PY[0] + 1, 0))         # the panel's left edge, as the rows above
         self.m_status.trace_add("write", self.fit_status)
         self.m_status_lbl.bind("<Configure>", self.fit_status)
         self.mpane = mid = self.make_pane(f, "vertical")           # V5.55: drag divider between the clip list and the song list
