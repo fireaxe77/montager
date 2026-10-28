@@ -21148,6 +21148,8 @@ class App:
         self.m_intro_on.trace_add("write", intro_changed)
         c3 = ttk.Frame(s3)
         c3.pack(fill="x", pady=2)
+        sd_ = ttk.Frame(c3)                                    # V9.2.0: Seed / Last seed / Preview packed first (right side): a narrow window cuts the Quality choice, never these buttons
+        sd_.pack(side="right")
         ttk.Label(c3, text="Length").pack(side="left")
         L = self.cfg.get("length_s", "optimal")
         self.m_opt = tk.BooleanVar(value=not isinstance(L, (int, float)))
@@ -21169,11 +21171,11 @@ class App:
         self.m_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
         ttk.Radiobutton(c3, text="Fast (NVENC)", variable=self.m_q, value="nvenc").pack(side="left")
         ttk.Radiobutton(c3, text="Max (x264 CRF15)", variable=self.m_q, value="max").pack(side="left", padx=4)
-        ttk.Label(c3, text="Seed").pack(side="left", padx=(12, 2))
+        ttk.Label(sd_, text="Seed").pack(side="left", padx=(12, 2))
         self.m_seed = tk.StringVar()
-        ttk.Entry(c3, textvariable=self.m_seed, width=8).pack(side="left")
-        self.btn(c3, "Last seed", self.fill_last_seed, name="manual:last_seed").pack(side="left", padx=(4, 0))         # V9.0: the seed of the most recently rendered montage
-        self.btn(c3, "Preview", lambda: self.manual("preview"), name="manual:preview").pack(side="left", padx=(6, 0))     # V9.2.0: the 720p / 20 s preview, a small button
+        ttk.Entry(sd_, textvariable=self.m_seed, width=8).pack(side="left")
+        self.btn(sd_, "Last seed", self.fill_last_seed, name="manual:last_seed").pack(side="left", padx=(4, 0))         # V9.0: the seed of the most recently rendered montage
+        self.btn(sd_, "Preview", lambda: self.manual("preview"), name="manual:preview").pack(side="left", padx=(6, 0))     # V9.2.0: the 720p / 20 s preview, a small button
         for v_ in (self.m_seed, self.m_style):
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
         self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
