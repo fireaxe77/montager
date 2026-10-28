@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.2.0"
+APP_VERSION = "V9.2.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -14669,6 +14669,15 @@ def sky_take_frames(plan, t, f0, f1, size=(SKY_W, SKY_H)):
     import numpy as np
     _inp, keep = sky_take_graph(plan, t, f0, f1, size)
     w, h = size
+    if HEAVY_REUSE_ON[0] and HEAVY_DIR[0] is not None:     # V9.2.1: the slow-motion pieces come from their lossless files (made once, as a lean job; the same frames, bit for bit)
+        groups_ = _split_inputs(_inp)
+        for L in heavy_labels(keep):
+            hf_ = heavy_file(_part(keep, groups_, [L], set(), {}), L)
+            if hf_ is not None:
+                n_ = len(groups_)
+                groups_.append(["-i", str(hf_)])
+                keep = [f"[{n_}:v:0]null[{L}]" if _chain_io(c)[1] == [L] else c for c in keep]
+        _inp = [a for g in groups_ for a in g]
     vin = sorted({int(i_) for p_ in keep for i_ in re.findall(r"\[(\d+):v:0\]", p_)})
     gp = Path(tempfile.mkstemp(prefix="skyframes_", suffix=".txt")[1])
     try:
@@ -16734,11 +16743,25 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = slice_plan(plan) if preview else plan
     itmp = render_tmpdir(outfile)
+    HEAVY_DIR[0] = Path(itmp) / "heavy"                    # V9.2.1: the sky check's slow-motion pieces (made once per take)
     sky_ok = sky_enabled(cfg, p.get("game"))               # V8.7: sky recolour off for this game (Settings): no probe, no mask, no recolour in the render (also for a plan made before it was switched off)
     if not sky_ok:
         for t_ in p.get("takes") or []:
             if t_.get("xfx"):
                 t_["xfx"] = [x_ for x_ in t_["xfx"] if x_.get("k") != "sky"]
+    if not preview:                                        # V9.2.1: the render's slow-motion parts start now, beside the sky check and the intro text
+        heavy_prestart(p, cfg, (set(FX_ALL) | (set(XFX_FX) if p.get("effects") == "extra" else set()) if effects else {"slow"}), Path(itmp) / "pre", p.get("game"))
+    intro_box = {}
+    if p.get("intro"):                                     # V9.2.1: the intro's text video is made beside the sky check (they share nothing; same file, made sooner)
+        def _intro_job():
+            t_ = time.perf_counter()
+            try:
+                intro_assets(p, itmp)
+            except Exception as ex_:                       # noqa: BLE001
+                intro_box["err"] = ex_
+            intro_box["s"] = time.perf_counter() - t_
+        intro_box["th"] = threading.Thread(target=_intro_job, daemon=True)
+        intro_box["th"].start()
     if p.get("effects") == "extra" and sky_ok:
         try:
             with jstage("sky analysis"):
@@ -16754,8 +16777,11 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         raise RuntimeError("cut list problem, not rendering: " + "; ".join(bad))
     if p.get("intro"):                                     # V9.0: the intro's text (a video with alpha) first, then the plan as the render sees it (the intro take in front)
         try:
-            with jstage("intro"):
-                intro_assets(p, itmp)
+            with jstage("intro (waited for)"):
+                intro_box["th"].join()
+            JOB_STAGES["intro"] = JOB_STAGES.get("intro", 0.0) + float(intro_box.get("s", 0.0))
+            if intro_box.get("err") is not None:
+                raise intro_box["err"]
         except Exception as ex_:                           # noqa: BLE001
             if CANCEL.is_set():
                 shutil.rmtree(itmp, ignore_errors=True)
@@ -16769,7 +16795,8 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     elog = LOG_DIR / "last_render_stderr.txt"
     fx = set(FX_ALL) | (set(XFX_FX) if p.get("effects") == "extra" else set()) if effects else {"slow"}
     try:                                                   # V6.9.3: low-fps clips are interpolated first (only the ranges the plan uses)
-        pr_ = interp_prepare(p, cfg, itmp, fx)
+        with jstage("render: interpolation"):
+            pr_ = interp_prepare(p, cfg, itmp, fx)
     except Exception as ex:
         if CANCEL.is_set():
             shutil.rmtree(itmp, ignore_errors=True)
@@ -16782,6 +16809,12 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     finally:
         if isinstance(plan.get("intro"), dict):
             plan["intro"].pop("_text", None)               # the temporary text video is gone with the temp folder: never saved in the plan
+        HEAVY_DIR[0] = None
+        if HEAVY_PRE:
+            LOGONLY(f"render: {len(PRE_USED)} of {len(HEAVY_PRE)} early slow-motion part(s) used ({', '.join(PRE_USED) or 'none'})")
+            for b_ in HEAVY_PRE.values():
+                b_["th"].join(timeout=600)
+            HEAVY_PRE.clear()
         shutil.rmtree(itmp, ignore_errors=True)
 
 
@@ -16815,6 +16848,11 @@ def failing_take_text(plan, graph, out_t):
 
 
 
+STEP3_PAD = ((6, 16), (1, 1))        # V9.2.1 Manual Step 3 grid: (label -> its control, between pairs) and (above, below) every row, px
+STEP3_DROP_W = 13                    # the Sky colour / Font / Style dropdowns: one width (characters)
+STEP3_ENTRY_W = 18                   # the intro text box
+STEP3_SLIDER_W = 110                 # the length slider (px; it grows with the column)
+STEP3_BTN_W = 8                      # Last seed and Preview: one size (characters)
 LIGHT_TASKS = ("clips",)             # V9.2.0: tasks that only read the caches and refill a list: they run beside a job instead of waiting for it
 
 FAST_RENDER = [True]                 # V8.8.8 switch: every take's own chains run in parallel ffmpeg processes into lossless files, then one light final pass (the same filters, the same frames)
@@ -16978,6 +17016,137 @@ def split_take_graphs(inputs, graph, pin=None, audio_final=False):
 FAST_VCODEC = ["-c:v", "utvideo", "-pred", "median"]     # V8.8.8: lossless intermediate picture codec (decodes ~5x faster than FFV1; yuv420p kept bit for bit)
 FAST_THREADS = [2, 2]                                    # V8.8.8: filter / encoder threads of each part (many parts run at once: more threads only fight for the cores)
 FAST_HEAVY = ("minterpolate",)                           # V8.8.8: a take's chain with one of these (slow motion: motion interpolation, one thread) runs as its own job
+HEAVY_REUSE_ON = [True]              # V9.2.1 switch: the sky check makes a take's slow-motion piece as its own lean job (lossless, like a render part; 196 s -> 79 s for the ILFTB ending) and reads it back.
+                                     # The render makes its own: its pieces carry the colour pin, which changes the pixels before the motion interpolation (not shareable)
+HEAVY_DIR = [None]                   # the render's folder for those files (set by render_plan for one render)
+_HEAVY_LOCK = threading.Lock()
+_HEAVY_KEY_LOCKS = {}
+
+
+HEAVY_PRE_ON = [False]               # V9.2.1 switch, off: measured slower (the early parts take the CPU from the sky check and the final pass is the limit); output identical either way
+HEAVY_PRE = {}                       # key -> {"th", "path", "ok"} for the running render
+PRE_USED = []                        # the render parts that were taken from HEAVY_PRE (log, tests)
+
+
+def part_cmd(part, read_files, gp, outs):
+    """V9.2.1 (V8.8.8 render_parts): the ffmpeg command of one render part: its inputs, its file reads, its filter script, every output as a lossless NUT with microsecond timestamps."""
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats"] + [a for g in part["groups"] for a in g] + sum([["-i", str(f_)] for f_ in read_files], [])
+    cmd += ["-filter_threads", str(FAST_THREADS[0]), "-filter_complex_script", str(gp)]
+    for l_, f_ in outs:
+        cmd += ["-map", f"[{l_}]"] + FAST_VCODEC + ["-threads", str(FAST_THREADS[1]), "-enc_time_base:v", "1:1000000", "-fps_mode", "passthrough", "-f", "nut", str(f_)]
+    return cmd
+
+
+def heavy_parts(inputs, graph, pin):
+    """V9.2.1: the render's slow-motion parts exactly as render_parts makes them: [(label, part)] with the colour pin applied (the same detection, chains and pin)."""
+    jobs, _final, _fg = split_take_graphs(inputs, graph, pin, audio_final=True)
+    opt_ = ":".join(o_ for o_ in ((f"pix_fmts={pin[2]}" if len(pin) > 2 and pin[2] else ""), (f"color_spaces={pin[0]}:color_ranges={pin[1]}" if pin[0] else "")) if o_)
+    kinds = {l_: k_ for j in jobs for l_, k_ in j["outs"]}
+    res = []
+    for j in jobs:
+        v_outs = [(l_, k_) for l_, k_ in j["outs"] if k_ == "v"]
+        pv = _part(j["chains"], j["groups"], [l_ for l_, _k in v_outs], set(), kinds)
+        for c in [j["chains"][i] for i in sorted(pv["cl"])]:
+            ins_, outs_ = _chain_io(c)
+            if any(h_ in c for h_ in FAST_HEAVY) and len(outs_) == 1 and ins_ and all(re.match(r"^\d+:", x) for x in ins_) and outs_[0] not in kinds:
+                L = outs_[0]
+                ph = _part(j["chains"], j["groups"], [L], set(), {**kinds, L: "v"})
+                if opt_:
+                    ph["chains"] = [re.sub(r"\[" + re.escape(L) + r"\]$", "[" + L + "_pin]", c_) for c_ in ph["chains"]] + [f"[{L}_pin]format={opt_}[{L}]"]
+                res.append((L, ph))
+    return res
+
+
+def heavy_prestart(p, cfg, fx, tdir, game):
+    """V9.2.1: starts the render's slow-motion parts (the longest render work; the same commands render_parts runs) beside the sky check and the intro, at most 2 at a time, into
+    `tdir`. The graph is the plan's before the sky check (the sky never touches a slow-motion piece; a piece whose filters still differ in the real graph has another key and is made again)."""
+    HEAVY_PRE.clear()
+    PRE_USED.clear()
+    if not HEAVY_PRE_ON[0] or not FAST_RENDER[0]:
+        return
+    try:
+        inputs, graph = build_filter(with_intro(dict(p, intro=None)), cfg, False, fx)      # the intro's text video is not made yet; the intro holds no slow-motion piece of a take
+        m_ = re.search(r"format=(\w+)\[vout\]\s*(?:;|$)", graph)
+        if not m_:
+            return
+        pins_ = load_json(DATA / "render_pins.json", {})
+        g_pin = pins_.get(str(game)) if isinstance(pins_, dict) else None
+        pin = (g_pin[0], g_pin[1], m_.group(1)) if isinstance(g_pin, list) and len(g_pin) == 2 else ("bt709", "tv", m_.group(1))
+        todo = heavy_parts(inputs, graph, pin)
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"slow-motion parts not started early: {type(ex).__name__}: {ex}")
+        return
+    tdir = Path(tdir)
+    tdir.mkdir(parents=True, exist_ok=True)
+    sem = threading.Semaphore(2)
+    for n_, (L, ph) in enumerate(sorted(todo, key=lambda x: -_est_frames(x[1]["chains"]))):
+        k = heavy_key(ph, L)
+        if k in HEAVY_PRE:
+            continue
+        box = {"path": tdir / f"pre{n_}.nut", "ok": False}
+
+        def job(L=L, ph=ph, box=box, n_=n_):
+            with sem:
+                if CANCEL.is_set():
+                    return
+                gp = tdir / f"pre{n_}.filter.txt"
+                gp.write_text(";\n".join(ph["chains"]), encoding="utf-8")
+                try:
+                    pr = subprocess.Popen(part_cmd(ph, [], gp, [(L, box["path"])]), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    PROCS.append(pr)
+                    _o, err = pr.communicate()
+                    if pr in PROCS:
+                        PROCS.remove(pr)
+                    box["ok"] = pr.returncode == 0
+                    if not box["ok"]:
+                        LOGONLY("slow-motion part made early failed (the render makes it): " + (err or b"").decode("utf-8", "ignore")[-200:])
+                except Exception as ex_:                   # noqa: BLE001
+                    LOGONLY(f"slow-motion part made early failed (the render makes it): {ex_}")
+        box["th"] = threading.Thread(target=job, daemon=True)
+        HEAVY_PRE[k] = box
+        box["th"].start()
+    LOGONLY(f"render: {len(HEAVY_PRE)} slow-motion part(s) started beside the sky check")
+
+
+def heavy_key(part, L):
+    """V9.2.1: the identity of a heavy (slow-motion) piece: its input arguments + its filter text (inputs renumbered from 0, its own output label left out)."""
+    lab_ = re.compile(r"\[" + re.escape(L) + r"(_pin)?\]")             # its output label and the pin's in-between label (both are numbered differently in another graph)
+    return hashlib.md5(json.dumps([part["groups"], [lab_.sub(lambda m: "[OUT" + (m.group(1) or "") + "]", c) for c in part["chains"]]]).encode()).hexdigest()
+
+
+def heavy_file(part, L):
+    """V9.2.1: the lossless file of a heavy piece in HEAVY_DIR, made now when it is not there yet (the render part's command, without the render's colour pin); None when off."""
+    if not HEAVY_REUSE_ON[0] or HEAVY_DIR[0] is None:
+        return None
+    d = Path(HEAVY_DIR[0])
+    d.mkdir(parents=True, exist_ok=True)
+    k = heavy_key(part, L)
+    dest = d / f"{k}.nut"
+    with _HEAVY_LOCK:
+        lk = _HEAVY_KEY_LOCKS.setdefault(k, threading.Lock())
+    with lk:
+        if dest.exists():
+            return dest
+        gp = d / f"{k}.filter.txt"
+        gp.write_text(";\n".join(part["chains"]), encoding="utf-8")
+        tmp = d / f"{k}.part.nut"
+        cmd = (["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats"] + [a for g in part["groups"] for a in g] + ["-filter_threads", str(FAST_THREADS[0]), "-filter_complex_script", str(gp),
+               "-map", f"[{L}]"] + FAST_VCODEC + ["-threads", str(FAST_THREADS[1]), "-enc_time_base:v", "1:1000000", "-fps_mode", "passthrough", "-f", "nut", str(tmp)])
+        r = run(cmd, timeout=1800)
+        if r.returncode != 0 or not tmp.exists():
+            raise RuntimeError("slow-motion piece not made: " + (r.stderr or b"").decode("utf-8", "ignore")[-300:])
+        os.replace(tmp, dest)
+        return dest
+
+
+def heavy_labels(chains):
+    """V9.2.1: the outputs of the chains that are a heavy piece the render runs as its own part (FAST_HEAVY, one output, read straight from the inputs)."""
+    res = []
+    for c in chains:
+        ins_, outs_ = _chain_io(c)
+        if any(h_ in c for h_ in FAST_HEAVY) and len(outs_) == 1 and ins_ and all(re.match(r"^\d+:", x) for x in ins_):
+            res.append(outs_[0])
+    return res
 
 
 def _concat_list(paths, p):
@@ -17172,14 +17341,11 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
         pos_ += (seg_frames(L, allc0) or 300) / 60.0
     tpos = {j["ti"]: min([seg_pos[l_] for l_, _k in j["outs"] if l_ in seg_pos] or [pos_]) for j in jobs}
 
-    def add(name, part, outs, deps, prio):
+    def add(name, part, outs, deps, prio, pre=None):
         gp_ = tdir / f"{name}.filter.txt"
         gp_.write_text(";\n".join(part["chains"]), encoding="utf-8")
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-nostats"] + [a for g in part["groups"] for a in g] + sum([["-i", str(fpath(l_))] for l_ in part["reads"]], [])
-        cmd += ["-filter_threads", str(FAST_THREADS[0]), "-filter_complex_script", str(gp_)]
-        for l_, _k in outs:
-            cmd += ["-map", f"[{l_}]"] + FAST_VCODEC + ["-threads", str(FAST_THREADS[1]), "-enc_time_base:v", "1:1000000", "-fps_mode", "passthrough", "-f", "nut", str(fpath(l_))]
-        tasks[name] = {"cmd": cmd, "deps": set(deps), "prio": prio}
+        cmd = part_cmd(part, [fpath(l_) for l_ in part["reads"]], gp_, [(l_, fpath(l_)) for l_, _k in outs])
+        tasks[name] = {"cmd": cmd, "deps": set(deps), "prio": prio, **({"pre": pre} if pre else {})}
         (tdir / f"{name}.cmd.json").write_text(json.dumps(cmd, ensure_ascii=False), encoding="utf-8")       # (kept with the part: a failed part can be rerun by hand)
 
     made_by = {}
@@ -17198,7 +17364,8 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
             if opt_:
                 ph["chains"] = [re.sub(r"\[" + re.escape(L) + r"\]$", "[" + L + "_pin]", c) for c in ph["chains"]] + [f"[{L}_pin]format={opt_}[{L}]"]
             nm = f"slow{ti}_{k}"
-            add(nm, ph, [(L, "v")], [], tpos[ti] - 0.3 * _est_frames(ph["chains"]) / 2.0)
+            pre_ = HEAVY_PRE.get(heavy_key(ph, L)) if HEAVY_PRE_ON[0] else None     # V9.2.1: made beside the sky check with this very command (same key = same filters, inputs, pin)
+            add(nm, ph, [(L, "v")], [], tpos[ti] - 0.3 * _est_frames(ph["chains"]) / 2.0, pre=pre_)
             hk[L] = "v"
             made_by[L] = nm
         pv = _part(j["chains"], j["groups"], [l_ for l_, _k in v_outs], set(hk), {**kinds, **hk})
@@ -17233,6 +17400,19 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
                         return
                     cv.wait(0.5)
             ts = time.time()
+            pre_ = tasks[nm].get("pre")
+            if pre_ is not None:                               # V9.2.1: a slow-motion part made beside the sky check: wait for it, then it IS this part's file
+                pre_["th"].join()
+                if pre_.get("ok") and Path(pre_["path"]).exists():
+                    os.replace(pre_["path"], Path(tasks[nm]["cmd"][-1]))
+                    PRE_USED.append(nm)
+                    with cv:
+                        running.discard(nm)
+                        done.add(nm)
+                        took[nm] = time.time() - ts
+                        t_done[nm] = time.time()
+                        cv.notify_all()
+                    continue
             try:
                 pr = subprocess.Popen(tasks[nm]["cmd"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 PROCS.append(pr)
@@ -17405,6 +17585,12 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
             except OSError:
                 pass
     slow = sorted(took.items(), key=lambda kv: -kv[1])[:3]
+    t_parts = max(t_done.values() or [t0]) - t0                # V9.2.1: the render's own stages in the job's STAGES line
+    JOB_STAGES["render: slow-motion parts"] = JOB_STAGES.get("render: slow-motion parts", 0.0) + sum(v for k, v in took.items() if k.startswith("slow"))
+    JOB_STAGES["render: takes"] = JOB_STAGES.get("render: takes", 0.0) + sum(v for k, v in took.items() if k.startswith("take"))
+    JOB_STAGES["render: dissolves"] = JOB_STAGES.get("render: dissolves", 0.0) + sum(v for k, v in took.items() if k.startswith("dissolve"))
+    JOB_STAGES["render: all parts made"] = JOB_STAGES.get("render: all parts made", 0.0) + t_parts
+    JOB_STAGES["render: final encode after the parts"] = JOB_STAGES.get("render: final encode after the parts", 0.0) + max(0.0, time.time() - t0 - t_parts)
     LOGONLY(f"fast render: {len([n for n in tasks if n.startswith('take')])} takes, {len([n for n in tasks if n.startswith('slow')])} slow-motion parts, "
             f"{len([n for n in tasks if n.startswith('dissolve')])} dissolves, {RENDER_JOBS} at a time (longest: " + ", ".join(f"{k} {v:.1f} s" for k, v in slow)
             + f"); all parts made after {max(t_done.values() or [0]) - t0:.1f} s, encoder done after {time.time() - t0:.1f} s (started at {t1 - t0:.1f} s), rc {rc}")
@@ -17745,6 +17931,8 @@ def montage_videos(d, game):
         new = re.compile(rf"_{GAME_CODE[game]}_[^_]+_(\d{{4}}-\d{{2}}-\d{{2}})(_\d+)?\.mp4$", re.I)
         old = re.compile(rf"^{GAME_DIR[game]}_(\d{{4}})-W(\d{{2}})_.*\.mp4$", re.I)
         for p in d.glob("*.mp4"):
+            if p.name.lower().endswith(".part.mp4"):
+                continue                                   # V9.2.1: a render that never finished (its .part file) is not a montage: it counted in the series number and as this week's montage
             m, mo = new.search(p.name), old.match(p.name)
             try:
                 if m:
@@ -21109,26 +21297,40 @@ class App:
     # ------------------------------------------------------------ Manual tab
     def build_manual(self):
         f = self.tabs["Manual"]
-        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=4)
+        s3 = ttk.LabelFrame(f, text="Step 3: make it", padding=(8, 1, 8, 2))
         s3.pack(side="bottom", fill="x", padx=2, pady=(6, 2))          # packed FIRST so it can never be pushed off-screen
-        bb = ttk.Frame(s3)
-        bb.pack(fill="x", pady=(2, 6))
-        ttk.Label(bb, text="INTRO TEXT", font=("Segoe UI", F(9), "bold")).pack(side="left", padx=(6, 0))        # V9.0: the intro's text (the main line, nothing else) and its tickbox, on the row of the big buttons
+        # V9.2.1: ONE grid: three rows of label + control pairs in the same columns (labels left-aligned, the same style, every control one height); Render top right
+        g3 = ttk.Frame(s3)
+        g3.pack(fill="x")
+        PX, PY = STEP3_PAD
+
+        def lab(text, r, c):
+            ttk.Label(g3, text=text).grid(row=r, column=c, sticky="w", padx=(0 if c == 0 else PX[1], PX[0]), pady=PY)
+
+        def put(w, r, c, span=1):
+            w.grid(row=r, column=c, columnspan=span, sticky="ew", pady=PY)
+            return w
+
+        def strip(r, c, span=1):
+            fr = ttk.Frame(g3)
+            put(fr, r, c, span)
+            return fr
+        lab("Intro text", 0, 0)                                # V9.0: the intro's text (the main line, nothing else) and its tickbox
+        it_ = strip(0, 1)
         self.m_intro_text = tk.StringVar(value=INTRO_MANUAL["text"])
-        self.e_intro = ttk.Entry(bb, textvariable=self.m_intro_text, width=26)
-        self.e_intro.pack(side="left", padx=(6, 4))
+        self.e_intro = ttk.Entry(it_, textvariable=self.m_intro_text, width=STEP3_ENTRY_W)
+        self.e_intro.pack(side="left", fill="x", expand=True)
         self.named["Intro text"] = self.e_intro
         self.m_intro_on = tk.BooleanVar(value=INTRO_MANUAL["on"])
-        cbi = ttk.Checkbutton(bb, text="Intro", variable=self.m_intro_on, command=lambda: intro_changed())
-        cbi.pack(side="left", padx=(2, 8))
+        cbi = ttk.Checkbutton(it_, text="Intro", variable=self.m_intro_on, command=lambda: intro_changed())
+        cbi.pack(side="left", padx=(PX[0], 0))
         self.named["Intro tickbox"] = cbi
-        self.m_pick = {}                                       # V9.2.0: Sky colour / Font (V9.0.2) sit where the big Preview and the Dry plan button were
-        for kind, lbl, name in (("sky", "Sky colour", "Sky colour"), ("font", "Font", "Font")):
-            ttk.Label(bb, text=lbl).pack(side="left", padx=(6, 2))
+        self.m_pick = {}                                       # V9.2.0: Sky colour / Font (V9.0.2)
+        for kind, lbl, name, row, col in (("sky", "Sky colour", "Sky colour", 0, 2), ("font", "Font", "Font", 1, 4)):
+            lab(lbl, row, col)
             ch_ = manual_pick_choices(kind)
             v_ = tk.StringVar(value=MANUAL_PICK.get(kind) if MANUAL_PICK.get(kind) in ch_ else PICK_DEFAULT)
-            cb_ = ttk.Combobox(bb, textvariable=v_, values=ch_, width=14, state="readonly")
-            cb_.pack(side="left", padx=(0, 4))
+            cb_ = put(ttk.Combobox(g3, textvariable=v_, values=ch_, width=STEP3_DROP_W, state="readonly"), row, col + 1)
             self.named[name] = cb_
             self.m_pick[kind] = v_
 
@@ -21137,7 +21339,6 @@ class App:
                 if hasattr(self, "m_status"):
                     self.update_status()
             v_.trace_add("write", pick_changed)
-        self.btn(bb, "Render", lambda: self.manual("render"), big=True, primary=True, name="manual:render").pack(side="left", expand=True, fill="x", padx=6)
 
         def intro_changed(*_):
             INTRO_MANUAL["on"] = bool(self.m_intro_on.get())
@@ -21146,42 +21347,49 @@ class App:
                 self.update_status()
         self.m_intro_text.trace_add("write", intro_changed)
         self.m_intro_on.trace_add("write", intro_changed)
-        c3 = ttk.Frame(s3)
-        c3.pack(fill="x", pady=2)
-        sd_ = ttk.Frame(c3)                                    # V9.2.0: Seed / Last seed / Preview packed first (right side): a narrow window cuts the Quality choice, never these buttons
-        sd_.pack(side="right")
-        ttk.Label(c3, text="Length").pack(side="left")
+        lab("Length", 1, 0)
+        ln_ = strip(1, 1)
         L = self.cfg.get("length_s", "optimal")
         self.m_opt = tk.BooleanVar(value=not isinstance(L, (int, float)))
-        cb = ttk.Checkbutton(c3, text="Optimal", variable=self.m_opt, command=self.update_status)
-        cb.pack(side="left", padx=(4, 2))
+        cb = ttk.Checkbutton(ln_, text="Optimal", variable=self.m_opt, command=self.update_status)
+        cb.pack(side="left")
         self.named["Optimal length"] = cb
         self.m_len = tk.IntVar(value=int(L) if isinstance(L, (int, float)) else LEN_MIN_S)
-        self.m_len_sc = ttk.Scale(c3, from_=LEN_MIN_S, to=LEN_MAX_S, variable=self.m_len, length=150,
+        self.m_len_sc = ttk.Scale(ln_, from_=LEN_MIN_S, to=LEN_MAX_S, variable=self.m_len, length=STEP3_SLIDER_W,
                                   command=lambda v: (self.m_len.set(int(float(v))), self.update_status()))
-        self.m_len_sc.pack(side="left", padx=4)
-        ttk.Label(c3, textvariable=self.m_len, width=4).pack(side="left")
-        ttk.Label(c3, text="Style").pack(side="left", padx=(12, 2))
+        self.m_len_sc.pack(side="left", fill="x", expand=True, padx=(PX[0], PX[0]))
+        ttk.Label(ln_, textvariable=self.m_len, width=4, anchor="e").pack(side="left")
+        lab("Style", 1, 2)
         st = self.cfg.get("style", "auto")
         self.m_style = tk.StringVar(value=st if st in STYLE_CHOICES else "auto")
-        cbx = ttk.Combobox(c3, textvariable=self.m_style, values=STYLE_CHOICES, width=10, state="readonly")
-        cbx.pack(side="left")
+        cbx = put(ttk.Combobox(g3, textvariable=self.m_style, values=STYLE_CHOICES, width=STEP3_DROP_W, state="readonly"), 1, 3)
         self.named["Style"] = cbx
-        ttk.Label(c3, text="Quality").pack(side="left", padx=(12, 2))
+        lab("Quality", 2, 0)
+        q_ = strip(2, 1)
         self.m_q = tk.StringVar(value=self.cfg.get("quality", "nvenc"))
-        ttk.Radiobutton(c3, text="Fast (NVENC)", variable=self.m_q, value="nvenc").pack(side="left")
-        ttk.Radiobutton(c3, text="Max (x264 CRF15)", variable=self.m_q, value="max").pack(side="left", padx=4)
-        ttk.Label(sd_, text="Seed").pack(side="left", padx=(12, 2))
+        ttk.Radiobutton(q_, text="Fast (NVENC)", variable=self.m_q, value="nvenc").pack(side="left")
+        ttk.Radiobutton(q_, text="Max (x264 CRF15)", variable=self.m_q, value="max").pack(side="left", padx=(PX[0], 0))
+        lab("Seed", 2, 2)
         self.m_seed = tk.StringVar()
-        ttk.Entry(sd_, textvariable=self.m_seed, width=8).pack(side="left")
-        self.btn(sd_, "Last seed", self.fill_last_seed, name="manual:last_seed").pack(side="left", padx=(4, 0))         # V9.0: the seed of the most recently rendered montage
-        self.btn(sd_, "Preview", lambda: self.manual("preview"), name="manual:preview").pack(side="left", padx=(6, 0))     # V9.2.0: the 720p / 20 s preview, a small button
+        put(ttk.Entry(g3, textvariable=self.m_seed, width=8), 2, 3)          # the seed box: the dropdowns' column and width
+        sb_ = ttk.Frame(g3)
+        sb_.grid(row=2, column=4, columnspan=2, sticky="ew", padx=(PX[1], 0), pady=PY)      # Last seed + Preview: under Render, the same left / right edges
+        for i_, (text_, cmd_, nm_) in enumerate((("Last seed", self.fill_last_seed, "manual:last_seed"), ("Preview", lambda: self.manual("preview"), "manual:preview"))):
+            self.btn(sb_, text_, cmd_, name=nm_, width=STEP3_BTN_W).grid(row=0, column=i_, sticky="ew", padx=((0, PX[0] // 2), (PX[0] // 2, 0))[i_])     # V9.0 Last seed, V9.2.0 the small 720p / 20 s Preview: the same size
+            sb_.columnconfigure(i_, weight=1, uniform="step3btn")
+        rb_ = self.btn(g3, "Render", lambda: self.manual("render"), name="manual:render", style="Accent.TButton")      # the primary action: accent colour, the panel's top right corner
+        rb_.grid(row=0, column=4, columnspan=2, sticky="nsew", padx=(PX[1], 0), pady=PY)
+        g3.columnconfigure(1, weight=2)
+        for c_ in (3, 5):
+            g3.columnconfigure(c_, weight=1, uniform="step3drop")      # the dropdown columns: one width
+        for r_ in range(3):
+            g3.rowconfigure(r_, uniform="step3row")
         for v_ in (self.m_seed, self.m_style):
             v_.trace_add("write", lambda *_: self.update_status() if hasattr(self, "m_status") else None)
         self.m_status = tk.StringVar(value="Tick some clips.")       # V6.1.5: ONE short line (full text of the summary goes to the log)
         self.m_status_disp = tk.StringVar(value="Tick some clips.")
         self.m_status_lbl = ttk.Label(s3, textvariable=self.m_status_disp, font=("Segoe UI", F(10), "bold"), width=1, anchor="w")
-        self.m_status_lbl.pack(anchor="w", fill="x", pady=2)
+        self.m_status_lbl.pack(anchor="w", fill="x", pady=(PY[0] + 1, 0))         # the panel's left edge, as the rows above
         self.m_status.trace_add("write", self.fit_status)
         self.m_status_lbl.bind("<Configure>", self.fit_status)
         self.mpane = mid = self.make_pane(f, "vertical")           # V5.55: drag divider between the clip list and the song list
@@ -22764,12 +22972,26 @@ class App:
             self.run_task("rescan", lambda: rescan_stale_names(load_config()))
 
     def rp_refresh(self):
-        """V6.8: the Settings region picker: every saved region of the selected game (same data as regioncheck)."""
+        """V6.8: the Settings region picker: every saved region of the selected game (same data as regioncheck).
+        V9.2.1: the rows are counted on a worker thread (it reads every cache entry: ~4 s that froze the window at start-up and on every refresh), then shown."""
         g = self.rp_game.get()
+        self._rp_gen = getattr(self, "_rp_gen", 0) + 1
+        gen = self._rp_gen
+
+        def work():
+            try:
+                rows = region_options(g)
+            except Exception as ex:                        # noqa: BLE001
+                LOGONLY(f"region list not read: {type(ex).__name__}: {ex}")
+                return
+            self.q.put(("call", lambda: gen == self._rp_gen and self.rp_fill(rows)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def rp_fill(self, rows_):
         keep = self.rp_tree.selection()
         self.rp_tree.delete(*self.rp_tree.get_children())
         self.rp_rows = {}
-        for i, row in enumerate(region_options(g)):
+        for i, row in enumerate(rows_):
             iid = f"r{i}"
             self.rp_rows[iid] = row
             self.rp_tree.insert("", "end", iid=iid, text=row["label"],
@@ -24486,7 +24708,8 @@ def pstage(name):
 
 
 JOB_STAGES = {}                      # V9.2.0: seconds per stage of the running job (scan, selection, pairing, planning, ...): one 'STAGES' line in montage.log per job
-JOB_STAGE_ORDER = ("scan", "song map", "selection", "pairing", "planning", "repair loop", "frame checks", "effects", "sky analysis", "intro", "render")
+JOB_STAGE_ORDER = ("scan", "song map", "selection", "pairing", "planning", "repair loop", "frame checks", "effects", "sky analysis", "intro", "intro (waited for)", "render: interpolation", "render",
+                   "render: slow-motion parts", "render: takes", "render: dissolves", "render: all parts made", "render: final encode after the parts")      # V9.2.1: the parts are CPU time of parallel jobs
 
 
 class _JobStage:
