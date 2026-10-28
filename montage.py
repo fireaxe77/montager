@@ -4301,6 +4301,8 @@ def cs2_name_kills_kept(a, b, sc, clip=""):
 CS2_LATE_ROW_ON = [True]             # V8.8 switch (tests / A-B): late rows re-timed, legacy-sidecar name kills kept
 CS2_LATE_ROW_S = 8.0                 # V8.8: a border row whose victim the name scan read this much (at most) EARLIER was picked up late (a row slid up / an old sidecar's merged rows)
 CS2_LATE_ROW_MIN_S = 1.0
+CS2_LATE_KIND_ON = [True]            # V9.3.0 switch: no re-time from a name-scan row read as a utility / notice row onto a gun kill row (2026.01.20 - 13.13.35.15: the gear-icon 'fireaxe' notice
+                                     # fading out at 3.1 s, read as one row with the Ramzes kill row that appears at 6.87 s, moved that kill 3.7 s early: its take ended before the kill)
 
 
 def cs2_late_rows_retime(a, b, clip=""):
@@ -4315,6 +4317,7 @@ def cs2_late_rows_retime(a, b, clip=""):
     for bk in sorted(b.get("kills", []), key=lambda k: k["t"]):
         cand = [nk for nk in a.get("kills", []) if id(nk) not in used and CS2_LATE_ROW_MIN_S <= bk["t"] - nk["t"] <= CS2_LATE_ROW_S
                 and nk.get("ks", 0.0) >= CS2_NAMEKEEP_KS and len(_alnum(nk.get("victim") or "")) >= 3 and cs2_same_victim(nk.get("victim"), bk.get("victim"))
+                and not (CS2_LATE_KIND_ON[0] and nk.get("weapon") == "util" and bk.get("weapon") != "util")      # V9.3.0: a notice row (gear icon) merged into the kill row's slot is not that row
                 and not any(abs(o["t"] - nk["t"]) < CS2_LATE_ROW_MIN_S for o in b["kills"] if o is not bk)]
         if not cand:
             continue
@@ -8943,6 +8946,16 @@ def cmd_songmatch(args):
     print(txt)
 
 
+def cmd_firstkill(args):
+    """V9.3.0: python montage.py firstkill <plan.json> [...]: the first-kill check of every take of saved plans (with the kill times the analysis gives now)."""
+    for f in args.plans:
+        p = load_json(Path(f), {})
+        bad = first_kill_audit(p)
+        out(f"{Path(f).name}: {len(p.get('takes') or [])} takes, {len(bad)} with the first kill not fully shown")
+        for b_ in bad:
+            out("   " + b_)
+
+
 def cmd_ledger(args):
     """V6.9.7: python montage.py ledger. Read-only: reprints the last run's kill ledger from montage_data\\ledger_last.json (written by the run) or, failing
     that, from the log; writes ledger.txt next to montage.py; changes no cache, flag or config file."""
@@ -12818,6 +12831,70 @@ def seen_rows_doomed(ev):
     return msgs[0] if msgs else None
 
 
+FIRST_KILL_LEAD_S = 0.3             # V9.3.0 first-kill check: footage shown before the first kill (LEAD_MIN) ...
+FIRST_KILL_TAIL_S = 0.4             # ... and after its row appears (ROW_TAIL), both inside one continuous stretch of the take
+_FK_MEMO = {}
+
+
+def _fk_clip_kills(path, cfg):
+    """V9.3.0: [(time, victim)] of a clip's kills as the analysis gives them NOW (the same analysis the planner uses), or None."""
+    if path in _FK_MEMO:
+        return _FK_MEMO[path]
+    res = None
+    try:
+        g = tag_game(path, cfg)[0]
+        rec = next((r for r in scan_clips(cfg) if _pkey(r["path"]) == _pkey(path)), None)
+        det = load_dets(g).get(g) if g else None
+        if rec and det:
+            rec = dict(rec, game=g)
+            e = load_kills_cache().get(kills_key(rec, g, det))
+            if e and not e.get("error"):
+                res = [(float(k["t"]), str(k.get("victim") or "")) for k in analyse_clip_entry(rec, e, cfg, g).get("kills", [])]
+    except Exception as ex:                                # noqa: BLE001
+        LOGONLY(f"first-kill check: {Path(path).name} not read ({type(ex).__name__}: {ex})")
+    _FK_MEMO[path] = res
+    return res
+
+
+def first_kill_audit(plan, cfg=None, fresh=True):
+    """V9.3.0: every take's FIRST kill must be seen: its moment and its row inside the footage the take shows, with FIRST_KILL_LEAD_S of continuous footage before the kill and
+    FIRST_KILL_TAIL_S after the row appears, before any cut away (a jump-cut, a dissolve, the take's end). fresh=True: the kill's moment is the one the clip's analysis gives NOW
+    (a planned time that the analysis no longer agrees with is the error this catches: a row dated seconds early puts the take before the kill). Returns [message]."""
+    cfg = cfg or load_config()
+    msgs = []
+    for ti, t in enumerate(plan.get("takes") or []):
+        if t.get("intro") or not t.get("kills"):
+            continue
+        k0, r0 = float(t["kills"][0]), float((t.get("rows") or t["kills"])[0])
+        vic = ((t.get("victims") or [""]) + [""])[0]
+        srcs = t.get("srcs") or [{"path": t["path"], "shift": 0.0}]
+        real = None
+        if fresh:
+            for s_ in srcs:
+                ks = _fk_clip_kills(s_["path"], cfg) or []
+                cand = [kt + float(s_.get("shift") or 0.0) for kt, v in ks if vic and v and (cs2_same_victim(v, vic) or ocr_ratio(v, vic) >= 80)]
+                if cand:
+                    real = min(cand, key=lambda x: abs(x - k0))
+                    break
+        k_ = k0 if real is None else real
+        r_ = max(r0 + (k_ - k0), k_)
+        segs = [sg for sg in t.get("segs", []) if sg[3] > 0]
+        runs, cur = [], None                               # continuous played stretches (source time)
+        for sg in segs:
+            a, b = float(sg[0]), float(sg[1])
+            if cur and abs(a - cur[1]) < 0.02:
+                cur[1] = b
+            else:
+                cur = [a, b]
+                runs.append(cur)
+        inside = next((r for r in runs if r[0] + FIRST_KILL_LEAD_S - 1e-3 <= k_ and r_ + FIRST_KILL_TAIL_S - 1e-3 <= r[1]), None)
+        if inside is None:
+            shown = ", ".join(f"{a:.2f}-{b:.2f}" for a, b in runs)
+            msgs.append(f"take {ti + 1} {Path(t['path']).name}: first kill ([{vic}]) at {k_:.2f} s" + (f" (the plan has {k0:.2f} s)" if abs(k_ - k0) > 0.05 else "")
+                        + f", its row from {r_:.2f} s, but the take shows {shown} s: the kill needs {FIRST_KILL_LEAD_S} s before it and its row {FIRST_KILL_TAIL_S} s after it, before any cut")
+    return msgs
+
+
 def verify_cutlist(plan, log=True):
     """Final check before rendering: contiguous frames, segments add up, every take >= 2 beats and holds its kills (in order,
     inside its source windows), 1.0x from 1.0 s before the first kill through the last, tails 0.2-0.5 s (ending excepted),
@@ -13902,7 +13979,7 @@ def sky_family_for(plan, ranked, qual=None):
     if pk_ in SKY_FAMILIES:                                # V9.0.2: a Manual Sky colour pick replaces only this choice (DEFAULT = no pick: the automatic choice below, unchanged)
         return pk_, "picked in Manual"
     if SKY_VARIETY_ON[0]:
-        return sky_variety_pick(plan, ranked)
+        return sky_variety_pick(plan, ranked, qual)
     song_p = (plan.get("song") or {}).get("path")
     fam, why = None, ""
     try:
@@ -13936,20 +14013,30 @@ def sky_family_for(plan, ranked, qual=None):
     return fam, why
 
 
-SKY_VARIETY_ON = [True]              # V9.2.0 switch: the automatic family is a seeded pick per montage among SKY_VARIETY (the cover / vibe rule above made ~90 % of montages orange)
-SKY_VARIETY = ("blue", "teal", "orange")         # deep blue, teal, hazy orange
-SKY_VARIETY_BIAS = 0.5               # the family the song's feel ranks first among these three gets this much more weight (each has 1.0): a lean, never a certainty (at most 40 %)
+SKY_VARIETY_ON = [True]              # V9.2.0 switch: the automatic family is a seeded pick per montage (V9.3.0: among EVERY family of the Sky colour dropdown)
+SKY_VARIETY = tuple(SKY_FAMILIES)    # V9.3.0: all of them (V9.2.0: deep blue / teal / hazy orange only, the song's lean +50 %: 3 of 5 montages came out orange)
+SKY_VARIETY_BIAS = 0.3               # V9.3.0: the family the song's feel ranks first gets this much more weight (each has 1.0): a small lean only
 
 
-def sky_variety_pick(plan, ranked):
-    """V9.2.0: the montage's sky family when nothing is picked in Manual: deep blue, teal or hazy orange, drawn from the montage's own seed (another montage of the same song can get another
-    colour); the song's feel (sky_ranked order) leans the draw toward its first family of the three. Returns (family, why)."""
+def sky_variety_pick(plan, ranked, qual=None):
+    """V9.3.0: the montage's sky family when nothing is picked in Manual: one of every family the dropdown offers, drawn from the montage's own seed; the song's feel (sky_ranked order) leans
+    the draw a little toward its first family. A white / black draw that would wash out / turn muddy in most of the montage's sky shots (sky_neutral_ok) is drawn again among the coloured ones
+    (same seed). Returns (family, why)."""
     fams_ = [SKY_NAME_FAMILY.get(n_) for n_ in (ranked or [])]
     lean = next((f_ for f_ in fams_ if f_ in SKY_VARIETY), None)
-    w = [1.0 + (SKY_VARIETY_BIAS if f_ == lean else 0.0) for f_ in SKY_VARIETY]
     rng = random.Random(int(plan.get("seed") or 1) * 7919 + 17)
-    fam = rng.choices(SKY_VARIETY, weights=w)[0]
-    return fam, f"seeded pick of deep blue / teal / hazy orange" + (f" (the song's feel leans {lean})" if lean else "")
+    pool = list(SKY_VARIETY)
+    w = [1.0 + (SKY_VARIETY_BIAS if f_ == lean else 0.0) for f_ in pool]
+    fam = rng.choices(pool, weights=w)[0]
+    why = "seeded pick of every sky colour" + (f" (the song's feel leans {lean})" if lean else "")
+    if fam in ("white", "black") and qual:
+        bad = sum(1 for c in qual if not sky_neutral_ok(fam, c.get("info"))[0])
+        if bad * 2 > len(qual):
+            pool2 = [f_ for f_ in pool if f_ not in ("white", "black")]
+            fam2 = rng.choices(pool2, weights=[1.0 + (SKY_VARIETY_BIAS if f_ == lean else 0.0) for f_ in pool2])[0]
+            why += f"; {fam} would wash out / turn muddy in {bad} of {len(qual)} sky shots -> {fam2}"
+            fam = fam2
+    return fam, why
 
 
 def sky_role_ok(t):
@@ -19086,6 +19173,13 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             out(f"Manual (this plan): {now_sum}")
             if pin and pin.get("summary") and pin["summary"] != now_sum:
                 out(f"NOTE: the summary shown at {pin.get('at', '?')} differs from this plan (inputs changed since: {pin['summary'][:160]} -> {now_sum[:160]})")
+        try:                                               # V9.3.0: every take's first kill (moment + row) inside the footage it shows, with lead and tail
+            fk_ = first_kill_audit(plan, cfg)
+            out("FIRST KILL CHECK: " + ("OK - every take shows its first kill with lead and tail" if not fk_ else f"{len(fk_)} take(s) do not show the first kill fully"))
+            for b_ in fk_:
+                out("   " + b_)
+        except Exception as ex:                            # noqa: BLE001
+            LOGONLY(f"first-kill check skipped: {type(ex).__name__}: {ex}")
         T_JOB = {"plan": time.time() - T0_JOB}
         out(f"PICK  song: {plan['pick']['title']}  style: {plan['pick']['style']}  (picked by {plan['pick']['by']})")
         out(f"EFFECTS {plan.get('effects', 'default')}")      # V8.4
@@ -25697,6 +25791,9 @@ def main():
     scp.set_defaults(fn=cmd_songcheck)
     sp.add_parser("cfgdump", help="print the config file path + contents").set_defaults(fn=cmd_cfgdump)
     sp.add_parser("timeanchor", help="V6.9.7: what the file-name time means (clip START or END) per naming scheme; read-only, writes timeanchor.txt").set_defaults(fn=cmd_timeanchor)
+    pfk = sp.add_parser("firstkill", help="V9.3.0: first-kill check (kill + row shown with lead and tail) of every take of saved plan.json files")
+    pfk.add_argument("plans", nargs="+")
+    pfk.set_defaults(fn=cmd_firstkill)
     pu = sp.add_parser("utilclip", help="V6.9.7: per-clip 'allow utility kills' override (Valorant): utilclip <name fragment | --list> [on|off]; writes only clip_overrides.json")
     pu.add_argument("target", nargs="?", default="", help="part of the clip file name, or --list")
     pu.add_argument("state", nargs="?", default="", help="on | off")
