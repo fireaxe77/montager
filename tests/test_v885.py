@@ -449,15 +449,20 @@ def _reg_plan():
               "intro_cut()" in body_of("optimal_fit") and "intro_cut()" in body_of("_plan_montage_once") and "def with_intro" in SRC()))
     R.append(("V9.0", "the intro's look is one of six, chosen from the style; only shaded and wide hype take the sky colour family (the sky's own function)", "sky_family_for(" in body_of("intro_prepare") and "pick_look(" in body_of("intro_prepare")))
     R.append(("V9.0 / V9.2.0 / V9.2.1", "Manual: Intro text box + tickbox, Last seed button next to the seed (V9.2.0: Dry plan only in the Auto tab, a small Preview next to Last seed; V9.2.1: label in sentence case)",
-              all(k in body_of("build_manual", SRC()) for k in ('lab("Intro text"', '"manual:preview"', '"manual:last_seed"', "m_intro_on")) and '"manual:dry"' not in body_of("build_manual", SRC())))
+              all(k in body_of("build_manual", SRC()) for k in ('text="Intro text"', '"manual:preview"', '"manual:last_seed"', "m_intro_on")) and '"manual:dry"' not in body_of("build_manual", SRC())))
     R.append(("V9.2.0", "nothing plans on its own: selecting a song / ticking clips only counts (no background estimate); Render reuses the plan Auto / Preview made for the same inputs",
               "start_estimate" not in SRC() and "keep_plan(" in body_of("auto_fill_ticks") and "keep_sig" in body_of("job_video")))
     R.append(("V9.2.0", "planning speed: bounded + memoised dead-air cuts, kill-row pre-check before planning, section early stop, cached stitch frame checks and sky probes",
               M.SEEN_PRECHECK_ON[0] and M.SECTION_EARLY_STOP[0] and "_dac" in body_of("dead_air_cuts") and "STITCH_CHECK_CACHE" in body_of("verify_stitch") and "sky_cache_put(" in body_of("xfx_probe_sky")))
-    R.append(("V9.2.0", "the sky family varies per montage (deep blue / teal / hazy orange, seeded; a Manual pick wins)", M.SKY_VARIETY_ON[0] and set(M.SKY_VARIETY) == {"blue", "teal", "orange"}))
+    R.append(("V9.2.0 / V9.3.0", "the sky family varies per montage: a seeded pick of EVERY Sky colour option, none over 25 % in 200 seeds (a Manual pick wins)",
+              M.SKY_VARIETY_ON[0] and set(M.SKY_VARIETY) == set(M.SKY_FAMILIES) and max(__import__("collections").Counter(M.sky_variety_pick({"seed": s_}, ["hazy orange"])[0] for s_ in range(1, 201)).values()) <= 50))
     R.append(("V9.2.0", "a montage that stops before the song ends stops at a calm moment, else the music fades longer", M.ENDING_CALM_ON[0] and "calm_outro_music(" in body_of("_plan_montage_once")))
-    R.append(("V9.2.1", "Manual Step 3 is one grid: three rows of label + control pairs in shared columns, Render top right as the accent button, Last seed / Preview one size",
-              all(k in body_of("build_manual", SRC()) for k in ("g3 = ttk.Frame(s3)", 'uniform="step3drop"', 'uniform="step3btn"', 'style="Accent.TButton"'))))
+    R.append(("V9.3.0", "Manual Step 3 in the V9.2.0 positions: row 1 Intro text, Intro, Sky colour, Font, the big Render at the right edge; row 2 Length .. Seed, Last seed, Preview (small)",
+              all(k in body_of("build_manual", SRC()) for k in ('rb_.pack(side="right", fill="x", expand=True', 'style="Small.TButton"', 'gap(ttk.Label(c3, text="Seed"))', 'lbi = gap(ttk.Label(bb, text="Intro"))'))))
+    R.append(("V9.3.0", "a sky lasts from its kill frame to the last frame of its take (a failed frame holds the last good mask); half as many skies, 12 s apart; organic patterns only",
+              M.SKY_HOLD_LAST_ON[0] and M.sky_spacing_for() == 12.0 and M.SKY_PER_S_88 == 30.0 and set(M.SKY_PATTERNS) == {"amoebas", "ink", "marble", "cells"}))
+    R.append(("V9.3.0", "first-kill check: every take shows its first kill and its row with lead and tail (run on every job); a notice row never re-times a gun kill row",
+              M.CS2_LATE_KIND_ON[0] and "first_kill_audit(plan, cfg)" in body_of("run_job", SRC())))
     R.append(("V9.2.1", "no start-up freeze: the killfeed region list is counted on a worker thread", "threading.Thread(target=work" in body_of("rp_refresh", SRC())))
     R.append(("V9.2.0", "CS2: the run-up before the first kill is counted from the hit, not the kill row", M.CS2_KILL_LEAD_ON[0] and M.CS2_ROW_DELAY_S + M.CS2_KILL_LEAD_S >= 0.55))
     R.append(("V9.0", "the outro: slow-mo release, an eased fade to black, a longer music tail, an ending with quiet footage after the kill preferred (always on)", M.OUTRO_PREFER[0] in (True, False) and "ending_good(" in body_of("_plan_montage_once") and "cos(PI*clip(" in body_of("build_filter")))
@@ -565,7 +570,7 @@ def _reg_look():
     R.append(("V8.4.4 / V8.4.5", "the kill flash is a clean white pulse (no colour cast, the frame before untouched)", ok_, why_))
     ok_, why_ = _sky_drop_order()
     R.append(("V8.8", "every drop gets a sky before any drop gets a second one; every kept sky has the montage's one pattern", ok_, why_))
-    R.append(("V8.8 / V8.8.2", "sky count / spacing: one per 15 s, at most 12, 6 s apart", M.sky_max_for(150) == 10 and M.sky_max_for(400) == 12 and M.sky_spacing_for() == 6.0))
+    R.append(("V8.8 / V9.3.0", "sky count / spacing: one per 30 s, at most 6, 12 s apart (V8.8: one per 15 s, at most 12, 6 s apart)", M.sky_max_for(150) == 5 and M.sky_max_for(400) == 6 and M.sky_spacing_for() == 12.0))
     an_ = M.sky_anim_params(0.8, 128, "hype")
     sch = M.sky_anim_schedule(an_, {"seed": 2, "beats": BEATS}, 12, 240)
     R.append(("V8.7 / V8.8", "strobe, drops to black on the beats and colour jumps are on (beat-locked)", an_["sync"] and an_["strobe_hz"] > 0 and float(sch["black"].max()) > 0.6 and float(sch["jump"].max()) > 0.5))
