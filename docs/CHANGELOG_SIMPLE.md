@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.1.4 - 2026-10-28: Kills double-checked on the frames
+- Every CS2 kill that changed in the last update was checked by eye, and kill times now land on the moment the kill appears in the killfeed
+- Kills during a red damage flash are no longer dated late
+- Two kills that were counted by mistake are gone
+- Valorant and Rainbow Six Siege are unchanged
+
 ## V9.1.3 - 2026-10-27: No more missing kills in CS2
 - Kill rows that were skipped before are now found: very long rows, a row that is the only one on screen, Dual Berettas kills and kills in the first moment of a clip
 - 69 CS2 clips gained kills that were missing, so a clip saved as a 4k now plays as a 4k; kills that had been counted twice are counted once
