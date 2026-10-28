@@ -69,7 +69,7 @@ def rule_of(reason):
 def death_lock(kills, deaths, lock=8.0):
     keep, out = [], []
     for k in kills:
-        if not k.get("util") and any(d < k["t"] <= d + lock for d in deaths):
+        if not k.get("util") and not (k.get("border") and k.get("name_read")) and any(d < k["t"] <= d + lock for d in deaths):     # as verified_kills (V9.1.3 CS2_LOCK_ROW_ON)
             out.append(k)
         else:
             keep.append(k)

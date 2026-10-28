@@ -1,5 +1,5 @@
 ; Montager installer (Inno Setup 6). Built by packaging/make_release.py:
-;   ISCC.exe /DAppVersion=9.1.3 /DSourceDir=<dist\Montager> /DOutDir=<folder> packaging\montager.iss
+;   ISCC.exe /DAppVersion=9.1.4 /DSourceDir=<dist\Montager> /DOutDir=<folder> packaging\montager.iss
 ; Per-user install (no admin): %LOCALAPPDATA%\Programs\Montager. User data lives in %LOCALAPPDATA%\Montager\montage_data
 ; (settings, caches, logs) and is NOT removed by the uninstaller.
 

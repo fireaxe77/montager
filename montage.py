@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.1.3"
+APP_VERSION = "V9.1.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -3114,11 +3114,13 @@ BORDER_PRE_F = 3                 # a track already there in the first frames = o
 BORDER_FAILED = set()            # clips whose sidecar could not be built in this process (not retried every time)
 CS2_OPEN_LEFT_ON = [True]        # V9.1.3: a row that runs past the region's left edge (long names / an assist) is a row with no left side in the crop
 BORDER_OPEN_LEFT_W = 0.8         # V9.1.3: ... and then spans at least this share of the region's width (a real cut row reaches the right edge)
+CS2_CUT_STRICT_ON = [True]       # V9.1.4: a row cut by the left edge needs a strict-red line that reaches the edge (a loose line made MLG maciora a 'cut' row 526 px wide)
 CS2_LOOSE_PAIR_ON = [True]       # V9.1.3: an outline edge only partly strict-red is completed by the loose mask before pairing
 CS2_PRE_F0_ON = [True]           # V9.1.3: an early row is pre-clip only when the clip's first frame already holds it (sidecar field f0, ext 5)
 BORDER_F0_SIM = 0.8              # V9.1.3: f0 at least this = the row was on screen in frame 0
 CS2_LONE_ROW_ON = [True]         # V9.1.3: the lone-line rescue of border_rects also runs in a frame that holds no other outlined row
 CS2_REACQ_LOOK_ON = [True]       # V9.1.3: the border tracker continues a track after missing frames only on an appearance match
+CS2_DOLLAR_ON = [True]           # V9.1.4 (ext 5): '$' in a victim read is an 's' for the pre-clip / stale-row comparison
 CS2_SAME_VIC_ON = [True]         # V9.1.3 (ext 5): a 2nd kill row of the same victim while the 1st is still on screen is a copy
 CS2_ICON_TEXT_ON = [True]        # V9.1.3: a 1-2 letter OCR read lying over most of a gun icon is the icon (ocr_rows, CS2 only)
 
@@ -3177,6 +3179,7 @@ def border_rects(fr):
         y0 = yb - (lt - 1) if a_thick else ya                      # such a line is the TOP of the row below it ...
         for j, (yc, yd, xb0, xb1) in enumerate(lines[i + 1:], i + 1):
             xa0, xa1 = xa0_s, xa1_s
+            strict_x0 = min(xa0_s, xb0)                            # V9.1.4: the left end the STRICT lines reach (a loose-mask extension never proves a cut row)
             b_thick = yd - yc + 1 > 5
             y1 = yc + (lt - 1) if b_thick else yd                  # ... and the BOTTOM of the row above it
             if y1 - y0 < BORDER_H[0] or yc - yb < 3:
@@ -3202,7 +3205,7 @@ def border_rects(fr):
             side = m[y0:y1 + 1, :]
             fl = float(side[:, max(0, x0 - 3):x0 + 9].any(axis=1).mean())
             fr_ = float(side[:, max(0, x1 - 9):x1 + 3].any(axis=1).mean())
-            cut_left = CS2_OPEN_LEFT_ON[0] and x0 <= 1 and fr_ >= 0.5 and x1 - x0 + 1 >= BORDER_OPEN_LEFT_W * m.shape[1]      # V9.1.3: a long row runs past the left edge of the killfeed region: it has no left side here
+            cut_left = CS2_OPEN_LEFT_ON[0] and x0 <= 1 and (strict_x0 <= 1 or not CS2_CUT_STRICT_ON[0]) and fr_ >= 0.5 and x1 - x0 + 1 >= BORDER_OPEN_LEFT_W * m.shape[1]      # V9.1.3: a long row runs past the left edge of the killfeed region: it has no left side here
             if (max(fl, fr_) >= 0.5 and min(fl, fr_) >= 0.25) or cut_left:
                 band = np.concatenate([dd[y0:y0 + lt, x0:x1 + 1].ravel(), dd[max(y0, y1 - lt + 1):y1 + 1, x0:x1 + 1].ravel()])
                 band = band[band >= 40]
@@ -4177,6 +4180,7 @@ def border_analysis(sc, cfg, deaths=None):
                     continue
                 if c["verdict"] != "none" and len(_alnum(c["vtext"] or "")) >= 4:
                     early.append((round(t["first"] / fps + off, 3), c["vtext"], t["id"], False))
+    same_v = (lambda a_, b_: cs2_same_victim(a_, b_) or cs2_same_victim((a_ or "").replace("$", "s"), (b_ or "").replace("$", "s")))         if (sc.get("ext", 1) >= 5 and CS2_DOLLAR_ON[0]) else cs2_same_victim        # V9.1.4: OCR reads 's' as '$' ('$oul' / 's0ul': a fragment of a pre-clip row was a new kill)
     if CS2_STALE_ON[0] and early:                            # V6.9.10: the row of a pre-clip kill read again a few seconds in (tracker lost it / re-found it) is not a new kill
         keep_k = []                                          # V7.7.6: ... also across feed positions: a row that was seen early and shifted up when the rows above it expired is the same row
         for k in kills:
@@ -4184,11 +4188,11 @@ def border_analysis(sc, cfg, deaths=None):
             real = len(_alnum(vic)) >= 4 and not vic.startswith("(unread")
             why = None
             for ef, ev_, eid, pre in early:
-                if pre and k["name_read"] and k["t"] <= CS2_STALE_S + off and cs2_same_victim(vic, ev_):
+                if pre and k["name_read"] and k["t"] <= CS2_STALE_S + off and same_v(vic, ev_):
                     why = f"already on screen at clip start ([{vic}] matches a pre-clip row)"
                 elif (not pre) and real and k.get("track") != eid and ef + 0.3 < k["t"] <= ef + CS2_STALE_S and cs2_same_victim(vic, ev_):
                     why = f"the same row as one on screen at {ef:.1f} s ([{vic}] matches [{ev_}], shifted up in the feed)"
-                elif pre and real and k["t"] <= CS2_STALE_S + off and cs2_same_victim(vic, ev_):
+                elif pre and real and k["t"] <= CS2_STALE_S + off and same_v(vic, ev_):
                     why = f"already on screen at clip start ([{vic}] matches a pre-clip row, shifted)"
                 if why:
                     break
@@ -4329,11 +4333,21 @@ CS2_DATING_SOFT = 0.7                # V7.7.6: the same row also counts as still
 CS2_DATING_MIN_MOVE = 0.1            # smaller moves are noise and are ignored
 CS2_DATING_MEMO = {}                 # (sidecar key, track id) -> first visible frame or None
 _DATING_LOGGED = set()
+CS2_DATING_OWN_ON = [True]           # V9.1.4: the walk back continues over a spot another track claimed when our name + victim patch matches there (2025.05.08 - 20.19.13 Slowmotion)
+CS2_DATING_OWN = 0.9
+CS2_DATING_SLOT_ON = [True]          # V9.1.4: a faint fade-in frame counts only when the name patch matches in the row's own slot (the row above matched: Oneelke, mytos, 小林 ... 0.13-0.25 s early)
+CS2_DATING_SLOT_PX = 8
+CS2_DATING_MIN_MOVE_5 = 0.06        # V9.1.4 (ext 5, own-slot proof): two frames earlier is a real correction (小林 12.97 -> 12.87, row from 12.83)
+CS2_DATING_FLASH_ON = [True]         # V9.1.4: in the first-appearance gate a red flash (the row's inside red too) is no outline (2023.10.29 - 16.03.59 Chevrolet dated 0.33 s late)
+CS2_FLASH_MIN_C = 0.45              # V9.1.4: under a flash the red slot proves nothing: a fade-in frame needs this much name-patch match
+CS2_FLASH_FILL = 0.3                 # share of the row's inside in the strict red mask that means a flash, not an outline
 CS2_GATE_REJECT = -1                 # cs2_dating_walk / cs2_row_first_frame: a move was proposed but its first appearance is not proven
 
 
 CS2_EDGE_DATING = [True]             # V8.1.1: rows cut by the region's lower edge are matched by their top part (CS2 dating only)
 CS2_EDGE_PART = 0.55                 # share of the row's name patch (from the top) that must be visible
+CS2_FULL_FEED_ON = [True]            # V9.1.4 (ext 5): kills first seen in the lowest row of a full feed get t_unsure (no drop / slow-mo / zoom, more run-in)
+CS2_FULL_FEED_LOW = 0.82             # share of the region height: a row whose bottom edge is this low is in the last row slot of the region
 CS2_UNSURE_EDGE = 8                  # px: a row first seen this close to the region's lower edge may have been there (cut off) earlier
 CS2_UNSURE_LEAD = 1.5                # s: extra footage shown before a kill whose time is uncertain (no slow-mo / zoom on it)
 
@@ -4455,21 +4469,38 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
         if j not in dms:
             dms[j] = border_dm(frames[j])[0]
         return int(dms[j][max(0, y - 3):y + hrow + 4, xa:xb].sum())
+
+    def corr_at(j, y):                                         # V9.1.4: the name-patch match inside the row's own slot only (y +- CS2_DATING_SLOT_PX)
+        r0, r1 = max(0, y + 4 - CS2_DATING_SLOT_PX), min(dh, y + 4 + th + CS2_DATING_SLOT_PX)
+        c0, c1 = max(0, rc["x0"]), min(dw, rc["x0"] + 6 + tw + 6)
+        reg = gray[j][r0:r1, c0:c1]
+        if reg.shape[0] < th or reg.shape[1] < tw:
+            return -1.0
+        return float(cv2.matchTemplate(reg, tpl, cv2.TM_CCOEFF_NORMED).max())
+
+    def flash(j, y):                                           # V9.1.4: a red damage flash fills the row's inside too (an outline is hollow)
+        if not CS2_DATING_FLASH_ON[0] or hrow <= 8:
+            return False
+        if j not in dms:
+            dms[j] = border_dm(frames[j])[0]
+        return float(dms[j][max(0, y) + 4:max(0, y) + hrow - 3, xa + 6:xb - 6].mean()) >= CS2_FLASH_FILL
     j, fade, gap = j1, 0, False
+    y_cur = corr(j1)[1]                                        # V9.1.4: the slot the row stands in during the walk (a fade-in frame must match THERE)
     while j - 1 >= 0 and ref >= 30:
         c, y_at = corr(j - 1)
-        if (c >= 0.3) and other_row_at(j - 1, y_at):
+        if (c >= 0.3) and other_row_at(j - 1, y_at) and not (CS2_DATING_OWN_ON[0] and c >= CS2_DATING_OWN):     # V9.1.4: our own name AND victim patch matched this well is our row, whichever track claimed the spot
             gap = True                                         # that is another tracked row
             break
         if c >= 0.9:
             fade = 0
-        elif c >= CS2_DATING_SOFT and outl(j - 1, y_at) >= 0.5 * ref:
+        elif c >= CS2_DATING_SOFT and outl(j - 1, y_at) >= 0.5 * ref and not flash(j - 1, y_at):
             fade = 0                                           # V7.7.6: the row is still there, only the picture behind it changed (dark / bright scene, smoke): same row, same slot
-        elif fade < int(0.5 * fps) and c >= 0.3 and cnt[j - 1] >= 0.3 * ref and pstd(j - 1) < 0.97 * pstd(j):
+        elif fade < int(0.5 * fps) and c >= (CS2_FLASH_MIN_C if flash(j - 1, y_at) else 0.3) and cnt[j - 1] >= 0.3 * ref                 and (not CS2_DATING_SLOT_ON[0] or abs(y_at - y_cur) <= CS2_DATING_SLOT_PX) and pstd(j - 1) < 0.97 * pstd(j):
             fade += 1                                          # faint fade-in frame: fainter than the frame after it (a row that is just as sharp is another row), previous frame accepted
         else:
             gap = True
             break
+        y_cur = y_at                                           # V9.1.4: follow the row frame by frame (the feed may scroll while it fades in); a jump to another row breaks the walk
         j -= 1
     if not (gap and j < j1):
         return None
@@ -4480,8 +4511,9 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
     if CS2_EDGE_DATING[0]:                                             # V8.1.1: the outline fades in a frame or two before the text matches: those frames are the row's own start
         y_f = corr(j)[1]
         back = 0
-        while j - 1 >= 0 and back < int(0.2 * fps) and corr(j - 1)[0] >= 0.3 and \
-                int(border_dm(frames[j - 1])[0][max(0, y_f - 3):min(dh, y_f + hrow + 4), xa:xb].sum()) >= 0.3 * ref and not other_row_at(j - 1, y_f):
+        while j - 1 >= 0 and back < int(0.2 * fps) and (corr_at(j - 1, y_f) if CS2_DATING_SLOT_ON[0] else corr(j - 1)[0]) >= (CS2_FLASH_MIN_C if flash(j - 1, y_f) else 0.3) and \
+                int(border_dm(frames[j - 1])[0][max(0, y_f - 3):min(dh, y_f + hrow + 4), xa:xb].sum()) >= 0.3 * ref \
+                and not other_row_at(j - 1, y_f):                   # V9.1.4: the band is the row's own box (3 px above it stood the row above's bottom edge: Oneelke dated 0.2 s early)
             j -= 1
             back += 1
     ng = max(3, int(math.ceil(CS2_GATE_S[0] * fps - 1e-9)))          # V7.5.1.2 gate: the first appearance must be PROVEN by empty frames before it
@@ -4492,12 +4524,16 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
 
     def gate_outl(fr, y, y0_, y1_):
         m_ = border_dm(fr)[0]
+        if CS2_DATING_FLASH_ON[0] and float(m_[y + 4:y + hrow - 3, xa + 6:xb - 6].mean() if hrow > 8 else 0.0) >= CS2_FLASH_FILL:
+            return 0                                           # V9.1.4: a red damage flash fills the row's INSIDE too (an outline is hollow): no proof of a row there (only the name patch counts)
         oc_ = int(m_[y0_:y1_, xa:xb].sum())
         if CS2_GATE_SHAPE[0] and oc_ and _outline_cover(m_, y, hrow, xa, xb) < CS2_GATE_EDGES:
             return 0                                           # V9.1.0: red in the slot that is not a row outline (a damage flash tinting the scene behind the feed): no row
         return oc_
     for q in range(j - ng, j):
-        c, _y = corr(q)
+        c, y_m = corr(q)
+        if CS2_DATING_SLOT_ON[0] and abs(y_m - y_first) > CS2_DATING_SLOT_PX:
+            c = corr_at(q, y_first)                            # V9.1.4: the best match stands in ANOTHER row's slot (a look-alike row: 计伯常): only our own slot counts
         oc = gate_outl(frames[q], y_first, yb0, yb1)
         if info is not None and "trace" in info:
             info["trace"].append((j, q, round(c, 3), oc, ref))
@@ -4506,15 +4542,16 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
     if info is not None:
         info["y"] = y_first
         yb0s, yb1s = max(0, rc["y0"] - 40), min(dh, rc["y1"] + 40)                 # the V7.5.1.2 gate (rows next to the slot count too): did the row pass it?
-        info["strict"] = not any(corr(q)[0] >= 0.6 or (int(border_dm(frames[q])[0][yb0s:yb1s, xa:xb].sum()) if not CS2_GATE_SHAPE[0] else
-                                                      gate_outl(frames[q], y_first, yb0s, yb1s)) >= 0.3 * ref for q in range(j - ng, j))
+        info["strict"] = True if CS2_DATING_SLOT_ON[0] else \
+            not any(corr(q)[0] >= 0.6 or (int(border_dm(frames[q])[0][yb0s:yb1s, xa:xb].sum()) if not CS2_GATE_SHAPE[0] else
+                                         gate_outl(frames[q], y_first, yb0s, yb1s)) >= 0.3 * ref for q in range(j - ng, j))     # V9.1.4: the own-slot gate above is the proof (neighbour rows in a busy feed made every move 'loose' and kept late times)
     return j
 
 
 def _dating_tid(sc, tr):
     """V9.1.3: the memo name of a track. From sidecar ext 5 on it carries the sidecar's build time and the track's first frame: a rebuilt sidecar numbers its
     tracks anew, and track 3 of the new sidecar took the date of track 3 of the old one (CS2 2026-10-17 17-15-59: a row at 20.5 s dated 18.2 s)."""
-    return str(tr["id"]) + (f"@{sc.get('built', '')}/{tr['first']}" if sc.get("ext", 1) >= 5 else "")
+    return str(tr["id"]) + (f"@{sc.get('built', '')}/{tr['first']}/d914b" if sc.get("ext", 1) >= 5 else "")       # V9.1.4: /d914 = dated with the V9.1.4 walk (flash gate, own-patch rule)
 
 
 def cs2_row_first_frame(rec, det, cfg, sc, tr):
@@ -4584,6 +4621,8 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
     prev, proposed, failed = None, 0, 0
     for k in sorted(b["kills"], key=lambda k: k["t"]):
         tr = by_id.get(k.get("track")) if k.get("border") else None
+        if tr is not None and tr.get("slots") and CS2_FULL_FEED_ON[0] and sc.get("ext", 1) >= 5 and tr["first"] > int(CS2_EARLY_S * fps)                 and _y_at(tr, tr["first"]) + (tr["y1"] - tr["y0"]) >= int((sc.get("size") or [0, 1080])[1]) * CS2_FULL_FEED_LOW:
+            k["t_unsure"] = True                               # V9.1.4: first seen in the lowest row of a full feed: the row may have entered below the killfeed region earlier (josef.prasnicky 0.37 s, Gamakek, VOT TAK)
         if tr is not None and tr.get("slots"):
             f = cs2_row_first_frame(rec, Detector("cs2"), cfg, sc, tr)
             if f == CS2_GATE_REJECT:
@@ -4607,7 +4646,7 @@ def cs2_kill_times_earlier(rec, det, cfg, sc, b, clip=""):
                 nt = round(f / fps + off, 3)
                 lo = max(0.0, k["t"] - CS2_DATING_MAX_S, (prev + 0.3) if prev is not None else 0.0)
                 nt = max(nt, lo)
-                if k["t"] - nt >= CS2_DATING_MIN_MOVE:
+                if k["t"] - nt >= (CS2_DATING_MIN_MOVE_5 if (CS2_DATING_SLOT_ON[0] and sc.get("ext", 1) >= 5) else CS2_DATING_MIN_MOVE) - 1e-6:
                     proposed += 1
                     k["t_cached"] = k["t"]
                     k["t"] = nt
@@ -4642,7 +4681,8 @@ def cs2_victim_times(entry, victim):
     for f, _since, boxes, blobs in entry.get("ocr", []):
         for r in ocr_rows(boxes, blobs, "cs2"):
             vt = r.get("vtext") or ""
-            if vt and (cs2_same_victim(vt, victim) or ocr_ratio(vt, victim) >= 80):
+            if vt and (cs2_same_victim(vt, victim) or ocr_ratio(vt, victim) >= 80
+                       or (CS2_DOLLAR_ON[0] and "$" in victim + vt and cs2_same_victim(vt.replace("$", "s"), victim.replace("$", "s")))):      # V9.1.4: '$oul' = 's0ul'
                 out_.append(f / FPS + off)
                 break
     return out_
