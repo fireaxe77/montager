@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.3.2"
+APP_VERSION = "V9.3.3"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6265,10 +6265,36 @@ def _dm_crop(path, t, box, rect, wh, scale=1.0):
     return im
 
 
+_DM_MEM, _DM_NEW = {}, [0]
+DM_FLUSH_EVERY = 50
+
+
+def _dm_view():
+    """V9.3.3: the saved deathmatch answers plus the ones measured since the last write."""
+    c = load_json(DM_CACHE, {})
+    return {**c, **_DM_MEM} if _DM_MEM else c
+
+
+def _dm_flush():
+    """V9.3.3: writes the answers measured so far (called with _DM_LOCK held, or alone at the end of a check); a write that Windows refuses is tried again a few times, then left for the next flush (the answers stay in memory)."""
+    if not _DM_MEM:
+        return
+    for _try in range(8):
+        try:
+            save_json(DM_CACHE, {**load_json(DM_CACHE, {}), **_DM_MEM})
+            _DM_MEM.clear()
+            _DM_NEW[0] = 0
+            return
+        except OSError as ex:                               # noqa: BLE001
+            if _try == 7:
+                LOGONLY(f"deathmatch answers not saved yet ({type(ex).__name__}: {ex}): kept in memory, saved with the next batch")
+            time.sleep(0.25)
+
+
 def cs2_dm_signals(rec, cfg):
     """V8.6.2: the deathmatch signals of ONE CS2 clip (cached in dm_cache.json per file): {'a1', 'a2', 'b', 'signals' (how many), 'dm' (>= DM_MIN_SIGNALS), 'texts' (what was read)}. Cheap first: the log text on
     3 frames; only when a deathmatch text is seen the other signals are measured (so a normal clip costs about 1 s once, then nothing)."""
-    cache = load_json(DM_CACHE, {})
+    cache = _dm_view()
     key = file_key(rec["path"])
     old = cache.get(key)
     if old is not None and (old.get("v") == DM_VER or old.get("dm")):
@@ -6315,17 +6341,18 @@ def cs2_dm_signals(rec, cfg):
     except Exception as ex:                                 # noqa: BLE001
         res["texts"].append(f"{type(ex).__name__}: {ex}")
         return res                                          # not cached: tried again next time
-    with _DM_LOCK:
-        cache = load_json(DM_CACHE, {})
-        cache[key] = res
-        save_json(DM_CACHE, cache)
+    with _DM_LOCK:                                          # V9.3.3: kept in memory and written in batches (4 threads rewriting the whole file after every clip failed on Windows: 'Access is denied')
+        _DM_MEM[key] = res
+        _DM_NEW[0] += 1
+        if _DM_NEW[0] >= DM_FLUSH_EVERY:
+            _dm_flush()
     return res
 
 
 def cs2_dm_rejected(cfg, recs, progress=None):
     """V8.6.2: the set of paths (of the CS2 records given) that are deathmatch clips; the first time a clip is seen it is measured (cached). One log line with the count. Hand-ticked clips are never passed here."""
     bad, n_new = set(), 0
-    cache0 = load_json(DM_CACHE, {})
+    cache0 = _dm_view()
     todo = [r for r in recs if file_key(r["path"]) not in cache0 or (cache0[file_key(r["path"])].get("v") != DM_VER and not cache0[file_key(r["path"])].get("dm"))]     # V9.3.2: V8.6.2 answers are completed once
     if todo:
         out(f"CS2 deathmatch check: {len(todo)} clip(s) not checked yet (first time only, about 1 s each) ...")
@@ -6341,8 +6368,12 @@ def cs2_dm_rejected(cfg, recs, progress=None):
             if progress and done[0] % 25 == 0:
                 progress(done[0] / max(1, len(todo)), f"deathmatch check {done[0]}/{len(todo)}")
             return d
-        with ThreadPoolExecutor(max_workers=4) as ex:       # one OCR engine per thread (ocr_engine)
-            list(ex.map(one, todo))
+        try:
+            with ThreadPoolExecutor(max_workers=4) as ex:   # one OCR engine per thread (ocr_engine)
+                list(ex.map(one, todo))
+        finally:
+            with _DM_LOCK:
+                _dm_flush()
     for r in recs:
         d = cs2_dm_signals(r, cfg)
         if d.get("dm"):

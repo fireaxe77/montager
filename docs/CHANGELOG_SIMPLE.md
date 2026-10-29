@@ -2,6 +2,10 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.3.3 - 2026-10-29: Deathmatch check no longer fails
+- The one-time deathmatch check of your CS2 clips no longer stops Auto and Random pick with an "Access is denied" error; it now saves its results in batches
+- Nothing is lost if saving fails once: the results are kept and saved with the next batch
+
 ## V9.3.2 - 2026-10-29: Deathmatch clips are now left out
 - CS2 deathmatch clips that were slipping into montages (the ones with the points log and the bonus-weapon prompt) are now recognised and left out
 - The first time you pick clips after this update, your CS2 clips are checked once more, which takes a few minutes
