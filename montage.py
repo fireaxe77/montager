@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.3.1"
+APP_VERSION = "V9.3.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -6244,6 +6244,7 @@ def cmd_scan(args):
 #   b   the top bar is the deathmatch one: a single timer and a row of points under >= 8 player icons (competitive: the timer with the two round scores, no row of numbers)
 DM_CACHE = DATA / "dm_cache.json"
 DM_MIN_SIGNALS = 2
+DM_VER = 2                                                  # V9.3.2: answers without this mark (V8.6.2: the points log looked for before the kill only) get the clip's last frames looked at once
 _DM_LOCK = threading.Lock()
 _DM_A1 = re.compile(r"points?\s*for", re.I)                # (competitive says "+$300: Award for neutralizing an enemy with ..." - only "points for" is the deathmatch text)
 _DM_A2 = re.compile(r"bonus\s*weapon|switch\s*to\s*bonus", re.I)
@@ -6269,14 +6270,17 @@ def cs2_dm_signals(rec, cfg):
     3 frames; only when a deathmatch text is seen the other signals are measured (so a normal clip costs about 1 s once, then nothing)."""
     cache = load_json(DM_CACHE, {})
     key = file_key(rec["path"])
-    if key in cache:
-        return cache[key]
-    res = {"a1": False, "a2": False, "b": False, "signals": 0, "dm": False, "texts": []}
+    old = cache.get(key)
+    if old is not None and (old.get("v") == DM_VER or old.get("dm")):
+        return old
+    res = dict(old) if old else {"a1": False, "a2": False, "b": False, "signals": 0, "dm": False, "texts": []}     # V9.3.2: an older (V8.6.2) answer gets only the new tail frames looked at
+    res["v"] = DM_VER
     try:
         eng = ocr_engine()
         dur = float(rec.get("dur") or 15.0)
         rect, wh = content_rect(rec, cfg), [rec["w"], rec["h"]]
         ts = sorted({round(min(max(0.5, 0.35 * dur), dur - 0.5), 2), round(max(0.5, dur - 2.5), 2)})
+        tail = sorted({round(max(0.5, dur - 1.5), 2), round(max(0.5, dur - 0.7), 2)})     # V9.3.2: the points log shows after a kill, and a clip ends just after its kill: the log is on screen in these frames
 
         def read(box, t, scale=1.0):
             im = _dm_crop(rec["path"], t, box, rect, wh, scale)
@@ -6284,20 +6288,21 @@ def cs2_dm_signals(rec, cfg):
                 return []
             out_, _ = eng(im)
             return [str(x[1]) for x in (out_ or [])]
-        for t in ts:                                          # a1: the points log (2 frames)
+        for t in ([] if res["a1"] else (ts if old is None else []) + tail):          # a1: the points log (V9.3.2: 4 frames, 2 at the end of the clip)
             tx = read((0.0, 0.72, 0.36, 0.95), t)
             if any(_DM_A1.search(x) for x in tx):
                 res["a1"] = True
                 res["texts"].append(" | ".join(tx)[:90])
                 break
-        for t in ([0.6] if not res["a1"] else [0.6, ts[-1]]):  # a2: the bonus-weapon panel (left of the picture, at spawn)
-            tx = read((0.0, 0.22, 0.26, 0.44), t)
-            if any(_DM_A2.search(x) for x in tx):
-                res["a2"] = True
-                res["texts"].append(" | ".join(tx)[:90])
-                break
-        if res["a1"] or res["a2"]:                          # only then the (slower) top bar
-            for t in ts:
+        if old is None:
+            for t in ([0.6] if not res["a1"] else [0.6, ts[-1]]):  # a2: the bonus-weapon panel (left of the picture, at spawn)
+                tx = read((0.0, 0.22, 0.26, 0.44), t)
+                if any(_DM_A2.search(x) for x in tx):
+                    res["a2"] = True
+                    res["texts"].append(" | ".join(tx)[:90])
+                    break
+        if (res["a1"] or res["a2"]) and not res["b"]:       # only then the (slower) top bar
+            for t in ts + tail:
                 tx = read((0.25, 0.0, 0.75, 0.12), t, 1.5)
                 nums = [m for x in tx if "$" not in x for m in re.findall(r"\d+", x)]
                 timer = any(re.fullmatch(r"\d{1,2}[:.]\d\d", x.strip()) for x in tx)
@@ -6321,7 +6326,7 @@ def cs2_dm_rejected(cfg, recs, progress=None):
     """V8.6.2: the set of paths (of the CS2 records given) that are deathmatch clips; the first time a clip is seen it is measured (cached). One log line with the count. Hand-ticked clips are never passed here."""
     bad, n_new = set(), 0
     cache0 = load_json(DM_CACHE, {})
-    todo = [r for r in recs if file_key(r["path"]) not in cache0]
+    todo = [r for r in recs if file_key(r["path"]) not in cache0 or (cache0[file_key(r["path"])].get("v") != DM_VER and not cache0[file_key(r["path"])].get("dm"))]     # V9.3.2: V8.6.2 answers are completed once
     if todo:
         out(f"CS2 deathmatch check: {len(todo)} clip(s) not checked yet (first time only, about 1 s each) ...")
     if todo:
