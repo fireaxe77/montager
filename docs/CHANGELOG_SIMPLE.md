@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.3.2 - 2026-10-29: Deathmatch clips are now left out
+- CS2 deathmatch clips that were slipping into montages (the ones with the points log and the bonus-weapon prompt) are now recognised and left out
+- The first time you pick clips after this update, your CS2 clips are checked once more, which takes a few minutes
+- Clips you tick yourself are still never touched
+
 ## V9.3.1 - 2026-10-29: Faster renders, no more deaths in CS2 montages
 - Montages render faster: the slow-motion parts now start first and the render sets up quicker, with the same picture and sound as before
 - CS2 montages never show your own death or the death screen any more: a clip that would run into it is cut before it, or another clip is used instead
