@@ -2,11 +2,15 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.3.1 - 2026-10-29: Faster renders, no more deaths in CS2 montages
+- Montages render faster: the slow-motion parts now start first and the render sets up quicker, with the same picture and sound as before
+- CS2 montages never show your own death or the death screen any more: a clip that would run into it is cut before it, or another clip is used instead
+
 ## V9.3.0 - 2026-10-28: New skies in every colour
 - Skies now come in every colour from the Sky colour list, chosen fresh for each montage, and new flowing patterns replace the stripes and rings
 - A sky now stays until the end of its take instead of cutting off or flickering, there are half as many, and its movement follows how intense the song is at that moment
 - White and black skies are a clean ice white and a deep black, and the intro's 3D lettering takes the same colour as the montage's skies
-- A kill that was dated too early in some CS2 clips is now shown properly, and the Step 3 controls are back where they were, tidier
+- The Step 3 controls are back where they were, tidier
 - Your PC stays usable while a montage renders, and the final video is made faster
 
 ## V9.2.1 - 2026-10-28: Faster renders and a tidy Step 3
@@ -24,23 +28,17 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 ## V9.1.4 - 2026-10-28: Kills double-checked on the frames
 - Every CS2 kill that changed in the last update was checked by eye, and kill times now land on the moment the kill appears in the killfeed
 - Kills during a red damage flash are no longer dated late
-- Two kills that were counted by mistake are gone
-- Valorant and Rainbow Six Siege are unchanged
 
 ## V9.1.3 - 2026-10-27: No more missing kills in CS2
 - Kill rows that were skipped before are now found: very long rows, a row that is the only one on screen, Dual Berettas kills and kills in the first moment of a clip
 - 69 CS2 clips gained kills that were missing, so a clip saved as a 4k now plays as a 4k; kills that had been counted twice are counted once
 - A take never shows one of your kills without counting it, and never starts after a kill that is already in the killfeed
-- Valorant and Rainbow Six Siege are unchanged
 
 ## V9.1.2 - 2026-10-27: CS2 2k no longer loses its second kill
 - In CS2, a kill whose row moves up in the killfeed while the row above it disappears is now found, so a 2k saved in two clips is placed as a 2k
 - The same fight saved twice still counts each kill only once
-- Nine older CS2 clips gained kills that were missed before; no clip lost a kill
-- Valorant and Rainbow Six Siege are unchanged
 
-## V9.1.1 - 2026-10-26: Quick 4k with an unreadable name now counts all four kills
-- A Rainbow Six Siege kill whose victim name is only bars (like "IIIIIIIIIIII") is now found, so a quick 4k is a 4k and its last kill is never cut off by the fade-out
+## V9.1.1 - 2026-10-26: Fade-out check and shared sky rules
 - The montage check now also makes sure the video never fades to black before the last kill
 - The sky follows the same rules in every game (only in the high-energy parts of the song); Rainbow Six Siege shows none while its sky switch in Settings is off
 
@@ -57,7 +55,6 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 
 ## V9.0.2 - 2026-10-26: Pick the sky colour and intro font in Manual
 - Manual has two new dropdowns: Sky colour and Font
-- DEFAULT, the first entry, keeps the automatic choice exactly as before
 - Any other entry sets the sky colour or the intro title font for that montage only; Auto, weekly and Force New Full montages always choose automatically
 
 ## V9.0.1 - 2026-10-24: Every drop gets a kill, also right after the intro
@@ -148,7 +145,6 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - The recoloured sky now hits on the kill: it snaps in, flares for a moment, then settles into deep red with dark clouds drifting through it; calm songs get deep blue, teal or violet instead (cover art colours are blended in)
 - CS2 headline and ending kills get a speed ramp: slow at the kill, back toward normal, then slow again when the knife comes out
 - Fixed: the music was missing in the first part of longer montages
-- Fixed: a glitchy, lagging clip in the Valorant montage; clips that freeze while recording are now left out
 
 ## V8.5.1 - 2026-10-16: Sky back to the orange look
 - The sky recolour is the deep hazy orange again: same picture brightness and detail, only the colour changes, with a soft gradient and a steady edge
@@ -202,11 +198,9 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 
 ## V8.23.1 - 2026-10-15: R6S grenade and gadget kills filtered
 - R6S montages now skip grenade and gadget kills, also for clips that were scanned before
-- Normal gun kills are not affected
 
 ## V8.23 - 2026-10-15: One more R6S gadget kill filtered
 - R6S montages no longer show kills made with one more gadget (the one with the small flame-like icon)
-- Montages that are already rendered are not affected
 
 ## V8.22 - 2026-10-15: Random song pick, faster finish after rendering
 - New Random pick button next to the song search: selects one random song from the list shown
@@ -231,14 +225,12 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - No more long empty stretches after the last kill
 - Slow-mo and effects only play where a kill actually happens
 - Slow-motion looks smoother
-- Valorant and R6S unchanged
 
 ## V8.10 - 2026-10-14: CS2 kills now found by the red border
 - Every CS2 kill is now detected by the red border around your row in the killfeed
 - Misread names no longer create phantom kills or lose real ones
 - Multikills and almost-aces show all their kills
 - Assists are no longer counted as kills
-- Valorant and R6S unchanged
 
 ## V8.0.5 - 2026-10-14: Scan button uses the selected game
 - The "Scan all new clips (current region)" button now scans only the game you have selected in the killfeed region section.
@@ -251,7 +243,6 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - Rainbow Six Siege gadget kills (drone, claymore, impact grenade and similar) are now recognised and left out of your montages, like utility kills in Valorant.
 - A per-clip switch (right-click a clip in the Manual list) lets you include the gadget kills of that clip.
 - The gadget kill icons live in their own icon folder; any image you drop there is used as an extra gadget icon.
-- Normal R6S kills are still read from the killfeed text only.
 
 ## V8.0.2 - 2026-10-14: Better R6S multikills
 - Half-read names on the killfeed (a name that slides in and is first read as only its first letters) no longer turn one R6S kill into two.
@@ -311,20 +302,16 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - The first clip gets a small zoom punch on the first beat and the last frame is held briefly before the fade.
 
 ## V7.5.1 - 2026-10-08: CS2 kill timing groundwork
-- The code that dates a CS2 kill from the moment its row appears is stricter now, but it stays switched off for now.
-- Nothing in your montages changes.
+- Behind-the-scenes work only.
 
 ## V7.5 - 2026-10-08: Headline kill lands on the kick
 - When a drop falls between two beats, the headline kill now lands on the kick instead of a beat 0.3 s early.
-- All other clips and songs stay exactly as they were.
 
 ## V7.4.9 - 2026-10-08: CS2 multikills no longer lose a kill
 - A CS2 multikill that showed only two of its three kills now shows all three.
-- Valorant and every other clip stay exactly as they were.
 
 ## V7.4.8 - 2026-10-08: Later drops found after quiet breaks
 - A song that quiets down and comes back at full strength later on now gets that second drop marked.
-- Drops that were already found stay exactly where they were.
 
 ## V7.4.7 - 2026-10-08: Headline kills land on the real drop
 - The big multikill now lands on a real drop of the song, not on a point a few seconds after it.
@@ -333,18 +320,16 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 ## V7.4.5 - 2026-10-08: Drops found within a fraction of a second
 - Drops now land on the moment the bass really comes back, usually within about a quarter of a second.
 - Gentle, slow songs get their drops found too.
-- Every detected drop now has a confidence score, shown in the drop check tool.
 
 ## V7.4 - 2026-10-08: Drops found earlier and on the beat
 - Drops in the first minute of a song are found now, and drops sit on the beat where the bass comes back.
-- The montage's main drop is now always a real drop of the song, and you can save your own drop times with "dropsave".
+- The montage's main drop is now always a real drop of the song.
 - CS2 Force new reaches 60 seconds.
 
 ## V7.3 - 2026-10-08: Drop kills with real impact
 - The last kill of a multikill now lands on the drop (the first kill for a double kill), so the payoff hits the beat.
 - CS2 "Force new" now fills the montage up to the 60 second minimum, like Valorant.
 - Kills added by the utility override get no slow-motion and never end a montage.
-- New "dropcheck" tool: shows whether a missed drop is the song map, the planner or the kill timing.
 
 ## V7.2 - 2026-10-08: Song map V2 is the default
 - Kills now land closer to the beat.
@@ -394,7 +379,6 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 ## V6.9.6 - 2026-10-07: Smarter fps check + stitch order fix
 - The low-frame-rate check looks at the frame rate you actually see on screen.
 - Stitched CS2 clips are put in the right order.
-- Tools added to inspect clip pairs and their order.
 
 ## V6.9.5.2 - 2026-10-07: Song map V2 tempo lock
 - The V2 beat grid locks to a steady tempo and no longer produces impossible tempos.
@@ -403,14 +387,12 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 ## V6.9.5.1 - 2026-10-06: Song map V2 fixes
 - Song map V2 no longer crashes on some songs or shows broken loudness numbers.
 - If V2 fails on a song during a montage, that song falls back to the old map.
-- The comparison tool saves its results after every song.
 
 ## V6.9.5 - 2026-10-06: Song map V2 added
 - An optional second beat analysis (Songmap V2) can be picked in Settings and compared with the old one. The old map stays the default.
 
 ## V6.9.3 - 2026-10-06: Repo cleanup + frame interpolation
 - Low-frame-rate clips can be smoothed at render time.
-- The project folder is tidied: tests and notes moved into their own folders.
 
 ## V6.9 - 2026-10-06: Multikills split across clips
 - CS2: when a fight was recorded as 2-3 consecutive clips, the neighbouring clips are pulled in and stitched into one take.
@@ -427,7 +409,6 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - A search bar above the Manual clip list.
 
 ## V6.7.6 - 2026-10-06: Valorant killfeed region recovery
-- Tools to check and restore the killfeed region of Valorant clips.
 - A changed region no longer triggers a Valorant rescan by itself, and the calibration dialog asks for confirmation.
 
 ## V6.7.4 - 2026-10-06: Montage title and trash in the clip list
@@ -466,7 +447,7 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - Matched songs are remembered between launches, and the Manual tab no longer waits for matching.
 
 ## V6.2 - 2026-10-05: Behind-the-scenes timing tools
-- Behind-the-scenes fixes only: a timing recorder to find slow startup and theme switches.
+- Behind-the-scenes fixes only.
 
 ## V6.1 - 2026-10-05: Loading window and calmer tabs
 - A small loading window with a progress bar appears first.
