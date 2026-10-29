@@ -5,6 +5,10 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V9.3.3 - 2026-10-29
+Fix for V9.3.2: the one-time deathmatch re-check (1042 clips) crashed Manual Auto fill with `PermissionError [WinError 5]` in `os.replace(dm_cache.json.<pid>.<tid>.tmp -> dm_cache.json)`: 4 threads rewrote the whole cache file after every clip (V8.6.2 did the same, but only for the few new clips).
+- `cs2_dm_signals` keeps its answers in `_DM_MEM`; `_dm_flush` writes them every `DM_FLUSH_EVERY` (50) answers and at the end of `cs2_dm_rejected`, retrying a refused write 8 times (0.25 s) and keeping the answers in memory if it still fails. `_dm_view` = file + memory. Detection results are unchanged.
+
 ## V9.3.2 - 2026-10-29
 CS2 deathmatch rejector (V8.6.2, unchanged until now) let deathmatch clips through. Detection, planning, effects, sky and speed untouched.
 - TOY_CS2_V9.3.1_2026-10-29 at video 1:49 / 1:56 (= cut list 102 s / 109 s with the 7 s intro, takes 52 and 54): `Counter-strike 2 2025.08.05 - 22.46.33.02.DVR.mp4` (Nuke, "BONUS WEAPON: MAC-10", the clip starts in the menu) and `Counter-strike 2 2024.04.30 - 15.19.03.02.DVR.mp4` (Italy, dies, respawns, "points for neutralizing"). Both cached with 0 signals.
