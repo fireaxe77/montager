@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.4 - 2026-10-29: Smoother 50 fps clips
+- Clips recorded at 50 fps are now smoothed to match the montage's 60 fps (clips at any other frame rate are left alone); the Settings checkbox switches it on or off
+- The last kill of a take is no longer cut off the moment it appears in the killfeed
+- The sky colour now disappears as soon as the camera looks away from the sky, and no longer covers walls
+- Drops now land only on the first or last kill of a take, never a middle one
+
 ## V9.3.3 - 2026-10-29: Deathmatch check no longer fails
 - The one-time deathmatch check of your CS2 clips no longer stops Auto and Random pick with an "Access is denied" error; it now saves its results in batches
 - Nothing is lost if saving fails once: the results are kept and saved with the next batch
