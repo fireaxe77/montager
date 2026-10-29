@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.3.3"
+APP_VERSION = "V9.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -259,6 +259,12 @@ def load_config():
     cfg.update(load_json(CONFIG_PATH, {}))
     if cfg.get("cfg_version", 1) < 2:                 # one-time migration of Stage 0 defaults
         cfg["game_audio_level"], cfg["cfg_version"] = 0.5, 2
+        try:
+            save_json(CONFIG_PATH, cfg)
+        except Exception:
+            pass
+    if not cfg.get("interp50_v94"):                   # V9.4: the interpolation comes back (50 fps clips only): switched on once, the Settings checkbox switches it off again
+        cfg["interpolate_low_fps"], cfg["interp50_v94"] = True, True
         try:
             save_json(CONFIG_PATH, cfg)
         except Exception:
@@ -4344,6 +4350,7 @@ CS2_DATING_OWN_ON = [True]           # V9.1.4: the walk back continues over a sp
 CS2_DATING_OWN = 0.9
 CS2_DATING_SLOT_ON = [True]          # V9.1.4: a faint fade-in frame counts only when the name patch matches in the row's own slot (the row above matched: Oneelke, mytos, 小林 ... 0.13-0.25 s early)
 CS2_DATING_SLOT_PX = 8
+CS2_DATING_EXT_SLOT = [True]         # V9.4: the text-before-outline extension of the dating walk matches in the row's own slot only (switch for tests)
 CS2_DATING_MIN_MOVE_5 = 0.06        # V9.1.4 (ext 5, own-slot proof): two frames earlier is a real correction (小林 12.97 -> 12.87, row from 12.83)
 CS2_DATING_FLASH_ON = [True]         # V9.1.4: in the first-appearance gate a red flash (the row's inside red too) is no outline (2023.10.29 - 16.03.59 Chevrolet dated 0.33 s late)
 CS2_FLASH_MIN_C = 0.45              # V9.1.4: under a flash the red slot proves nothing: a fade-in frame needs this much name-patch match
@@ -4512,11 +4519,16 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
     if not (gap and j < j1):
         return None
     ext = 0                                                            # V7.5.1.2: the row's text can show a few frames before its outline does (still the same row, no outline yet)
-    while j - 1 >= 0 and ext < int(0.2 * fps) and corr(j - 1)[0] >= 0.6 and not other_row_at(j - 1, corr(j - 1)[1]):
-        j -= 1
-        ext += 1
+    if CS2_DATING_EXT_SLOT[0]:                                         # V9.4: ... in the row's OWN slot (the whole-region match found the row above, same killer and weapon: the 2nd kill of 1v2.mp4 was dated 0.4 s early and its take ended as the row appeared)
+        while j - 1 >= 0 and ext < int(0.2 * fps) and corr_at(j - 1, y_cur) >= 0.6 and not other_row_at(j - 1, y_cur):
+            j -= 1
+            ext += 1
+    else:
+        while j - 1 >= 0 and ext < int(0.2 * fps) and corr(j - 1)[0] >= 0.6 and not other_row_at(j - 1, corr(j - 1)[1]):
+            j -= 1
+            ext += 1
     if CS2_EDGE_DATING[0]:                                             # V8.1.1: the outline fades in a frame or two before the text matches: those frames are the row's own start
-        y_f = corr(j)[1]
+        y_f = y_cur if CS2_DATING_EXT_SLOT[0] else corr(j)[1]
         back = 0
         while j - 1 >= 0 and back < int(0.2 * fps) and (corr_at(j - 1, y_f) if CS2_DATING_SLOT_ON[0] else corr(j - 1)[0]) >= (CS2_FLASH_MIN_C if flash(j - 1, y_f) else 0.3) and \
                 int(border_dm(frames[j - 1])[0][max(0, y_f - 3):min(dh, y_f + hrow + 4), xa:xb].sum()) >= 0.3 * ref \
@@ -4558,7 +4570,7 @@ def cs2_dating_walk(frames, rc, j1, fps, others=(), info=None, y3=None):
 def _dating_tid(sc, tr):
     """V9.1.3: the memo name of a track. From sidecar ext 5 on it carries the sidecar's build time and the track's first frame: a rebuilt sidecar numbers its
     tracks anew, and track 3 of the new sidecar took the date of track 3 of the old one (CS2 2026-10-17 17-15-59: a row at 20.5 s dated 18.2 s)."""
-    return str(tr["id"]) + (f"@{sc.get('built', '')}/{tr['first']}/d914b" if sc.get("ext", 1) >= 5 else "")       # V9.1.4: /d914 = dated with the V9.1.4 walk (flash gate, own-patch rule)
+    return str(tr["id"]) + (f"@{sc.get('built', '')}/{tr['first']}/{'d94' if CS2_DATING_EXT_SLOT[0] else 'd914b'}" if sc.get("ext", 1) >= 5 else "")       # V9.1.4: /d914 = dated with the V9.1.4 walk (flash gate, own-patch rule)
 
 
 def cs2_row_first_frame(rec, det, cfg, sc, tr):
@@ -10598,6 +10610,8 @@ def reorder_for_drop(plan, t_d, fps, protected, least=False):
                 continue
             start_f = sum(t["nf"] for t in rest[:q])
             for kj in range(len(X["kills"])):
+                if DROP_FIRST_LAST_ONLY[0] and not least and 0 < kj < len(X["kills"]) - 1:
+                    continue                                   # V9.4: (see anchor_all_drops; the strong beats, least=True, are not drops)
                 if not drop_kill_clear(X, kj):
                     continue                                   # V9.1.0: (see anchor_all_drops)
                 e = s0 + start_f / fps + src_to_out(X["segs"], X["kills"][kj]) - t_d
@@ -10717,6 +10731,9 @@ def drop_skip_flags(ev, n):
     return out
 
 
+DROP_FIRST_LAST_ONLY = [True]       # V9.4: a drop lands only on a take's first or last kill (switch for tests)
+
+
 def drop_kill_clear(tk, kj):
     """V9.1.0: may kill kj of take tk carry a drop? Only a clearly read kill: my name read on its row (CS2 'unread' = not read), its time not uncertain (row first seen at the feed's lower edge) and
     its first appearance proven (CS2 dating: 'unproven' = the row was on screen earlier than the stored time). Valorant / R6S kills and kills of saved plans without these flags: True."""
@@ -10763,6 +10780,8 @@ def anchor_all_drops(plan, drops, game, notes, grid=None):
                 continue
             nk = len(tk["kills"])
             for kj in range(nk):
+                if DROP_FIRST_LAST_ONLY[0] and 0 < kj < nk - 1:
+                    continue                                   # V9.4: a drop lands only on a take's first or last kill, never a middle one (V7.6.0 made the middle kills candidates of last resort)
                 if not drop_kill_clear(tk, kj):
                     continue                                   # V9.1.0: a drop gets a clearly read kill (my name read on the row, its first appearance proven)
                 e = impact_time(plan, ti, kj) - t_d
@@ -14900,6 +14919,8 @@ SKY_SHOT_DIFF = 28.0                 # V8.8.5: mean grey change (0-255, on a 96 
 SKY_WARM_FRAME = [True]              # V8.8.6 switch (tests): a frame whose smooth region is warm is a wall in the mask too (as in the kill-frame probe)
 SKY_CUT_ON = [True]                  # V8.8.6 switch (tests): the sky ends where the camera leaves it instead of the take losing its sky (V9.3.0: with SKY_HOLD_LAST_ON it holds instead of ending)
 SKY_HOLD_LAST_ON = [True]            # V9.3.0 switch: every sky runs from its kill frame to the last frame of its take; a frame whose mask fails holds the last good mask (it cut off / popped in and out)
+SKY_HOLD_OWN = [True]                # V9.4 switch (tests): a held mask is cut to what still looks like its sky in the frame it is held on (sky_take_mask)
+SKY_WARM_FRAME_B = 4.0               # V9.4: a frame's smooth region with Lab b above 128 + this (and L < 200) is a wall in the mask (was 8: a shaded beige wall read b +8 .. +10 and was painted as sky, CS2 2024.02.10 23.52.37)
 SKY_CUT_MIN_F = 18                   # V8.8.6: ... when at least this many frames (0.3 s) of clean sky come first
 SKY_GUARD_GROW = 1                   # V8.8.5: mask pixels the painted region may reach past the frame's own sky (the soft edge); never more
 
@@ -14952,7 +14973,7 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
         if sp is not None:
             if float(sp["lab"][0]) < SKY_MIN_L:
                 st_ = "bad"                                            # a smooth region that is too dark for a sky (a wall)
-            elif SKY_WARM_FRAME[0] and float(sp["lab"][2]) - 128.0 > 8.0 and float(sp["lab"][0]) < 200:
+            elif SKY_WARM_FRAME[0] and float(sp["lab"][2]) - 128.0 > SKY_WARM_FRAME_B and float(sp["lab"][0]) < 200:
                 st_ = "bad"                                            # V8.8.6: warm (orange / yellow): a wall, the same rule as the kill-frame probe (sky_eyedrop)
             else:
                 m = sky_eyedrop_mask(img, sp)
@@ -15017,18 +15038,26 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                     held_i.add(i)
                     held += 1
     if SKY_HOLD_LAST_ON[0]:                                # V9.3.0: from the kill frame to the take's last frame: a frame whose own mask failed (a wall, a dropout, nothing found) holds the last good mask
-        last_ = None
+        def own_hold(i, j):                                # V9.4: a held mask keeps only what still looks like the sky of the frame it comes from in THIS frame: once the camera has left the sky the recolour is gone with it
+            if not SKY_HOLD_OWN[0]:
+                return segm[j].copy()
+            sp_ = smp[j] if j < len(smp) else None
+            own_ = sky_eyedrop_mask(imgs[i], sp_) if sp_ is not None else np.zeros((h, w), bool)
+            if own_.any():
+                own_ = cv2.dilate(own_.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+            return (segm[j].astype(bool) & own_).astype(np.uint8)
+        last_, last_i = None, None
         for i in range(k):
             if status[i] == "ok" and segm[i].any() and good[i]:
-                last_ = segm[i]
+                last_, last_i = segm[i], i
             elif last_ is not None and i not in held_i:
-                segm[i] = last_.copy()
+                segm[i] = own_hold(i, last_i)
                 held_i.add(i)
                 held += 1
         first_ = next((i for i in range(k) if status[i] == "ok" and segm[i].any()), None)
         for i in range(first_ or 0):                       # frames before the first good one (the kill frame itself unreadable) take the first good mask
             if first_ is not None and not segm[i].any():
-                segm[i] = segm[first_].copy()
+                segm[i] = own_hold(i, first_)
                 held_i.add(i)
                 held += 1
     imgs = None
@@ -16394,6 +16423,8 @@ INTERP_MIN_MEAN_SSIM, INTERP_MIN_FRAME_SSIM = 0.90, 0.75
 INTERP_MCI = "minterpolate=fps=60:mi_mode=mci:mc_mode=obmc:me_mode=bidir:scd=fdiff:mb_size=8:search_param=8"      # conservative: smallest block / search, no vsbmc
 INTERP_BLEND = "framerate=fps=60"                                                          # blend only (scene changes are duplicated)
 INTERP_STATE = {"mci_slow": False}
+INTERP_ONLY_50 = [True]                 # V9.4: interp_prepare interpolates only clips recorded at 50 fps (the other V6.9.3 reasons are not used); switch for tests
+INTERP_50_LO, INTERP_50_HI = 49.0, 51.0   # the clip's real (timestamp) frame rate
 INTERP_MAX_FPS = 240.0                  # never interpolate above this rate
 INTERP_MAX_X = 4.0                      # nor above this multiple of the unique source rate
 VFR_SHARE, VFR_GAP_FRAMES = 0.10, 4.0   # VFR candidate: >= 10% of the intervals above 1.5x the median, or any gap above 4 frames
@@ -16642,7 +16673,7 @@ def take_source_ranges(t, srcs, fx=None):
     return out_
 
 
-def analyse_takes(plan, fx=None, workers=4):
+def analyse_takes(plan, fx=None, workers=4, only50=False):
     """Measure every (take, source) of a plan. Returns [{"take": i, "si": si, "path", "range", "m", "speed", "why", ...}] (read-only)."""
     from concurrent.futures import ThreadPoolExecutor
     jobs = []
@@ -16662,6 +16693,8 @@ def analyse_takes(plan, fx=None, workers=4):
                 probes[pth] = probe_fps(pth)
             pr = probes[pth]
             lo, hi = rg["all"]
+            if only50 and not (INTERP_50_LO <= float(pr["avg"] or pr["eff"] or 0) <= INTERP_50_HI and INTERP_50_LO <= float(pr["eff"] or pr["avg"] or 0) <= INTERP_50_HI):
+                return {"take": ti, "si": si, "path": pth, "range": (lo, hi), "slow": rg["slow"], "m": None, "speed": 1.0, "why": []}       # V9.4: not a 50 fps clip: nothing else is measured
             m = measure_range(pth, lo, hi, pr["dur"], pr)
             spd = min([s_[2] for s_ in rg["slow"]], default=1.0)
             return {"take": ti, "si": si, "path": pth, "range": (lo, hi), "slow": rg["slow"], "m": m, "speed": spd, "why": classify_range(m, spd)}
@@ -16695,12 +16728,18 @@ def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
     if not cfg.get("interpolate_low_fps", False):
         out("fps: interpolation off (setting)")                # V6.9.7: also the Settings checkbox (config key interpolate_low_fps); nothing is probed
         return plan
-    res = analyse_takes(plan, fx)
+    res = analyse_takes(plan, fx, only50=INTERP_ONLY_50[0])
+    if INTERP_ONLY_50[0]:                                   # V9.4: only clips recorded at 50 fps (OBS PAL) are interpolated (to the montage's 60 fps); every other frame rate is left as it is
+        for r_ in res:
+            m_ = r_.get("m")
+            r_["why"] = ["50 fps"] if m_ and not m_["ts"].get("vfr") and INTERP_50_LO <= float(m_["ts_fps"] or 0) <= INTERP_50_HI else []
     n_takes = len(plan["takes"])
     bad_ = [r_ for r_ in res if r_.get("error")]
     cand = [r_ for r_ in res if r_["why"]]
-    cnt = {k: sum(1 for r_ in cand if k in r_["why"]) for k in ("slow-mo", "duplicated frames", "vfr gaps", "low fps")}
-    reasons = f"slow-mo {cnt['slow-mo']}, duplicated {cnt['duplicated frames']}, vfr {cnt['vfr gaps']}" + (f", low-fps {cnt['low fps']}" if cnt["low fps"] else "")
+    cnt = {k: sum(1 for r_ in cand if k in r_["why"]) for k in ("slow-mo", "duplicated frames", "vfr gaps", "low fps", "50 fps")}
+    reasons = f"slow-mo {cnt['slow-mo']}, duplicated {cnt['duplicated frames']}, vfr {cnt['vfr gaps']}" + (f", low-fps {cnt['low fps']}" if cnt["low fps"] else "") + (f", 50 fps {cnt['50 fps']}" if cnt["50 fps"] else "")
+    if INTERP_ONLY_50[0]:
+        reasons = f"50 fps {cnt['50 fps']}"
     if not cand:
         out(f"fps: {n_takes} takes probed, 0 low-effective-fps" + (f" ({len(bad_)} unreadable)" if bad_ else ""))
         return plan
@@ -16721,7 +16760,7 @@ def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
                 raise RuntimeError("cancelled")
             si, m = r_["si"], r_["m"]
             nm = Path(srcs[si]["path"]).name
-            whole = any(k in r_["why"] for k in ("vfr gaps", "low fps", "duplicated frames"))
+            whole = any(k in r_["why"] for k in ("vfr gaps", "low fps", "duplicated frames", "50 fps"))
             lo, hi = r_["range"] if whole else (min(x[0] for x in r_["slow"]), max(x[1] for x in r_["slow"]))
             pr = m["container"]
             s0 = max(0.0, lo - INTERP_MARGIN_S)
@@ -16745,7 +16784,7 @@ def interp_prepare(plan, cfg, tmpdir, fx=FX_ALL):
                 fell += 1
                 continue
             target = float(OUT_FPS)
-            if sp < 1:
+            if sp < 1 and "50 fps" not in r_["why"]:               # V9.4: a 50 fps clip is only brought to the montage rate (the slow-motion pieces keep their own interpolation)
                 target = max(float(OUT_FPS), min(INTERP_MAX_FPS, OUT_FPS / sp, INTERP_MAX_X * max(urate, 1.0)))
                 target = float(round(target))
             seg = Path(tmpdir) / f"seg{idx}.mov"
@@ -23177,7 +23216,7 @@ class App:
         r[0] += 1
         self.set_interp = tk.BooleanVar(value=bool(self.cfg.get("interpolate_low_fps", False)))      # V6.9.7: the existing hidden key, now a checkbox
         label("Low-fps takes")
-        ttk.Checkbutton(holder(), text="Interpolate low-fps takes (slow-mo, duplicated frames, VFR)", variable=self.set_interp).pack(side="left")
+        ttk.Checkbutton(holder(), text="Interpolate 50 fps clips to 60 fps (smoother, slower render)", variable=self.set_interp).pack(side="left")
         r[0] += 1
         self.set_music = tk.BooleanVar(value=bool(self.cfg.get("lower_music_clips", False)))      # V7.7.0
         label("Music in clips")
