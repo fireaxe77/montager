@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.3.0"
+APP_VERSION = "V9.3.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -9269,6 +9269,20 @@ def _build_events(items, game, cfg, rng, flick_budget, det, gap, notes, led):
 KILL_AT_ROW = [True]                    # V8.8.4: the kill time is the moment the kill row appears (every game); False = the old shot-based time (tests only)
 
 
+CS2_DEATH_TAIL_ON = [True]          # V9.3.1 switch (tests): CS2 footage never runs into my own death (see make_event)
+CS2_DEATH_SAME_S = 0.35             # V9.3.1: a death dated this much BEFORE my last kill is the same moment (a trade: both rows appear together, the dating differs by a frame or two)
+CS2_DEATH_TAIL_S = 4.0              # V9.3.1: deaths up to this long after my last kill limit the footage that follows it (V9.3.0: 2.0 s, and never a death dated at the kill)
+
+
+def death_after_for(game, deaths, last):
+    """Seconds from my last kill to the death that limits the footage after it (None = no death close enough). V9.3.1 (CS2 only, CS2_DEATH_TAIL_ON): a trade (my death row dated at, or a hair
+    before, the kill) gives 0.0 - the take cannot end before it, so the event forms no take - and a death up to CS2_DEATH_TAIL_S after the kill ends the footage before it. Other games
+    (and the switch off): a death 0 to 2 s after the kill, as before."""
+    if game == "cs2" and CS2_DEATH_TAIL_ON[0]:
+        return min([max(0.0, d - last) for d in deaths if -CS2_DEATH_SAME_S <= d - last <= CS2_DEATH_TAIL_S], default=None)
+    return min([d - last for d in deaths if 0 < d - last <= 2.0], default=None)
+
+
 def make_event(cl, parts, det, cfg, refine, verify=True):
     """One event from a kill cluster. parts = [(pool item, timeline offset), ...]; >1 part = stitched continuation.
     times = the KILL MOMENTS: V8.8.4 the frame-exact time the kill ROW appears (every game; the gunshot is only a hint, it never sets or moves a kill; before: the refined fatal shot, else row - lag);
@@ -9380,7 +9394,7 @@ def make_event(cl, parts, det, cfg, refine, verify=True):
     for s_ in spans:
         deaths += [d + s_["shift"] for d in s_["it"].get("deaths", [])]
     last = times[-1]
-    d_after = min([d - last for d in deaths if 0 < d - last <= 2.0], default=None)
+    d_after = death_after_for(main["rec"].get("game"), deaths, last)
     imp = len(times) - 1
     rec = spans[0]["it"]["rec"] if len(spans) == 1 else main["rec"]
     shift0 = spans[0]["shift"] if len(spans) == 1 else 0.0
@@ -13793,6 +13807,27 @@ def _audio_packets(path, a_stream):
     return pk
 
 
+AUDIO_PREFETCH = [True]              # V9.3.1 switch: the audio packet lists of every clip a render uses are read together (they were read one clip after the other while the filter graph was built: ~15 s for 90 takes)
+
+
+def audio_prefetch(takes, workers=8):
+    """V9.3.1: reads (and caches in _APKT / _FPS60_CACHE) the audio packet times and the 60 fps check of every clip of the takes at once; build_filter then finds them cached. The same
+    values audio_gap / audio_hole / _jf would read one by one."""
+    want, paths = [], []
+    for t in takes:
+        for src in (t.get("srcs") or [t]):
+            if src.get("path") and str(src["path"]) not in _FPS60_CACHE and str(src["path"]) not in paths:
+                paths.append(str(src["path"]))
+            if src.get("audio") and not src.get("mute") and src.get("path"):
+                k_ = (str(src["path"]), int(src.get("a_stream") or 0))
+                if k_ not in _APKT and k_ not in want:
+                    want.append(k_)
+    if len(want) + len(paths) > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex_:
+            list(ex_.map(lambda k: _audio_packets(k[0], k[1]), want))
+            list(ex_.map(src_is_60, paths))
+
+
 AUDIO_GAP_S = 0.035                  # V8.4.5: an AAC packet lasts 21.3 ms; a space between two packets longer than this is a hole in the recording
 
 
@@ -15827,6 +15862,8 @@ def build_filter(plan, cfg, preview, fx=None):
     if fx is None:
         fx = tuple(FX_ALL) + (XFX_FX if plan.get("effects") == "extra" else ())          # V8.4.2: the extra effects have their own switches (the render drops a failing one on its own)
     takes = plan["takes"]
+    if AUDIO_PREFETCH[0]:
+        audio_prefetch(takes)
     exact = plan.get("placement", "v5") != "v4"
     vl = []
     slow_ip = CS2_SLOW_INTERP if CS2_SMOOTH_SLOW[0] else "framerate=fps=60:scene=100"      # V8.1.1 (CS2) / V8.2 (all games): slowed pieces only
@@ -17028,7 +17065,8 @@ STEP3_SEED_W = 6                     # the seed box (a 6-digit seed)
 STEP3_SLIDER_W = 46                  # the length slider (px)
 LIGHT_TASKS = ("clips",)             # V9.2.0: tasks that only read the caches and refill a list: they run beside a job instead of waiting for it
 
-FAST_RENDER = [True]                 # V8.8.8 switch: every take's own chains run in parallel ffmpeg processes into lossless files, then one light final pass (the same filters, the same frames)
+HEAVY_FIRST = [True]                 # V9.3.1 switch: the render's slow-motion parts start first, longest first (they started in the encoder's order, so the longest began late and ran almost alone at the end); same files
+FAST_RENDER = [True]                # V8.8.8 switch: every take's own chains run in parallel ffmpeg processes into lossless files, then one light final pass (the same filters, the same frames)
 RENDER_JOBS = max(2, min(8, (os.cpu_count() or 4) // 4))      # parts rendered at the same time (measured on 16 threads: 4 = 207 s, 5 = 212 s, 6 = 223 s, 8 = 226 s for a 146 s CS2 montage)
 _GLAB = re.compile(r"\[([^\]]+)\]")
 _TAKE_LAB = re.compile(r"^(?:t(\d+)(?:v|a|hd|tl)|h(\d+)[ab])$")
@@ -17515,11 +17553,11 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
         pos_ += (seg_frames(L, allc0) or 300) / 60.0
     tpos = {j["ti"]: min([seg_pos[l_] for l_, _k in j["outs"] if l_ in seg_pos] or [pos_]) for j in jobs}
 
-    def add(name, part, outs, deps, prio, pre=None):
+    def add(name, part, outs, deps, prio, pre=None, sched=None):
         gp_ = tdir / f"{name}.filter.txt"
         gp_.write_text(";\n".join(part["chains"]), encoding="utf-8")
         cmd = part_cmd(part, [fpath(l_) for l_ in part["reads"]], gp_, [(l_, fpath(l_)) for l_, _k in outs])
-        tasks[name] = {"cmd": cmd, "deps": set(deps), "prio": prio, **({"pre": pre} if pre else {})}
+        tasks[name] = {"cmd": cmd, "deps": set(deps), "prio": prio, "sched": prio if sched is None else sched, **({"pre": pre} if pre else {})}
         (tdir / f"{name}.cmd.json").write_text(json.dumps(cmd, ensure_ascii=False), encoding="utf-8")       # (kept with the part: a failed part can be rerun by hand)
 
     made_by = {}
@@ -17539,7 +17577,8 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
                 ph["chains"] = [re.sub(r"\[" + re.escape(L) + r"\]$", "[" + L + "_pin]", c) for c in ph["chains"]] + [f"[{L}_pin]format={opt_}[{L}]"]
             nm = f"slow{ti}_{k}"
             pre_ = HEAVY_PRE.get(heavy_key(ph, L)) if HEAVY_PRE_ON[0] else None     # V9.2.1: made beside the sky check with this very command (same key = same filters, inputs, pin)
-            add(nm, ph, [(L, "v")], [], tpos[ti] - 0.3 * _est_frames(ph["chains"]) / 2.0, pre=pre_)
+            add(nm, ph, [(L, "v")], [], tpos[ti] - 0.3 * _est_frames(ph["chains"]) / 2.0, pre=pre_,
+                sched=(-1e6 - _est_frames(ph["chains"])) if HEAVY_FIRST[0] else None)      # V9.3.1: the slow-motion parts (one thread each, the longest work of all) start first, the longest first; `prio` (the encoder's order) still sets the process priority
             hk[L] = "v"
             made_by[L] = nm
         pv = _part(j["chains"], j["groups"], [l_ for l_, _k in v_outs], set(hk), {**kinds, **hk})
@@ -17567,7 +17606,7 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
                         return
                     ready = [n for n, t_ in tasks.items() if n not in done and n not in running and t_["deps"] <= done]
                     if ready:
-                        nm = min(ready, key=lambda n: (tasks[n]["prio"], n))
+                        nm = min(ready, key=lambda n: (tasks[n]["sched"], n))
                         running.add(nm)
                         break
                     if len(done) == len(tasks):
