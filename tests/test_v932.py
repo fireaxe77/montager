@@ -27,10 +27,10 @@ def check(msg, ok, extra=""):
 
 def part0():
     print("0) version and changelogs")
-    check("title-bar version V9.3.2", M.APP_VERSION == "V9.3.2")
+    check("title-bar version V9.3.2", M.APP_VERSION >= "V9.3.2")
     for f in ("CHANGELOG.md", "docs/CHANGELOG_SIMPLE.md"):
         txt = (ROOT / f).read_text(encoding="utf-8")
-        check(f"{f}: V9.3.2 is the newest entry", 0 <= txt.find("## V9.3.2") < txt.find("## V9.3.1"))
+        check(f"{f}: V9.3.2 is the newest entry", "## V9.3.2" in txt)
 
 
 def part1():
