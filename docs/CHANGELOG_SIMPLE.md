@@ -6,6 +6,7 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - Songs the downloader is unsure about now show their best choices with a link to listen first and a "Download this" button
 - You can also paste any YouTube link for a song and download it
 - An existing song is only replaced after you confirm, and the old file is kept in the "_replaced" folder
+- The Songs tab has a search box that filters the list by file name, title or artist
 
 ## V9.5.3 - 2026-10-31: Song maps survive new covers and tags
 - Song maps and beat data are now tied to the song's audio, so adding covers or changing tags never makes the program analyse a song again
