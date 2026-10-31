@@ -1,4 +1,4 @@
-MONTAGER V9.5.3 - kill montages from your own Valorant, CS2 and Rainbow Six Siege clips, cut to a song.
+MONTAGER V9.5.4 - kill montages from your own Valorant, CS2 and Rainbow Six Siege clips, cut to a song.
 
 1. Install Python 3.12 (64-bit) from https://www.python.org/downloads/
    Tick "Add python.exe to PATH" in the installer.
