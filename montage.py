@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.5.2"
+APP_VERSION = "V9.5.3"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -7315,7 +7315,23 @@ def _peek_v1_bpm(path, csv_bpm=None):
     try:
         st = os.stat(path)
         hit = load_json_ro(SONG_CACHE, {}).get(f"{path}|{int(st.st_mtime)}|{st.st_size}|{SONGMAP_V}|{round(float(csv_bpm or 0), 3)}")          # V9.5.1: read-only, parsed once (16 MB)
-        return float(hit["bpm"]) if hit and hit.get("bpm") else None
+        if hit and hit.get("bpm"):
+            if SONGID_ON[0]:                               # V9.5.3: remembered per audio identity, so a later tag / cover change finds the same bpm (and the same V2 key)
+                try:
+                    aid_ = song_audio_id(path)
+                    k_ = f"{aid_}|{round(float(csv_bpm or 0), 3)}"
+                    if aid_ and k_ not in load_json_ro(DATA / V1BPM_FILE, {}):
+                        d_ = load_json(DATA / V1BPM_FILE, {})
+                        d_[k_] = float(hit["bpm"])
+                        save_json(DATA / V1BPM_FILE, d_)
+                except Exception:                          # noqa: BLE001
+                    pass
+            return float(hit["bpm"])
+        if SONGID_ON[0]:                                   # V9.5.3: the same song after a tag / cover change: the bpm recorded for its audio identity
+            aid = song_audio_id(path)
+            b = load_json_ro(DATA / V1BPM_FILE, {}).get(f"{aid}|{round(float(csv_bpm or 0), 3)}") if aid else None
+            return float(b) if b else None
+        return None
     except Exception:
         return None
 
@@ -7421,9 +7437,231 @@ def add_repeat_drops(an, path):
 def songmap_v2_sig(path):
     try:
         import songmap_v2
+        songid_install()
         return songmap_v2.build.file_signature(path)
     except Exception:
         return file_key(path)
+
+
+# ---------------------------------------------------------------- V9.5.3: song identity (tags / covers never make a song look new)
+SONGID_ON = [True]                    # switch (tests): the song-map caches are keyed by the audio's identity (songid.audio_id), not by size / modified time / first + last bytes
+SONGDATA_FLAG = "song_identity_v953"  # config key: the one-time migration of the existing caches has run
+V1BPM_FILE = "song_v1bpm.json"        # {audio id|csv bpm: the V1 map's bpm}: _peek_v1_bpm for a file whose V1 cache key (path + size + time) changed
+LABEL_IDS_FILE = "song_label_ids.json"    # {file name of a hand-labelled song: its audio id}: the labels follow the audio when the file is renamed
+_SONGID = {"orig": None, "done": False}
+_SONGDATA_LOCK = threading.RLock()
+
+
+def songid_install():
+    """V9.5.3: the V2 song-map cache key (songmap_v2.cache_key) and the repeat-drop key take their file signature from songmap_v2.build.file_signature: replaced here at run time (the package's
+    sources stay as they are: their hash is part of the key) by the audio identity. Idempotent. A file that cannot be read keeps the old signature."""
+    if _SONGID["done"] or not SONGID_ON[0]:
+        return
+    with _SONGDATA_LOCK:
+        if _SONGID["done"]:
+            return
+        import songmap_v2
+        import songmap_v2.build as B
+        import songid
+        orig = B.file_signature
+        _SONGID["orig"] = orig
+
+        def file_signature(path):
+            aid = songid.audio_id(path, DATA)
+            return aid if aid else orig(path)
+        B.file_signature = file_signature
+        songmap_v2.file_signature = file_signature
+        _SONGID["done"] = True
+
+
+def song_audio_id(path):
+    """the stable identity of a song file (None when unreadable)"""
+    import songid
+    return songid.audio_id(path, DATA)
+
+
+def _label_entry(song_path):
+    """the hand-label entry of a song: by file name as before, else by the audio identity recorded for a labelled name (a renamed file keeps its labels)"""
+    cur = load_json(DATA / "song_drops.json", {})
+    e = cur.get(Path(song_path).name)
+    if e is not None:
+        return e
+    ids = load_json(DATA / LABEL_IDS_FILE, {})
+    if ids:
+        aid = song_audio_id(song_path)
+        if aid:
+            for nm, a in ids.items():
+                if a == aid and nm in cur:
+                    return cur[nm]
+    return None
+
+
+def songdata_backup(tag="V9.5.3"):
+    """a timestamped copy of montage_data's top-level files (the caches, the hand labels, the config; not the logs, the big per-clip folders or temp files) before the migration changes any"""
+    dst = DATA / f"backup_songdata_{tag}_{time.strftime('%Y-%m-%d_%H%M%S')}"
+    dst.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for p in sorted(DATA.iterdir()):
+        if p.is_file() and not p.name.endswith(".tmp") and ".tmp" not in p.name:
+            shutil.copy2(p, dst / p.name)
+            n += 1
+    return dst, n
+
+
+def songdata_migrate(cfg=None, force=False):
+    """V9.5.3: ONCE (config flag song_identity_v953): the song data that was keyed by size / modified time / first + last bytes gets the audio identity.
+    - backup first (songdata_backup);
+    - song_cache_v2.json and repeat_cache.json: every entry whose old signature can be tied to ONE current file (same modified time - a tag writer keeps it - and a duration within 1 s) is
+      re-keyed; two entries of the same audio keep the older one (made before the tags changed) as the map and the other as '|alt'; entries that cannot be tied stay exactly as they are;
+    - the V1 bpm that went into a key as '|v1:' is recorded per audio identity (song_v1bpm.json) so _peek_v1_bpm finds it again;
+    - song_label_ids.json: the identity of every hand-labelled song (song_drops.json itself is not touched);
+    - verified (the file is read back and every re-keyed entry compared) before it replaces the cache.
+    Returns the report text (also written to logs\\songdata_migration_<time>.txt) or None when it has run before."""
+    import songid
+    cfg = cfg if cfg is not None else load_config()
+    with _SONGDATA_LOCK:
+        if cfg.get(SONGDATA_FLAG) and not force:
+            return None
+        import songmap_v2
+        songid_install()
+        t0 = time.time()
+        L = []
+        bdir, nb = songdata_backup()
+        L.append(f"backup of {nb} files of montage_data: {bdir}")
+        audio = scan_audio(cfg)
+        files = []
+        for a in audio:
+            try:
+                st = os.stat(a["path"])
+            except OSError:
+                continue
+            files.append({"path": a["path"], "dur": float(a.get("dur") or 0), "mtime": int(st.st_mtime), "size": st.st_size})
+        L.append(f"songs folder: {len(files)} audio files")
+        v2p = DATA / songmap_v2.CACHE_NAME
+        v2 = load_json(v2p, {})
+        rp_p = REPEAT_CACHE
+        rp = load_json(rp_p, {})
+        sigs, keysplit = {}, {}
+        for k, v in v2.items():
+            sp = songid.split_v2_key(k)
+            if sp:
+                keysplit[k] = sp
+                d = float(v.get("dur") or 0) if isinstance(v, dict) else 0.0
+                if sp[1] not in sigs or (d and not sigs[sp[1]]):
+                    sigs[sp[1]] = d or sigs.get(sp[1])
+        for k in rp:
+            m = re.match(r"^r1\|(\d+-\d+-[0-9a-f]+)\|", k)
+            if m and m.group(1) not in sigs:
+                sigs[m.group(1)] = None
+        ok, bad = songid.tie_orphans(sigs, files)
+        ids = {}
+        for sig, f in ok.items():
+            aid = songid.audio_id(f["path"], DATA)
+            if aid:
+                ids[sig] = aid
+        ok = {s: f for s, f in ok.items() if s in ids}
+        # ---- V2 maps
+        new, moved, conflicts, v1b = {}, 0, 0, {}
+        pre = lambda sig: songid.sig_parts(sig)[0] != ok[sig]["size"]             # an entry made before the file's size changed (before the tags were written)
+        origin = {}
+        for k, v in v2.items():
+            sp = keysplit.get(k)
+            if sp and sp[1] in ids:
+                nk = f"{sp[0]}{ids[sp[1]]}|{sp[2]}"
+                m1 = re.search(r"\|v1:([0-9.]+)", sp[2])
+                if m1:
+                    v1b[f"{ids[sp[1]]}|{sp[2].split('|')[0]}"] = float(m1.group(1))
+                if nk in new:
+                    conflicts += 1
+                    if pre(sp[1]) and not origin[nk]:                               # the older map stays the map; the rebuilt one is kept beside it
+                        new[nk + "|alt"], new[nk], origin[nk] = new[nk], v, True
+                    else:
+                        new[nk + "|alt"] = v
+                else:
+                    new[nk] = v
+                    origin[nk] = pre(sp[1])
+                    moved += 1
+            else:
+                new[k] = v
+        # ---- repeat drops
+        rnew, rmoved = {}, 0
+        for k, v in rp.items():
+            m = re.match(r"^(r1\|)(\d+-\d+-[0-9a-f]+)(\|.*)$", k)
+            if m and m.group(2) in ids:
+                nk = m.group(1) + ids[m.group(2)] + m.group(3)
+                rnew[nk if nk not in rnew else nk + "|alt"] = v
+                rmoved += 1
+            else:
+                rnew[k] = v
+        # ---- hand labels: identity per labelled name (song_drops.json is not touched)
+        drops = load_json(DATA / "song_drops.json", {})
+        drops_before = (DATA / "song_drops.json").read_bytes() if (DATA / "song_drops.json").exists() else b""
+        by_name = {Path(f["path"]).name: f["path"] for f in files}
+        lab_ids, lab_missing = {}, []
+        for nm in drops:
+            p = by_name.get(nm)
+            aid = songid.audio_id(p, DATA) if p else None
+            if aid:
+                lab_ids[nm] = aid
+            else:
+                lab_missing.append(nm)
+        # ---- write, verify, replace
+        def put(path, obj, indent=None):
+            tmp = Path(str(path) + ".tmp")
+            tmp.write_text(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+            back = json.loads(tmp.read_text(encoding="utf-8"))
+            if len(back) != len(obj) or any(json.dumps(back[k_], sort_keys=True) != json.dumps(obj[k_], sort_keys=True) for k_ in list(obj)[:: max(1, len(obj) // 400)]):
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError(f"verification of {Path(path).name} failed: nothing was replaced")
+            os.replace(tmp, path)
+        put(v2p, new)
+        put(rp_p, rnew)
+        if v1b:
+            old = load_json(DATA / V1BPM_FILE, {})
+            old.update(v1b)
+            put(DATA / V1BPM_FILE, old)
+        if lab_ids:
+            put(DATA / LABEL_IDS_FILE, lab_ids)
+        songid.index_save(DATA)
+        assert (DATA / "song_drops.json").read_bytes() == drops_before if drops_before else True
+        cfg2 = load_config()
+        cfg2[SONGDATA_FLAG] = True
+        save_json(CONFIG_PATH, cfg2)
+        cfg[SONGDATA_FLAG] = True
+        n_sig = len(sigs)
+        L.append(f"V2 song maps: {len(v2)} entries for {n_sig} file signatures; {len([s for s in sigs if s in ids])} signatures tied to a file, {moved} entries re-keyed, "
+                 f"{conflicts} second entries of the same audio kept as '|alt'; {len(bad)} signatures could not be tied (those entries are unchanged)")
+        L.append(f"repeat drops: {len(rp)} entries, {rmoved} re-keyed")
+        L.append(f"V1 bpm recorded for {len(v1b)} songs (so the V2 key of a re-tagged file is the same as before)")
+        L.append(f"hand-labelled songs (song_drops.json): {len(drops)}; identity recorded for {len(lab_ids)}; not touched (the file is byte-identical); no file of that name: {lab_missing}")
+        by_reason = {}
+        for s, why in bad.items():
+            by_reason.setdefault(why, []).append(s)
+        for why, ss in by_reason.items():
+            L.append(f"  not migrated ({len(ss)} signatures): {why}")
+        L.append(f"took {time.time() - t0:.1f} s")
+        txt = "\n".join(L) + "\n"
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            (LOG_DIR / f"songdata_migration_{time.strftime('%Y%m%d_%H%M%S')}.txt").write_text(txt, encoding="utf-8")
+        except OSError:
+            pass
+        out("song data migration: " + " | ".join(L))
+        return txt
+
+
+def songdata_ensure():
+    """V9.5.3: the one-time migration (once per process; the config flag says it has run). A failure leaves every cache as it was."""
+    if _SONGID.get("ensured") or not SONGID_ON[0]:
+        return
+    _SONGID["ensured"] = True
+    try:
+        cfg = load_config()
+        if not cfg.get(SONGDATA_FLAG):
+            songdata_migrate(cfg)
+    except Exception as ex:                                # noqa: BLE001
+        _SONGID["ensured"] = False
+        out(f"song data migration did not run ({type(ex).__name__}: {ex}): the caches are unchanged")
 
 
 def get_songmap(path, csv_bpm=None, version=None):
@@ -7501,6 +7739,8 @@ def songmap_prefetch(songs):
     try:
         if songmap_version() != "v2" or songmap_mode() != "v2" or SONGMAP_PREFETCH_WORKERS < 2:
             return
+        songid_install()
+        songdata_ensure()
         import songmap_v2
         from concurrent.futures import ThreadPoolExecutor
         cache = load_json_ro(DATA / songmap_v2.CACHE_NAME, {})
@@ -7570,6 +7810,8 @@ def _get_songmap_routed(path, csv_bpm=None, version=None):
     v = version or songmap_version()
     if v not in ("v2", SONGMAP_AUTO):
         return analyse_song(path, csv_bpm)
+    songid_install()                                       # V9.5.3: the V2 cache key follows the audio, not the tags
+    songdata_ensure()
     name = Path(path).name
     if v == "v2" and songmap_mode() == "v2":               # V7.7.1 SongMap mode 'V2': no V1 map, no safety rule, no fallback
         return _songmap_strict_v2(path, csv_bpm, name)
@@ -10225,7 +10467,7 @@ def song_drop_labels(song_path):
     if not song_path:
         return None
     try:
-        v = (load_json(DATA / "song_drops.json", {}).get(Path(song_path).name) or {}).get("drops")
+        v = (_label_entry(song_path) or {}).get("drops")
         return sorted(float(x) for x in v) if v else None
     except Exception:
         return None
@@ -10236,7 +10478,7 @@ def song_strong_beats(song_path):
     if not song_path:
         return None
     try:
-        v = (load_json(DATA / "song_drops.json", {}).get(Path(song_path).name) or {}).get("strong_beats")
+        v = (_label_entry(song_path) or {}).get("strong_beats")
         return sorted(float(x) for x in v) if v else None
     except Exception:
         return None
@@ -10261,6 +10503,15 @@ def song_drops_write(song_path, times, title="", artist="", kind="drops"):
     tmp = Path(str(f) + ".tmp")
     tmp.write_text(json.dumps(cur, indent=1, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, f)
+    try:                                                   # V9.5.3: the labelled song's audio identity is recorded (the labels follow the audio when the file is renamed)
+        if nm in cur and os.path.exists(song_path):
+            ids = load_json(DATA / LABEL_IDS_FILE, {})
+            aid = song_audio_id(song_path)
+            if aid and ids.get(nm) != aid:
+                ids[nm] = aid
+                save_json(DATA / LABEL_IDS_FILE, ids)
+    except Exception:                                      # noqa: BLE001
+        pass
 
 
 HEAD_KICK_ON = [True]                 # V7.5: test switch (headline finisher on the kick when the map drop is off the beat grid)
@@ -20278,6 +20529,7 @@ def song_cache_keys(path):
         pass
     try:
         import songmap_v2
+        songid_install()
         sig = songmap_v2.build.file_signature(path)
     except Exception:
         pass
@@ -21684,6 +21936,7 @@ class App:
         if not shutil.which("ffmpeg"):
             out("ffmpeg not found. Troubleshoot > Selfcheck explains how to get it without admin.")
         self.cfg = autodetect_dirs(load_config())
+        self.run_task("songdata", songdata_ensure)          # V9.5.3: the song caches get the audio identity once (backup first), before anything picks a song
         self.run_task("clips", self.load_clips)
         self.run_task("matches", self.load_matches)
         threading.Thread(target=self.bpm_worker, daemon=True).start()
