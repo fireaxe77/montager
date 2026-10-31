@@ -2,7 +2,7 @@
 
 For the version on main (APP_VERSION in montage.py = the title bar):
   1. exports origin/main with `git archive` into build/src (a clean copy: never your working folder or montage_data)
-  2. checks that the app files there are identical to the git tag of that version (v9.5.2 for V9.5.2)
+  2. checks that the app files there are identical to the git tag of that version (v9.5.3 for V9.5.3)
   3. builds Montager.exe + Montager-CLI.exe (PyInstaller, packaging/montager.spec) with FFmpeg and the OCR engine inside
   4. checks the app files inside the build: data files byte for byte, Python modules by their compiled code
   5. builds Montager-Portable.zip, Montager-Setup.exe (Inno Setup) and Montager-Python.zip (the plain Python version)
@@ -33,11 +33,11 @@ BUILD = ROOT / "build"
 SRC, DIST, WORK, OUT = BUILD / "src", BUILD / "dist", BUILD / "work", BUILD / "release"
 REPO = "fireaxe77/montager"
 # the app as the user runs it (bundled unchanged); everything else in the package is packaging
-APP_FILES = ["montage.py", "intro90.py", "ytsongs.py", "songmap_compare.py", "songmap_v2", "fonts/*.ttf", "fonts/README.txt", "fixtures", "montage.ico",
+APP_FILES = ["montage.py", "intro90.py", "ytsongs.py", "songid.py", "songmap_compare.py", "songmap_v2", "fonts/*.ttf", "fonts/README.txt", "fixtures", "montage.ico",
              "montage.png", "CHANGELOG.md", "docs/CHANGELOG_SIMPLE.md"]
-PY_MODULES = ["montage", "intro90", "ytsongs", "songmap_compare"]
+PY_MODULES = ["montage", "intro90", "ytsongs", "songid", "songmap_compare"]
 OVERLAY = ["packaging", "setup_check.py", "first_run.py", "config.example.json", "LICENSE", "CREDITS.md"]
-PY_ZIP_FILES = ["montage.py", "intro90.py", "ytsongs.py", "songmap_compare.py", "songmap_v2", "fonts", "fixtures", "montage.ico", "montage.png",
+PY_ZIP_FILES = ["montage.py", "intro90.py", "ytsongs.py", "songid.py", "songmap_compare.py", "songmap_v2", "fonts", "fixtures", "montage.ico", "montage.png",
                 "Montager.vbs", "Montage.vbs", "Create_Desktop_Shortcut.vbs", "Set_Shortcut_AppId.ps1", "Start_Montager.bat",
                 "setup_check.py", "first_run.py", "config.example.json", "START_HERE.txt", "README.md", "LICENSE", "CREDITS.md",
                 "CHANGELOG.md", "docs/CHANGELOG_SIMPLE.md", "docs/guides", "docs/PROJECT_STRUCTURE.md"]
