@@ -16,7 +16,10 @@ from pathlib import Path
 
 DUR_TOL_S = 5.0                          # a result must be within this many seconds of the Spotify length
 SEARCH_N = 10                            # results read per search query
-BANNED = ("slowed", "sped up", "speed up", "nightcore", "reverb", "8d", "live", "remix", "cover", "instrumental", "karaoke")
+BANNED = ("slowed", "sped up", "speed up", "nightcore", "reverb", "8d", "live", "remix", "cover", "instrumental", "karaoke",
+          "8-bit", "8 bit", "8bit", "chiptune", "emulation", "midi", "piano version", "acoustic", "tribute", "mashup", "bass boosted", "type beat", "reaction", "tutorial")
+OK_WORDS = {"official", "audio", "video", "music", "lyric", "lyrics", "visualizer", "visualiser", "hd", "hq", "4k", "album", "version", "topic", "remastered",
+            "feat", "ft", "featuring"}              # words of a video title that cost nothing
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
@@ -35,24 +38,66 @@ def banned_words(video_title, spotify_title):
     return [w for w in BANNED if _has_word(v, w) and not _has_word(s, w)]
 
 
+def _words(s):
+    return re.findall(r"\w+", _norm(s))
+
+
+def extra_words(video_title, title, artists):
+    """The words of a video title that are neither the track title, nor an artist of the CSV, nor feat / ft / featuring, nor on the small allowlist (official, audio, video, ...). Fewer = cleaner."""
+    known = set(_words(title)) | OK_WORDS
+    for a in artists:
+        known |= set(_words(a))
+    return [w for w in _words(video_title) if w not in known]
+
+
+def _alnum(s):
+    return re.sub(r"[^\w]+", "", _norm(s))
+
+
+def _is_name(channel, names, label=""):
+    """True when a channel name is one of the artists (also 'X Official', 'X Music', 'XVEVO', 'X Records') or the CSV record label."""
+    cn = _alnum(channel)
+    if not cn:
+        return False
+    for a in list(names) + ([label] if label else []):
+        an = _alnum(a)
+        if not an:
+            continue
+        if cn == an:
+            return True
+        for suf in ("official", "music", "vevo", "records", "recordings", "topic"):
+            if cn in (an + suf, suf + an):
+                return True
+    return False
+
+
+# channel score, best first
+CH_TOPIC_OWN, CH_NAMED, CH_VERIFIED, CH_OTHER = 0, 1, 2, 3
+CH_TEXT = {0: "Topic channel of the artist / label", 1: "channel of the artist / label", 2: "verified channel", 3: "other channel"}
+
+
+def channel_score(channel, artists, label="", verified=False):
+    """0 an auto-generated '- Topic' channel whose name is an artist or the record label (a Topic channel of anybody else is no better than any channel), 1 a channel named like an artist
+    or the label, 2 a verified channel, 3 anything else."""
+    c = _norm(channel)
+    if c.endswith(" - topic"):
+        if _is_name(c[:-len(" - topic")], artists, label):
+            return CH_TOPIC_OWN
+    elif _is_name(channel, artists, label):
+        return CH_NAMED
+    return CH_VERIFIED if verified else CH_OTHER
+
+
 def channel_kind(channel, artists):
-    """'topic' (auto-generated 'Artist - Topic' album audio) | 'artist' (official channel of one of the artists) | 'other'."""
+    """'topic' | 'artist' | 'other' (the V9.5 words; kept for the older tests)."""
     c = _norm(channel)
     if c.endswith(" - topic"):
         return "topic"
-    cn = re.sub(r"[^\w]+", "", c)
-    for a in artists:
-        an = re.sub(r"[^\w]+", "", _norm(a))
-        if an and (cn == an or cn in (an + "official", an + "vevo", an + "music", "official" + an) or cn.startswith(an) and cn.endswith(("official", "vevo", "music"))):
-            return "artist"
-    return "other"
-
-
-KIND_RANK = {"topic": 0, "artist": 1, "other": 2}
+    return "artist" if _is_name(channel, artists) else "other"
 
 
 def judge(cand, title, artists, want_dur):
-    """None when the result passes every rule, else the reason it was rejected."""
+    """None when the result passes the HARD rules (length within DUR_TOL_S of the CSV length, none of the banned words unless the Spotify title has it), else the reason."""
     d = cand.get("duration")
     if not d:
         return "no length"
@@ -69,22 +114,35 @@ def fmt_len(sec):
     return f"{sec // 60}:{sec % 60:02d}"
 
 
-def pick(cands, title, artists, want_dur):
-    """(best passing result or None, nearest-miss description). Order: Topic upload, official channel, anything else; then the closest
-    length, then the search order."""
-    ok, seen = [], []
+def rank(cands, title, artists, want_dur, label=""):
+    """(ranked, rejected): ranked = every result that passes the hard rules, best first by (fewest extra words, channel score, most views, search order), each as the result dict plus
+    `extra` (the leftover words), `ch` (channel score), `kind` and `uncertain`; rejected = [(reason, result)]. A pick is UNCERTAIN when it still has extra words or comes from an 'other' channel."""
+    ok, rej = [], []
     for i, c in enumerate(cands):
         why = judge(c, title, artists, want_dur)
-        k = channel_kind(c.get("channel", ""), artists)
-        if why is None:
-            ok.append((KIND_RANK[k], abs(c["duration"] - want_dur), i, c, k))
-        else:
-            seen.append((why, c))
-    if ok:
-        ok.sort(key=lambda x: x[:3])
-        best = ok[0]
-        return dict(best[3], kind=best[4]), ""
-    return None, nearest_miss(seen, want_dur)
+        if why:
+            rej.append((why, c))
+            continue
+        ex = extra_words(c.get("title", ""), title, artists)
+        ch = channel_score(c.get("channel", ""), artists, label, bool(c.get("verified")))
+        ok.append((len(ex), ch, -int(c.get("views") or 0), i, dict(c, extra=ex, ch=ch, kind=("topic" if ch == CH_TOPIC_OWN else "artist" if ch == CH_NAMED else "other"),
+                                                                    uncertain=bool(ex) or ch == CH_OTHER)))
+    ok.sort(key=lambda x: x[:4])
+    return [x[4] for x in ok], rej
+
+
+def pick(cands, title, artists, want_dur, label=""):
+    """(best result or None, nearest-miss text). The best may be UNCERTAIN (see rank): the caller does not download those."""
+    ranked, rej = rank(cands, title, artists, want_dur, label)
+    if ranked:
+        return ranked[0], ""
+    return None, nearest_miss(rej, want_dur)
+
+
+def describe(c):
+    """one result as text: title, channel, length, views, extra words, link"""
+    return (f"\"{c.get('title', '')}\" | {c.get('channel', '')} ({CH_TEXT.get(c.get('ch', 3))}) | {fmt_len(c.get('duration'))} | {int(c.get('views') or 0):,} views | "
+            f"{len(c.get('extra') or [])} extra word(s)" + (f": {' '.join(c['extra'])}" if c.get("extra") else "") + f" | https://youtu.be/{c.get('id')}")
 
 
 def nearest_miss(seen, want_dur):
@@ -207,7 +265,7 @@ def search(data_dir, query, n=SEARCH_N):
         if not e or not e.get("id"):
             continue
         res.append({"id": e["id"], "title": e.get("title") or "", "channel": e.get("channel") or e.get("uploader") or "",
-                    "duration": e.get("duration") or 0})
+                    "duration": e.get("duration") or 0, "views": e.get("view_count") or 0, "verified": bool(e.get("channel_is_verified"))})
     return res
 
 
@@ -585,7 +643,7 @@ def fetch_new(rows, songs_dir, data_dir, n, sort_key, progress=print, search_fn=
     Returns {"downloaded": [...], "notfound": [...], "failed": [...], "stopped": bool}."""
     tmp_dir = Path(tmp_dir or Path(data_dir) / "yt_tmp")
     todo = sorted(rows, key=sort_key, reverse=True) if n is None else sorted(rows, key=sort_key, reverse=True)[:max(0, int(n))]
-    rep = {"downloaded": [], "notfound": [], "failed": [], "checked": len(todo), "stopped": False}
+    rep = {"downloaded": [], "notfound": [], "failed": [], "uncertain": [], "checked": len(todo), "stopped": False}
     dl = download_fn or (lambda vid: download_mp3(data_dir, vid, tmp_dir))
     cf = cover_fn or (lambda row, topic_id: cover_for(row, data_dir, topic_id))
     for i, r in enumerate(todo, 1):
@@ -604,9 +662,15 @@ def fetch_new(rows, songs_dir, data_dir, n, sort_key, progress=print, search_fn=
         except RuntimeError as ex:
             rep["failed"].append({"title": t, "artist": a, "reason": f"search failed: {ex}" + keep})
             continue
-        best, miss = pick(cands, t, [x.strip() for x in a.split(",")], want)
-        if not best:
-            rep["notfound"].append({"title": t, "artist": a, "reason": miss + keep})
+        label = track_tags(r, meta).get("label", "")
+        ranked, rej = rank(cands, t, [x.strip() for x in a.split(",")], want, label)
+        if not ranked:
+            rep["notfound"].append({"title": t, "artist": a, "reason": nearest_miss(rej, want) + keep})
+            continue
+        best = ranked[0]
+        runner = ranked[1] if len(ranked) > 1 else None
+        if best["uncertain"]:                              # still extra words in the title, or an unrelated channel: never downloaded in a batch, listed with the best 3
+            rep["uncertain"].append({"title": t, "artist": a, "top": [describe(c) for c in ranked[:3]], "existing": bool(old)})
             continue
         progress(f"{i}/{len(todo)} downloading: {name}  <-  {best['channel']}")
         try:
@@ -625,22 +689,29 @@ def fetch_new(rows, songs_dir, data_dir, n, sort_key, progress=print, search_fn=
         else:
             rep["downloaded"].append({"title": t, "artist": a, "video": best["title"], "channel": best["channel"], "kind": best["kind"],
                                       "length": fmt_len(best["duration"]), "id": best["id"], "file": str(dest), "cover": csrc, "cover_note": cnote,
-                                      "replaced": Path(old).name if old else ""})
+                                      "replaced": Path(old).name if old else "", "chosen": describe(best), "runner": describe(runner) if runner else ""})
         cache_save(data_dir)
     return rep
 
 
 def report_text(rep, update_msg=""):
-    L = [f"Checked {rep['checked']} song(s): {len(rep['downloaded'])} downloaded, {len(rep['notfound'])} not found, {len(rep['failed'])} failed."
+    L = [f"Checked {rep['checked']} song(s): {len(rep['downloaded'])} downloaded, {len(rep.get('uncertain', []))} uncertain, {len(rep['notfound'])} not found, {len(rep['failed'])} failed."
          + ("  STOPPED early." if rep.get("stopped") else ""), ""]
     if update_msg:
         L += [f"yt-dlp: {update_msg}", ""]
     if rep["downloaded"]:
         L.append("DOWNLOADED")
         for d in rep["downloaded"]:
-            L.append(f"  {d['title']} - {d['artist']}\n      video: \"{d['video']}\" ({d['length']}) | channel: {d['channel']} | https://youtu.be/{d['id']}\n"
+            L.append(f"  {d['title']} - {d['artist']}\n      chosen:    {d.get('chosen') or d['video']}\n      runner-up: {d.get('runner') or '(none passed the rules)'}\n"
                      f"      cover: {d.get('cover', 'none')}" + (f" ({d['cover_note']})" if d.get("cover_note") else "")
                      + (f"\n      replaced: {d['replaced']} (old file kept in {REPLACED_DIR})" if d.get("replaced") else ""))
+        L.append("")
+    if rep.get("uncertain"):
+        L.append("UNCERTAIN (not downloaded: the best title still has extra words or comes from an unrelated channel; pick by hand)")
+        for d in rep["uncertain"]:
+            L.append(f"  {d['title']} - {d['artist']}" + ("  (the existing file is untouched)" if d.get("existing") else ""))
+            for i, c in enumerate(d["top"], 1):
+                L.append(f"      {i}. {c}")
         L.append("")
     if rep["notfound"]:
         L.append("NOT FOUND (nothing downloaded; check by hand)")
