@@ -40,7 +40,7 @@ Montager turns your own Valorant, CS2 and Rainbow Six Siege clips into kill mont
 | Python | **3.12, 64-bit** from python.org, with tcl/tk (tkinter) installed. 3.10 / 3.11 may work but are not tested. |
 | FFmpeg | A recent build with `ffmpeg` and `ffprobe`, for example the gyan.dev "essentials" build. |
 | Python packages (required) | `numpy opencv-python Pillow librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime` |
-| Python packages (recommended) | `sv-ttk` (the dark theme), `psutil` (memory readings), `fonttools` (intro titles in other alphabets) |
+| Python packages (recommended) | `sv-ttk` (the dark theme), `psutil` (memory readings), `fonttools` (intro titles in other alphabets), `yt-dlp` (Songs tab > Download new songs) |
 | OCR engine | RapidOCR (the `rapidocr-onnxruntime` package). Runs offline on the CPU; no separate install. |
 | GPU (optional) | An NVIDIA GPU makes rendering faster (NVENC). The installed app switches to x264 by itself when there is no working NVIDIA encoder (slower, same result); the Python version: pick Quality "Max (x264)". |
 | Disk / RAM | Space for the montages (about 100 to 400 MB each). 16 GB RAM recommended: a long render with effects can use about 10 GB. |
@@ -73,7 +73,7 @@ More detail: [docs/guides/INSTALL.md](docs/guides/INSTALL.md).
    ```
 4. **Python packages**: in that folder run
    ```bash
-   python -m pip install --user numpy opencv-python Pillow librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime sv-ttk psutil fonttools
+   python -m pip install --user numpy opencv-python Pillow librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime sv-ttk psutil fonttools yt-dlp
    ```
 5. **Start it**: double-click **`Start_Montager.bat`**. It creates your settings file the first time, runs a read-only setup check, then opens Montager.
    - If the check finds a problem, it lists it with the fix and waits for a key press.

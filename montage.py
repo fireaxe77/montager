@@ -6,7 +6,7 @@ GET IT RUNNING (Windows 11, Python 3.12) - in cmd.exe:
     cd C:\Users\fireaxe\Desktop\CLAUDECODE
     git clone https://github.com/fireaxe77/montager.git montager      (later updates: cd montager && git pull origin main)
     cd montager
-    python -m pip install --user numpy opencv-python librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime sv-ttk
+    python -m pip install --user numpy opencv-python librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime sv-ttk yt-dlp
     python montage.py                    <- opens the GUI (Montager) (the app also offers a one-click install of missing packages)
     ffmpeg missing?  winget install --id Gyan.FFmpeg -e --scope user   (open a new terminal afterwards)
 
@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.4"
+APP_VERSION = "V9.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -22698,6 +22698,10 @@ class App:
         self.btn(bar, "Play selected file", self.play_match).pack(side="left", padx=3)
         self.btn(bar, "Open song_matches.csv", lambda: self.open_path(DATA / "song_matches.csv")).pack(side="left", padx=3)
         self.btn(bar, "Song map of selected file...", self.map_match).pack(side="left", padx=3)
+        self.btn(bar, "Download new songs", self.start_yt_download).pack(side="left", padx=(14, 3))      # V9.5
+        ttk.Label(bar, text="Newest songs to check").pack(side="left", padx=(6, 2))
+        self.yt_n = tk.StringVar(value="10")
+        ttk.Spinbox(bar, from_=1, to=500, width=5, textvariable=self.yt_n).pack(side="left")
         self.m_info = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
         fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "len", "added", "score", "flag", "trash"), height=18, selectmode="browse")
@@ -22712,6 +22716,63 @@ class App:
         self.mtree.tag_configure("weak", foreground="#ffc65c")
         self.mtree.tag_configure("none", foreground="#ff8a80")
         self.match_rows, self.match_audio = [], []
+
+    def start_yt_download(self):
+        """V9.5: Songs tab > Download new songs: the CSV tracks without an MP3 are looked up on YouTube (yt-dlp) in a background task."""
+        try:
+            n = int(str(self.yt_n.get()).strip())
+            if n < 1:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            messagebox.showinfo("Download new songs", "Type a whole number (1 or more) in 'Newest songs to check'.")
+            return
+        self.run_task("ytsongs", self.download_new_songs, n)
+
+    def download_new_songs(self, n):
+        import ytsongs
+        cfg = load_config()
+        say = lambda t: self.q.put(("call", lambda: self._prog_ui(None, t)))
+        if not cfg.get("mp3_dir") or not os.path.isdir(cfg["mp3_dir"]):
+            self.q.put(("call", lambda: messagebox.showinfo("Download new songs", "Set the MP3 folder in Settings first.")))
+            return
+        csvp, rows, _col = read_playlist(cfg)
+        if not rows:
+            self.q.put(("call", lambda: messagebox.showinfo("Download new songs", "No Exportify CSV found in the playlist folder.")))
+            return
+        say("yt-dlp: updating ...")
+        ok, msg = ytsongs.update(DATA, log=out)
+        upd = f"updated ({msg})" if ok else f"UPDATE FAILED, using the installed version: {msg}"
+        out("yt-dlp: " + upd)
+        if not ytsongs.base_cmd(DATA):
+            text = f"yt-dlp is not available.\n\n{msg}\n"
+            self.q.put(("call", lambda: self.show_yt_report("Download new songs", text)))
+            return
+        say("Checking which CSV tracks have no MP3 ...")
+        audio = scan_audio(cfg)
+        _m, unmatched, _st = match_cached(cfg, csvp, rows, audio)
+        far = datetime.datetime(1970, 1, 1)
+        key = lambda r: (parse_added(r["added"]) or far) if r.get("added") else far
+        rep = ytsongs.fetch_new(unmatched, cfg["mp3_dir"], DATA, n, key, progress=lambda t: (say(t), out("yt: " + t)))
+        text = ytsongs.report_text(rep, "" if ok else upd)
+        out("yt: " + text.replace("\n", " | "))
+        say(f"Songs: {len(rep['downloaded'])} downloaded, {len(rep['notfound'])} not found")
+        if rep["downloaded"]:
+            self.run_task("matches", self.load_matches)               # the new songs appear in the lists without a restart
+        self.q.put(("call", lambda: self.show_yt_report("Download new songs - result", text)))
+
+    def show_yt_report(self, title, text):
+        w = self.reg(tk.Toplevel(self.root), "window")
+        w.title(title)
+        w.geometry("900x520")
+        fr = ttk.Frame(w)
+        fr.pack(fill="both", expand=True, padx=8, pady=8)
+        t = tk.Text(fr, wrap="word", font=("Consolas", 10))
+        sb = ttk.Scrollbar(fr, command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        t.pack(side="left", fill="both", expand=True)
+        t.insert("1.0", text)
+        t.configure(state="disabled")
 
     def load_matches(self):
         cfg = load_config()

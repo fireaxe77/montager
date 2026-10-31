@@ -42,7 +42,7 @@ for dist in ("numpy", "scipy", "opencv-python", "Pillow", "librosa", "soundfile"
     except Exception:                                      # noqa: BLE001 - a package that is not installed is simply not credited twice
         pass
 
-hidden = ["montage", "intro90", "songmap_compare", "setup_check", "first_run", "sv_ttk", "psutil", "fontTools.ttLib",
+hidden = ["montage", "intro90", "ytsongs", "songmap_compare", "setup_check", "first_run", "sv_ttk", "psutil", "fontTools.ttLib",
           "rapidocr_onnxruntime", "soundfile", "mutagen", "rapidfuzz", "PIL.ImageFont", "PIL.ImageFilter", "PIL.ImageChops"]
 hidden += collect_submodules("songmap_v2")
 

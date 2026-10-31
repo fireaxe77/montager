@@ -26,6 +26,7 @@ Used unmodified for the intro / outro titles. Full license text and copyright li
 | [OpenCV](https://opencv.org) (`opencv-python`) | frames and images | Apache 2.0 (+ MIT wrapper) |
 | [librosa](https://librosa.org), [soundfile](https://github.com/bastibe/python-soundfile) | song analysis | ISC / BSD |
 | [mutagen](https://github.com/quodlibet/mutagen) | song tags | GPL-2.0-or-later |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Songs tab > Download new songs (installed separately, updated before each run) | Unlicense |
 | [RapidFuzz](https://github.com/rapidfuzz/RapidFuzz) | fuzzy name / title matching | MIT |
 | [Pillow](https://python-pillow.org) | intro titles | MIT-CMU (HPND) |
 | [sv-ttk](https://github.com/rdbende/Sun-Valley-ttk-theme) (optional) | the dark theme | MIT |
