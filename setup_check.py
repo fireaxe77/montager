@@ -28,6 +28,7 @@ REQUIRED = [("numpy", "numpy"), ("cv2", "opencv-python"), ("PIL", "Pillow"), ("l
             ("scipy", "scipy"), ("mutagen", "mutagen"), ("rapidfuzz", "rapidfuzz"), ("rapidocr_onnxruntime", "rapidocr-onnxruntime")]
 RECOMMENDED = [("sv_ttk", "sv-ttk", "the dark Sun Valley look (without it a plain theme is used)"),
                ("psutil", "psutil", "free-memory readings during a render"),
+               ("yt_dlp", "yt-dlp", "Songs tab > Download new songs (the app also installs and updates it by itself when you click it)"),
                ("fontTools", "fonttools", "picks a fallback font for intro titles in other alphabets")]
 OPTIONAL = [("send2trash", "Send2Trash", "the clip list's trash icon uses the Windows Recycle Bin through it (works without it too)")]
 

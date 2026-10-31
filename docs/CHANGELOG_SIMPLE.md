@@ -2,6 +2,12 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.5 - 2026-10-31: Download missing songs from YouTube
+- New "Download new songs" button in the Songs tab: it finds the newest playlist songs you have no MP3 for and downloads them from YouTube
+- Only a video with the right length and no slowed, sped-up, remix, live or cover version is used; songs it cannot match safely are listed so you can check them by hand
+- Downloaded songs are named and tagged from your playlist and appear in the song list right away
+- Choose how many of the newest songs to check in the box next to the button
+
 ## V9.4 - 2026-10-29: Smoother 50 fps clips
 - Clips recorded at 50 fps are now smoothed to match the montage's 60 fps (clips at any other frame rate are left alone); the Settings checkbox switches it on or off
 - The last kill of a take is no longer cut off the moment it appears in the killfeed
