@@ -28,7 +28,7 @@ def C(title, channel, dur, vid="x"):
 def main():
     # 0 version
     src = (ROOT / "montage.py").read_text(encoding="utf-8")
-    check("0 APP_VERSION is V9.5", 'APP_VERSION = "V9.5"' in src)
+    check("0 APP_VERSION is V9.5.x", 'APP_VERSION = "V9.5' in src)
     check("0 Songs tab has the button and the box", "Download new songs" in src and "Newest songs to check" in src and 'tk.StringVar(value="10")' in src)
 
     # 1 pick rules
