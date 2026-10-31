@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.5.1 - 2026-10-31: Covers and batch song downloads
+- Downloaded songs now get their album cover and full details, and a new button adds covers and details to the songs you already have (it shows a preview first)
+- In the Songs tab you can select several songs, with or without an MP3, and download or replace them in one go
+- Montages start faster, and the intro always uses footage that actually moves
+
 ## V9.5 - 2026-10-31: Download missing songs from YouTube
 - New "Download new songs" button in the Songs tab: it finds the newest playlist songs you have no MP3 for and downloads them from YouTube
 - Only a video with the right length and no slowed, sped-up, remix, live or cover version is used; songs it cannot match safely are listed so you can check them by hand

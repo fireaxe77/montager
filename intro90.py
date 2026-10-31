@@ -315,50 +315,91 @@ def text_scale(t):
     return 1.0 + (SCALE_FROM - 1.0) * (1.0 - smooth((t - TEXT_IN) / SCALE_S))
 
 
-def text_video(out_path, look, title, subline=None, pal=None, ffmpeg="ffmpeg", cancel=None):
+TEXT_FFV1 = ["-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuva420p", "-c:v", "ffv1", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
+TEXT_WORKERS = 4                   # V9.5.1: frames of the text video are made by this many threads (the same frames, the same order: 26 s -> about 10 s)
+
+
+def text_stand_in(out_path, h, ffmpeg="ffmpeg"):
+    """V9.5.1: a 0.25 s video with alpha of exactly the text video's format (same codec, colour tags, width, band height), so the render's colour probe can read the intro's input while the real text
+    video is still being made."""
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", f"color=c=black@0.0:s={W}x{h}:r={FPS}:d=0.25,format=rgba"] + TEXT_FFV1 + ["-t", "0.25", str(out_path)]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError("intro text stand-in failed: " + r.stderr.decode("utf-8", "replace")[-300:])
+    return str(out_path)
+
+
+def text_video(out_path, look, title, subline=None, pal=None, ffmpeg="ffmpeg", cancel=None, on_geometry=None, workers=None):
     """the intro text as a video with alpha (ffv1 / yuva420p bt709, the picture's width, a band of its height, 60 fps, INTRO_S s): look A = a slow fade with a gentle scale 104 % -> 100 %.
-    Returns {"file", "y0", "h", "font"} for the overlay: overlay=0:y0."""
+    Returns {"file", "y0", "h", "font"} for the overlay: overlay=0:y0. V9.5.1: on_geometry(that dict) is called as soon as the band is known (before the frames are made); the frames are made
+    by `workers` threads, written in order (every frame is exactly what the single-thread loop made)."""
+    import threading
+    from collections import OrderedDict, deque
+    from concurrent.futures import ThreadPoolExecutor
     layer, note = build_layer(look, title, subline, pal)
     ua = np.asarray(layer.getchannel("A"))
     ys = np.where(ua.max(axis=1) > 0)[0]
     marg = int(round(70 * K))
     y0, y1 = max(0, int(ys.min()) - marg) // 2 * 2, min(H, int(ys.max()) + marg) // 2 * 2
     cyb = (int(ys.min()) + int(ys.max())) / 2 - y0
+    info = {"file": str(out_path), "y0": int(y0), "h": int(y1 - y0), "font": note or FONT_NAMES[LOOKS[look][0][0]]}
+    if on_geometry is not None:
+        on_geometry(dict(info))
     chs = _premult(layer, y0, y1)
     static_px = _straight(_xform(chs, 1.0, W / 2, cyb))
-    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-video_size", f"{W}x{y1 - y0}", "-framerate", str(FPS), "-i", "pipe:0",
-           "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuva420p", "-c:v", "ffv1", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
-           "-t", f"{INTRO_S:.3f}", str(out_path)]            # a YUV (bt709) video with alpha: the render's colour probe then sees one colour space (an RGB input turned the fast render off)
+    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgba", "-video_size", f"{W}x{y1 - y0}", "-framerate", str(FPS), "-i", "pipe:0"] + TEXT_FFV1         + ["-t", f"{INTRO_S:.3f}", str(out_path)]            # a YUV (bt709) video with alpha: the render's colour probe then sees one colour space (an RGB input turned the fast render off)
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     blank = np.zeros((y1 - y0, W, 4), np.uint8).tobytes()
-    last_s, last_px = None, None
+    nfr = int(round(INTRO_S * FPS))
+    scale_of = [None if text_alpha(n / FPS) <= 0 else round(text_scale(n / FPS), 4) for n in range(nfr)]
+    last_use = {}
+    for n, s in enumerate(scale_of):
+        if s is not None and s != 1.0:
+            last_use[s] = n
+    memo, mlock = {}, threading.Lock()
+
+    def get_px(s):
+        with mlock:
+            e = memo.get(s)
+            if e is None:
+                e = memo[s] = [threading.Lock(), None]
+        with e[0]:
+            if e[1] is None:
+                e[1] = _straight(_xform(chs, s, W / 2, cyb))
+            return e[1]
+
+    def frame_bytes(n):
+        s = scale_of[n]
+        if s is None:
+            return blank
+        px = static_px if s == 1.0 else get_px(s)
+        fr = px.copy()
+        fr[..., 3] *= text_alpha(n / FPS)
+        return (fr * 255 + 0.5).astype(np.uint8).tobytes()
+    nw = int(workers or TEXT_WORKERS)
     try:
-        for n in range(int(round(INTRO_S * FPS))):
-            if cancel is not None and cancel.is_set():
-                break
-            t = n / FPS
-            al = text_alpha(t)
-            if al <= 0:
-                p.stdin.write(blank)
-                continue
-            s = round(text_scale(t), 4)
-            if s != 1.0:
-                if s != last_s:
-                    last_px = _straight(_xform(chs, s, W / 2, cyb))
-                    last_s = s
-                px = last_px
-            else:
-                px = static_px
-            fr = px.copy()
-            fr[..., 3] *= al
-            p.stdin.write((fr * 255 + 0.5).astype(np.uint8).tobytes())
+        with ThreadPoolExecutor(max_workers=nw) as ex:
+            pend, nxt = deque(), 0
+            for n in range(nfr):
+                if cancel is not None and cancel.is_set():
+                    for f_ in pend:
+                        f_.cancel()
+                    break
+                while nxt < nfr and len(pend) < nw * 2:
+                    pend.append(ex.submit(frame_bytes, nxt))
+                    nxt += 1
+                p.stdin.write(pend.popleft().result())
+                s = scale_of[n]
+                if s is not None and s != 1.0 and last_use.get(s) == n:
+                    with mlock:
+                        memo.pop(s, None)                    # no later frame uses this scale: its picture is dropped (memory)
         p.stdin.close()
     except (BrokenPipeError, OSError):
         pass
     err = p.stderr.read().decode("utf-8", "replace")
     if p.wait() != 0:
         raise RuntimeError("intro text video failed: " + err[-400:])
-    return {"file": str(out_path), "y0": int(y0), "h": int(y1 - y0), "font": note or FONT_NAMES[LOOKS[look][0][0]]}
+    return info
 
 
 # ----------------------------------------------------------------------------------------------------------- the speed
