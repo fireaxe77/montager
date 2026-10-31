@@ -5,6 +5,12 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V9.5.4 - 2026-10-31
+YouTube downloader: UNCERTAIN / not-found songs can be picked by hand. Scoring and the UNCERTAIN marks are unchanged; nothing else is touched.
+- `build_yt_picker` (result window): for every UNCERTAIN song each of the best 3 candidates has "Open" (browser) and "Download this"; every UNCERTAIN / not found / failed song has a "Paste a YouTube link" field + "Download link" (`ytsongs.parse_video_id`: watch?v=, youtu.be, shorts, embed, bare id). `fetch_new` now keeps the row, the old file and the candidate dicts in the report.
+- `ytsongs.download_chosen`: the one pipeline (the batch uses it too): MP3 VBR 0, CSV file name + tags, Deezer cover by ISRC (Topic thumbnail only for a Topic upload), `place`. A name that is taken raises `PlaceError`; `old` moves the existing file to `_replaced`. `App.yt_pick_start` asks before an existing MP3 (matched, or a file of that name) is replaced; `yt_pick_worker` runs it in the background and refreshes the lists.
+Tests: `tests/test_v954.py` (picker on a withdrawn window), `tests/live954.py` (search-only "Another Day", `--download N` = one real download into a temp folder).
+
 ## V9.5.3 - 2026-10-31
 Song data survives tag / cover rewrites. Detection, planning results, effects, the sky and the final picture are unchanged.
 - Diagnosis (copy of montage_data): song-map caches were keyed by size + modified time + first / last 64 KB (V2 `song_cache_v2.json`, `repeat_cache.json`) or path + size + time (V1 `song_cache.json`, only used for the bpm that goes into a V2 key). The Apply of covers and tags changed size and first bytes of 1361 files, so their maps looked new: of 213 V2 signatures only 27 still matched a file. Hand labels (`song_drops.json`: 31 songs, 6 with strong beats) are keyed by FILE NAME and were not touched (file unchanged since 10-29; no entry of any cache was overwritten or removed, only 11 V2 maps added by rebuilds). There is no store of hand-edited / fixed maps other than these labels.
