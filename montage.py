@@ -23345,6 +23345,13 @@ class App:
         self.btn(bar2, "Add covers and tags to existing songs", lambda: self.start_covers(False)).pack(side="left", padx=3)
         self.btn(bar2, "Apply", lambda: self.start_covers(True)).pack(side="left", padx=3)
         ttk.Button(bar2, text="Stop", command=stop_all).pack(side="left", padx=3)                  # (not in self.buttons: stays usable while a task runs)
+        bar3 = ttk.Frame(f)                                                                         # V9.5.4: search the song list
+        bar3.pack(fill="x", pady=2)
+        ttk.Label(bar3, text="Search songs").pack(side="left", padx=(3, 4))
+        self.s_search = tk.StringVar()
+        ttk.Entry(bar3, textvariable=self.s_search, width=40).pack(side="left")
+        ttk.Button(bar3, text="Clear", command=lambda: self.s_search.set("")).pack(side="left", padx=4)
+        self.s_search.trace_add("write", lambda *a: self.fill_matches())
         self.m_info = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
         fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "len", "added", "score", "flag", "trash"), height=18, selectmode="extended")      # V9.5.1: Ctrl / Shift select
@@ -23593,6 +23600,9 @@ class App:
 
     def fill_matches(self):
         items = getattr(self, "match_items", [])
+        q_ = self.s_search.get().strip().lower() if hasattr(self, "s_search") else ""
+        if q_:                                                     # V9.5.4: the search box: file name, track, artist
+            items = [i for i in items if q_ in f"{i[1]} {i[2]} {i[3]}".lower()]
         rows = self.sorted_rows(self.mtree, [(pth, nm, (tr, ar, bpm, ln, ad, sc, fl, self.TRASH_GLYPH)) for pth, nm, tr, ar, sc, fl, bpm, ln, ad in items])
         self.mtree.delete(*self.mtree.get_children())
         for pth, nm, vals in rows:

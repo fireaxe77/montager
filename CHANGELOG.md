@@ -9,6 +9,7 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 YouTube downloader: UNCERTAIN / not-found songs can be picked by hand. Scoring and the UNCERTAIN marks are unchanged; nothing else is touched.
 - `build_yt_picker` (result window): for every UNCERTAIN song each of the best 3 candidates has "Open" (browser) and "Download this"; every UNCERTAIN / not found / failed song has a "Paste a YouTube link" field + "Download link" (`ytsongs.parse_video_id`: watch?v=, youtu.be, shorts, embed, bare id). `fetch_new` now keeps the row, the old file and the candidate dicts in the report.
 - `ytsongs.download_chosen`: the one pipeline (the batch uses it too): MP3 VBR 0, CSV file name + tags, Deezer cover by ISRC (Topic thumbnail only for a Topic upload), `place`. A name that is taken raises `PlaceError`; `old` moves the existing file to `_replaced`. `App.yt_pick_start` asks before an existing MP3 (matched, or a file of that name) is replaced; `yt_pick_worker` runs it in the background and refreshes the lists.
+- Songs tab: a "Search songs" box (`s_search`, `fill_matches` filters on file name / track / artist, also the rows without an MP3), added to this version after the tag (the tag v9.5.4 was not moved).
 Tests: `tests/test_v954.py` (picker on a withdrawn window), `tests/live954.py` (search-only "Another Day", `--download N` = one real download into a temp folder).
 
 ## V9.5.3 - 2026-10-31
