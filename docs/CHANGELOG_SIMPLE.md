@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.5.3 - 2026-10-31: Song maps survive new covers and tags
+- Song maps and beat data are now tied to the song's audio, so adding covers or changing tags never makes the program analyse a song again
+- Your hand-labelled drops are kept, and follow the song if you rename its file
+- Existing data is moved over automatically the first time you start, after a backup
+
 ## V9.5.2 - 2026-10-31: Songs match again, better YouTube picks
 - Songs that showed "NO MATCH" after adding covers and tags match again
 - The YouTube downloader now prefers the official upload and skips 8-bit, tribute and other odd versions; unsure picks are listed for you to choose
