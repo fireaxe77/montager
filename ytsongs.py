@@ -637,6 +637,40 @@ def place(tmp_mp3, songs_dir, title, artist, old=None):
     return dest, None
 
 
+class PlaceError(RuntimeError):
+    """the finished MP3 could not be put into the songs folder (a file of that name is there)"""
+
+
+def parse_video_id(text):
+    """The 11-character YouTube video id of a pasted link (watch?v=, youtu.be/, shorts/, embed/, music.youtube.com) or of a bare id; None when it is neither."""
+    s = str(text or "").strip()
+    if re.fullmatch(r"[\w-]{11}", s):
+        return s
+    m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|live/)([\w-]{11})(?![\w-])", s)
+    return m.group(1) if m else None
+
+
+def download_chosen(r, vid, songs_dir, data_dir, meta=None, old=None, topic=False, dl=None, cover_fn=None, tmp_dir=None):
+    """THE download pipeline of one chosen video (used by the batch and by the hand picks): best audio -> MP3 (VBR 0), the CSV's tags, the cover (Deezer by ISRC, else a Topic upload's thumbnail when
+    `topic`), the file named from the CSV, put into the songs folder. Never overwrites: a file of that name is an error unless `old` (the file it replaces) is given: that one is moved to
+    songs\\_replaced first. Returns {"file", "cover", "cover_note", "replaced"}; raises RuntimeError (PlaceError when the name is taken)."""
+    tmp_dir = Path(tmp_dir or Path(data_dir) / "yt_tmp")
+    dlf = dl or (lambda v: download_mp3(data_dir, v, tmp_dir))
+    cf = cover_fn or (lambda row, topic_id: cover_for(row, data_dir, topic_id))
+    try:
+        tmp = dlf(vid)
+        tg = track_tags(r, meta)
+        cover, csrc, cnote = cf(dict(r, isrc=tg["isrc"]), vid if topic else None)
+        write_tags(tmp, tg, cover)
+        dest, why = place(tmp, songs_dir, r["title"], r["artist"], old=old)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    if dest is None:
+        raise PlaceError(why or "could not place the file")
+    cache_save(data_dir)
+    return {"file": str(dest), "cover": csrc, "cover_note": cnote, "replaced": Path(old).name if old else ""}
+
+
 def fetch_new(rows, songs_dir, data_dir, n, sort_key, progress=print, search_fn=None, download_fn=None, tmp_dir=None, meta=None, cover_fn=None, stop=None):
     """rows: CSV tracks to fetch ({title, artist, dur, added, uri}; a row with "_old" = the existing file it replaces). n = None: all of them, else the `n` newest (by sort_key). A track is
     downloaded only when a result passes every rule; its MP3 gets the CSV tags and a cover (Deezer, else a Topic upload's thumbnail). stop() true = stop after the current track.
@@ -655,41 +689,35 @@ def fetch_new(rows, songs_dir, data_dir, n, sort_key, progress=print, search_fn=
         name = f"{a} - {t}"
         progress(f"{i}/{len(todo)} searching: {name}")
         if want <= 0:
-            rep["notfound"].append({"title": t, "artist": a, "reason": "the CSV has no track length, so no result can be checked" + keep})
+            rep["notfound"].append({"title": t, "artist": a, "reason": "the CSV has no track length, so no result can be checked" + keep, "row": r, "old": old})
             continue
         try:
             cands = find_candidates(data_dir, t, a, search_fn)
         except RuntimeError as ex:
-            rep["failed"].append({"title": t, "artist": a, "reason": f"search failed: {ex}" + keep})
+            rep["failed"].append({"title": t, "artist": a, "reason": f"search failed: {ex}" + keep, "row": r, "old": old})
             continue
         label = track_tags(r, meta).get("label", "")
         ranked, rej = rank(cands, t, [x.strip() for x in a.split(",")], want, label)
         if not ranked:
-            rep["notfound"].append({"title": t, "artist": a, "reason": nearest_miss(rej, want) + keep})
+            rep["notfound"].append({"title": t, "artist": a, "reason": nearest_miss(rej, want) + keep, "row": r, "old": old})
             continue
         best = ranked[0]
         runner = ranked[1] if len(ranked) > 1 else None
         if best["uncertain"]:                              # still extra words in the title, or an unrelated channel: never downloaded in a batch, listed with the best 3
-            rep["uncertain"].append({"title": t, "artist": a, "top": [describe(c) for c in ranked[:3]], "existing": bool(old)})
+            rep["uncertain"].append({"title": t, "artist": a, "top": [describe(c) for c in ranked[:3]], "existing": bool(old), "row": r, "old": old, "items": ranked[:3]})
             continue
         progress(f"{i}/{len(todo)} downloading: {name}  <-  {best['channel']}")
         try:
-            tmp = dl(best["id"])
-            tg = track_tags(r, meta)
-            cover, csrc, cnote = cf(dict(r, isrc=tg["isrc"]), best["id"] if best.get("kind") == "topic" else None)
-            write_tags(tmp, tg, cover)
-            dest, why = place(tmp, songs_dir, t, a, old=old)
-        except Exception as ex:
-            rep["failed"].append({"title": t, "artist": a, "reason": f"download failed: {ex}" + keep})
+            got = download_chosen(r, best["id"], songs_dir, data_dir, meta, old=old, topic=best.get("kind") == "topic", dl=download_fn, cover_fn=cover_fn, tmp_dir=tmp_dir)
+        except PlaceError as ex:
+            rep["failed"].append({"title": t, "artist": a, "reason": str(ex) + keep, "row": r, "old": old})
             continue
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-        if dest is None:
-            rep["failed"].append({"title": t, "artist": a, "reason": (why or "") + keep})
-        else:
-            rep["downloaded"].append({"title": t, "artist": a, "video": best["title"], "channel": best["channel"], "kind": best["kind"],
-                                      "length": fmt_len(best["duration"]), "id": best["id"], "file": str(dest), "cover": csrc, "cover_note": cnote,
-                                      "replaced": Path(old).name if old else "", "chosen": describe(best), "runner": describe(runner) if runner else ""})
+        except Exception as ex:
+            rep["failed"].append({"title": t, "artist": a, "reason": f"download failed: {ex}" + keep, "row": r, "old": old})
+            continue
+        rep["downloaded"].append({"title": t, "artist": a, "video": best["title"], "channel": best["channel"], "kind": best["kind"],
+                                  "length": fmt_len(best["duration"]), "id": best["id"], "file": got["file"], "cover": got["cover"], "cover_note": got["cover_note"],
+                                  "replaced": got["replaced"], "chosen": describe(best), "runner": describe(runner) if runner else ""})
         cache_save(data_dir)
     return rep
 

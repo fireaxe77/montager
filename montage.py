@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.5.3"
+APP_VERSION = "V9.5.4"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -8103,6 +8103,64 @@ def song_thumb(path, S):
     im.save(tmp, "PNG")
     os.replace(tmp, png)
     return str(png)
+
+
+def build_yt_picker(win, text, rep, on_pick, on_open):
+    """V9.5.4: the result window of the YouTube downloader: the report as text and, for every song that was UNCERTAIN, not found or failed, a block to choose by hand: each of the best candidates
+    with 'Open' (the video in the browser, to listen first) and 'Download this', and a field to paste any YouTube link with 'Download link'. on_pick(entry, video id, topic upload?, set_status);
+    on_open(url). Nothing is downloaded by building it."""
+    import ytsongs
+    top = ttk.Frame(win)
+    top.pack(fill="both", expand=bool(rep is None), padx=8, pady=(8, 4))
+    t = tk.Text(top, wrap="word", font=("Consolas", 10), height=12 if rep is not None else 20)
+    sb = ttk.Scrollbar(top, command=t.yview)
+    t.configure(yscrollcommand=sb.set)
+    sb.pack(side="right", fill="y")
+    t.pack(side="left", fill="both", expand=True)
+    t.insert("1.0", text)
+    t.configure(state="disabled")
+    entries = []
+    if rep:
+        for key, label in (("uncertain", "UNCERTAIN: choose one"), ("notfound", "NOT FOUND: paste a link"), ("failed", "FAILED: paste a link or try again")):
+            entries += [(label, e) for e in rep.get(key, []) if e.get("row")]
+    if not entries:
+        return
+    ttk.Label(win, text="Choose by hand").pack(anchor="w", padx=10)
+    host = ttk.Frame(win)
+    host.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    cv = tk.Canvas(host, highlightthickness=0)
+    vs = ttk.Scrollbar(host, orient="vertical", command=cv.yview)
+    inner = ttk.Frame(cv)
+    inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+    cv.create_window((0, 0), window=inner, anchor="nw")
+    cv.configure(yscrollcommand=vs.set)
+    vs.pack(side="right", fill="y")
+    cv.pack(side="left", fill="both", expand=True)
+    for label, e in entries:
+        box = ttk.LabelFrame(inner, text=f"{e['title']} - {e['artist']}   [{label}]" + ("   (has an MP3 now)" if e.get("old") else ""))
+        box.pack(fill="x", padx=2, pady=4)
+        status = tk.StringVar(value="")
+        for i, c in enumerate(e.get("items") or [], 1):
+            row = ttk.Frame(box)
+            row.pack(fill="x", padx=4, pady=1)
+            ttk.Label(row, text=f"{i}. {ytsongs.describe(c)}", wraplength=620, justify="left").pack(side="left", fill="x", expand=True)
+            ttk.Button(row, text="Open", width=7, command=lambda u=f"https://youtu.be/{c['id']}": on_open(u)).pack(side="left", padx=2)
+            ttk.Button(row, text="Download this", command=lambda c=c, e=e, s=status: on_pick(e, c["id"], c.get("kind") == "topic", s.set)).pack(side="left", padx=2)
+        pr = ttk.Frame(box)
+        pr.pack(fill="x", padx=4, pady=(2, 1))
+        ttk.Label(pr, text="Paste a YouTube link:").pack(side="left")
+        link = tk.StringVar()
+        ttk.Entry(pr, textvariable=link, width=46).pack(side="left", padx=4)
+
+        def go(e=e, link=link, s=status):
+            vid = ytsongs.parse_video_id(link.get())
+            if not vid:
+                s.set("That is not a YouTube link (watch?v=..., youtu.be/...).")
+                return
+            on_pick(e, vid, False, s.set)
+        ttk.Button(pr, text="Download link", command=go).pack(side="left")
+        ttk.Button(pr, text="Open", width=7, command=lambda l=link: ytsongs.parse_video_id(l.get()) and on_open(f"https://youtu.be/{ytsongs.parse_video_id(l.get())}")).pack(side="left", padx=2)
+        ttk.Label(box, textvariable=status, wraplength=800, justify="left").pack(anchor="w", padx=6)
 
 
 def fmt_mss(sec):
@@ -23360,7 +23418,7 @@ class App:
         self.say(f"Songs: {len(rep['downloaded'])} downloaded, {len(rep['uncertain'])} uncertain, {len(rep['notfound'])} not found")
         if rep["downloaded"]:
             self.run_task("matches", self.load_matches)               # the new songs appear in the lists without a restart
-        self.q.put(("call", lambda: self.show_yt_report(title, text)))
+        self.q.put(("call", lambda: self.show_yt_report(title, text, rep)))
 
     def selected_song_rows(self):
         """V9.5.1: the Songs tab selection as [(row, old file or None, list name)]; MP3 rows without a CSV track are returned separately."""
@@ -23439,19 +23497,51 @@ class App:
         self.say(("Applied: " if apply else "Preview: ") + f"{rep['cover']} covers, {rep['tags']} tag sets")
         self.q.put(("call", lambda: self.show_yt_report("Covers and tags - " + ("result" if apply else "preview"), text)))
 
-    def show_yt_report(self, title, text):
+    def show_yt_report(self, title, text, rep=None):
         w = self.reg(tk.Toplevel(self.root), "window")
         w.title(title)
-        w.geometry("900x520")
-        fr = ttk.Frame(w)
-        fr.pack(fill="both", expand=True, padx=8, pady=8)
-        t = tk.Text(fr, wrap="word", font=("Consolas", 10))
-        sb = ttk.Scrollbar(fr, command=t.yview)
-        t.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        t.pack(side="left", fill="both", expand=True)
-        t.insert("1.0", text)
-        t.configure(state="disabled")
+        w.geometry("900x640" if rep and any(rep.get(k) for k in ("uncertain", "notfound", "failed")) else "900x520")
+        build_yt_picker(w, text, rep, self.yt_pick_start, lambda u: __import__("webbrowser").open(u))
+
+    def yt_pick_start(self, entry, vid, topic, setstatus):
+        """V9.5.4: a hand pick of the result window (a candidate's 'Download this' or a pasted link): asks before an existing MP3 is replaced (it goes to songs\\_replaced), then the normal download
+        pipeline runs in the background."""
+        cfg = load_config()
+        r = entry["row"]
+        old = entry.get("old")
+        if not old:
+            dest = Path(cfg.get("mp3_dir") or ".") / __import__("ytsongs").song_filename(r["title"], r["artist"])
+            if dest.exists():
+                old = str(dest)
+        if old and os.path.exists(old):
+            if not messagebox.askyesno("Replace the existing song?", f"{r['title']} - {r['artist']} already has an MP3:\n{Path(old).name}\n\nThe old file is moved to the '_replaced' folder inside the songs folder "
+                                       "(never deleted) and the new download takes its place.\n\nContinue?"):
+                return
+        else:
+            old = None
+        setstatus("waiting / downloading ...")
+        self.run_task("ytsongs", self.yt_pick_worker, entry, vid, topic, old, setstatus)
+
+    def yt_pick_worker(self, entry, vid, topic, old, setstatus):
+        import ytsongs
+        cfg = load_config()
+        csvp, rows, _col = read_playlist(cfg)
+        say = lambda t: self.q.put(("call", lambda: setstatus(t)))
+        try:
+            if not self.yt_ready(cfg, rows):
+                say("yt-dlp is not available (see the message)")
+                return
+            self.say(f"Downloading by hand: {entry['title']} - {entry['artist']}")
+            meta = ytsongs.read_meta(csvp)
+            got = ytsongs.download_chosen(entry["row"], vid, cfg["mp3_dir"], DATA, meta, old=old, topic=topic)
+        except Exception as ex:                            # noqa: BLE001
+            out(f"yt: hand pick failed: {type(ex).__name__}: {ex}")
+            say(f"FAILED: {ex}")
+            return
+        out(f"yt: hand pick: {entry['title']} - {entry['artist']} <- https://youtu.be/{vid} -> {got['file']} (cover: {got['cover']})")
+        entry["old"] = None
+        say(f"Downloaded: {Path(got['file']).name}  (cover: {got['cover']})" + (f"  | old file moved to _replaced: {got['replaced']}" if got["replaced"] else ""))
+        self.run_task("matches", self.load_matches)        # the new song appears in the lists
 
     def load_matches(self):
         cfg = load_config()
