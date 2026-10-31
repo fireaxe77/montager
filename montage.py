@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.5"
+APP_VERSION = "V9.5.1"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -76,7 +76,7 @@ VIDEO_EXT = {".mov", ".mp4", ".mkv"}
 AUDIO_EXT = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".opus"}
 MIN_VIDEO = 1 * 1024 * 1024
 SKIP_DIR_NAMES = {"windows", "program files", "program files (x86)", "appdata", "programdata", "snipping tool",
-                  "$recycle.bin", "system volume information", "montage_data", "node_modules", ".git", "montager moved clips"}     # V8.8.7: the move folder is never scanned
+                  "$recycle.bin", "system volume information", "montage_data", "node_modules", ".git", "montager moved clips", "_replaced"}     # V8.8.7: the move folder is never scanned
 BAR_THRESHOLD = 12        # pixel brightness (0-255) counted as content
 BAR_FRAMES = 24
 GAMES = ("valorant", "cs2", "r6s")        # V8.0.0: r6s = Rainbow Six Siege (own folders, own icon-template detection, nothing shared with the other two)
@@ -5071,7 +5071,7 @@ def gun_onsets(rec, cache=None, cfg=None):
     import numpy as np
     key = _onset_key(rec, cfg)
     stream = _shot_stream(rec, cfg)                                    # V8.8: the Settings track (or the track that has the gunshots), every game, with or without cfg
-    cache = cache if cache is not None else load_json(ONSET_CACHE, {})
+    cache = cache if cache is not None else load_json_ro(ONSET_CACHE, {})          # V9.5.1: parsed once per file version (it was parsed again for every clip of every plan round: ~6 s a run)
     if key in cache:
         return cache[key]
     import librosa
@@ -7308,7 +7308,7 @@ def _peek_v1_bpm(path, csv_bpm=None):
     """BPM of the V1 map IF it is already in the V1 cache (read-only: never analyses, never writes), else None."""
     try:
         st = os.stat(path)
-        hit = load_json(SONG_CACHE, {}).get(f"{path}|{int(st.st_mtime)}|{st.st_size}|{SONGMAP_V}|{round(float(csv_bpm or 0), 3)}")
+        hit = load_json_ro(SONG_CACHE, {}).get(f"{path}|{int(st.st_mtime)}|{st.st_size}|{SONGMAP_V}|{round(float(csv_bpm or 0), 3)}")          # V9.5.1: read-only, parsed once (16 MB)
         return float(hit["bpm"]) if hit and hit.get("bpm") else None
     except Exception:
         return None
@@ -7470,7 +7470,8 @@ def _songmap_v2_raw(path, csv_bpm, v1_bpm):
     def work():
         _V2_RAW.on = True                                  # this worker thread only: safety.apply (patched below) hands back the raw V2 map
         try:
-            box["m"] = songmap_v2.build_songmap_v2(path, csv_bpm, deadline=deadline, hook=SONGMAP_V2_HOOK[0], v1_bpm=v1_bpm)
+            pre_ = SONGMAP_PRE.pop((path, csv_bpm, v1_bpm), None)          # V9.5.1: built ahead (songmap_prefetch) with these very arguments
+            box["m"] = pre_ if pre_ is not None else songmap_v2.build_songmap_v2(path, csv_bpm, deadline=deadline, hook=SONGMAP_V2_HOOK[0], v1_bpm=v1_bpm)
         except BaseException as ex:      # noqa: BLE001 - nothing may escape the worker
             box["err"] = f"{type(ex).__name__}: {ex}"
     th = threading.Thread(target=work, daemon=True)
@@ -7482,6 +7483,48 @@ def _songmap_v2_raw(path, csv_bpm, v1_bpm):
     c2[key] = box["m"]
     save_json(cpath, c2)
     return box["m"], ""
+
+
+SONGMAP_PRE = {}                      # V9.5.1: {(path, csv bpm, v1 bpm): raw V2 map or an error text} built ahead by songmap_prefetch, taken (once) by _songmap_v2_raw
+SONGMAP_PREFETCH_WORKERS = 3          # songs analysed at the same time when several are new (one run analysed 8 new songs one after the other: 75 s)
+
+
+def songmap_prefetch(songs):
+    """V9.5.1: the songs a pick is about to analyse and that have no V2 map yet are analysed SEVERAL AT A TIME (the same analysis, the same arguments, the same raw-V2 mode as _songmap_v2_raw);
+    the maps wait in SONGMAP_PRE and the normal sequential code takes each one and writes the cache exactly as before (nothing here writes a cache file). SongMap mode 'V2' only."""
+    try:
+        if songmap_version() != "v2" or songmap_mode() != "v2" or SONGMAP_PREFETCH_WORKERS < 2:
+            return
+        import songmap_v2
+        from concurrent.futures import ThreadPoolExecutor
+        cache = load_json_ro(DATA / songmap_v2.CACHE_NAME, {})
+        todo = []
+        for s in songs:
+            v1b = _peek_v1_bpm(s["path"], s.get("csv_bpm"))
+            key = songmap_v2.cache_key(s["path"], s.get("csv_bpm"), v1b)
+            hit = cache.get(key)
+            if hit and not hit.get("fallback_marker") and not (hit.get("v2") or {}).get("fallback"):
+                continue                                   # a usable cached map
+            if cache.get(key + "|raw"):
+                continue                                   # its raw map is cached (or its marker)
+            todo.append((s["path"], s.get("csv_bpm"), v1b))
+        if len(todo) < 2:
+            return
+        _patch_v2_safety()
+
+        def one(a):
+            path, bpm, v1b = a
+            _V2_RAW.on = True                              # this worker thread only (as in _songmap_v2_raw)
+            try:
+                SONGMAP_PRE[a] = songmap_v2.build_songmap_v2(path, bpm, deadline=time.monotonic() + songmap_v2.ANALYSIS_CAP_S, hook=SONGMAP_V2_HOOK[0], v1_bpm=v1b)
+            except BaseException as ex:                    # noqa: BLE001 - the sequential code analyses it again and reports the real error
+                SONGMAP_PRE.pop(a, None)
+                LOGONLY(f"songmap prefetch: {Path(path).name}: {type(ex).__name__}: {ex}")
+        with ThreadPoolExecutor(max_workers=min(SONGMAP_PREFETCH_WORKERS, len(todo))) as ex_:
+            list(ex_.map(one, todo))
+        LOGONLY(f"songmap prefetch: {len(SONGMAP_PRE)} new song(s) analysed {min(SONGMAP_PREFETCH_WORKERS, len(todo))} at a time")
+    except Exception as ex:                                # noqa: BLE001 - nothing here may stop a pick
+        LOGONLY(f"songmap prefetch skipped: {type(ex).__name__}: {ex}")
 
 
 class SongMapError(RuntimeError):
@@ -7807,6 +7850,7 @@ def pick_song(cfg, game, songs, now=None, forced=None):
     rest = sorted([s for s in songs if s not in week], key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
     for tier, name in ((week, "this week"), (rest, "older")):
         board = []
+        songmap_prefetch(tier[:15])                        # V9.5.1: new songs of this tier are analysed several at a time (the loop below takes their maps)
         for i, s in enumerate(tier[:15]):
             if CANCEL.is_set():
                 raise RuntimeError("cancelled")
@@ -10986,6 +11030,28 @@ def intro_clean_start(ev, t1, cfg):
     return max([0.08] + [m + 0.15 for m in marks if m <= t1 + 0.02]), note
 
 
+INTRO_MOTION_ON = [True]             # V9.5.1: the intro's footage must move (test switch)
+INTRO_MOTION_MIN = 4.0               # V9.5.1: mean grey change (0-255, 160 x 90) between frames 0.2 s apart; 14 intros that looked fine measured 11.9 - 29.4, the one that looked like a still 0.45
+INTRO_MOTION_MEMO = {}
+INTRO_V0_FLOOR = 0.25                # V9.5.1: the blurred hold never runs slower than this (intro90.V0_MIN 0.10 made a short run-up a near-still)
+
+
+def intro_motion(src, c0, c1):
+    """V9.5.1: how much the picture of `src` moves between clip times c0 and c1: the mean grey change between frames 0.2 s apart (160 x 90, 10 frames a second). 0.0 when it cannot be read."""
+    import numpy as np
+    k_ = (str(src["path"]), round(float(c0), 2), round(float(c1), 2), tuple(src["rect"]))
+    if k_ in INTRO_MOTION_MEMO:                            # the planner asks about the same footage again in every plan round
+        return INTRO_MOTION_MEMO[k_]
+    try:
+        fr = sky_grab_frames(src["path"], c0, c1, src["rect"], src["wh"], size=(160, 90), fps=10)
+    except Exception:                                      # noqa: BLE001
+        return 0.0
+    g = [f.astype(np.float32).mean(axis=2) for f in fr]
+    d = [float(np.abs(g[i + 2] - g[i]).mean()) for i in range(len(g) - 2)]
+    INTRO_MOTION_MEMO[k_] = float(np.mean(d)) if d else 0.0
+    return INTRO_MOTION_MEMO[k_]
+
+
 def intro_prepare(plan, ev, cfg, rname, song, seed):
     """V9.0: the plan's intro, decided at plan time: the first take's footage just before its first kill (blurred, slowed to ~0.3x, frame blending only), the title over it, then an unblur and a speed ramp
     to that take's own first speed. Writes plan['intro'] (never changes the takes: the render puts the intro in front, see with_intro) or a note when this montage cannot have one."""
@@ -11011,10 +11077,14 @@ def intro_prepare(plan, ev, cfg, rname, song, seed):
             cs_, w2 = intro_clean_start(ev1, a1 - float(src.get("shift", 0.0)), cfg)          # the quiet footage right before the take: no gunshot, no death of mine in it
             avail = a1 - float(src.get("shift", 0.0)) - cs_
             ok, v0, hold, ramp, used = intro90.speeds(avail, sg[2])
-            if not ok:
+            if not ok or v0 < INTRO_V0_FLOOR - 1e-9:
                 why_no = f"only {max(0.0, avail):.2f} s of quiet footage before the first take (no shot, no death in it; the intro needs {used:.2f} s)"
             else:
                 a0 = round(a1 - used, 4)
+                sh_ = float(src.get("shift", 0.0))
+                mo_ = intro_motion(src, a0 - sh_, a1 - sh_) if INTRO_MOTION_ON[0] else INTRO_MOTION_MIN
+                if mo_ < INTRO_MOTION_MIN:
+                    why_no = f"the footage before the first take hardly moves (motion {mo_:.1f}, the intro needs {INTRO_MOTION_MIN:.1f}): it would look like a still"
         if why_no is None:
             man_ = bool(INTRO_CTX.get("manual"))
             title = (INTRO_CTX.get("text") or "").strip() if man_ else ""
@@ -15649,6 +15719,7 @@ def xfx_probe_sky(plan, tmpdir=None):
     qual = [c for c in cands if c["cov"] is not None and XFX_SKY_MIN_COV <= c["cov"] <= XFX_SKY_MAX_COV]
     calm_ = [c for c in qual if not sky_role_ok(plan["takes"][c["ti"]])]
     for c in calm_:                                        # V9.1.0: the sky belongs to the song's high-energy parts (drop / build, headline, ending)
+        c["calm"] = plan["takes"][c["ti"]].get("role") or "calm"           # V9.5.1: named in the per-candidate line below (it said "within 12 s of a better one")
         LOGONLY(f"SKY recolour take {c['ti'] + 1}: clear sky, but a {plan['takes'][c['ti']].get('role') or 'calm'} take (low-energy part of the song): no sky")
     qual = [c for c in qual if c not in calm_]
     kept, used_ = [], []
@@ -15752,6 +15823,8 @@ def xfx_probe_sky(plan, tmpdir=None):
             msg = f"{x.get('why', 'kill')}: frame not readable{c['why']}, skipped"
         elif c["cov"] < XFX_SKY_MIN_COV or c["cov"] > XFX_SKY_MAX_COV:
             msg = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% of the picture ({c['info'].get('why') or c['info'].get('kind', 'none')}) -> no clear sky here, skipped"
+        elif c.get("calm"):
+            msg = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% -> clear sky, but not chosen (a {c['calm']} take: low-energy part of the song)"
         else:
             msg = f"{x.get('why', 'kill')}: sky covers {c['cov'] * 100:.0f}% -> clear sky, but not chosen ({'enough sky recolours for this length' if len(kept) >= mx else 'within ' + format(space, '.0f') + ' s of a better one'})"
         out(f"SKY recolour take {c['ti'] + 1}: {msg}")
@@ -17016,6 +17089,63 @@ def intro_assets(p, tdir):
     out(f"intro text: {it['look']} look, {it['_text'].get('font')}")
 
 
+INTRO_GATE = {}                      # V9.5.1: {"box": the running intro text job} while the render's parts may start before the text video is finished
+
+
+class _EitherSet:
+    """is_set() of a private event or the global cancel"""
+    def __init__(self, ev):
+        self.ev = ev
+
+    def is_set(self):
+        return self.ev.is_set() or CANCEL.is_set()
+
+
+def intro_assets_start(p, tdir):
+    """V9.5.1: the intro's text video is made in the background (frames by several threads); this returns at once, `geo` is set when its band (y0, h, font) is known and a stand-in of the same format
+    exists, so the render can be set up and every part that does not show the text can start. box: th, geo (band known), done (video finished), cancel, err, s (seconds), stand."""
+    import intro90
+    it = p["intro"]
+    Path(tdir).mkdir(parents=True, exist_ok=True)
+    box = {"geo": threading.Event(), "done": threading.Event(), "cancel": threading.Event(), "err": None, "s": 0.0, "stand": None}
+
+    def on_geo(info):
+        it["_text"] = dict(info)
+        try:
+            box["stand"] = intro90.text_stand_in(Path(tdir) / "intro_text_probe.mkv", info["h"])
+        except Exception as ex_:                           # noqa: BLE001
+            box["err"] = ex_
+        box["geo"].set()
+
+    def job():
+        t_ = time.perf_counter()
+        try:
+            it["_text"] = intro90.text_video(Path(tdir) / "intro_text.mkv", it["look"], it["title"], it.get("subline"), it.get("pal"), ffmpeg="ffmpeg",
+                                             cancel=_EitherSet(box["cancel"]), on_geometry=on_geo)
+            if not box["cancel"].is_set():
+                out(f"intro text: {it['look']} look, {it['_text'].get('font')}")
+        except Exception as ex_:                           # noqa: BLE001
+            box["err"] = ex_
+        finally:
+            box["s"] = time.perf_counter() - t_
+            box["geo"].set()
+            box["done"].set()
+    box["th"] = threading.Thread(target=job, daemon=True)
+    box["th"].start()
+    return box
+
+
+def intro_text_wait(box):
+    """V9.5.1: block until the intro's text video is finished (an error in it is raised)."""
+    if not box or box.get("th") is None:
+        return
+    while not box["done"].wait(0.5):
+        if CANCEL.is_set():
+            raise RuntimeError("cancelled")
+    if box.get("err") is not None:
+        raise box["err"]
+
+
 def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, effects=True):
     """Encode the plan in ONE attempt (V8.4.4: no retry, no effect dropped, no fallback render; a failure prints the failing filter, take and ffmpeg error).
     The finished file must last exactly as long as the plan (else it is reported as a failure, never silently kept)."""
@@ -17033,16 +17163,9 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
     if not preview:                                        # V9.2.1: the render's slow-motion parts start now, beside the sky check and the intro text
         heavy_prestart(p, cfg, (set(FX_ALL) | (set(XFX_FX) if p.get("effects") == "extra" else set()) if effects else {"slow"}), Path(itmp) / "pre", p.get("game"))
     intro_box = {}
+    INTRO_GATE.clear()
     if p.get("intro"):                                     # V9.2.1: the intro's text video is made beside the sky check (they share nothing; same file, made sooner)
-        def _intro_job():
-            t_ = time.perf_counter()
-            try:
-                intro_assets(p, itmp)
-            except Exception as ex_:                       # noqa: BLE001
-                intro_box["err"] = ex_
-            intro_box["s"] = time.perf_counter() - t_
-        intro_box["th"] = threading.Thread(target=_intro_job, daemon=True)
-        intro_box["th"].start()
+        intro_box = intro_assets_start(p, itmp)            # V9.5.1: and beside the parts too: nothing but the intro's own part waits for it
     if p.get("effects") == "extra" and sky_ok:
         try:
             with jstage("sky analysis"):
@@ -17058,16 +17181,21 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         raise RuntimeError("cut list problem, not rendering: " + "; ".join(bad))
     if p.get("intro"):                                     # V9.0: the intro's text (a video with alpha) first, then the plan as the render sees it (the intro take in front)
         try:
-            with jstage("intro (waited for)"):
-                intro_box["th"].join()
             it_ = p.get("intro") or {}
-            if intro_box.get("err") is None and it_.get("pal") and p.get("xfx_sky_fam") in SKY_FAMILIES and it_.get("family") != p["xfx_sky_fam"]:
+            if it_.get("pal") and p.get("xfx_sky_fam") in SKY_FAMILIES and it_.get("family") != p["xfx_sky_fam"]:
                 import intro90                             # V9.3.0: the skies ended in another family than the plan's guess (a white / black redraw): the intro text again in theirs
+                intro_box["cancel"].set()
+                intro_box["th"].join()
+                JOB_STAGES["intro"] = JOB_STAGES.get("intro", 0.0) + float(intro_box.get("s", 0.0))
                 it_["family"], it_["pal"] = p["xfx_sky_fam"], intro90.fam_palette(p["xfx_sky_fam"], SKY_FAMILIES, it_["look"])
-                intro_assets(p, itmp)
-            JOB_STAGES["intro"] = JOB_STAGES.get("intro", 0.0) + float(intro_box.get("s", 0.0))
+                intro_box = intro_assets_start(p, itmp)
+            with jstage("intro (waited for)"):             # V9.5.1: only until the text's band is known (about a second); the video itself is finished beside the parts
+                intro_box["geo"].wait()
             if intro_box.get("err") is not None:
                 raise intro_box["err"]
+            INTRO_GATE["box"] = intro_box
+            INTRO_GATE["file"] = it_["_text"]["file"]
+            INTRO_GATE["stand"] = intro_box.get("stand")
         except Exception as ex_:                           # noqa: BLE001
             if CANCEL.is_set():
                 shutil.rmtree(itmp, ignore_errors=True)
@@ -17093,6 +17221,12 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
         with jstage("render"):
             return _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, fx, D)
     finally:
+        if intro_box.get("th") is not None:                # V9.5.1: the text video's writer is finished (or stopped) before its folder goes
+            if not intro_box["done"].is_set():
+                intro_box["cancel"].set()
+            intro_box["th"].join(timeout=60)
+            JOB_STAGES["intro"] = JOB_STAGES.get("intro", 0.0) + float(intro_box.get("s", 0.0))
+        INTRO_GATE.clear()
         if isinstance(plan.get("intro"), dict):
             plan["intro"].pop("_text", None)               # the temporary text video is gone with the temp folder: never saved in the plan
         HEAVY_DIR[0] = None
@@ -17101,7 +17235,10 @@ def render_plan(plan, outfile, cfg, maxq=False, preview=False, encoder=None, eff
             for b_ in HEAVY_PRE.values():
                 b_["th"].join(timeout=600)
             HEAVY_PRE.clear()
-        shutil.rmtree(itmp, ignore_errors=True)
+        if os.environ.get("MONTAGER_KEEP_TMP"):            # V9.5.1 (timing tests): the temp folder with the parts is kept
+            out(f"render temp folder kept: {itmp}")
+        else:
+            shutil.rmtree(itmp, ignore_errors=True)
 
 
 def failing_take_text(plan, graph, out_t):
@@ -17702,6 +17839,13 @@ def render_parts(inputs, graph, tdir, D, elog, pin, tail_, stem, awork, gate=Non
                         cv.notify_all()
                     continue
             try:
+                gbox_ = INTRO_GATE.get("box")
+                if gbox_ is not None and INTRO_GATE.get("file") in tasks[nm]["cmd"]:       # V9.5.1: only the part that shows the intro's text waits for its video
+                    while not gbox_["done"].wait(0.5):
+                        if failed or CANCEL.is_set():
+                            return
+                    if gbox_.get("err") is not None:
+                        raise RuntimeError(f"{nm}: the intro text video failed: {gbox_['err']}")
                 pr = subprocess.Popen(tasks[nm]["cmd"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 PROCS.append(pr)
                 procs.append(pr)
@@ -17929,7 +18073,11 @@ def _render_fast(inputs, graph, tail_, tmp, D, elog, stem, tdir, game=None):
 
         def probe_():
             try:
-                res_["pin"], txt_ = render_colour_probe(inputs, graph, tdir / "probe")
+                inp_ = inputs
+                gb_ = INTRO_GATE.get("box")
+                if gb_ is not None and INTRO_GATE.get("stand") and not gb_["done"].is_set():
+                    inp_ = [INTRO_GATE["stand"] if a_ == INTRO_GATE["file"] else a_ for a_ in inputs]         # V9.5.1: the same format, finished
+                res_["pin"], txt_ = render_colour_probe(inp_, graph, tdir / "probe")
                 res_["ok"] = colour_pin_same(guess, res_["pin"], txt_)
             except Exception as ex_:                       # noqa: BLE001
                 res_["err"], res_["ok"] = ex_, False
@@ -17959,7 +18107,8 @@ def _render_fast(inputs, graph, tail_, tmp, D, elog, stem, tdir, game=None):
         LOGONLY(f"fast render not used ({type(ex).__name__}: {str(ex)[:300]}): one run as before")
         return None
     finally:
-        shutil.rmtree(tdir, ignore_errors=True)
+        if not os.environ.get("MONTAGER_KEEP_TMP"):        # V9.5.1 (timing tests): the parts are kept
+            shutil.rmtree(tdir, ignore_errors=True)
 
 
 def _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, elog, fx, D):
@@ -17976,6 +18125,7 @@ def _render_once(plan, pr_, outfile, cfg, maxq, preview, encoder, nvenc, tmp, el
     awork = DATA / f"cmdalias_{os.getpid()}"
     rc = _render_fast(inputs, graph, tail_, tmp, D, elog, stem, render_tmpdir(outfile) / "takes", pr_.get("game")) if FAST_RENDER[0] and not preview else None
     if rc is None:
+        intro_text_wait(INTRO_GATE.get("box"))                  # V9.5.1: the one-run render reads the finished text video
         extras_ = []
         try:
             run_cmd, cwd_, extras_ = fit_cmd(cmd, awork)        # V8.8.1: a command over the Windows limit gets short input names (the same files); a short one is unchanged
@@ -19008,9 +19158,10 @@ def _make_plan(cfg, game, paths=None, song_path=None, target=None, style=None, s
     if full and not manual:                                # V8.5: the planner's own song pick first (same pick as Force New), so the clip pick knows how much to fill
         songs_, unm_, csv_ = song_pool(cfg)
         pin_s = pin["song"] if pin and not song_path and pin.get("song") and os.path.exists(pin["song"]) else None
-        pre_song = pick_song(cfg, game, songs_, forced=song_path or pin_s)
-        if not song_path and not pin_s:
-            pre_song = weekly_song_fit(*pre_song)
+        with jstage("song map"):                           # V9.5.1: this pick analysed every new song of the week and was not timed (75 s of one run)
+            pre_song = pick_song(cfg, game, songs_, forced=song_path or pin_s)
+            if not song_path and not pin_s:
+                pre_song = weekly_song_fit(*pre_song)
         an_ = pre_song[1]
         avail_ = float(an_.get("dur") or 0) - float((an_.get("beats") or [0])[0])
         need_full = (min(FULL_CAP_S, avail_) - intro_cut()) * 1.25
@@ -19466,7 +19617,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
             out(f"rendered {outfile}")
             T_JOB["checks"] = time.time() - t_c0
             out("TIMING: " + " | ".join(f"{k} {v:.1f} s" for k, v in T_JOB.items()))
-            out(job_stages_line())
+            out(job_stages_line(T_JOB.get("plan")))
             return outfile
         out("video ready - running the quality / sync / transition checks")
         try:
@@ -19480,7 +19631,7 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
                 out(f"sync report skipped: {ex}")
         T_JOB["checks"] = time.time() - t_c0
         out("TIMING: " + " | ".join(f"{k} {v:.1f} s" for k, v in T_JOB.items()))
-        out(job_stages_line())
+        out(job_stages_line(T_JOB.get("plan")))
         try:                                               # the checks add their numbers to the plan (ssim ...): saved again
             save_json(logs / (outfile.stem + ".plan.json"), plan)
         except Exception as ex:
@@ -22015,7 +22166,7 @@ class App:
         if tree.identify_region(e.x, e.y) in ("heading", "separator"):
             return None
         iid = tree.identify_row(e.y)
-        if iid and iid != "auto" and tree.identify_column(e.x) == col:
+        if iid and iid != "auto" and not str(iid).startswith("csv:") and tree.identify_column(e.x) == col:
             self.trash_song(iid)
             return "break"                                 # the trash cell never selects the row
         return None
@@ -22694,17 +22845,22 @@ class App:
         bar = ttk.Frame(f)
         bar.pack(fill="x", pady=4)
         self.btn(bar, "Refresh", lambda: self.run_task("matches", self.load_matches)).pack(side="left", padx=3)
-        self.btn(bar, "Change match for selected file...", self.change_match).pack(side="left", padx=3)
         self.btn(bar, "Play selected file", self.play_match).pack(side="left", padx=3)
         self.btn(bar, "Open song_matches.csv", lambda: self.open_path(DATA / "song_matches.csv")).pack(side="left", padx=3)
         self.btn(bar, "Song map of selected file...", self.map_match).pack(side="left", padx=3)
-        self.btn(bar, "Download new songs", self.start_yt_download).pack(side="left", padx=(14, 3))      # V9.5
-        ttk.Label(bar, text="Newest songs to check").pack(side="left", padx=(6, 2))
+        bar2 = ttk.Frame(f)
+        bar2.pack(fill="x", pady=2)
+        self.btn(bar2, "Download new songs", self.start_yt_download).pack(side="left", padx=3)      # V9.5
+        ttk.Label(bar2, text="Newest songs to check").pack(side="left", padx=(6, 2))
         self.yt_n = tk.StringVar(value="10")
-        ttk.Spinbox(bar, from_=1, to=500, width=5, textvariable=self.yt_n).pack(side="left")
+        ttk.Spinbox(bar2, from_=1, to=500, width=5, textvariable=self.yt_n).pack(side="left")
+        self.btn(bar2, "Download / replace selected", self.start_yt_selected).pack(side="left", padx=(14, 3))      # V9.5.1
+        self.btn(bar2, "Add covers and tags to existing songs", lambda: self.start_covers(False)).pack(side="left", padx=3)
+        self.btn(bar2, "Apply", lambda: self.start_covers(True)).pack(side="left", padx=3)
+        ttk.Button(bar2, text="Stop", command=stop_all).pack(side="left", padx=3)                  # (not in self.buttons: stays usable while a task runs)
         self.m_info = tk.StringVar(value="")
         ttk.Label(f, textvariable=self.m_info).pack(anchor="w")
-        fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "len", "added", "score", "flag", "trash"), height=18, selectmode="browse")
+        fr, self.mtree = make_tree(f, ("track", "artist", "bpm", "len", "added", "score", "flag", "trash"), height=18, selectmode="extended")      # V9.5.1: Ctrl / Shift select
         fr.pack(fill="both", expand=True)
         for c, w, t in (("#0", 420, "MP3 file"), ("track", 300, "Matched playlist track"), ("artist", 200, "Artist"),
                         ("bpm", 60, "BPM"), ("len", 64, "Length"), ("added", 100, "Added"), ("score", 70, "Score"), ("flag", 130, "Flag"), ("trash", 40, "")):
@@ -22715,6 +22871,7 @@ class App:
                                                             "bpm": "BPM", "len": "Length", "added": "Added", "score": "Score", "flag": "Flag"})
         self.mtree.tag_configure("weak", foreground="#ffc65c")
         self.mtree.tag_configure("none", foreground="#ff8a80")
+        self.mtree.tag_configure("nomp3", foreground="#8fb4d9")
         self.match_rows, self.match_audio = [], []
 
     def start_yt_download(self):
@@ -22729,36 +22886,128 @@ class App:
         self.run_task("ytsongs", self.download_new_songs, n)
 
     def download_new_songs(self, n):
-        import ytsongs
         cfg = load_config()
-        say = lambda t: self.q.put(("call", lambda: self._prog_ui(None, t)))
-        if not cfg.get("mp3_dir") or not os.path.isdir(cfg["mp3_dir"]):
-            self.q.put(("call", lambda: messagebox.showinfo("Download new songs", "Set the MP3 folder in Settings first.")))
-            return
         csvp, rows, _col = read_playlist(cfg)
-        if not rows:
-            self.q.put(("call", lambda: messagebox.showinfo("Download new songs", "No Exportify CSV found in the playlist folder.")))
+        if not self.yt_ready(cfg, rows):
             return
-        say("yt-dlp: updating ...")
-        ok, msg = ytsongs.update(DATA, log=out)
-        upd = f"updated ({msg})" if ok else f"UPDATE FAILED, using the installed version: {msg}"
-        out("yt-dlp: " + upd)
-        if not ytsongs.base_cmd(DATA):
-            text = f"yt-dlp is not available.\n\n{msg}\n"
-            self.q.put(("call", lambda: self.show_yt_report("Download new songs", text)))
-            return
+        say = self.say
         say("Checking which CSV tracks have no MP3 ...")
         audio = scan_audio(cfg)
         _m, unmatched, _st = match_cached(cfg, csvp, rows, audio)
+        self.yt_run(cfg, csvp, unmatched, n, "Download new songs - result")
+
+    def yt_ready(self, cfg, rows):
+        """V9.5.1 (shared by every yt-dlp button): the folders / CSV are there; yt-dlp is updated first. False = a message was shown."""
+        import ytsongs
+        if not cfg.get("mp3_dir") or not os.path.isdir(cfg["mp3_dir"]):
+            self.q.put(("call", lambda: messagebox.showinfo("Download new songs", "Set the MP3 folder in Settings first.")))
+            return False
+        if not rows:
+            self.q.put(("call", lambda: messagebox.showinfo("Download new songs", "No Exportify CSV found in the playlist folder.")))
+            return False
+        self.say("yt-dlp: updating ...")
+        ok, msg = ytsongs.update(DATA, log=out)
+        self._yt_upd = "" if ok else f"UPDATE FAILED, using the installed version: {msg}"
+        out("yt-dlp: " + (f"updated ({msg})" if ok else self._yt_upd))
+        if not ytsongs.base_cmd(DATA):
+            text = f"yt-dlp is not available.\n\n{msg}\n"
+            self.q.put(("call", lambda: self.show_yt_report("Download new songs", text)))
+            return False
+        return True
+
+    def say(self, t):
+        self.q.put(("call", lambda: self._prog_ui(None, t)))
+
+    def yt_run(self, cfg, csvp, rows, n, title):
+        """V9.5.1: search / download `rows` (all of them when n is None, else the n newest), covers + tags included; result window, song list refresh. A row with "_old" replaces that file."""
+        import ytsongs
         far = datetime.datetime(1970, 1, 1)
         key = lambda r: (parse_added(r["added"]) or far) if r.get("added") else far
-        rep = ytsongs.fetch_new(unmatched, cfg["mp3_dir"], DATA, n, key, progress=lambda t: (say(t), out("yt: " + t)))
-        text = ytsongs.report_text(rep, "" if ok else upd)
+        meta = ytsongs.read_meta(csvp)
+        rep = ytsongs.fetch_new(rows, cfg["mp3_dir"], DATA, n, key, progress=lambda t: (self.say(t), out("yt: " + t)), meta=meta, stop=CANCEL.is_set)
+        text = ytsongs.report_text(rep, getattr(self, "_yt_upd", ""))
         out("yt: " + text.replace("\n", " | "))
-        say(f"Songs: {len(rep['downloaded'])} downloaded, {len(rep['notfound'])} not found")
+        self.say(f"Songs: {len(rep['downloaded'])} downloaded, {len(rep['notfound'])} not found")
         if rep["downloaded"]:
             self.run_task("matches", self.load_matches)               # the new songs appear in the lists without a restart
-        self.q.put(("call", lambda: self.show_yt_report("Download new songs - result", text)))
+        self.q.put(("call", lambda: self.show_yt_report(title, text)))
+
+    def selected_song_rows(self):
+        """V9.5.1: the Songs tab selection as [(row, old file or None, list name)]; MP3 rows without a CSV track are returned separately."""
+        rows, nomatch = [], []
+        for iid in self.mtree.selection():
+            hit = getattr(self, "match_rowmap", {}).get(iid)
+            if hit:
+                rows.append((hit[0], hit[1]))
+            else:
+                nomatch.append(Path(iid).name)
+        return rows, nomatch
+
+    def start_yt_selected(self):
+        """V9.5.1: Download / replace selected: every selected row (with or without an MP3) is searched and downloaded, no limit. Existing files go to songs\\_replaced after a confirmation."""
+        rows, nomatch = self.selected_song_rows()
+        if not rows:
+            messagebox.showinfo("Download / replace selected", "Select one or more rows in the list first (Ctrl+click / Shift+click)." + (f"\n\n{len(nomatch)} selected MP3(s) have no playlist track." if nomatch else ""))
+            return
+        olds = [o for _r, o in rows if o]
+        if olds and not messagebox.askyesno("Replace existing songs", f"Up to {len(olds)} existing MP3 file(s) will be replaced by a new download.\n\nThe old file is moved to the '_replaced' folder inside "
+                                            "the songs folder (never deleted). A song with no confident YouTube match keeps its existing file.\n\nContinue?"):
+            return
+        self.run_task("ytsongs", self.download_selected, [dict(r, _old=o) if o else dict(r) for r, o in rows])
+
+    def download_selected(self, rows):
+        cfg = load_config()
+        csvp, allrows, _col = read_playlist(cfg)
+        if not self.yt_ready(cfg, allrows):
+            return
+        self.yt_run(cfg, csvp, rows, None, "Download / replace selected - result")
+
+    def start_covers(self, apply):
+        """V9.5.1: Add covers and tags to existing songs. apply=False: the PREVIEW (changes nothing); apply=True: the real run (only after a preview)."""
+        if apply:
+            pv = getattr(self, "cov_preview", None)
+            if not pv:
+                messagebox.showinfo("Covers and tags", "Run 'Add covers and tags to existing songs' first: it is a preview that changes nothing and shows what Apply would do.")
+                return
+            if not messagebox.askyesno("Apply", f"Add covers and tags to your existing MP3 files now?\n\nPreview: {pv['cover']} would get a cover, {pv['tags']} would get tags.\n"
+                                       "Only what is missing is written; file names and audio never change."):
+                return
+        self.run_task("covers", self.covers_task, bool(apply))
+
+    def covers_task(self, apply):
+        import ytsongs
+        cfg = load_config()
+        csvp, rows, _col = read_playlist(cfg)
+        if not cfg.get("mp3_dir") or not os.path.isdir(cfg["mp3_dir"]) or not rows:
+            self.q.put(("call", lambda: messagebox.showinfo("Covers and tags", "Set the MP3 folder in Settings and put the Exportify CSV in the playlist folder first.")))
+            return
+        meta = ytsongs.read_meta(csvp)
+        audio = scan_audio(cfg)
+        matched, _un = match_playlist(rows, audio, cfg, loose=False)           # the app's exact title + artist match
+        exact = [(r, a) for r, a, sc in matched if sc >= 100]
+        logf = None
+        if apply:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            logf = LOG_DIR / time.strftime("covers_%Y%m%d_%H%M%S.txt")
+            logf.write_text(f"Covers and tags - {time.strftime('%Y-%m-%d %H:%M:%S')} - {len(exact)} MP3 files matched to the CSV\n", encoding="utf-8")
+
+        def log(line):
+            with open(logf, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        rep = ytsongs.process_existing(exact, meta, DATA, apply, progress=lambda t: (self.say(("Applying " if apply else "Preview ") + t)), stop=CANCEL.is_set, log=log if logf else None)
+        rep["not_in_csv"] = len(audio) - len(exact)
+        text = ytsongs.existing_report_text(rep, apply)
+        if logf:
+            with open(logf, "a", encoding="utf-8") as f:
+                f.write("\n" + text)
+            text += f"\nLog: {logf}\n"
+        out("covers: " + text.replace("\n", " | "))
+        if not apply and not rep["stopped"]:
+            self.cov_preview = {"cover": rep["cover"], "tags": rep["tags"]}
+        if apply and rep["changed"]:
+            self.run_task("matches", self.load_matches)
+        self.say(("Applied: " if apply else "Preview: ") + f"{rep['cover']} covers, {rep['tags']} tag sets")
+        self.q.put(("call", lambda: self.show_yt_report("Covers and tags - " + ("result" if apply else "preview"), text)))
 
     def show_yt_report(self, title, text):
         w = self.reg(tk.Toplevel(self.root), "window")
@@ -22799,6 +23048,15 @@ class App:
                           f"{r['tempo']:.0f}" if r and r.get("tempo") else "",
                           fmt_mss(a.get("dur")), ad.strftime("%Y-%m-%d") if ad else ""))
         weak = sum(1 for i in items if i[5] != "ok")
+        rowmap = {a["path"]: (by[a["path"]][0], a["path"]) for a in audio if a["path"] in by}          # V9.5.1: list row -> (playlist track, its MP3)
+        for r_ in unmatched:                                                         # ... and the playlist tracks WITHOUT an MP3 are rows too (select them to download)
+            iid_ = "csv:" + _rank_key(r_)
+            if iid_ in rowmap:                                                       # the same track twice in the CSV: one row
+                continue
+            ad_ = parse_added(r_["added"]) if r_.get("added") else None
+            items.append((iid_, "(no MP3)", r_["title"], r_["artist"], 0, "NO MP3", f"{r_['tempo']:.0f}" if r_.get("tempo") else "", fmt_mss(r_.get("dur")),
+                          ad_.strftime("%Y-%m-%d") if ad_ else ""))
+            rowmap[iid_] = (r_, None)
 
         def fill():
             _f0 = time.perf_counter()
@@ -22806,7 +23064,7 @@ class App:
             if songs is not None and [(x["path"], x["title"], x["artist"]) for x in songs] != [(x["path"], x["title"], x["artist"]) for x in self.songs]:
                 self.songs = songs                                  # V6.1.2: the new match result is applied once, in one batch
                 self.refresh_songs()
-            self.match_rows, self.match_audio, self.match_items = rows, audio, items
+            self.match_rows, self.match_audio, self.match_items, self.match_rowmap = rows, audio, items, rowmap
             self.fill_matches()
             self.m_info.set(f"{len(audio)} MP3 files, {len(rows)} playlist tracks, {len(matched)} matched, {weak} to check, {len(unmatched)} playlist tracks without a file")
             if PERF is not None:
@@ -22819,7 +23077,7 @@ class App:
         self.mtree.delete(*self.mtree.get_children())
         for pth, nm, vals in rows:
             fl = vals[6]
-            self.mtree.insert("", "end", iid=pth, text=nm, values=vals, tags=("none" if fl == "NO MATCH" else "weak" if fl != "ok" else "",))
+            self.mtree.insert("", "end", iid=pth, text=nm, values=vals, tags=("none" if fl == "NO MATCH" else "nomp3" if fl == "NO MP3" else "weak" if fl != "ok" else "",))
 
     def map_song(self):
         sel = self.stree.selection()
@@ -22830,7 +23088,7 @@ class App:
         return SongMapView(self, sel[0], s.get("csv_bpm"))
 
     def map_match(self):
-        sel = self.mtree.selection()
+        sel = [i for i in self.mtree.selection() if not str(i).startswith("csv:")]
         if not sel:
             messagebox.showinfo("Song map", "Select a file first (press Refresh if the list is empty).")
             return
@@ -22842,7 +23100,7 @@ class App:
         return SongMapView(self, sel[0], bpm or None)
 
     def play_match(self):
-        sel = self.mtree.selection()
+        sel = [i for i in self.mtree.selection() if not str(i).startswith("csv:")]
         if sel:
             self.open_path(sel[0])
 
@@ -25121,9 +25379,18 @@ def jstage(name):
     return _JobStage(name)
 
 
-def job_stages_line():
-    ks = [k for k in JOB_STAGE_ORDER if k in JOB_STAGES] + [k for k in JOB_STAGES if k not in JOB_STAGE_ORDER]
-    return "STAGES: " + " | ".join(f"{k} {JOB_STAGES[k]:.1f} s" for k in ks) if ks else "STAGES: none timed"
+PLAN_STAGES = ("scan", "song map", "selection", "pairing", "planning", "repair loop", "frame checks", "effects")
+
+
+def job_stages_line(plan_s=None):
+    """V9.2.0: the job's STAGES line. V9.5.1: given the plan's total (seconds) it also names what no stage covers ('plan: other'), so the plan stages always add up to the plan time."""
+    st = dict(JOB_STAGES)
+    if plan_s is not None:
+        rest = float(plan_s) - sum(st.get(k, 0.0) for k in PLAN_STAGES)
+        if rest >= 0.5:
+            st["plan: other"] = rest
+    ks = [k for k in JOB_STAGE_ORDER if k in st] + [k for k in st if k not in JOB_STAGE_ORDER]
+    return "STAGES: " + " | ".join(f"{k} {st[k]:.1f} s" for k in ks) if ks else "STAGES: none timed"
 
 
 def pmark(name):
