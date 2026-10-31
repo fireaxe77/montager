@@ -2,6 +2,13 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.5.2 - 2026-10-31: Songs match again, better YouTube picks
+- Songs that showed "NO MATCH" after adding covers and tags match again
+- The YouTube downloader now prefers the official upload and skips 8-bit, tribute and other odd versions; unsure picks are listed for you to choose
+- Each song in the lists shows its small cover
+- The sky colour now follows the whole sky instead of stopping in a straight line
+- Interpolation is off by default
+
 ## V9.5.1 - 2026-10-31: Covers and batch song downloads
 - Downloaded songs now get their album cover and full details, and a new button adds covers and details to the songs you already have (it shows a preview first)
 - In the Songs tab you can select several songs, with or without an MP3, and download or replace them in one go
@@ -276,11 +283,13 @@ Newest first. This is the history shown in Settings. Technical details are in CH
 - Every R6S kill of a joined fight is either in the montage or listed with the reason it was left out.
 - The two R6S kill icons are supported as an optional extra check; the killfeed text stays the main source.
 
-## V8.0.1 - 2026-10-14: Rainbow Six Siege support
-- Rainbow Six Siege is the third game next to CS2 and Valorant: it has its own circle in the Manual list, its own row in Settings and its own output folder.
-- Your R6S clips are only read when you tick or pick them, never all at once.
+## V8.0.1 - 2026-10-14: R6S works without icon files
 - It works without any icon files: kills are read straight from the killfeed, and icon images in the R6S icons folder are only an extra help.
 - Picked clips are always scanned first, then planned, previewed or rendered.
+
+## V8 - 2026-10-14: Rainbow Six Siege support
+- Rainbow Six Siege is the third game next to CS2 and Valorant: it has its own circle in the Manual list, its own row in Settings and its own output folder.
+- Your R6S clips are only read when you tick or pick them, never all at once.
 
 ## V7.7.7 - 2026-10-13: CS2 kills now start at the right moment
 - A CS2 kill that was already on the killfeed when a clip started is no longer used as the opening kill.

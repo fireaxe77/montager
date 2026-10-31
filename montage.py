@@ -60,7 +60,7 @@ from pathlib import Path
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.5.1"
+APP_VERSION = "V9.5.2"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -265,6 +265,12 @@ def load_config():
             pass
     if not cfg.get("interp50_v94"):                   # V9.4: the interpolation comes back (50 fps clips only): switched on once, the Settings checkbox switches it off again
         cfg["interpolate_low_fps"], cfg["interp50_v94"] = True, True
+        try:
+            save_json(CONFIG_PATH, cfg)
+        except Exception:
+            pass
+    if not cfg.get("interp_off_v952"):                # V9.5.2: interpolation is off by default again: switched off once (also in a saved config), the Settings checkbox switches it on again
+        cfg["interpolate_low_fps"], cfg["interp_off_v952"] = False, True
         try:
             save_json(CONFIG_PATH, cfg)
         except Exception:
@@ -7724,13 +7730,16 @@ def _akey(a):
 
 
 def _folder_sig(audio):
-    newest = 0
+    """[file count, newest modified time, total size]. V9.5.2: the size is part of it: a tool that rewrites tags keeps every modified time but changes the sizes, and the match cache (keyed by
+    path + size + time) then found none of its files while the folder still looked unchanged: 1361 songs showed NO MATCH."""
+    newest, total = 0, 0
     for a in audio:
         try:
             newest = max(newest, int(_akey(a).rsplit("|", 1)[1]))
         except (IndexError, ValueError):
             pass
-    return [len(audio), newest]
+        total += _file_size(a)
+    return [len(audio), newest, total]
 
 
 def match_cached(cfg, csvp, rows, audio, cached_only=False):
@@ -7764,7 +7773,8 @@ def match_cached(cfg, csvp, rows, audio, cached_only=False):
             if a is not None and r is not None:
                 used_r.add(id(r))
                 kept.append((r, a, int(e.get("s", 0))))
-    exact = isinstance(cache, dict) and cache.get("csv") == csv_sig and cache.get("folder") == folder and cache.get("ov") == ov
+    exact = (isinstance(cache, dict) and cache.get("csv") == csv_sig and cache.get("folder") == folder and cache.get("ov") == ov
+             and len(kept) == len(cache.get("pairs", [])))          # V9.5.2: a hit only when every saved pair was found again (a cache whose files changed is recomputed)
     def unmatched_of(m):
         got = {id(r) for r, _, _ in m}
         return [r for r in rows if id(r) not in got]
@@ -7813,6 +7823,44 @@ def song_pool(cfg, cached_only=False):
         for a in audio:
             songs[a["path"]] = {"path": a["path"], "artist": a["artist"], "title": a["title"], "added": None, "dur": a.get("dur") or 0}
     return list(songs.values()), unmatched, (csvp.name if csvp else None)
+
+
+THUMBS_ON = [os.environ.get("MONTAGE_NO_THUMBS") != "1"]      # V9.5.2 switch (MONTAGE_NO_THUMBS=1: no cover squares, for the before / after check)
+
+
+def song_thumb(path, S):
+    """V9.5.2: the PNG (S x S px, the cover cut to a square) of the cover embedded in an MP3, made once and kept in montage_data\\thumbs\\<S>\\ (key: path + size + modified time, so a changed file gets a new
+    one); None when the file has no cover (also remembered)."""
+    st = os.stat(path)
+    key = hashlib.sha1(f"{path}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8")).hexdigest()
+    d = DATA / "thumbs" / str(S)
+    png, none = d / f"{key}.png", d / f"{key}.none"
+    if png.is_file():
+        return str(png)
+    if none.is_file():
+        return None
+    d.mkdir(parents=True, exist_ok=True)
+    data = None
+    try:
+        from mutagen.id3 import ID3
+        ap = ID3(path).getall("APIC")
+        if ap:
+            data = (next((x for x in ap if x.type == 3), None) or ap[0]).data
+    except Exception:                                      # noqa: BLE001 - not an MP3 / no tag
+        data = None
+    if not data:
+        none.write_bytes(b"")
+        return None
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    w, h = im.size
+    s = min(w, h)
+    im = im.crop(((w - s) // 2, (h - s) // 2, (w - s) // 2 + s, (h - s) // 2 + s)).resize((S, S), Image.LANCZOS)
+    tmp = d / f"{key}.{os.getpid()}.tmp"
+    im.save(tmp, "PNG")
+    os.replace(tmp, png)
+    return str(png)
 
 
 def fmt_mss(sec):
@@ -14995,6 +15043,46 @@ SKY_CUT_MIN_F = 18                   # V8.8.6: ... when at least this many frame
 SKY_GUARD_GROW = 1                   # V8.8.5: mask pixels the painted region may reach past the frame's own sky (the soft edge); never more
 
 
+SKY_EXTEND_ON = [True]               # V9.5.2 switch: the painted sky follows the real sky down its gradient (sky_extend_mask)
+SKY_EXTEND_ROUNDS = 10               # growth rounds of 8 px, the sky colour re-estimated from the sky grown so far after each
+SKY_EXTEND_SAMPLE_DAB = 34.0         # a pixel taken in this way is never further than this (Lab a / b) from the sampled sky colour ...
+SKY_EXTEND_L = (-30.0, 85.0)         # ... nor darker / brighter than this (Lab L) around the sample: a paler sky towards the horizon is sky, a building is not
+
+
+def sky_extend_mask(img, m, sample):
+    """V9.5.2: the sky mask of the PAINT only (the choice of the kills and the wall checks use the mask as it was). The eyedropper mask ends where the sky's colour has moved too far from the colour sampled at
+    the top (the sky turns paler and hazier towards the horizon): on a big sky (CS2 Vertigo) the recolour then stopped in a ragged, nearly straight line halfway down while the real sky went on. Here
+    the mask grows downwards / sideways through smooth pixels that continue the sky's own colour (compared with the sky grown so far, in steps), within a wide band around the sampled colour, and
+    stops where the picture stops being sky (an edge, texture, another colour): the lower edge of the paint is then the sky's real boundary. Returns the grown mask (bool)."""
+    import cv2
+    import numpy as np
+    if not m.any() or sample is None:
+        return m
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB).astype(np.float32)
+    L, A, B = lab[..., 0], lab[..., 1] - 128.0, lab[..., 2] - 128.0
+    L0, a0, b0 = float(sample["lab"][0]), float(sample["lab"][1]) - 128.0, float(sample["lab"][2]) - 128.0
+    Lc = lab[..., 0]
+    sdl = np.sqrt(np.maximum(cv2.boxFilter(Lc * Lc, -1, (5, 5)) - cv2.boxFilter(Lc, -1, (5, 5)) ** 2, 0))
+    chroma = np.hypot(A, B)
+    base = (sdl < 6.0) & (chroma >= 3.0) & (np.hypot(A - a0, B - b0) <= SKY_EXTEND_SAMPLE_DAB) & (L >= L0 + SKY_EXTEND_L[0]) & (L <= L0 + SKY_EXTEND_L[1])
+    cur = m.astype(np.uint8)
+    cross = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    for _ in range(SKY_EXTEND_ROUNDS):
+        wgt = cur.astype(np.float32)
+        den = cv2.GaussianBlur(wgt, (0, 0), 16) + 1e-4
+        la, lb_, ll = (cv2.GaussianBlur(c * wgt, (0, 0), 16) / den for c in (A, B, L))
+        ok = base & (den > 0.02) & (np.hypot(A - la, B - lb_) <= 7.0) & (np.abs(L - ll) <= 14.0)
+        nxt = cur.copy()
+        for _s in range(8):
+            g = cv2.dilate(nxt, cross) & ok.astype(np.uint8)
+            nxt = nxt | g
+        if int(nxt.sum()) == int(cur.sum()):
+            break
+        cur = nxt
+    out = cur.astype(bool)
+    return out
+
+
 def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
     """V8.4.4 / V8.5.1: writes the sky mask of one take for the render: a raw video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take). V8.5.1: the window is x['t0'] .. x['t1'] = the KILL frame to the
     END of the take (the frames before the kill are 0); every frame's mask is the V8.4.1 colour rule (sky_rule_mask) of the take's own source frame (so slow-mo and speed-ups are followed), a frame whose region
@@ -15130,6 +15218,8 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                 segm[i] = own_hold(i, first_)
                 held_i.add(i)
                 held += 1
+    if SKY_EXTEND_ON[0]:                                   # V9.5.2: the paint follows the sky down its gradient (the choice of kills and the wall checks above used the mask as it was)
+        segm = list(pool_.map(lambda a_: sky_extend_mask(a_[0], a_[1].astype(bool), a_[2]).astype(np.uint8) if a_[1].any() else a_[1], zip(imgs, segm, smp)))
     imgs = None
     segm = list(pool_.map(sky_mask_even, segm))           # V8.8.2: one even region per frame: small gaps closed, enclosed holes (cloud specks, cut-out texture) filled, so the tint has no patches inside the sky
     pool_.shutdown()
@@ -21598,6 +21688,91 @@ class App:
         self.run_task("matches", self.load_matches)
         threading.Thread(target=self.bpm_worker, daemon=True).start()
 
+    # ------------------------------------------------------------ V9.5.2: cover thumbnails in the song lists
+    THUMB_SKIP = ("auto",)
+
+    def thumb_size(self):
+        """side (px) of the square: the list's row height minus 2, so a row never gets taller than it is without a picture"""
+        try:
+            rh = int(ttk.Style().lookup("Treeview", "rowheight") or 0)
+        except (tk.TclError, ValueError):
+            rh = 0
+        return max(16, min(28, (rh or 24) - 2))
+
+    def thumb_register(self, tree):
+        """V9.5.2: `tree`'s rows (their iid = the MP3's path) show the embedded cover as a small square at the left of the name; rows without a cover (or not read yet) show a blank square of the same
+        size. The squares are read in a background thread, only for rows in view, and kept on disk (montage_data\\thumbs)."""
+        if not THUMBS_ON[0]:
+            return
+        th = self.__dict__.setdefault("_thumb", None)
+        if th is None:
+            S = self.thumb_size()
+            blank = tk.PhotoImage(width=S, height=S)
+            th = self._thumb = {"S": S, "blank": blank, "photos": {}, "pending": set(), "trees": [], "want": [], "wake": threading.Event(), "lock": threading.Lock(), "started": False}
+        th["trees"].append(tree)
+        if not th["started"]:
+            th["started"] = True
+            threading.Thread(target=self._thumb_worker, daemon=True).start()
+            self.root.after(300, self._thumb_poll)
+
+    def thumb_image(self, tree, iid):
+        """the image an inserted row gets: its square when it is known, else the blank one (the name never moves when the square arrives)"""
+        th = getattr(self, "_thumb", None)
+        if th is None or tree not in th["trees"]:
+            return ""
+        return th["photos"].get(iid, th["blank"])
+
+    def _thumb_poll(self):
+        th = self._thumb
+        try:
+            want = []
+            for tree in th["trees"]:
+                if not tree.winfo_ismapped():
+                    continue
+                step = max(12, th["S"])
+                for y in range(0, tree.winfo_height(), step):
+                    iid = tree.identify_row(y)
+                    if iid and iid not in self.THUMB_SKIP and not str(iid).startswith("csv:") and iid not in th["photos"] and iid not in want:
+                        want.append(iid)
+            with th["lock"]:
+                th["want"] = want                                  # only what is in view NOW (rows scrolled past are dropped)
+            if want:
+                th["wake"].set()
+        except tk.TclError:
+            pass
+        self.root.after(250, self._thumb_poll)
+
+    def _thumb_worker(self):
+        th = self._thumb
+        S = th["S"]
+        while True:
+            with th["lock"]:
+                iid = th["want"].pop(0) if th["want"] else None
+            if iid is None:
+                th["wake"].wait()
+                th["wake"].clear()
+                continue
+            try:
+                png = song_thumb(iid, S)
+            except Exception:                                      # noqa: BLE001 - a song without a readable cover just has no square
+                png = None
+            self.q.put(("call", lambda i=iid, p=png: self._thumb_ready(i, p)))
+            time.sleep(0.004)                                      # never hog the interpreter: the list stays smooth
+
+    def _thumb_ready(self, iid, png):
+        th = self._thumb
+        try:
+            ph = tk.PhotoImage(file=png) if png else th["blank"]
+        except tk.TclError:
+            ph = th["blank"]
+        th["photos"][iid] = ph
+        for tree in th["trees"]:
+            try:
+                if tree.exists(iid):
+                    tree.item(iid, image=ph)
+            except tk.TclError:
+                pass
+
     def fill_chunked(self, tree, rows, chunk=300):
         """V5.6: build every row while the list is unmapped, then show it once (no row-by-row growth in a visible list).
         Held back (latest rows kept) while a clip scan runs; refilled once when it ends."""
@@ -21623,7 +21798,7 @@ class App:
         try:
             tree.delete(*tree.get_children())
             for iid, text, vals in rows:
-                tree.insert("", "end", iid=iid, text=text, values=vals)
+                tree.insert("", "end", iid=iid, text=text, values=vals, image=self.thumb_image(tree, iid))
         finally:
             if info:
                 if mgr == "pack":
@@ -21960,6 +22135,7 @@ class App:
         self.stree.column("trash", width=40, minwidth=36, stretch=False, anchor="center")        # V7.6.1: same Recycle Bin column as the clip list
         self.stree.heading("trash", text="")
         self.stree.heading("#0", text="Song")
+        self.thumb_register(self.stree)                                            # V9.5.2: the same cover squares in the song picker
         self.stree.heading("bpm", text="BPM")
         self.stree.heading("len", text="Length")
         self.stree.heading("added", text="Added")
@@ -22872,6 +23048,7 @@ class App:
         self.mtree.tag_configure("weak", foreground="#ffc65c")
         self.mtree.tag_configure("none", foreground="#ff8a80")
         self.mtree.tag_configure("nomp3", foreground="#8fb4d9")
+        self.thumb_register(self.mtree)                                            # V9.5.2: cover squares
         self.match_rows, self.match_audio = [], []
 
     def start_yt_download(self):
@@ -22927,7 +23104,7 @@ class App:
         rep = ytsongs.fetch_new(rows, cfg["mp3_dir"], DATA, n, key, progress=lambda t: (self.say(t), out("yt: " + t)), meta=meta, stop=CANCEL.is_set)
         text = ytsongs.report_text(rep, getattr(self, "_yt_upd", ""))
         out("yt: " + text.replace("\n", " | "))
-        self.say(f"Songs: {len(rep['downloaded'])} downloaded, {len(rep['notfound'])} not found")
+        self.say(f"Songs: {len(rep['downloaded'])} downloaded, {len(rep['uncertain'])} uncertain, {len(rep['notfound'])} not found")
         if rep["downloaded"]:
             self.run_task("matches", self.load_matches)               # the new songs appear in the lists without a restart
         self.q.put(("call", lambda: self.show_yt_report(title, text)))
@@ -23077,7 +23254,7 @@ class App:
         self.mtree.delete(*self.mtree.get_children())
         for pth, nm, vals in rows:
             fl = vals[6]
-            self.mtree.insert("", "end", iid=pth, text=nm, values=vals, tags=("none" if fl == "NO MATCH" else "nomp3" if fl == "NO MP3" else "weak" if fl != "ok" else "",))
+            self.mtree.insert("", "end", iid=pth, text=nm, values=vals, image=self.thumb_image(self.mtree, pth), tags=("none" if fl == "NO MATCH" else "nomp3" if fl == "NO MP3" else "weak" if fl != "ok" else "",))
 
     def map_song(self):
         sel = self.stree.selection()
