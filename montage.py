@@ -58,9 +58,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import published                                   # V9.5.5: published montages (records, move, exclusion)
+
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.5.4"
+APP_VERSION = "V9.5.5"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -76,7 +78,7 @@ VIDEO_EXT = {".mov", ".mp4", ".mkv"}
 AUDIO_EXT = {".mp3", ".flac", ".m4a", ".wav", ".ogg", ".opus"}
 MIN_VIDEO = 1 * 1024 * 1024
 SKIP_DIR_NAMES = {"windows", "program files", "program files (x86)", "appdata", "programdata", "snipping tool",
-                  "$recycle.bin", "system volume information", "montage_data", "node_modules", ".git", "montager moved clips", "_replaced"}     # V8.8.7: the move folder is never scanned
+                  "$recycle.bin", "system volume information", "montage_data", "node_modules", ".git", "montager moved clips", "_replaced", "published clips"}     # V8.8.7: the move folder is never scanned
 BAR_THRESHOLD = 12        # pixel brightness (0-255) counted as content
 BAR_FRAMES = 24
 GAMES = ("valorant", "cs2", "r6s")        # V8.0.0: r6s = Rainbow Six Siege (own folders, own icon-template detection, nothing shared with the other two)
@@ -352,6 +354,10 @@ def walk_files(roots, exts, min_size, cfg):
         skip_mv = norm(moved_root(cfg)) if cfg.get("moved_dir") else None          # V8.8.8: the Settings folder of moved clips is never scanned, wherever it is
     except Exception:                                      # noqa: BLE001
         skip_mv = None
+    try:
+        skip_pub = norm(published_root(cfg))               # V9.5.5: the folder of published clips is never scanned, wherever it is
+    except Exception:                                      # noqa: BLE001
+        skip_pub = None
     for root in roots:
         stack = [root]
         while stack:
@@ -368,6 +374,8 @@ def walk_files(roots, exts, min_size, cfg):
                             if nl in SKIP_DIR_NAMES or norm(e.path) == skip_out or norm(e.path).startswith(skip_out + os.sep):
                                 continue
                             if skip_mv and (norm(e.path) == skip_mv or norm(e.path).startswith(skip_mv + os.sep)):
+                                continue
+                            if skip_pub and (norm(e.path) == skip_pub or norm(e.path).startswith(skip_pub + os.sep)):
                                 continue
                             stack.append(e.path)
                         elif e.is_file(follow_symlinks=False):
@@ -607,9 +615,12 @@ def _scan_clips_run(cfg, rescan=False):
     max_b = int(cfg.get("max_mb", 60)) * 1024 * 1024
     paths, r6s_paths = [], set()
     with pstage("  scan_clips: walk + stat clips + tag_game"):
+        pub_ex = published.excluded(DATA)                    # V9.5.5: a published montage's clips are never listed, so no mode can pick them
         for p in sorted(set(walk_files(roots, VIDEO_EXT, MIN_VIDEO, cfg))):
             try:
                 g_ = tag_game(p, cfg)[0]
+                if g_ and pub_ex[0] and published.is_published(DATA, p):
+                    continue
                 if g_ and os.path.getsize(p) <= max_b:
                     paths.append(p)
                     if g_ == "r6s":
@@ -641,7 +652,8 @@ def _scan_clips_run(cfg, rescan=False):
                     out(f"    {i}/{len(paths)}")
     with pstage("  scan_clips: save clips cache"):
         live = {file_key(p) for p in paths}
-        save_json(CLIPS_CACHE, {k: v for k, v in cache.items() if k in live})
+        pub_keep = published.keep_cache_keys(DATA)         # V9.5.5: the entries of published clips (moved away) stay, so Unmark needs no new analysis
+        save_json(CLIPS_CACHE, {k: v for k, v in cache.items() if k in live or (pub_keep and norm(k.rsplit("|", 2)[0]) in pub_keep)})
     recs += [{"path": p, "unprobed": True} for p in lazy]       # V8.0.0: R6S stubs (no size / duration yet: skipped by every scan / pool, shown in the Manual list)
     maxd = float(cfg.get("max_dur_s", 60))
     keep = []
@@ -756,6 +768,8 @@ HEADER_ALIASES = {
 
 
 def newest_csv(cfg):
+    if not str(cfg.get("playlist_dir") or "").strip():                 # V9.5.5: no CSV folder set = no CSV (an empty path would mean the current folder)
+        return None
     d = Path(cfg["playlist_dir"])
     files = sorted(d.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if d.is_dir() else []
     return files[0] if files else None
@@ -958,6 +972,69 @@ def loose_match(rows, audio, taken_a, taken_r, skip_a):
     return found, uniq
 
 
+# V9.5.5: swapped-order match. A file the older tiers left alone is read in BOTH orders ("Artist - Title" and "Title - Artist", plus its title / artist tags) and a CSV row too (a local-file row
+# has the whole "Artist - Title" as its title and no artist). Accepted only on the same base title AND a shared artist AND a length within SWAP_DUR_S; when two readings could match different rows
+# the closer length decides, and a pair that stays unclear is left unmatched and listed in SWAP_AMBIG. It never touches a match that exists.
+SWAP_VER = 1
+SWAP_DUR_S = 3.0
+SWAP_AMBIG = []                      # [(file name, track name, why)] of the last run
+SWAP_NEW = []                        # [(track row, file)] matched by this tier in the last run
+
+
+def _swap_readings(title, artist, split_title):
+    """[(base title, primary artist, every artist)] a name can mean; split_title: also every ' - ' split of the title in both orders."""
+    out_ = []
+    if title and artist:
+        out_.append((_loose_title(title),) + _loose_artists(artist))
+    if split_title:
+        parts = [x for x in norm_song(title).split(" - ") if x.strip()]
+        for k in range(1, len(parts)):
+            left, right = " - ".join(parts[:k]), " - ".join(parts[k:])
+            for t, ar in ((left, right), (right, left)):
+                out_.append((_loose_title(t),) + _loose_artists(ar))
+    return [x for x in out_ if x[0] and x[1]]
+
+
+def swap_match(rows, audio, taken_a, taken_r, skip_a):
+    """Returns [(file index, track index, score)] for the files / tracks not in taken_* / skip_a (see SWAP_VER)."""
+    SWAP_AMBIG.clear()
+    fk, whole = {}, {}
+    for i, a in enumerate(audio):
+        if i in taken_a or i in skip_a:
+            continue
+        stem = Path(a["path"]).stem
+        whole[i] = _loose_txt(stem)                      # a local-file row has no artist: its whole title is the file's whole name
+        k_ = _swap_readings(stem, "", True) + _swap_readings(a.get("title", ""), a.get("artist", ""), False)
+        if float(a.get("dur") or 0) > 0:
+            fk[i] = k_
+    rk = {}
+    for j, r in enumerate(rows):
+        if j in taken_r or float(r.get("dur") or 0) <= 0:
+            continue
+        rk[j] = _swap_readings(r["title"], r["artist"], not r["artist"] or " - " in r["title"])
+    pairs = []
+    for i, fks in fk.items():
+        for j, rks in rk.items():
+            dd = abs(float(audio[i].get("dur") or 0) - float(rows[j]["dur"]))
+            if dd > SWAP_DUR_S:
+                continue
+            if any(ft == rt and (fp == rp or fp in ra or rp in fa) for ft, fp, fa in fks for rt, rp, ra in rks)                     or (not rows[j]["artist"] and whole.get(i) and whole[i] == _loose_txt(rows[j]["title"])):
+                pairs.append((dd, i, j))
+    pairs.sort()
+    found, used_i, used_j = [], set(), set()
+    for dd, i, j in pairs:
+        if i in used_i or j in used_j:
+            continue
+        rivals = [d2 for d2, i2, j2 in pairs if (i2 == i) != (j2 == j) and d2 - dd < 0.5 and i2 not in used_i and j2 not in used_j]
+        if rivals:
+            SWAP_AMBIG.append((os.path.basename(audio[i]["path"]), f"{rows[j]['artist']} - {rows[j]['title']}", "two candidates with nearly the same length"))
+            continue
+        found.append((i, j, 72))
+        used_i.add(i)
+        used_j.add(j)
+    return found
+
+
 def _file_size(a):
     try:
         return int(_akey(a).rsplit("|", 2)[1])
@@ -971,7 +1048,7 @@ def _file_size(a):
 LOOSE_NEW = []                       # V7.7.5: [(track row, file, tier)] matched by the loose rule in the last run
 
 
-def match_playlist(rows, audio, cfg, loose=True):
+def match_playlist(rows, audio, cfg, loose=True, swap=True):
     """V6.5: a file matches a playlist track only when BOTH the title and an artist agree (nothing fuzzy, no leftover assignments).
     ok (100): normalised title identical AND at least one normalised artist identical. CHECK (80): an artist matches and the title is the
     same once bracketed / dash suffixes are removed. Everything else: no match. One file per track: of several files that match a track
@@ -1047,14 +1124,24 @@ def match_playlist(rows, audio, cfg, loose=True):
             LOOSE_NEW.append((rows[j], audio[i], tier))
         for tier, i, j in la:
             LOOSE_AMBIG.append((tier, os.path.basename(audio[i]["path"]), f"{rows[j]['artist']} - {rows[j]['title']}"))
+    SWAP_NEW.clear()
+    SWAP_AMBIG.clear()
+    if swap:
+        for i, j, sc in swap_match(rows, audio, taken_a, taken_r, exact_files):
+            matched.append((i, j, sc))
+            taken_a.add(i)
+            taken_r.add(j)
+            SWAP_NEW.append((rows[j], audio[i]))
     matched.sort()
     return [(rows[j], audio[i], sc) for i, j, sc in matched], [r for j, r in enumerate(rows) if j not in taken_r]
 
 
-def match_flag(path, r, sc):
-    """The Flag column of the song match: ok | CHECK (under 85) | DUPLICATE | NO MATCH."""
+def match_flag(path, r, sc, csv_on=True):
+    """The Flag column of the song match: ok | CHECK (under 85) | DUPLICATE | not in CSV (V9.5.5: was NO MATCH; no flag at all when no CSV is used)."""
     if not r:
-        return "DUPLICATE" if path in SONG_DUPS else "NO MATCH"
+        if not csv_on:
+            return ""
+        return "DUPLICATE" if path in SONG_DUPS else "not in CSV"
     return "CHECK (under 85)" if sc < 85 else "ok"
 
 
@@ -5210,7 +5297,7 @@ def kills_key(rec, game, det):
 
 
 CLIP_ROWS_ON = [True]                  # V8.8.8 switch: the clip list's kill times per clip kept in memory + on disk (clip_rows_v1.json) and recomputed only for a clip whose inputs changed
-CLIP_ROWS_UI_KEYS = ("ui_layout", "ui_mode", "accent", "base", "ui_scale", "update_on_start", "moved_dir", "sync_report", "post_checks")   # look / window only: never in the kill times
+CLIP_ROWS_UI_KEYS = ("ui_layout", "ui_mode", "accent", "base", "ui_scale", "update_on_start", "moved_dir", "published_dir", "sync_report", "post_checks")   # look / window only: never in the kill times
 CLIP_ROWS_MEMO = {}                    # {data folder: {"games": {game: {"sig", "rows": {clip key: kill times or None}}}}}
 _CLIP_ROWS_LOCK = threading.Lock()
 
@@ -7984,6 +8071,21 @@ def _folder_sig(audio):
     return [len(audio), newest, total]
 
 
+def _swap_extra(rows, audio, kept):
+    """V9.5.5: the swapped-order matches for the files / tracks the saved matches left free."""
+    got_a = {a["path"] for r, a, sc in kept}
+    got_r = {id(r) for r, a, sc in kept}
+    ta = {i for i, a in enumerate(audio) if a["path"] in got_a}
+    tr = {j for j, r in enumerate(rows) if id(r) in got_r}
+    sk = {i for i, a in enumerate(audio) if a["path"] in SONG_DUPS}
+    SWAP_NEW.clear()
+    res = []
+    for i, j, sc in swap_match(rows, audio, ta, tr, sk):
+        res.append((rows[j], audio[i], sc))
+        SWAP_NEW.append((rows[j], audio[i]))
+    return res
+
+
 def match_cached(cfg, csvp, rows, audio, cached_only=False):
     """V6.1.2: song match with an on-disk cache keyed by the CSV (name, size, mtime) and the songs folder (file count, newest mtime).
     Same key: the saved matches are returned at once. Key changed: matches of unchanged files whose track is still in the CSV are
@@ -8021,12 +8123,19 @@ def match_cached(cfg, csvp, rows, audio, cached_only=False):
         got = {id(r) for r, _, _ in m}
         return [r for r in rows if id(r) not in got]
     if exact:
+        if cache.get("sw") != SWAP_VER:                            # V9.5.5: the swapped-order tier is added on top of the saved matches (nothing already matched changes, no rematch)
+            kept = kept + _swap_extra(rows, audio, kept)
+            if not cached_only:
+                try:
+                    save_json(MATCH_CACHE, dict(cache, sw=SWAP_VER, pairs=[{"a": _akey(a), "r": _rank_key(r), "s": sc} for r, a, sc in kept]))
+                except Exception as ex:
+                    out(f"songs: match cache not saved ({ex})")
         return kept, unmatched_of(kept), "hit"
     if cached_only:
         return kept, unmatched_of(kept), ("stale" if kept else "none")
     matched, _ = match_playlist(rows, audio, cfg)                  # V6.5: exact rule, cheap: everything is recomputed when the key changed
     try:
-        save_json(MATCH_CACHE, {"v": MATCH_CACHE_VER, "csv": csv_sig, "folder": folder, "ov": ov,
+        save_json(MATCH_CACHE, {"v": MATCH_CACHE_VER, "sw": SWAP_VER, "csv": csv_sig, "folder": folder, "ov": ov,
                                 "dups": [_akey(a) for a in audio if a["path"] in SONG_DUPS],
                                 "pairs": [{"a": _akey(a), "r": _rank_key(r), "s": sc} for r, a, sc in matched]})
     except Exception as ex:
@@ -8060,11 +8169,29 @@ def song_pool(cfg, cached_only=False):
             f"this week: {len(wk)} added, {sum(1 for r in wk if id(r) in have)} with MP3")
     if not songs and cached_only and rows:
         return [], unmatched, (csvp.name if csvp else None)          # first show: the matcher is still running (status line says so)
-    if not songs:
-        out("no playlist matches: using every audio file in the MP3 folder")
-        for a in audio:
-            songs[a["path"]] = {"path": a["path"], "artist": a["artist"], "title": a["title"], "added": None, "dur": a.get("dur") or 0}
+    n_csv = len(songs)
+    for a in audio:                                        # V9.5.5: a song without a CSV row (no CSV at all, or none for this file) is a normal song: tags / file name, its own analysis, file date
+        if a["path"] not in songs and a["path"] not in SONG_DUPS:
+            songs[a["path"]] = song_without_csv(a)
+    if not n_csv and songs and not cached_only:
+        out("songs: no CSV rows used: every audio file in the MP3 folder is a song (tempo, energy and drops from the song analysis)")
     return list(songs.values()), unmatched, (csvp.name if csvp else None)
+
+
+def file_added(path):
+    """V9.5.5: when a file entered the library (creation time; the modified time when the system has none), as a datetime; None when unreadable."""
+    try:
+        st = os.stat(path)
+        return datetime.datetime.fromtimestamp(min(st.st_ctime, st.st_mtime) if st.st_ctime > 0 else st.st_mtime)
+    except (OSError, ValueError, OverflowError):
+        return None
+
+
+def song_without_csv(a):
+    """V9.5.5: the song record of a file that has no CSV row. Title / artist: the tags, else the file name; length: the file; csv_bpm / energy / dance stay None (the song map supplies them, logged as analysis);
+    'added' = the file's creation date."""
+    return {"path": a["path"], "artist": a.get("artist") or "", "title": a.get("title") or Path(a["path"]).stem, "added": file_added(a["path"]),
+            "csv_bpm": None, "energy": None, "dance": None, "dur": a.get("dur") or 0, "no_csv": True}
 
 
 THUMBS_ON = [os.environ.get("MONTAGE_NO_THUMBS") != "1"]      # V9.5.2 switch (MONTAGE_NO_THUMBS=1: no cover squares, for the before / after check)
@@ -9364,6 +9491,61 @@ def cmd_utilclip(args):
     show()
 
 
+def pub_game_of(rec, video):
+    """The game of a montage: its record, else the output folder it sits in, else the game tag in its file name."""
+    if rec.get("game") in GAME_DIR:
+        return rec["game"]
+    parts = [x.lower() for x in Path(video).parts]
+    for g, d in GAME_DIR.items():
+        if d.lower() in parts or f"_{d.lower()}_" in Path(video).stem.lower():
+            return g
+    return None
+
+
+def pub_find(video, cfg):
+    """V9.5.5: (record, preview) of a montage video; (None, None) when no record can be found. Changes nothing."""
+    clips = [v["path"] for v in load_json(CLIPS_CACHE, {}).values() if isinstance(v, dict) and v.get("path")]
+    rec = published.find_record(DATA, video, clips)
+    if not rec:
+        return None, None
+    rec["game"] = pub_game_of(rec, video)
+    return rec, published.preview(DATA, rec, published_root(cfg), GAME_DIR)
+
+
+def pub_preview_text(video, rec, pv):
+    if not rec:
+        return f"{video}\n\nNo record of this montage was found (no saved record, no .plan.json in its logs folder, no CUT LIST for it in montage.log). Nothing can be moved."
+    v = Path(video)
+    try:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(v.stat().st_mtime))
+    except OSError:
+        when = "(video not found)"
+    try:
+        length = f"{float(probe_duration(str(v)) or 0):.1f} s"
+    except Exception:                                      # noqa: BLE001
+        length = "unknown"
+    L = ["PREVIEW - nothing has been changed", "", f"montage:   {v}", f"date:      {when}   length: {length} (the video is about 7 s longer than its cut list: intro)",
+         f"game:      {rec.get('game')}   song: {rec.get('song') or '?'}", f"record:    {rec.get('found_by')}", "",
+         f"clips used in the final cut list: {len(rec.get('clips', []))}",
+         f"clip files that would be moved: {len(pv['moves'])}  ->  {published_root(load_config())}\\{pv['game_dir']}\\",
+         f"not found on disk: {len(pv['missing'])}   already published: {len(pv['already'])}   names that could not be resolved: {len(pv['unresolved'])}", ""]
+    L += [f"  {a}" for a, _b in pv["moves"]]
+    if pv["missing"]:
+        L += ["", "NOT ON DISK:"] + [f"  {x}" for x in pv["missing"]]
+    if pv["unresolved"]:
+        L += ["", "NAME NOT UNIQUE / NOT IN THE CLIP LIST (left alone):"] + [f"  {x}" for x in pv["unresolved"]]
+    return "\n".join(L)
+
+
+def cmd_pubpreview(args):
+    """V9.5.5: python montage.py pubpreview <montage.mp4> [...]: the PREVIEW of 'Mark montage as published' (read-only: nothing is moved or written)."""
+    cfg = load_config()
+    for f in args.videos:
+        rec, pv = pub_find(f, cfg)
+        print(pub_preview_text(f, rec, pv))
+        print()
+
+
 def cmd_songmatch(args):
     """V7.7.5: python montage.py songmatch. Read-only: matches the songs folder to the newest CSV with and without the loose rule (primary artist +
     base title), prints both counts and writes montage_data/song_match_v775.txt (every newly matched pair, then the ambiguous ones)."""
@@ -10031,7 +10213,7 @@ def auto_style(an, song, rng, events=None):
     e = song.get("energy")
     e_src = "CSV"
     if e is None:
-        e, e_src = float(sum(an.get("energy", [0.5])) / max(1, len(an.get("energy", [1])))), "map"
+        e, e_src = float(sum(an.get("energy", [0.5])) / max(1, len(an.get("energy", [1])))), "analysis"
     e = float(e)
     bpm = float(an.get("bpm") or 120)
     drop = min(1.0, float(an.get("drop_strength") or 0.0) / 0.6)
@@ -20004,6 +20186,10 @@ def run_job(game, mode="render", force=False, paths=None, song_path=None, target
         (logs / (outfile.stem + ".plan.txt")).write_text(text, encoding="utf-8")
         save_json(logs / (outfile.stem + ".plan.json"), plan)
         record_history(plan, outfile.stem)
+        try:                                               # V9.5.5: the montage's record (the clip files really in the cut list) for 'Mark montage as published'
+            published.save_record(DATA, plan, outfile)
+        except Exception as ex:                            # noqa: BLE001
+            out(f"Montage record not saved: {ex}")
         save_last_seed(plan)                               # V9.0: the Manual tab's 'Last seed' button
         try:                                               # V6.0: flagged used only now, after the render succeeded
             mark_used({t["path"] for t in plan["takes"]} | {x["path"] for t in plan["takes"] for x in t.get("srcs", [])}, title=outfile.stem)
@@ -20055,8 +20241,9 @@ def ask(prompt, default=""):
 def cmd_setup(args):
     DATA.mkdir(parents=True, exist_ok=True)
     cfg = load_config()
-    cfg["playlist_dir"] = ask("Folder where you will drop the Exportify CSV", cfg["playlist_dir"])
-    Path(cfg["playlist_dir"]).mkdir(parents=True, exist_ok=True)
+    cfg["playlist_dir"] = ask("Folder of a playlist CSV (optional: leave it as it is if you have none)", cfg["playlist_dir"])
+    if cfg["playlist_dir"]:
+        Path(cfg["playlist_dir"]).mkdir(parents=True, exist_ok=True)
     while True:
         m = ask("Path of your MP3 folder", cfg["mp3_dir"])
         if m and os.path.isdir(m):
@@ -20183,7 +20370,7 @@ def cmd_inventory(args):
     out(f"  audio files found: {len(audio)}")
     csv_path, rows, col = read_playlist(cfg)
     if not csv_path:
-        out(f"  no Exportify CSV in {cfg['playlist_dir']} yet (drop one there).")
+        out("  no playlist CSV: not needed, the songs in the MP3 folder are used directly.")
     else:
         out(f"  newest CSV: {csv_path.name}  columns used: { {k: v for k, v in col.items()} }")
         try:
@@ -20551,6 +20738,13 @@ def moved_root(cfg):
         if norm(base) == norm(d) or norm(base).startswith(norm(d) + os.sep):
             return os.path.join(str(DATA.parent), MOVED_DIR_NAME)
     return base
+
+
+def published_root(cfg):
+    """V9.5.5: the folder the clips of PUBLISHED montages are moved into (one subfolder per game): the Settings folder, else <clip root>\Published clips (E:\Movies\Published clips). Never scanned."""
+    if str((cfg or {}).get("published_dir") or "").strip():
+        return str(cfg["published_dir"]).strip()
+    return os.path.join((cfg or {}).get("clip_root") or str(DATA.parent), "Published clips")
 
 
 def move_clip_file(path, game, cfg):
@@ -21734,6 +21928,8 @@ class App:
             cfg[k] = v.get().strip()
         if "moved_dir" in cfg and norm(cfg["moved_dir"] or ".") == norm(moved_root(dict(cfg, moved_dir=""))):
             cfg["moved_dir"] = ""                                  # V8.8.8: the default folder stays the default (it follows the clip root)
+        if "published_dir" in cfg and norm(cfg["published_dir"] or ".") == norm(published_root(dict(cfg, published_dir=""))):
+            cfg["published_dir"] = ""                              # V9.5.5: same for the published clips folder
         cfg["clip_dirs"] ={g: [x.strip() for x in v.get().split(";") if x.strip()] for g, v in self.sl.items()}
         for k, v in self.sn.items():
             try:
@@ -23327,15 +23523,19 @@ class App:
     # ------------------------------------------------------------ Songs tab
     def build_songs(self):
         f = self.tabs["Songs"]
-        ttk.Label(f, text="Which MP3 was matched to which playlist track (one-to-one). Rows under 85 are flagged - fix them with Change match. "
-                          "Also saved as montage_data\\song_matches.csv.", wraplength=1100).pack(anchor="w", pady=4)
+        self.s_head = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.s_head, wraplength=1100).pack(anchor="w", pady=4)
         bar = ttk.Frame(f)
         bar.pack(fill="x", pady=4)
+        self.m_bar1 = bar
         self.btn(bar, "Refresh", lambda: self.run_task("matches", self.load_matches)).pack(side="left", padx=3)
         self.btn(bar, "Play selected file", self.play_match).pack(side="left", padx=3)
-        self.btn(bar, "Open song_matches.csv", lambda: self.open_path(DATA / "song_matches.csv")).pack(side="left", padx=3)
         self.btn(bar, "Song map of selected file...", self.map_match).pack(side="left", padx=3)
+        self.m_open_csv = self.btn(bar, "Open song_matches.csv", lambda: self.open_path(DATA / "song_matches.csv"))
         bar2 = ttk.Frame(f)
+        self.m_bar2 = bar2                                                                           # V9.5.5: the CSV tools are shown only when a CSV is used (songs_view)
+        self.m_csv_note = ttk.Label(f, text="Download new songs and Add covers and tags use a playlist CSV (an Exportify export in the playlist folder). Without one they are switched off; nothing else needs it.",
+                                    wraplength=1100)
         bar2.pack(fill="x", pady=2)
         self.btn(bar2, "Download new songs", self.start_yt_download).pack(side="left", padx=3)      # V9.5
         ttk.Label(bar2, text="Newest songs to check").pack(side="left", padx=(6, 2))
@@ -23360,12 +23560,14 @@ class App:
                         ("bpm", 60, "BPM"), ("len", 64, "Length"), ("added", 100, "Added"), ("score", 70, "Score"), ("flag", 130, "Flag"), ("trash", 40, "")):
             self.mtree.column(c, width=w, minwidth=(36 if c == "trash" else 50), stretch=(c in ("#0", "track")), **({"anchor": "center"} if c == "trash" else {}))
             self.mtree.heading(c, text=t)
-        self.mtree.bind("<Button-1>", lambda e: self.on_song_click(self.mtree, self.MTREE_TRASH_COL, e))
+        self.m_trash_col = self.MTREE_TRASH_COL
+        self.mtree.bind("<Button-1>", lambda e: self.on_song_click(self.mtree, self.m_trash_col, e))
         self.make_sortable(self.mtree, self.fill_matches, {"#0": "MP3 file", "track": "Matched playlist track", "artist": "Artist",
                                                             "bpm": "BPM", "len": "Length", "added": "Added", "score": "Score", "flag": "Flag"})
         self.mtree.tag_configure("weak", foreground="#ffc65c")
         self.mtree.tag_configure("none", foreground="#ff8a80")
         self.mtree.tag_configure("nomp3", foreground="#8fb4d9")
+        self.m_csv_on = None
         self.thumb_register(self.mtree)                                            # V9.5.2: cover squares
         self.match_rows, self.match_audio = [], []
 
@@ -23559,10 +23761,12 @@ class App:
         with pstage("load_matches: match_playlist (cached / incremental)"):
             matched, unmatched, _st = match_cached(cfg, csvp, rows, audio) if rows and audio else ([], rows, "none")
         with pstage("load_matches: write_song_matches"):
-            write_song_matches(audio, matched)
+            if rows:
+                write_song_matches(audio, matched)
         by = {a["path"]: (r, sc) for r, a, sc in matched}
         songs = None
-        if rows and cfg.get("mp3_dir"):
+        csv_on = bool(rows)
+        if cfg.get("mp3_dir"):
             with pstage("load_matches: song_pool (cache hit)"):
                 songs = sorted(song_pool(cfg)[0], key=lambda s: s["added"] or datetime.datetime(1970, 1, 1), reverse=True)
         added_of = {s["path"]: s["added"] for s in (songs or [])}          # V7.7.0: the SAME 'date added' as the Manual song list (song_pool: the newest playlist 'Added At' of the file)
@@ -23571,10 +23775,11 @@ class App:
             r, sc = by.get(a["path"], (None, 0))
             ad = added_of.get(a["path"]) if songs is not None else (parse_added(r["added"]) if r and r.get("added") else None)
             items.append((a["path"], Path(a["path"]).name, r["title"] if r else "", r["artist"] if r else "", sc,
-                          match_flag(a["path"], r, sc),
+                          match_flag(a["path"], r, sc, csv_on),
                           f"{r['tempo']:.0f}" if r and r.get("tempo") else "",
                           fmt_mss(a.get("dur")), ad.strftime("%Y-%m-%d") if ad else ""))
-        weak = sum(1 for i in items if i[5] != "ok")
+        weak = sum(1 for i in items if i[5] not in ("ok", "", "not in CSV"))
+        n_nocsv = sum(1 for i in items if i[5] == "not in CSV")
         rowmap = {a["path"]: (by[a["path"]][0], a["path"]) for a in audio if a["path"] in by}          # V9.5.1: list row -> (playlist track, its MP3)
         for r_ in unmatched:                                                         # ... and the playlist tracks WITHOUT an MP3 are rows too (select them to download)
             iid_ = "csv:" + _rank_key(r_)
@@ -23592,11 +23797,36 @@ class App:
                 self.songs = songs                                  # V6.1.2: the new match result is applied once, in one batch
                 self.refresh_songs()
             self.match_rows, self.match_audio, self.match_items, self.match_rowmap = rows, audio, items, rowmap
+            self.songs_view(csv_on)
             self.fill_matches()
-            self.m_info.set(f"{len(audio)} MP3 files, {len(rows)} playlist tracks, {len(matched)} matched, {weak} to check, {len(unmatched)} playlist tracks without a file")
+            if csv_on:
+                self.m_info.set(f"{len(audio)} MP3 files, {len(rows)} playlist tracks, {len(matched)} matched, {weak} to check, {n_nocsv} not in the CSV, {len(unmatched)} playlist tracks without a file")
+            else:
+                self.m_info.set(f"{len(audio)} songs in the library")
             if PERF is not None:
                 PERF.stage("load_matches: fill() on UI thread", _f0)
         self.q.put(("call", fill))
+
+    def songs_view(self, csv_on):
+        """V9.5.5: the Songs tab with a CSV (track / score / flag columns, CSV tools) or without one (just the library: no CSV words, columns or tools)."""
+        if self.m_csv_on is csv_on:
+            return
+        self.m_csv_on = csv_on
+        if csv_on:
+            self.s_head.set("Which MP3 was matched to which playlist track (one-to-one). Rows under 85 are flagged - fix them with Change match. "
+                            "Songs that are not in the CSV are still normal songs. Also saved as montage_data\\song_matches.csv.")
+            self.mtree.configure(displaycolumns=("track", "artist", "bpm", "len", "added", "score", "flag", "trash"))
+            self.m_trash_col = self.MTREE_TRASH_COL
+            self.m_csv_note.pack_forget()
+            self.m_open_csv.pack(side="left", padx=3)
+            self.m_bar2.pack(fill="x", pady=2, after=self.m_bar1)
+        else:
+            self.s_head.set("The songs in your MP3 folder. Tempo, energy and drops come from the song analysis.")
+            self.mtree.configure(displaycolumns=("artist", "bpm", "len", "added", "trash"))
+            self.m_trash_col = "#5"
+            self.m_bar2.pack_forget()
+            self.m_open_csv.pack_forget()
+            self.m_csv_note.pack(anchor="w", pady=2, after=self.m_bar1)
 
     def fill_matches(self):
         items = getattr(self, "match_items", [])
@@ -23607,7 +23837,7 @@ class App:
         self.mtree.delete(*self.mtree.get_children())
         for pth, nm, vals in rows:
             fl = vals[6]
-            self.mtree.insert("", "end", iid=pth, text=nm, values=vals, image=self.thumb_image(self.mtree, pth), tags=("none" if fl == "NO MATCH" else "nomp3" if fl == "NO MP3" else "weak" if fl != "ok" else "",))
+            self.mtree.insert("", "end", iid=pth, text=nm, values=vals, image=self.thumb_image(self.mtree, pth), tags=("none" if fl == "NO MATCH" else "nomp3" if fl == "NO MP3" else "weak" if fl not in ("ok", "", "not in CSV") else "",))
 
     def map_song(self):
         sel = self.stree.selection()
@@ -23670,6 +23900,77 @@ class App:
                 w.destroy()
                 self.run_task("matches", self.load_matches)
         ttk.Button(w, text="Use this track", command=ok).pack(pady=8)
+        self.reveal(w)
+
+    # ------------------------------------------------------------ Published montages (Settings)
+    def pub_dialog(self):
+        """V9.5.5: Mark montage as published: pick the montage video, see the PREVIEW (changes nothing), then Apply moves its clips out of the library."""
+        cfg = load_config()
+        f = filedialog.askopenfilename(title="Pick the montage video you published", initialdir=cfg.get("output_root") or None,
+                                       filetypes=[("Video", "*.mp4 *.mkv *.mov"), ("All files", "*.*")])
+        if not f:
+            return
+        rec, pv = pub_find(f, cfg)
+        w = self.reg(tk.Toplevel(self.root), "window")
+        w.withdraw()
+        w.title("Mark montage as published")
+        w.geometry("900x620")
+        bar = ttk.Frame(w)
+        bar.pack(side="bottom", fill="x", padx=8, pady=8)
+        t = tk.Text(w, wrap="word", font=("Consolas", 10))
+        sb = ttk.Scrollbar(w, command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        t.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(8, 0))
+        t.insert("1.0", pub_preview_text(f, rec, pv))
+        t.configure(state="disabled")
+
+        def go():
+            if self.busy or getattr(self, "scan_active", False):
+                messagebox.showinfo("Published montage", "A job or a scan is running. Try again when it has finished.")
+                return
+            if not messagebox.askyesno("Apply", f"Move {len(pv['moves'])} clip file(s) of this montage into\n{published_root(cfg)}\\{pv['game_dir']}\nand never use them again?"):
+                return
+            res = published.apply(DATA, rec, published_root(cfg), GAME_DIR)
+            _SCAN_MEMO["m"] = None
+            messagebox.showinfo("Published montage", f"{len(res['moved'])} clip(s) moved, {len(res['failed'])} failed. Logged in montage_data\\logs\\published.log. The clip list updates at the next scan.")
+            w.destroy()
+        b = ttk.Button(bar, text="Apply (move the clips)", command=go)
+        b.pack(side="left")
+        if not pv or not pv["moves"]:
+            b.state(["disabled"])
+        ttk.Button(bar, text="Close", command=w.destroy).pack(side="left", padx=8)
+        self.reveal(w)
+
+    def pub_unmark_dialog(self):
+        """V9.5.5: Unmark published: the clips of the chosen montage go back to their original paths and can be used again."""
+        lst = published.published_list(DATA)
+        if not lst:
+            messagebox.showinfo("Published montages", "No montage is marked as published.")
+            return
+        w = self.reg(tk.Toplevel(self.root), "window")
+        w.withdraw()
+        w.title("Unmark published")
+        w.geometry("760x320")
+        lb = tk.Listbox(w, height=10)
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+        for v, g, d, n in lst:
+            lb.insert("end", f"{Path(v).name}   ({g}, marked {d}, {n} clips moved)")
+
+        def go():
+            if not lb.curselection():
+                return
+            if self.busy or getattr(self, "scan_active", False):
+                messagebox.showinfo("Published montage", "A job or a scan is running. Try again when it has finished.")
+                return
+            v = lst[lb.curselection()[0]][0]
+            if not messagebox.askyesno("Unmark", f"Move the clips of {Path(v).name} back to their original folders and use them again?"):
+                return
+            res = published.unmark(DATA, v)
+            _SCAN_MEMO["m"] = None
+            messagebox.showinfo("Published montage", f"{len(res['restored'])} clip(s) restored, {len(res['failed'])} not restored. Logged in montage_data\\logs\\published.log.")
+            w.destroy()
+        ttk.Button(w, text="Unmark selected", command=go).pack(pady=(0, 8))
         self.reveal(w)
 
     # ------------------------------------------------------------ Troubleshoot tab
@@ -23940,9 +24241,11 @@ class App:
             r[0] += 1
 
         section("Folders")
-        for k, lab in (("mp3_dir", "MP3 folder"), ("playlist_dir", "Exportify CSV folder"), ("output_root", "Output folder"),
-                       ("moved_dir", "Moved clips folder (move icon)")):              # V8.8.8: where the move icon puts clips (one folder per game inside; never scanned)
-            v = tk.StringVar(value=self.cfg.get(k, "") if k != "moved_dir" else (self.cfg.get("moved_dir") or moved_root(self.cfg)))
+        for k, lab in (("mp3_dir", "MP3 folder"), ("playlist_dir", "Playlist CSV folder (optional)"), ("output_root", "Output folder"),
+                       ("moved_dir", "Moved clips folder (move icon)"),              # V8.8.8: where the move icon puts clips (one folder per game inside; never scanned)
+                       ("published_dir", "Published clips folder")):                # V9.5.5: where the clips of published montages go (one folder per game inside; never scanned)
+            v = tk.StringVar(value=self.cfg.get(k, "") if k not in ("moved_dir", "published_dir") else
+                             (self.cfg.get("moved_dir") or moved_root(self.cfg)) if k == "moved_dir" else (self.cfg.get("published_dir") or published_root(self.cfg)))
             self.sv[k] = v
             folder_row(lab, v, "Browse", lambda v=v: v.set(filedialog.askdirectory(initialdir=v.get() or None) or v.get()))
         for g, lab in (("valorant", "Valorant clip folders (separated by ;)"), ("cs2", "CS2 clip folders (separated by ;)"),
@@ -23951,6 +24254,13 @@ class App:
             self.sl[g] = v
             folder_row(lab, v, "Add folder", lambda v=v: v.set("; ".join([x for x in v.get().split(";") if x.strip()] +
                                                                            [filedialog.askdirectory() or ""]).strip("; ")))
+        section("Published montages")                                          # V9.5.5
+        label("Clips of a montage you uploaded and made public are moved out of every scanned folder and never used again")
+        pf_ = ttk.Frame(f)
+        pf_.grid(row=r[0], column=1, columnspan=2, sticky="w", padx=(0, PX), pady=PY)
+        ttk.Button(pf_, text="Mark montage as published...", command=self.pub_dialog).pack(side="left")
+        ttk.Button(pf_, text="Unmark published...", command=self.pub_unmark_dialog).pack(side="left", padx=6)
+        r[0] += 1
         section("Scanning and detection")
         for k, lab in (("max_mb", "Skip files larger than (MB)"), ("max_dur_s", "Skip clips longer than (s)"),
                        ("auto_recent_days", "Auto: scan new clips from the last (days)"),
@@ -26913,6 +27223,9 @@ def main():
     q_ = sp.add_parser("r6srecheck", help="V8.8.1: re-check every saved R6S scan against all utility icons (once per clip), then list kills that still hold a utility icon (the audit; must be empty)")
     q_.add_argument("--audit-only", dest="audit_only", action="store_true", help="only the audit, no re-check")
     q_.set_defaults(fn=cmd_r6srecheck)
+    q_ = sp.add_parser("pubpreview", help="V9.5.5: the preview of 'Mark montage as published' for montage videos (read-only)")
+    q_.add_argument("videos", nargs="+")
+    q_.set_defaults(fn=cmd_pubpreview)
     sp.add_parser("songmatch", help="V7.7.5: song-to-CSV match counts with / without the loose rule (read-only; writes montage_data/song_match_v775.txt)").set_defaults(fn=cmd_songmatch)
     sp.add_parser("ledger", help="V6.9.7: reprint the last run's kill ledger (read-only; writes ledger.txt only)").set_defaults(fn=cmd_ledger)
     sp.add_parser("detectcheck", help="V4 vs V5 kill classification on all cached OCR data").set_defaults(fn=cmd_detectcheck)
