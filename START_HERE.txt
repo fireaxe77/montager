@@ -27,7 +27,7 @@ MONTAGER V9.5.7 - kill montages from your own Valorant, CS2 and Rainbow Six Sieg
 7. Uploaded a montage and made it public? Settings > Published montages > "Mark montage as published..." moves its clips out of your
    clip folders so they are never used again ("Unmark published..." puts them back).
 
-Full guide: README.md (or https://github.com/fireaxe77/montager).
+Short overview: README.md. Full guide: docs\guides\USER_GUIDE.md (or https://github.com/fireaxe77/montager).
 Problems: docs\guides\TROUBLESHOOTING.md, or run "python setup_check.py" in this folder.
 
 Note: kill detection was tested mainly on the developer's setup (1920x1080, default HUD, NVIDIA / OBS recordings).

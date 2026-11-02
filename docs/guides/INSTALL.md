@@ -1,6 +1,6 @@
 # Installing Montager on Windows
 
-Short version: [README > Install](../../README.md#install). This page has the details.
+Short version: [User guide > Install](USER_GUIDE.md#install). This page has the details.
 
 ## 1. Python 3.12 (64-bit)
 

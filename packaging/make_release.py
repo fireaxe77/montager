@@ -236,7 +236,7 @@ def notes(ver, untagged):
              "", "Python, FFmpeg and the OCR engine are included in the installer and the portable ZIP. Your settings and caches live in "
              "`%LOCALAPPDATA%\\Montager` and survive updates and uninstalling.",
              "", "First start: Montager lists what is still missing (clip folders, songs, your in-game name; a playlist CSV is optional). "
-             "Guide: [README](https://github.com/fireaxe77/montager#readme)."]
+             "Guide: [README](https://github.com/fireaxe77/montager#readme) and the [user guide](https://github.com/fireaxe77/montager/blob/main/docs/guides/USER_GUIDE.md)."]
     if untagged:
         lines += ["", f"_The download is built from main, which has small fixes after the v{ver} tag._"]
     return "\n".join(lines)
