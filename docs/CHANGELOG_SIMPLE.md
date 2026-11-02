@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.5.6 - 2026-11-02: Sky patterns vary again
+- The sky pattern now changes from montage to montage, and the one you got last time is less likely to come back
+- More of your two- and three-kill clips make it into CS2 montages when your previous kill is still on screen
+- The sky recolour no longer spills onto walls and the radar
+
 ## V9.5.5 - 2026-11-02: Songs work without a playlist CSV
 - A folder of MP3s is all you need now: the playlist CSV is optional, and songs the CSV does not list are used like any other song
 - More songs find their playlist entry, including files named "Artist - Title"

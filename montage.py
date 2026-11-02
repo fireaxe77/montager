@@ -62,7 +62,7 @@ import published                                   # V9.5.5: published montages 
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.5.5"
+APP_VERSION = "V9.5.6"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5187,6 +5187,9 @@ CS2_LOCK_ROW_ON = [True]         # V9.1.3: a CS2 outlined kill row that reads my
 SEEN_GUARD_ON = [True]           # V9.1.3 switch: CS2 / R6S takes carry the clip's kill rows of mine (counted or not) for the CUT LIST CHECK
 SEEN_NOT_KILL = ("death", "victim side", "suspicious", "assist", "not mine", "other player", "utility", "gadget", "shifted up", "same victim",
                  "same row", "same-timestamp", "no readable name", "revive")       # rejections that say the row is NOT a kill of mine (or a copy of a counted one)
+SEEN_PRE_NAME_ON = [True]        # V9.5.6 switch: a pre-clip row whose name was not read as mine is not an uncounted kill row of mine (the kill count never counted it either)
+SEEN_PRE_START_ON = [True]       # V9.5.6 switch: a take starts after the pre-clip row at the start of its clip has faded (seen_min_start) instead of the clip being dropped
+SEEN_PRE_SLACK_S = 0.2           # V9.5.6: the last part of the fade (shorter than SEEN_MIN_S) may still be on screen at the take start
 SEEN_MIN_S = 0.25                # V9.1.3: an uncounted row must be on screen at least this long inside a take to fail the check
 SEEN_MATCH_S = 0.6               # V9.1.3: a take kill this close to a row's first frame is that row's kill
 
@@ -5215,6 +5218,8 @@ def clip_seen_rows(a, kills, rej=()):
                 out_.append({"t": round(min(k["t"], t0), 3), "t_last": tl, "victim": k.get("victim", ""), "rule": None})
                 continue
             why = why_at(t0) or "not in the kill list"
+            if "pre-clip" in why and SEEN_PRE_NAME_ON[0] and not d["cls"].get("name_read", True):
+                continue                                        # V9.5.6: the same rule as the kill count (an unread name is not proven to be mine): an old row of unproven owner is not a row of mine
             if not any(w in why.lower() for w in SEEN_NOT_KILL):
                 out_.append({"t": round(t0, 3), "t_last": tl, "victim": d["cls"]["vtext"], "rule": why})
         for k in kills:                                         # kills the border list took from the name scan
@@ -10207,14 +10212,20 @@ RECIPES = {                             # all within V4's effect strength; they 
 STYLE_CHOICES = ["auto"] + list(RECIPES) + ["mix", "random"]
 
 
+def song_energy_of(an, song, with_src=False):
+    """V9.5.6: the song's energy as Auto style reads it: the CSV value when the song has one, else the mean of the song map's energy (the same value in both places)."""
+    e = (song or {}).get("energy")
+    src = "CSV"
+    if e is None:
+        e, src = float(sum((an or {}).get("energy", [0.5])) / max(1, len((an or {}).get("energy", [1])))), "analysis"
+    e = float(e)
+    return (e, src) if with_src else round(e, 4)
+
+
 def auto_style(an, song, rng, events=None):
     """Auto: the recipe that fits THIS song's map (energy, BPM, strong drops, how steady the rhythm is) and the material (how
     many multikills vs singles); the seed picks between close fits. Energy: the CSV value when present, else the song map."""
-    e = song.get("energy")
-    e_src = "CSV"
-    if e is None:
-        e, e_src = float(sum(an.get("energy", [0.5])) / max(1, len(an.get("energy", [1])))), "analysis"
-    e = float(e)
+    e, e_src = song_energy_of(an, song, with_src=True)
     bpm = float(an.get("bpm") or 120)
     drop = min(1.0, float(an.get("drop_strength") or 0.0) / 0.6)
     n_drops = sum(1 for d in an.get("drops", []) if d.get("strength", 0) >= 1.5)
@@ -10475,6 +10486,9 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first", 
         r = r if r >= 1.15 else 1.0
     cover = lead_t if r == 1.0 else 1.0 + (lead_t - 1.0) * r
     if first - min(ev.get("rows") or ev["times"]) > cover - 0.05:                   # killfeed row must be inside the footage
+        return None
+    ms_ = seen_min_start(ev)
+    if ms_ is not None and first - cover < ms_ - 1e-6:                              # V9.5.6: the previous kill's row (from before the clip) must have faded when the take starts
         return None
     dmax = (ev["death_after"] - 0.05) if ev.get("death_after") is not None else 99.0
     post = min(ev["post"], dmax)
@@ -13371,6 +13385,7 @@ def finish_plan(cfg, game, takes, head_take, song, an, U, bt, seed, rname, rp, w
                      "start_t": round(bt0, 6), "drop_t": None if drop_beat is None else round(float(bt[drop_beat if used_drop_beat is None else used_drop_beat]) - bt0, 3),
                      "drop_beat": drop_beat, "fade_in": FADE_IN, "fade_out_start": fade_st, "lufs": an.get("lufs"),
                      "section_s": round(float(an.get("dur") or (bt[-1] + U[1] - U[0])) - bt0, 3)},
+            "song_energy": song_energy_of(an, song),                           # V9.5.6: the very value Auto style reads (CSV, else the song map); the sky pattern choice uses it
             "takes": out_takes, "duration": round(total_s, 4), "total_frames": total_f, "notes": notes,
             "beats_out": [round(float(t) - bt0, 4) for t in bt if bt0 - 1e-6 <= t <= bt0 + total_s + 1e-6],
             "drops_out": [round(d["t"] - bt0, 3) for d in an.get("drops", []) if bt0 <= d["t"] <= bt0 + total_s],
@@ -13451,7 +13466,8 @@ def seen_rows_audit(t):
     def same_vic(a, b):
         return bool(a and b and (cs2_same_victim(a, b) or ocr_ratio(a, b) >= 80))
     for r in t["seen"]:
-        if "pre-clip" in (r.get("rule") or "") and any(o.get("clip") != r.get("clip") and o["t"] < r["t"] and same_vic(o.get("victim"), r.get("victim"))
+        if "pre-clip" in (r.get("rule") or "") and any(o.get("clip") != r.get("clip") and o["t"] < r["t"] and (same_vic(o.get("victim"), r.get("victim"))
+                                                       or (SEEN_PRE_START_ON[0] and float(o.get("t_last", o["t"])) >= r["t"] - 0.5))      # V9.5.6: or the earlier clip's row is still on screen at that moment (a garbled name can not tell)
                                                        for o in t["seen"]):
             continue                                       # a stitched clip's pre-clip row is the earlier clip's row still on screen: that row is judged there
         vis = sum(max(0.0, min(sg[1], r["t_last"]) - max(sg[0], r["t"])) for sg in segs if own(sg, r))
@@ -13466,6 +13482,24 @@ def seen_rows_audit(t):
             msgs.append(f"the kill row of the kill at {min(mine):.2f}s ([{r.get('victim') or '?'}]) is on screen from {r['t']:.2f}s, before the take starts ({segs[0][0]:.2f}s): "
                         "the take shows the row, then a kill that already happened")
     return msgs
+
+
+def seen_min_start(ev):
+    """V9.5.6: the earliest time (the event's timeline) a take of this event may start: a kill row of mine from BEFORE the clip (rule 'pre-clip', the previous kill still on screen when
+    the clip starts) must have faded (all but its last SEEN_PRE_SLACK_S) before the take starts. Only rows of the clip the take starts in count. None = no such row."""
+    if not SEEN_PRE_START_ON[0] or not ev.get("seen"):
+        return None
+    parts = ev.get("parts") or []
+    first_clip = Path(parts[0]["path"]).name if parts and parts[0].get("path") else None
+    ms = None
+    for r in ev["seen"]:
+        if "pre-clip" not in (r.get("rule") or "") or (first_clip and r.get("clip") and r["clip"] != first_clip):
+            continue
+        if r["t"] > float(ev["times"][0]):
+            continue
+        v = float(r["t_last"]) - SEEN_PRE_SLACK_S
+        ms = v if ms is None else max(ms, v)
+    return ms
 
 
 SEEN_PRECHECK_ON = [True]          # V9.2.0 switch: events whose kill-row check fails on the footage EVERY take of them must show are left out before planning
@@ -15574,6 +15608,62 @@ def sky_extend_mask(img, m, sample):
     return out
 
 
+SKY_TRACK_ON = [True]                # V9.5.6 switch: the tracked sky stays near the sky detected on the kill frame (per-frame coverage cap, never below the detected horizon, sky colours only)
+SKY_TRACK_GROW = 1.5                 # V9.5.6: a frame's mask may cover at most this many times the coverage detected on the kill frame ...
+SKY_TRACK_SLACK = 0.02               # ... (plus this share of the picture, so a very small sky may still grow a little)
+SKY_TRACK_ROWS = 2                   # V9.5.6: rows (of the mask) the mask may reach below the detected horizon
+SKY_TAKE_MAX_HOR = 0.50              # V9.5.6: a take whose sky horizon sits lower than this share of the picture height is not recoloured (a wall / the radar is in it)
+SKY_LIKE_BLUE = (85, 135)            # V9.5.6: OpenCV hue (0-179) of a blue sky ...
+SKY_LIKE_WHITE = {"s_max": 60, "v_min": 190, "b_over_r": 8}      # ... or a white / cloud pixel: bright, low saturation and a cool (bluish) tint; neutral or warm greys are walls (concrete measured: B - R about -5 .. 0, S about 10)
+
+
+def sky_like_pixels(img):
+    """V9.5.6: the pixels of an RGB picture that have a sky's colour: blue (hue, some saturation, not dark) or white / cloud (bright, low saturation, not warm). Neutral grey, low-saturation dark, warm and
+    concrete-like pixels are not."""
+    import cv2
+    import numpy as np
+    rgb = np.ascontiguousarray(img[..., :3], dtype=np.uint8)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hh, ss, vv = hsv[..., 0].astype(np.int16), hsv[..., 1].astype(np.int16), hsv[..., 2].astype(np.int16)
+    blue = (hh >= SKY_LIKE_BLUE[0]) & (hh <= SKY_LIKE_BLUE[1]) & (ss >= 30) & (vv >= 80)
+    white = (ss <= SKY_LIKE_WHITE["s_max"]) & (vv >= SKY_LIKE_WHITE["v_min"]) & (rgb[..., 2].astype(np.int16) - rgb[..., 0].astype(np.int16) >= SKY_LIKE_WHITE["b_over_r"])
+    return blue | white
+
+
+def sky_track_clamp(img, m, cov_cap, bot_cap):
+    """V9.5.6: one frame's tracked mask held to the sky it was detected as: only sky-coloured pixels (sky_like_pixels), no row below bot_cap (the detected horizon + SKY_TRACK_ROWS), and not more than
+    cov_cap of the picture (rows are given up from the bottom first). Returns (mask, share of the mask's pixels that were not sky-coloured)."""
+    import cv2
+    import numpy as np
+    h, w = m.shape
+    n0 = int(m.sum())
+    if n0 == 0:
+        return m, 0.0
+    like = sky_like_pixels(img)
+    like = cv2.morphologyEx(like.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8)) > 0       # a cloud's grey core, a bird: gaps inside real sky stay
+    out_ = m & like
+    wallfrac = 1.0 - float(out_.sum()) / n0
+    if bot_cap is not None and bot_cap + 1 < h:
+        out_[int(bot_cap) + 1:] = False
+    if cov_cap is not None and out_.mean() > cov_cap:
+        cum = np.cumsum(out_.sum(1)) / float(h * w)
+        r = int(np.searchsorted(cum, cov_cap, side="right"))
+        out_[r:] = False
+    return out_, wallfrac
+
+
+def sky_take_reject(c, st):
+    """V9.5.6: why a take's sky mask is not used (None = fine): its mean coverage is far beyond what was detected on the kill frame, or its horizon sits in the lower half of the picture."""
+    if not SKY_TRACK_ON[0]:
+        return None
+    cov0, covf = c.get("cov"), st.get("cov_full")
+    if cov0 and covf is not None and covf > SKY_TRACK_GROW * float(cov0) + SKY_TRACK_SLACK + 1e-9:
+        return f"the tracked sky covers {covf * 100:.0f}% of the picture on average, {covf / float(cov0):.1f}x the {float(cov0) * 100:.0f}% detected on the kill frame - no sky for this take"
+    if st.get("horizon", 0.0) > SKY_TAKE_MAX_HOR:
+        return f"the sky's horizon sits at {st['horizon'] * 100:.0f}% of the height (lower than {SKY_TAKE_MAX_HOR * 100:.0f}%: a wall or the radar is in it) - no sky for this take"
+    return None
+
+
 def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
     """V8.4.4 / V8.5.1: writes the sky mask of one take for the render: a raw video (SKY_W x SKY_H, 60 fps, one frame per output frame of the take). V8.5.1: the window is x['t0'] .. x['t1'] = the KILL frame to the
     END of the take (the frames before the kill are 0); every frame's mask is the V8.4.1 colour rule (sky_rule_mask) of the take's own source frame (so slow-mo and speed-ups are followed), a frame whose region
@@ -15709,10 +15799,27 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
                 segm[i] = own_hold(i, first_)
                 held_i.add(i)
                 held += 1
+    det_ = [i for i in range(k) if status[i] == "ok" and segm[i].any()]
+    cov0_ = (float(x["cov"]) if x.get("cov") else None) if x.get("cov") is not None else None
+    if cov0_ is None and det_:
+        cov0_ = float(segm[det_[0]].mean())                                # V9.5.6: the sky detected on the kill frame: what every later frame is held to
+    low0_ = int(np.where(segm[det_[0]].any(1))[0].max()) if det_ else None
+    own_low = [(int(np.where(m_.any(1))[0].max()) if m_.any() else None) for m_ in segm]
     if SKY_EXTEND_ON[0]:                                   # V9.5.2: the paint follows the sky down its gradient (the choice of kills and the wall checks above used the mask as it was)
         segm = list(pool_.map(lambda a_: sky_extend_mask(a_[0], a_[1].astype(bool), a_[2]).astype(np.uint8) if a_[1].any() else a_[1], zip(imgs, segm, smp)))
-    imgs = None
     segm = list(pool_.map(sky_mask_even, segm))           # V8.8.2: one even region per frame: small gaps closed, enclosed holes (cloud specks, cut-out texture) filled, so the tint has no patches inside the sky
+    wall_fr = 0
+    if SKY_TRACK_ON[0] and cov0_ is not None:              # V9.5.6: every frame's paint stays inside sky colours, above the detected horizon and within 1.5x the detected coverage (last, so nothing above re-grows it)
+        cap_ = SKY_TRACK_GROW * cov0_ + SKY_TRACK_SLACK
+
+        def clamp_(i):
+            lows = [v_ for v_ in (own_low[i], low0_) if v_ is not None]
+            return sky_track_clamp(imgs[i], segm[i].astype(bool), cap_, (max(lows) + SKY_TRACK_ROWS) if lows else None)
+        for i, (m_, wf_) in enumerate(pool_.map(clamp_, range(k))):
+            if segm[i].any() and wf_ > 0.35:
+                wall_fr += 1
+            segm[i] = m_.astype(np.uint8)
+    imgs = None
     pool_.shutdown()
     if k > 4:                                              # V8.7: temporal stabilisation: pixels that flicker in and out of the sky mask (a smoke grenade drifting in front of the sky, noise) are taken out for the whole window
         sm_ = [m_ for m_ in segm]
@@ -15787,7 +15894,8 @@ def sky_take_mask(t, x, zone, path, ramp=False, plan=None):
     if ramp:
         x["mask_fmt"] = "yuva444p" if fam_ else "yuv444p"
     cov = float(np.mean([m_[:int(h * 0.55)].mean() for m_ in segm[:max(1, cut)]])) if segm else 0.0
-    return {"mean_y": ymean, "frames": nf, "cov": cov, "held": held, "horizon": x["horizon"], "bad": n_bad, "window": cut, "ok_frames": sum(1 for q in status if q == "ok"), "breaks": len(breaks),
+    cov_full = float(np.mean([m_.mean() for m_ in segm[:max(1, cut)]])) if segm else 0.0
+    return {"mean_y": ymean, "frames": nf, "cov": cov, "cov_full": cov_full, "cov_detected": cov0_, "wall_frames": wall_fr, "held": held, "horizon": x["horizon"], "bad": n_bad, "window": cut, "ok_frames": sum(1 for q in status if q == "ok"), "breaks": len(breaks),
             "cut": cut if cut < k else None}
 
 
@@ -15867,24 +15975,72 @@ SKY_PATTERN_FEEL = {"amoebas": (0.35, 85.0, ("black",)), "ink": (0.80, 140.0, ("
 SKY_PATTERN_JITTER = 0.45            # the song's own fixed share of the score (a hash of artist + title): similar songs still get different patterns, the same song always the same
 
 
-def sky_pattern_for(plan):
-    """V8.8.5: the ONE sky pattern of a montage (SKY_PATTERNS), chosen once per montage from the song alone: its energy, tempo, danceability and the album cover (its colour family, or white /
-    black), plus a fixed per-song share (a hash of artist + title), so different songs get different patterns and the same song always gets the same one, whatever the seed, style or game.
-    Returns (pattern, why)."""
-    import hashlib
-    song = plan.get("song") or {}
+SKY_PATTERN_HISTORY = DATA / "sky_pattern_history.json"      # V9.5.6: the last SKY_HIST_N patterns chosen for a montage (newest last)
+SKY_HIST_N = 5
+SKY_HIST_MUL = (0.25, 0.6)                                   # V9.5.6: weight x0.25 for the pattern used last, x0.6 for the one before
+SKY_PAT_MIN, SKY_PAT_MAX = 0.15, 0.40                        # V9.5.6: every pattern keeps at least 15 % odds, none may exceed 40 %
+
+
+def sky_pattern_key(plan):
+    """V9.5.6: one montage = its seed + song; a plan chosen again (preview, fill round, re-render) is the same montage and never counts twice in the history."""
+    return f"{plan.get('seed')}|{(plan.get('song') or {}).get('path')}"
+
+
+def sky_pattern_history(skip_key=None):
+    """V9.5.6: the patterns of the last SKY_HIST_N montages, newest last (the entry of `skip_key` left out)."""
+    h = load_json(SKY_PATTERN_HISTORY, [])
+    h = [x for x in (h if isinstance(h, list) else []) if isinstance(x, dict) and x.get("p") in SKY_PATTERNS]
+    return [x["p"] for x in h if skip_key is None or x.get("k") != skip_key][-SKY_HIST_N:]
+
+
+def sky_pattern_history_add(pat, key=None):
+    """V9.5.6: remember the pattern of a finished choice (the last SKY_HIST_N are kept; the same montage replaces its own entry)."""
     try:
-        e = max(0.0, min(1.0, float(song.get("energy") if song.get("energy") is not None else 0.6)))
+        h = load_json(SKY_PATTERN_HISTORY, [])
+        h = [x for x in (h if isinstance(h, list) else []) if isinstance(x, dict) and x.get("p") in SKY_PATTERNS and (key is None or x.get("k") != key)]
+        save_json(SKY_PATTERN_HISTORY, (h + [{"p": pat, "k": key}])[-SKY_HIST_N:])
+    except Exception as ex:                                  # noqa: BLE001
+        LOGONLY(f"sky pattern history not saved ({type(ex).__name__}: {ex})")
+
+
+def sky_odds_bounded(p, lo=SKY_PAT_MIN, hi=SKY_PAT_MAX):
+    """V9.5.6: odds (list summing to 1) held to [lo, hi] each: every value is q x k clipped into the range, k found so that they add up to 1 (the order and the lead of the strong ones is kept)."""
+    n = len(p)
+    tot = float(sum(p)) or 1.0
+    q = [x / tot for x in p]
+    if lo * n > 1.0 or hi * n < 1.0:
+        return [1.0 / n] * n
+    k0, k1 = 0.0, 1e9
+    for _ in range(200):
+        k = 0.5 * (k0 + k1)
+        if sum(min(hi, max(lo, x * k)) for x in q) < 1.0:
+            k0 = k
+        else:
+            k1 = k
+    r = [min(hi, max(lo, x * k1)) for x in q]
+    t = sum(r)
+    return [x / t for x in r]
+
+
+def sky_pattern_for(plan, history=None):
+    """V8.8.5 / V9.5.6: the ONE sky pattern of a montage (SKY_PATTERNS), chosen once per montage and reused by every take. Preference scores come from the song's real energy (the value Auto style uses),
+    its tempo and its cover colour family. They become odds (SKY_PICK_MIX, SKY_PICK_TAU), the pattern used last x0.25 and the one before x0.6 (history of the last 5 montages), then every pattern is held
+    to 15 .. 40 %. The draw uses the MONTAGE seed, so the same song can get another pattern in another render. Returns (pattern, why); plan['xfx_sky_pattern_log'] gets the full odds line."""
+    song = plan.get("song") or {}
+    e_src = "song energy: CSV, else song map"
+    try:
+        e0 = plan.get("song_energy")
+        if e0 is None:
+            e0, e_src = song.get("energy"), "plan song"
+        if e0 is None:
+            e0, e_src = 0.6, "default (not in the plan)"
+        e = max(0.0, min(1.0, float(e0)))
     except (TypeError, ValueError):
-        e = 0.6
+        e, e_src = 0.6, "default (not readable)"
     try:
         b = max(60.0, min(200.0, float(song.get("bpm") or 120.0)))
     except (TypeError, ValueError):
         b = 120.0
-    try:
-        d = float(song.get("dance")) if song.get("dance") is not None else 0.6
-    except (TypeError, ValueError):
-        d = 0.6
     cover = None
     try:
         tone_, _w = sky_cover_tone(song.get("path"))
@@ -15895,19 +16051,40 @@ def sky_pattern_for(plan):
             cover = sky_family_from_hue(_hue_deg(rgb_)) if rgb_ is not None else None
     except Exception:                                      # noqa: BLE001
         cover = None
-    ident = " | ".join(" ".join(str(song.get(k_) or "").casefold().split()) for k_ in ("artist", "title")) if (song.get("title") or song.get("artist")) else Path(str(song.get("path") or "")).stem.casefold()
+    ident = _sky_ident(song) if (song.get("title") or song.get("artist")) else Path(str(song.get("path") or "")).stem.casefold()
     sc = {}
     for p_, (pe, pb, pcov) in SKY_PATTERN_FEEL.items():
         s_ = 1.0 - 1.2 * abs(e - pe) - abs(b - pb) / 80.0 + (0.15 if cover in pcov else 0.0)
-        if p_ == "rings":
-            s_ += 0.10 * (d - 0.6)
         jit = int(hashlib.md5(f"{ident}#{p_}".encode("utf-8")).hexdigest()[:8], 16) / float(16 ** 8)
         sc[p_] = s_ + (0.0 if SKY_PICK_SPREAD[0] else SKY_PATTERN_JITTER * jit)
-    if SKY_PICK_SPREAD[0]:                                 # V8.8.8: a weighted pick (the song's preference + an even share) by the song's own fixed number: every pattern is used across a library
+    seed = plan.get("seed")
+    odds_txt = ""
+    if SKY_PICK_SPREAD[0]:
+        hist = sky_pattern_history(sky_pattern_key(plan)) if history is None else [x for x in history if x in SKY_PATTERNS][-SKY_HIST_N:]
         ws = [math.exp(sc[p_] / SKY_PICK_TAU) for p_ in SKY_PATTERNS]
-        best = _sky_weighted_pick(list(SKY_PATTERNS), ws, _sky_song_u(ident, "pattern"))
+        tot = float(sum(ws)) or 1.0
+        before = [SKY_PICK_MIX * w / tot + (1.0 - SKY_PICK_MIX) / len(SKY_PATTERNS) for w in ws]
+        mul = [1.0] * len(SKY_PATTERNS)
+        for k_, m_ in enumerate(SKY_HIST_MUL):                 # k 0 = the pattern used last, 1 = the one before
+            if len(hist) > k_:
+                mul[SKY_PATTERNS.index(hist[-1 - k_])] *= m_
+        aft = [x * m for x, m in zip(before, mul)]
+        aft = [x / sum(aft) for x in aft]
+        fin = sky_odds_bounded(aft)
+        u = random.Random(f"sky-pattern|{seed if seed is not None else ident}").random()
+        c, best = 0.0, SKY_PATTERNS[-1]
+        for nm, pr in zip(SKY_PATTERNS, fin):
+            c += pr
+            if u < c:
+                best = nm
+                break
+        pc = lambda v: ", ".join(f"{n_} {x * 100:.0f}%" for n_, x in zip(SKY_PATTERNS, v))
+        odds_txt = (f"SKY PATTERN {best}: energy {e:.2f} ({e_src}), {b:.0f} BPM" + (f", cover {cover}" if cover else "") + f", montage seed {seed}, draw {u:.3f}; scores "
+                    + ", ".join(f"{p_} {sc[p_]:.2f}" for p_ in SKY_PATTERNS) + f"; odds before history {pc(before)}; after history {pc(aft)} (last used: {', '.join(hist[::-1]) or 'none'}); "
+                    f"after the {SKY_PAT_MIN * 100:.0f}-{SKY_PAT_MAX * 100:.0f}% limits {pc(fin)}")
     else:
         best = max(SKY_PATTERNS, key=lambda p_: (sc[p_], p_))
+    plan["xfx_sky_pattern_log"] = odds_txt
     return best, f"energy {e:.2f}, {b:.0f} BPM" + (f", cover {cover}" if cover else "") + f" -> {best} ({', '.join(f'{p_} {sc[p_]:.2f}' for p_ in SKY_PATTERNS)})"
 
 
@@ -16307,6 +16484,9 @@ def xfx_probe_sky(plan, tmpdir=None):
     fam, fam_why = sky_family_for(plan, ranked, qual)      # V8.8.3: ONE colour family for every sky of the montage (song vibe or cover art), chosen once
     pat, pat_why = sky_pattern_for(plan)                   # V8.8.5: ONE pattern for every sky of the montage (from the song: tempo, energy, vibe, cover), chosen once
     plan["xfx_sky_pattern"] = pat
+    if plan.get("xfx_sky_pattern_log"):
+        out(plan["xfx_sky_pattern_log"])                       # V9.5.6: the chosen pattern, odds before / after history and limits, energy, seed (once per montage)
+    sky_pattern_history_add(pat, sky_pattern_key(plan))
     plan["xfx_sky_fam"] = fam                              # V9.3.0: the intro's sky-coloured looks use this very family
     order = sorted(qual, key=lambda c: (-int(c["x"].get("prio", 0)), -c["cov"]))
     if any(c["x"].get("drop_i") is not None for c in qual):           # V8.8 (CS2 / R6S): first the best sky kill of EVERY drop (headline, then the strongest beat), then the rest by role
@@ -16362,7 +16542,7 @@ def xfx_probe_sky(plan, tmpdir=None):
                 if r_ is None:
                     want.append(c)
                     kept_s.append(gp)
-                elif r_[2] is None and not r_[1][2]["bad"] > SKY_MAX_BAD * max(1, r_[1][2]["window"]):
+                elif r_[2] is None and not r_[1][2]["bad"] > SKY_MAX_BAD * max(1, r_[1][2]["window"]) and not sky_take_reject(c, r_[1][2]):
                     kept_s.append(gp)
             if not want:
                 break
@@ -16386,6 +16566,9 @@ def xfx_probe_sky(plan, tmpdir=None):
                 mp, an_, st = mask_one(c, x)
             if st["bad"] > SKY_MAX_BAD * max(1, st["window"]):                           # V8.6.2: a wrong sky is worse than none
                 raise RuntimeError(f"the sky mask was a wall in {st['bad']} of {st['window']} frames of the take - no sky for this take")
+            why_rej = sky_take_reject(c, st)                                             # V9.5.6: the tracked sky grew far past the detected one / the horizon is low: no recolour for this take
+            if why_rej:
+                raise RuntimeError(why_rej)
             x.update({"ok": True, "mask": str(mp), "hue": fam, "hue_why": fam_why, "grade": sky_family_grade(fam, st["mean_y"]), "alt_hue": fam if an_["jump"] > 0 else None,
                       "mask_cov": round(st["cov"], 3), "grad": "family", "held": st["held"], "palette_rgb": SKY_FAMILIES[fam][0]})
             kept.append(gp)
