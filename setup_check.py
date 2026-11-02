@@ -265,14 +265,12 @@ def check_settings():
         n = count_files(mp3, AUDIO_EXT)
         (ok if n else bad)(f"MP3 folder: {mp3}  ({n} song file{'s' if n != 1 else ''})",
                            None if n else "put your songs there (mp3 / flac / m4a / wav / ogg / opus)")
-    pl = str(cfg.get("playlist_dir") or "").strip() or str(DATA / "playlist")
-    csvs = sorted(Path(pl).glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if os.path.isdir(pl) else []
-    if not os.path.isdir(pl):
-        bad(f"Exportify CSV folder not found: {pl}", "Settings > Folders > Exportify CSV folder (see README: Songs)")
-    elif not csvs:
-        bad(f"no Exportify CSV in {pl}", "export your Spotify playlist at https://exportify.app and save the .csv there")
+    pl = str(cfg.get("playlist_dir") or "").strip()                       # V9.5.5: a playlist CSV is optional: the songs folder alone is enough
+    csvs = sorted(Path(pl).glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if pl and os.path.isdir(pl) else []
+    if csvs:
+        ok(f"Playlist CSV: {csvs[0].name} (the newest .csv in {pl} is used)")
     else:
-        ok(f"Exportify CSV: {csvs[0].name} (the newest .csv in {pl} is used)")
+        ok("no playlist CSV (optional): the songs in the MP3 folder are used directly")
 
     section("Output")
     outr = str(cfg.get("output_root") or "").strip()

@@ -2,6 +2,11 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.5.5 - 2026-11-02: Songs work without a playlist CSV
+- A folder of MP3s is all you need now: the playlist CSV is optional, and songs the CSV does not list are used like any other song
+- More songs find their playlist entry, including files named "Artist - Title"
+- New in Settings: mark a montage as published to move its clips out of your library for good, with an undo
+
 ## V9.5.4 - 2026-10-31: Pick YouTube downloads by hand
 - Songs the downloader is unsure about now show their best choices with a link to listen first and a "Download this" button
 - You can also paste any YouTube link for a song and download it

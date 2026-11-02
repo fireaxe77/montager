@@ -44,7 +44,7 @@ Montager turns your own Valorant, CS2 and Rainbow Six Siege clips into kill mont
 | OCR engine | RapidOCR (the `rapidocr-onnxruntime` package). Runs offline on the CPU; no separate install. |
 | GPU (optional) | An NVIDIA GPU makes rendering faster (NVENC). The installed app switches to x264 by itself when there is no working NVIDIA encoder (slower, same result); the Python version: pick Quality "Max (x264)". |
 | Disk / RAM | Space for the montages (about 100 to 400 MB each). 16 GB RAM recommended: a long render with effects can use about 10 GB. |
-| Songs | Your own audio files plus a playlist CSV from [Exportify](https://exportify.app) (see [Songs](#1-songs)). |
+| Songs | Your own audio files. A playlist CSV from [Exportify](https://exportify.app) is optional (see [Songs](#1-songs)). |
 
 More detail: [docs/guides/INSTALL.md](docs/guides/INSTALL.md).
 
@@ -87,7 +87,7 @@ Everything below is in Montager's **Settings** tab. Changes are saved as you mak
 ### 1. Songs
 
 - **MP3 folder**: the folder with your songs. Files named **`<title> - <artists>.mp3`**, for example `Ocean City - Klaas.mp3`. Several artists: `Title - Artist A, Artist B.mp3`. mp3, flac, m4a, wav, ogg and opus all work. Tags inside the file (title / artist) are used when present.
-- **Exportify CSV folder**: the folder with your playlist CSV. Montager reads the newest `.csv` in it.
+- **Playlist CSV folder (optional)**: the folder with a playlist CSV. Montager reads the newest `.csv` in it. Without a CSV (no Spotify needed) every file in the MP3 folder is a song and its tempo, energy and drops come from Montager's own analysis; the date a file was created counts as "added".
   1. Open [exportify.app](https://exportify.app) and log in with Spotify.
   2. Click **Export** next to the playlist that holds your montage songs.
   3. Save the `.csv` into the Exportify CSV folder (it can be the same folder as the songs).
@@ -177,7 +177,7 @@ Prefer to choose yourself? Use the **Manual** tab:
 
 | Section | What's there |
 |---|---|
-| Folders | MP3 folder, Exportify CSV folder, output folder, moved-clips folder, clip folders per game |
+| Folders | MP3 folder, playlist CSV folder (optional), output folder, moved-clips folder, published-clips folder, clip folders per game |
 | Scanning and detection | max clip size / length, how many clips Auto scans per run, fuzzy name match, "no kills after my death" window, what "this week" means |
 | Killfeed region | the saved region per game and which clips were scanned with it (calibration itself is in Troubleshoot) |
 | Game audio | the game audio level under the music (per game) and which audio track of a clip is the game sound (Auto = the one with the most gunshots, or track 1 / 2 / 3) |
@@ -226,7 +226,7 @@ Prefer to choose yourself? Use the **Manual** tab:
 | NVENC test fails | Update the NVIDIA driver, or choose Quality "Max (x264)". |
 | 0 kills found | Check the player names (exactly as in the killfeed), run Self-test detection, then [calibrate](#killfeed-calibration). |
 | Songs missing or "unmatched" | Check the Songs tab: the file name / tags and the CSV must share the title and an artist. "Change match" fixes one by hand. |
-| No CSV found | Settings > Exportify CSV folder must hold the `.csv`; the newest one is used. |
+| No CSV found | Nothing to fix: the CSV is optional. To use one, Settings > Playlist CSV folder must hold the `.csv`; the newest one is used. |
 | Render is slow or runs out of memory | Close other heavy apps; use Effects "Default" and/or a shorter length. |
 | Something else | Troubleshoot > **Open logs** (`montage_data\logs\montage.log`). Include the end of it when you report a problem. |
 
