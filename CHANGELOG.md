@@ -5,6 +5,11 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 
 **Rule:** every new version must add an entry at the top of this file (see CLAUDE.md).
 
+## V9.5.7 - 2026-11-02
+A kill row that is already on screen when its clip starts (rule "pre-clip": a kill from before the clip) is a stale row, never a kill of the clip: it is ignored, a multikill is never dropped for it. Replaces the V9.5.6 "start the take later" handling.
+- `SEEN_PRE_IGNORE_ON`: `clip_seen_rows` leaves pre-clip rows out (both detection layouts) and `seen_rows_audit` skips them (so events cached by older versions are covered too, and `seen_rows_doomed` no longer drops them before planning). Removed: `seen_min_start` and its check in `geom`, `SEEN_PRE_NAME_ON`, `SEEN_PRE_START_ON`, `SEEN_PRE_SLACK_S`. Rows that are not stale still fail as before.
+- Tests: `tests/test_v957.py` (`V957_PARTS=0,1`). `tests/test_v956.py` part 2 tested the removed handling and is frozen.
+
 ## V9.5.6 - 2026-11-02
 Sky pattern choice, pre-clip kill rows, sky mask. Detection, effects' looks and the patterns' own drawing are untouched.
 - `sky_pattern_for`: the odds now use the plan's real song energy (`plan["song_energy"]` = `song_energy_of`, the value Auto style reads: CSV, else the song map; it was always the default 0.60), the draw is seeded by the MONTAGE seed (not a hash of artist + title), the pattern used last gets x0.25 and the one before x0.6 (`montage_data\sky_pattern_history.json`, last 5, keyed by seed + song so a plan chosen again never counts twice), then every pattern is held to 15 .. 40 % (`sky_odds_bounded`). One `SKY PATTERN` log line: pattern, energy, seed, draw, scores, odds before history / after history / after the limits.
