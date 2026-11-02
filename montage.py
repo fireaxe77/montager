@@ -62,7 +62,7 @@ import published                                   # V9.5.5: published montages 
 
 PERF_T0 = time.perf_counter()                    # ~process start (after the stdlib imports above); perflog times count from here
 
-APP_VERSION = "V9.5.6"
+APP_VERSION = "V9.5.7"
 ACCENTS = ("lime", "yellow", "orange", "red", "pink", "purple")      # V5.57 theme choices
 BASES = ("grey", "black")
 AUDIO_MODES = {"auto": "Auto (V5.56)", "legacy": "Legacy (V5.55)"}
@@ -5187,9 +5187,7 @@ CS2_LOCK_ROW_ON = [True]         # V9.1.3: a CS2 outlined kill row that reads my
 SEEN_GUARD_ON = [True]           # V9.1.3 switch: CS2 / R6S takes carry the clip's kill rows of mine (counted or not) for the CUT LIST CHECK
 SEEN_NOT_KILL = ("death", "victim side", "suspicious", "assist", "not mine", "other player", "utility", "gadget", "shifted up", "same victim",
                  "same row", "same-timestamp", "no readable name", "revive")       # rejections that say the row is NOT a kill of mine (or a copy of a counted one)
-SEEN_PRE_NAME_ON = [True]        # V9.5.6 switch: a pre-clip row whose name was not read as mine is not an uncounted kill row of mine (the kill count never counted it either)
-SEEN_PRE_START_ON = [True]       # V9.5.6 switch: a take starts after the pre-clip row at the start of its clip has faded (seen_min_start) instead of the clip being dropped
-SEEN_PRE_SLACK_S = 0.2           # V9.5.6: the last part of the fade (shorter than SEEN_MIN_S) may still be on screen at the take start
+SEEN_PRE_IGNORE_ON = [True]      # V9.5.7 switch: a kill row that is already on screen when the clip starts (rule "pre-clip": a kill from before the clip) is a stale row, not a kill of the clip: it never fails the check, never drops a clip
 SEEN_MIN_S = 0.25                # V9.1.3: an uncounted row must be on screen at least this long inside a take to fail the check
 SEEN_MATCH_S = 0.6               # V9.1.3: a take kill this close to a row's first frame is that row's kill
 
@@ -5218,8 +5216,8 @@ def clip_seen_rows(a, kills, rej=()):
                 out_.append({"t": round(min(k["t"], t0), 3), "t_last": tl, "victim": k.get("victim", ""), "rule": None})
                 continue
             why = why_at(t0) or "not in the kill list"
-            if "pre-clip" in why and SEEN_PRE_NAME_ON[0] and not d["cls"].get("name_read", True):
-                continue                                        # V9.5.6: the same rule as the kill count (an unread name is not proven to be mine): an old row of unproven owner is not a row of mine
+            if SEEN_PRE_IGNORE_ON[0] and "pre-clip" in why:
+                continue                                        # V9.5.7: a stale row from before the clip: ignored
             if not any(w in why.lower() for w in SEEN_NOT_KILL):
                 out_.append({"t": round(t0, 3), "t_last": tl, "victim": d["cls"]["vtext"], "rule": why})
         for k in kills:                                         # kills the border list took from the name scan
@@ -5234,6 +5232,8 @@ def clip_seen_rows(a, kills, rej=()):
                 out_.append({"t": round(k["t"], 3), "t_last": round(float(k.get("t_last", k["t"] + 1.0)), 3), "victim": k.get("victim", ""), "rule": None})
                 continue
             why = why_at(m["t"]) or "not in the kill list"
+            if SEEN_PRE_IGNORE_ON[0] and "pre-clip" in why:
+                continue                                        # V9.5.7: a stale row from before the clip: ignored
             if not any(w in why.lower() for w in SEEN_NOT_KILL):
                 out_.append({"t": round(m["t"], 3), "t_last": round(m["t"] + 1.0, 3), "victim": (m.get("row") or "").rsplit("[", 1)[-1].rstrip("]"), "rule": why})
     out_.sort(key=lambda r: r["t"])
@@ -10487,9 +10487,6 @@ def geom(ev, U, c, kb, end, ramp, slow, ending=False, ext=True, anchor="first", 
     cover = lead_t if r == 1.0 else 1.0 + (lead_t - 1.0) * r
     if first - min(ev.get("rows") or ev["times"]) > cover - 0.05:                   # killfeed row must be inside the footage
         return None
-    ms_ = seen_min_start(ev)
-    if ms_ is not None and first - cover < ms_ - 1e-6:                              # V9.5.6: the previous kill's row (from before the clip) must have faded when the take starts
-        return None
     dmax = (ev["death_after"] - 0.05) if ev.get("death_after") is not None else 99.0
     post = min(ev["post"], dmax)
     if (slow or ending) and (ev.get("unsure") or [False])[-1]:
@@ -13466,8 +13463,9 @@ def seen_rows_audit(t):
     def same_vic(a, b):
         return bool(a and b and (cs2_same_victim(a, b) or ocr_ratio(a, b) >= 80))
     for r in t["seen"]:
-        if "pre-clip" in (r.get("rule") or "") and any(o.get("clip") != r.get("clip") and o["t"] < r["t"] and (same_vic(o.get("victim"), r.get("victim"))
-                                                       or (SEEN_PRE_START_ON[0] and float(o.get("t_last", o["t"])) >= r["t"] - 0.5))      # V9.5.6: or the earlier clip's row is still on screen at that moment (a garbled name can not tell)
+        if SEEN_PRE_IGNORE_ON[0] and "pre-clip" in (r.get("rule") or ""):
+            continue                                       # V9.5.7: a row already on screen when its clip starts is a stale row of a kill from before the clip, never a kill of this take (also in events cached before)
+        if "pre-clip" in (r.get("rule") or "") and any(o.get("clip") != r.get("clip") and o["t"] < r["t"] and same_vic(o.get("victim"), r.get("victim"))
                                                        for o in t["seen"]):
             continue                                       # a stitched clip's pre-clip row is the earlier clip's row still on screen: that row is judged there
         vis = sum(max(0.0, min(sg[1], r["t_last"]) - max(sg[0], r["t"])) for sg in segs if own(sg, r))
@@ -13482,24 +13480,6 @@ def seen_rows_audit(t):
             msgs.append(f"the kill row of the kill at {min(mine):.2f}s ([{r.get('victim') or '?'}]) is on screen from {r['t']:.2f}s, before the take starts ({segs[0][0]:.2f}s): "
                         "the take shows the row, then a kill that already happened")
     return msgs
-
-
-def seen_min_start(ev):
-    """V9.5.6: the earliest time (the event's timeline) a take of this event may start: a kill row of mine from BEFORE the clip (rule 'pre-clip', the previous kill still on screen when
-    the clip starts) must have faded (all but its last SEEN_PRE_SLACK_S) before the take starts. Only rows of the clip the take starts in count. None = no such row."""
-    if not SEEN_PRE_START_ON[0] or not ev.get("seen"):
-        return None
-    parts = ev.get("parts") or []
-    first_clip = Path(parts[0]["path"]).name if parts and parts[0].get("path") else None
-    ms = None
-    for r in ev["seen"]:
-        if "pre-clip" not in (r.get("rule") or "") or (first_clip and r.get("clip") and r["clip"] != first_clip):
-            continue
-        if r["t"] > float(ev["times"][0]):
-            continue
-        v = float(r["t_last"]) - SEEN_PRE_SLACK_S
-        ms = v if ms is None else max(ms, v)
-    return ms
 
 
 SEEN_PRECHECK_ON = [True]          # V9.2.0 switch: events whose kill-row check fails on the footage EVERY take of them must show are left out before planning

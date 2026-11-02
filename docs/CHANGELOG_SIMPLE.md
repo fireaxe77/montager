@@ -2,6 +2,9 @@
 
 Newest first. This is the history shown in Settings. Technical details are in CHANGELOG.md.
 
+## V9.5.7 - 2026-11-02: Multikills are no longer dropped for an old kill row
+- A kill row left over from before a clip starts is simply ignored: your two- and three-kill clips stay in the montage
+
 ## V9.5.6 - 2026-11-02: Sky patterns vary again
 - The sky pattern now changes from montage to montage, and the one you got last time is less likely to come back
 - More of your two- and three-kill clips make it into CS2 montages when your previous kill is still on screen
