@@ -16,7 +16,7 @@ It only reads and lists every problem with its fix. Inside the app: **Troublesho
 
 1. **Player names** (Settings > Player names): exactly as the killfeed shows them. Several names separated by `;`.
 2. **Troubleshoot > Self-test detection**: shows the rows the OCR read in your scanned clips and why each counted or not.
-3. **Killfeed region**: if Self-test reads few or no rows, calibrate it (README > [Killfeed calibration](../../README.md#killfeed-calibration)).
+3. **Killfeed region**: if Self-test reads few or no rows, calibrate it ([User guide > Killfeed calibration](USER_GUIDE.md#killfeed-calibration)).
 4. **Black bars**: 4:3 / stretched recordings need Troubleshoot > Black bars > Re-measure.
 5. **Clip limits**: clips over 60 s or 60 MB are skipped by default (Settings > Scanning and detection).
 6. **Rescan one clip**: Troubleshoot > Clips > pick the clip > Rescan this clip.
