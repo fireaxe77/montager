@@ -26,8 +26,8 @@ It only reads and lists every problem with its fix. Inside the app: **Troublesho
 
 | Symptom | Fix |
 |---|---|
-| "no Exportify CSV" | Put the `.csv` from exportify.app into the Exportify CSV folder (Settings > Folders). The newest one is used. |
-| Song not in the list | It needs both a file in the MP3 folder and a row in the CSV with the same title and at least one same artist. Songs tab > "Change match for selected file" matches by hand. |
+| "No CSV" / no playlist CSV | Nothing to fix: the CSV is optional and the MP3 folder alone is enough. To use a playlist, put the `.csv` from exportify.app into the playlist CSV folder (Settings > Folders); the newest one is used. Download new songs and Add covers and tags need it. |
+| Song not in the list | Every supported audio file in the MP3 folder is a song. Check it is in that folder (sub-folders are included). With a CSV the Songs tab shows "not in CSV" for a file without a row; that file still works. Songs tab > "Change match for selected file" matches by hand. |
 | A song is flagged CHECK | The match is uncertain (score under 85). Play it, then fix it with Change match if it is wrong. |
 | Wrong tempo / drops | Songs tab > Song map of selected file shows what was detected. |
 

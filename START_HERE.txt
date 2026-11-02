@@ -15,7 +15,7 @@ MONTAGER V9.5.7 - kill montages from your own Valorant, CS2 and Rainbow Six Sieg
    checks your setup (read-only) and lists anything still missing, then opens Montager.
 
 5. In Montager > Settings:
-   - MP3 folder: your songs, named "<title> - <artists>.mp3"
+   - MP3 folder: your songs, named "<title> - <artists>.mp3" (or "<artist> - <title>.mp3"); a folder of songs is all you need
    - Playlist CSV folder (optional): a playlist .csv from https://exportify.app (not needed: the MP3 folder alone is enough)
    - Valorant / CS2 / R6S clip folders: where your recorder saves clips
    - Player names: your in-game name exactly as the killfeed shows it
@@ -23,6 +23,9 @@ MONTAGER V9.5.7 - kill montages from your own Valorant, CS2 and Rainbow Six Sieg
 
 6. Troubleshoot > Scan all clips now (first time only; roughly 7-17 s per clip, cached afterwards).
    Then Auto tab > Dry plan, Preview, and "Make this week's montage".
+
+7. Uploaded a montage and made it public? Settings > Published montages > "Mark montage as published..." moves its clips out of your
+   clip folders so they are never used again ("Unmark published..." puts them back).
 
 Full guide: README.md (or https://github.com/fireaxe77/montager).
 Problems: docs\guides\TROUBLESHOOTING.md, or run "python setup_check.py" in this folder.

@@ -35,7 +35,7 @@ Check: `ffmpeg -version` prints a version line.
 
 From the Montager folder:
 ```bash
-python -m pip install --user numpy opencv-python Pillow librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime sv-ttk psutil fonttools
+python -m pip install --user numpy opencv-python Pillow librosa soundfile scipy mutagen rapidfuzz rapidocr-onnxruntime sv-ttk psutil fonttools yt-dlp
 ```
 
 | Package | Needed for | Required? |
@@ -50,6 +50,7 @@ python -m pip install --user numpy opencv-python Pillow librosa soundfile scipy 
 | sv-ttk | the dark Sun Valley theme | recommended (a plain theme is used without it) |
 | psutil | free-memory readings during renders | recommended |
 | fonttools | fallback font for titles in other alphabets | recommended |
+| yt-dlp | Songs tab > Download new songs (needs a playlist CSV) | optional |
 | Send2Trash | the trash icon uses the Recycle Bin through it | optional (works without it) |
 
 If a required package is missing, Montager offers to install it when it starts.
@@ -86,5 +87,5 @@ You can also start Montager directly with `Montager.vbs`, or `python montage.py`
 ## Where your data lives
 
 Everything Montager stores is in `montage_data\` next to `montage.py`: settings (`config.json`), scan caches, song maps,
-used-clip flags, logs. Your clips and songs are only read, never changed (except the move / trash icons in the clip list,
-which act only when you click them). To start over, close Montager and rename `montage_data`.
+used-clip flags, logs. Your clips and songs are only read, never changed (except the move / trash icons in the clip list and
+Settings > Published montages, which move clips only when you click them). To start over, close Montager and rename `montage_data`.

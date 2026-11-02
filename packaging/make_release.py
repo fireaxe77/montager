@@ -235,7 +235,7 @@ def notes(ver, untagged):
              f"- [{ASSETS['python']}]({base}/{ASSETS['python']}): the plain Python version (needs Python 3.12 + FFmpeg; see `START_HERE.txt`).",
              "", "Python, FFmpeg and the OCR engine are included in the installer and the portable ZIP. Your settings and caches live in "
              "`%LOCALAPPDATA%\\Montager` and survive updates and uninstalling.",
-             "", "First start: Montager lists what is still missing (clip folders, songs + Exportify CSV, your in-game name). "
+             "", "First start: Montager lists what is still missing (clip folders, songs, your in-game name; a playlist CSV is optional). "
              "Guide: [README](https://github.com/fireaxe77/montager#readme)."]
     if untagged:
         lines += ["", f"_The download is built from main, which has small fixes after the v{ver} tag._"]

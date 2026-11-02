@@ -6,7 +6,7 @@ Montager turns your own Valorant, CS2 and Rainbow Six Siege clips into kill mont
 - **Cut to the music:** every song gets a beat map (beats, sections, drops); kills land on beats and every drop gets a strong clip.
 - **Effects:** slow-mo, speed ramps, zooms, flashes, transitions, sky recolour, and an intro title and outro, all chosen per montage.
 - **Modes:** fully automatic (one montage per game per week) or Manual (you tick clips and pick the song).
-- **Local:** runs on your Windows PC. Your clips are never changed and nothing is uploaded.
+- **Local:** runs on your Windows PC. Nothing is uploaded. Your clips are only touched when you click a move icon or mark a montage as published (they are moved, never edited).
 
 <p align="center"><img src="docs/images/demo.gif" alt="Montager demo" width="320"></p>
 
@@ -86,14 +86,16 @@ Everything below is in Montager's **Settings** tab. Changes are saved as you mak
 
 ### 1. Songs
 
-- **MP3 folder**: the folder with your songs. Files named **`<title> - <artists>.mp3`**, for example `Ocean City - Klaas.mp3`. Several artists: `Title - Artist A, Artist B.mp3`. mp3, flac, m4a, wav, ogg and opus all work. Tags inside the file (title / artist) are used when present.
-- **Playlist CSV folder (optional)**: the folder with a playlist CSV. Montager reads the newest `.csv` in it. Without a CSV (no Spotify needed) every file in the MP3 folder is a song and its tempo, energy and drops come from Montager's own analysis; the date a file was created counts as "added".
+- **MP3 folder**: the folder with your songs. mp3, flac, m4a, wav, ogg and opus all work. Name the files **`Title - Artist.mp3`** (for example `Ocean City - Klaas.mp3`; several artists: `Title - Artist A, Artist B.mp3`) or `Artist - Title.mp3`. Title and artist tags inside the file are used when present.
+- **A folder of songs is all you need.** There is no Spotify or CSV requirement: every file in the MP3 folder is a normal song. Its title and artist come from the tags (else the file name), its length from the file, its tempo, energy and drops from Montager's own song analysis, and the date the file was created counts as "added" (so recent songs are preferred).
+- **Playlist CSV folder (optional):** if you also keep a Spotify playlist, you can point Montager at a playlist `.csv` and it will use that playlist's tempo, energy and "date added". Montager reads the newest `.csv` in the folder.
   1. Open [exportify.app](https://exportify.app) and log in with Spotify.
   2. Click **Export** next to the playlist that holds your montage songs.
-  3. Save the `.csv` into the Exportify CSV folder (it can be the same folder as the songs).
-- The CSV supplies the tempo, energy and "date added" of each song. A song needs **both** a file and a CSV row (title + an artist must match) to be used.
-- Check the result in the **Songs** tab: each file, the playlist track it matched, and a flag for anything to check.
-- Songs are newest-first: Auto prefers the songs added most recently to the playlist.
+  3. Save the `.csv` into the playlist CSV folder (it can be the same folder as the songs).
+- With a CSV, files are matched to its rows by title and artist (either name order). A file with no row is still a normal song and shows **not in CSV**. If a match is wrong, **Change match** fixes it by hand.
+- The **Songs** tab lists your songs with a search box, tempo, length and date added, and **Song map of selected file...**. With a CSV it also shows the matched playlist track, a score and a flag for anything to check. Without a CSV those columns, the CSV buttons and every Spotify wording are hidden.
+- **Download new songs** and **Add covers and tags to existing songs** (Songs tab) only work with a CSV; without one they are switched off and nothing else needs them. "Download new songs" fetches missing songs from YouTube; songs it is not sure about are listed so you can pick one by hand.
+- Songs are newest-first: Auto prefers the songs added most recently.
 
 ### 2. Clip folders
 
@@ -178,6 +180,7 @@ Prefer to choose yourself? Use the **Manual** tab:
 | Section | What's there |
 |---|---|
 | Folders | MP3 folder, playlist CSV folder (optional), output folder, moved-clips folder, published-clips folder, clip folders per game |
+| Published montages | **Mark montage as published...** and **Unmark published...** (see [Published montages](#published-montages)) |
 | Scanning and detection | max clip size / length, how many clips Auto scans per run, fuzzy name match, "no kills after my death" window, what "this week" means |
 | Killfeed region | the saved region per game and which clips were scanned with it (calibration itself is in Troubleshoot) |
 | Game audio | the game audio level under the music (per game) and which audio track of a clip is the game sound (Auto = the one with the most gunshots, or track 1 / 2 / 3) |
@@ -187,6 +190,20 @@ Prefer to choose yourself? Use the **Manual** tab:
 | General | check for updates on start (git installs only; off by default) |
 
 - **Move-to-folder icon** (clip list, arrow): moves a clip out of your clip folders into the "Moved clips" folder, so no montage uses it again.
+
+### Published montages
+
+Used a montage? Clips used in a montage are only flagged "used". If you uploaded a montage and made it public, you can make sure its clips are **never used again**:
+
+1. Settings > **Published montages** > **Mark montage as published...**, then pick the montage video file.
+2. Montager finds the clips that montage really used (every file of a stitched take, not clips you only ticked) and shows a **preview that changes nothing**: the montage found, its date and length, how many clips, and which files would move.
+3. Click **Apply (move the clips)**. The clip files are **moved** (never edited, never overwritten; a name clash gets a suffix) into the published-clips folder, one subfolder per game. The default is `Published clips` inside your clip root, for example `E:\Movies\Published clips\<game>\`; change it under Settings > Folders > **Published clips folder**. That folder is never scanned, so published clips are left out of every clip list and no mode (Auto, weekly, Manual or the "reuse used clips" fallback) can pick them.
+4. **Unmark published...** moves the clips of a montage back to their original folders and uses them again.
+5. Every Apply and Unmark is written to `montage_data\logs\published.log`.
+
+- Only that montage's clips move. Other clips of the same game stay where they are.
+- Montager matches clips by file, so a *second copy* of the same recording under another name is a different clip: remove such copies yourself.
+- Montager keeps a small record of every montage it renders (`montage_data\montage_records.json`); for older montages it rebuilds the clip list from `montage.log`.
 - **High performance UI mode** (Settings > Appearance): the same app with a flat, lighter theme for slower PCs.
 
 ## Calibration and limitations
@@ -214,7 +231,6 @@ Prefer to choose yourself? Use the **Manual** tab:
 - Very long clips (over 60 s) are skipped by default; raise the limit in Settings if you need them.
 - The first scan of a big library takes hours (once).
 - R6S: clips are scanned only when they are picked or ticked (at most 12 new ones per automatic run).
-- No installer; Python and FFmpeg are installed separately.
 
 ## Troubleshooting
 
@@ -225,8 +241,9 @@ Prefer to choose yourself? Use the **Manual** tab:
 | `ffmpeg not found` | Install it (step 2), then open a **new** terminal / restart Montager. Or put `ffmpeg.exe` + `ffprobe.exe` into `montage_data\bin`. |
 | NVENC test fails | Update the NVIDIA driver, or choose Quality "Max (x264)". |
 | 0 kills found | Check the player names (exactly as in the killfeed), run Self-test detection, then [calibrate](#killfeed-calibration). |
-| Songs missing or "unmatched" | Check the Songs tab: the file name / tags and the CSV must share the title and an artist. "Change match" fixes one by hand. |
-| No CSV found | Nothing to fix: the CSV is optional. To use one, Settings > Playlist CSV folder must hold the `.csv`; the newest one is used. |
+| A song is missing, or shows "not in CSV" | Every file in the MP3 folder is a song, with or without a CSV. With a CSV, the file name / tags and the CSV row must share the title and an artist to be matched to it; "not in CSV" only means no row was found. **Change match** fixes one by hand. Check the file really is in the MP3 folder and its type is supported. |
+| No CSV found | Nothing to fix: the CSV is optional. To use one, Settings > Playlist CSV folder must hold the `.csv`; the newest one is used. Download new songs and Add covers and tags need it. |
+| A clip I published still shows up | Montager matches by file. A copy of the same recording under another name is another clip: delete or mark that copy. Check Settings > Published montages. |
 | Render is slow or runs out of memory | Close other heavy apps; use Effects "Default" and/or a shorter length. |
 | Something else | Troubleshoot > **Open logs** (`montage_data\logs\montage.log`). Include the end of it when you report a problem. |
 

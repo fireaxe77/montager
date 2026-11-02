@@ -9,6 +9,7 @@ version contained, the entry says "Details not recorded". Dates are the commit d
 A kill row that is already on screen when its clip starts (rule "pre-clip": a kill from before the clip) is a stale row, never a kill of the clip: it is ignored, a multikill is never dropped for it. Replaces the V9.5.6 "start the take later" handling.
 - `SEEN_PRE_IGNORE_ON`: `clip_seen_rows` leaves pre-clip rows out (both detection layouts) and `seen_rows_audit` skips them (so events cached by older versions are covered too, and `seen_rows_doomed` no longer drops them before planning). Removed: `seen_min_start` and its check in `geom`, `SEEN_PRE_NAME_ON`, `SEEN_PRE_START_ON`, `SEEN_PRE_SLACK_S`. Rows that are not stale still fail as before.
 - Tests: `tests/test_v957.py` (`V957_PARTS=0,1`). `tests/test_v956.py` part 2 tested the removed handling and is frozen.
+- Docs only (after the tag, no code): README (songs without a CSV, Songs tab, Published montages, stale installer / CSV lines), START_HERE, `docs/guides/INSTALL.md`, `docs/guides/TROUBLESHOOTING.md`, installer text in `packaging/make_release.py`.
 
 ## V9.5.6 - 2026-11-02
 Sky pattern choice, pre-clip kill rows, sky mask. Detection, effects' looks and the patterns' own drawing are untouched.
