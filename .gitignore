@@ -56,3 +56,7 @@ used_*.json
 # packaging build output
 /build/
 packaging/build/
+
+# local assistant files
+CLAUDE.md
+.claude/
